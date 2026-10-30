@@ -1,0 +1,28 @@
+# Build artifacts
+/target
+**/*.rs.bk
+
+# Local config with credentials
+/config/crosstalk.toml
+/config/janitor.toml
+/config/*.toml
+!/config/*.example.toml
+
+# Runtime state
+*.db
+*.db-shm
+*.db-wal
+/exports/
+/data/local/
+
+# Reference copy of the Python plugin (its own repository, kept out of this one)
+/reference/
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Planning scratch
+.remember/

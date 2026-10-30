@@ -1,0 +1,23 @@
+[package]
+name = "janitor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "crosstalk sub-app: fast, accurate EPG matcher for Dispatcharr"
+
+[dependencies]
+crosstalk-core.workspace = true
+crosstalk-matching.workspace = true
+
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+rayon.workspace = true
+csv.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

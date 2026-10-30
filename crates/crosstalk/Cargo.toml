@@ -1,0 +1,24 @@
+[package]
+name = "crosstalk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Host daemon for Dispatcharr tools, with janitor as its first sub-app"
+
+[[bin]]
+name = "crosstalk"
+path = "src/main.rs"
+
+[dependencies]
+crosstalk-core.workspace = true
+crosstalk-matching.workspace = true
+crosstalk-web.workspace = true
+janitor.workspace = true
+
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde_json.workspace = true

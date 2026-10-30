@@ -1,0 +1,75 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/crosstalk-matching",
+    "crates/crosstalk-core",
+    "crates/janitor",
+    "crates/crosstalk-web",
+    "crates/crosstalk",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+repository = "https://github.com/darkspadez/crosstalk"
+
+[workspace.dependencies]
+# Internal
+crosstalk-matching = { path = "crates/crosstalk-matching" }
+crosstalk-core = { path = "crates/crosstalk-core" }
+crosstalk-web = { path = "crates/crosstalk-web" }
+janitor = { path = "crates/janitor" }
+
+# Async / runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures = "0.3"
+
+# HTTP
+axum = { version = "0.7", features = ["macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs", "trace"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
+
+# Serialization / config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+toml_edit = "0.22"
+figment = { version = "0.10", features = ["toml", "env"] }
+
+# Matching
+rayon = "1"
+regex = "1"
+fancy-regex = "0.14"
+unicode-normalization = "0.1"
+unicode-general-category = "1"
+unicode_names2 = "1"
+globset = "0.4"
+strsim = "0.11"
+
+# Storage
+rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+
+# Web UI
+askama = { version = "0.12", features = ["with-axum"] }
+askama_axum = "0.4"
+mime_guess = "2"
+
+# Observability / CLI
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
+thiserror = "2"
+chrono = { version = "0.4", features = ["serde"] }
+tokio-cron-scheduler = "0.13"
+dashmap = "6"
+csv = "1"
+include_dir = "0.7"
+
+# Dev
+tempfile = "3"
+wiremock = "0.6"
