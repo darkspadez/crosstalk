@@ -13,6 +13,7 @@ pub mod runner;
 pub mod scheduler;
 pub mod store;
 pub mod subapp;
+pub mod wildcard;
 
 pub use config::{ConfigReport, CrosstalkConfig};
 pub use csv_report::{
@@ -30,6 +31,7 @@ pub use subapp::{
     ActionKind, ActionSpec, FieldKind, FieldSpec, FieldValue, JobOutcome, Registry, SettingsSchema,
     SettingsValues, SubApp,
 };
+pub use wildcard::{expand_patterns, parse_tokens};
 
 pub const HOST_NAME: &str = "crosstalk";
 pub const HOST_VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -308,7 +308,7 @@ New repository, so everything is new. The critical paths:
 - [x] Dispatcharr client (auth, channels, groups, profiles, sources, epgdata pagination,
       program search memo, batch-set-epg) with a mock server test (`wiremock`).
 - [x] SQLite store + migrations; job runner with progress channel; scheduler.
-- [ ] CSV preamble/writer/retention port with the `test_csv_retention.py` cases.
+- [x] CSV preamble/writer/retention port with the `test_csv_retention.py` cases.
 - [ ] `wildcard.rs` with `test_wildcard_match.py` cases.
 - [ ] AI: `Decider` trait, TypeSafe backend (retry, semaphore, decision log), OpenAI-compat
       backend; tests against recorded responses.
