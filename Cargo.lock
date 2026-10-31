@@ -546,7 +546,6 @@ version = "0.1.0"
 dependencies = [
  "fancy-regex",
  "regex",
- "serde",
  "serde_json",
  "unicode-general-category",
  "unicode-normalization",
@@ -563,7 +562,6 @@ dependencies = [
  "axum",
  "chrono",
  "crosstalk-core",
- "janitor",
  "mime_guess",
  "serde",
  "serde_json",

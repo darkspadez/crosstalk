@@ -291,7 +291,7 @@ New repository, so everything is new. The critical paths:
       `Cargo.toml`, `rust-toolchain.toml`, CI stub (fmt, clippy, test).
 
 ### Phase 1: crosstalk-matching with parity proof
-- [ ] Port `similarity.rs`, `tokens.rs`; golden tests for `calculate_similarity` and
+- [x] Port `similarity.rs`, `tokens.rs`; golden tests for `calculate_similarity` and
       token guards from `matcher_golden_baseline.json`.
 - [ ] Port `normalize.rs` (all tables, lookaround patterns via `fancy-regex`, Unicode
       helpers); golden tests for `normalize_name` + cases from `test_normalization_port.py`.

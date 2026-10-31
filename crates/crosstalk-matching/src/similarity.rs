@@ -8,9 +8,11 @@
 //! same edit distance and lets numbered siblings (`Fox Sports 1` vs `2`) through a 95
 //! threshold.
 //!
-//! `min_ratio` reproduces the Python gate exactly, including its two deliberate quirks:
-//!   * the comparison is `>=`, so a score landing exactly on the cutoff is KEPT;
-//!   * below the cutoff the result is `0.0`, not the raw ratio.
+//! `min_ratio` reproduces the rapidfuzz fast path the plugin actually takes: the
+//! comparison is `>=` (a score landing exactly on the cutoff is KEPT), and below the
+//! cutoff the result is `0.0` rather than the raw ratio. The pure-Python fallback can
+//! leak a sub-cutoff value on rare pairs, but every call site re-tests the score against
+//! the same or a higher threshold, so the two are behaviourally identical there.
 
 /// Levenshtein similarity in `0.0..=1.0`, defined as `1 - distance / max_len`.
 ///

@@ -8,7 +8,6 @@ description = "crosstalk daemon web UI: Askama templates and htmx"
 
 [dependencies]
 crosstalk-core.workspace = true
-janitor.workspace = true
 
 anyhow.workspace = true
 serde.workspace = true

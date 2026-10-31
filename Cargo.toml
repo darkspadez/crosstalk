@@ -48,7 +48,6 @@ unicode-normalization = "0.1"
 unicode-general-category = "1"
 unicode_names2 = "1"
 globset = "0.4"
-strsim = "0.11"
 
 # Storage
 rusqlite = { version = "0.32", features = ["bundled", "chrono"] }

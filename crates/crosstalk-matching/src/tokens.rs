@@ -11,11 +11,8 @@
 use regex::Regex;
 use std::collections::HashSet;
 use std::sync::OnceLock;
+use unicode_general_category::{get_general_category, GeneralCategory as G};
 use unicode_normalization::UnicodeNormalization;
-
-/// Stream-label variants that are not distinctive enough to distinguish channels.
-/// `ABC News` should still match `ABC News Live`.
-const NON_DISTINCTIVE_TOKENS: [&str; 3] = ["live", "now", "new"];
 
 /// Words that carry no discriminating power on their own.
 const COMMON_WORDS: [&str; 13] = [
@@ -43,15 +40,18 @@ const NUMERIC_TOKENS: [&str; 29] = [
 
 fn letter_digit_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    // Python: r'([^\W\d_])(\d)' — a letter of any script followed by a digit.
-    RE.get_or_init(|| Regex::new(r"(\p{L})(\d)").expect("static regex"))
+    // Python: r'([^\W\d_])(\d)' — one alphanumeric character that is not a digit and
+    // not an underscore, followed by a digit. That class is `L* ∪ Nl ∪ No`, not `\p{L}`,
+    // so `〇5` and `ᛮ3` split in Python and must split here too.
+    RE.get_or_init(|| Regex::new(r"([\p{L}\p{Nl}\p{No}])(\d)").expect("static regex"))
 }
 
 fn trailing_number_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    // Python: r'(?:^|\s)(\d{1,4})\s*$'. ASCII digits only: every real channel number is
-    // ASCII, and Python's Unicode-digit acceptance there is an accident of `\d`.
-    RE.get_or_init(|| Regex::new(r"(?:^|\s)([0-9]{1,4})\s*$").expect("static regex"))
+    // Python: r'(?:^|\s)(\d{1,4})\s*$'. `\d` there is any Unicode decimal digit, so
+    // Arabic-Indic and friends must count; the captured run is NFKC-folded to ASCII
+    // before parsing, which is exactly what Python's `int()` accepts.
+    RE.get_or_init(|| Regex::new(r"(?:^|\s)(\d{1,4})\s*$").expect("static regex"))
 }
 
 /// Python's `str.isalnum()`: a letter in any script, or a digit in Nd/Nl/No.
@@ -60,7 +60,6 @@ fn trailing_number_re() -> &'static Regex {
 /// accepts some spacing marks that Python excludes, so the categories are checked
 /// directly instead.
 pub fn is_alnum(c: char) -> bool {
-    use unicode_general_category::{get_general_category, GeneralCategory as G};
     matches!(
         get_general_category(c),
         G::UppercaseLetter
@@ -74,10 +73,55 @@ pub fn is_alnum(c: char) -> bool {
     )
 }
 
-/// Python's `str.isdigit()` for the purposes of these guards: an ASCII digit or any
-/// other decimal digit. `t.isdigit()` is used on normalized tokens, which are ASCII.
+/// Whether a token is numeric, for the single-character-token rule in majority mode.
+///
+/// Python uses `str.isdigit()`, which is the decimal digits (Nd) plus the `No`
+/// characters whose Unicode Numeric_Type is Digit (superscript two etc.). This accepts
+/// Nd only. That is deliberately narrower than Rust's `is_numeric` (Nd/Nl/No), which
+/// would keep `½`, `Ⅻ` and `〇` as meaningful where Python drops them; the residual
+/// difference is limited to single-character superscript tokens, which no real channel
+/// name contains.
 pub fn is_digit(token: &str) -> bool {
-    !token.is_empty() && token.chars().all(|c| c.is_ascii_digit() || c.is_numeric())
+    !token.is_empty()
+        && token
+            .chars()
+            .all(|c| get_general_category(c) == G::DecimalNumber)
+}
+
+/// Start code point of every run of ten decimal digits (Nd) in Unicode 17.
+///
+/// `\d` in both Python's regex engine and Rust's matches Nd, so a channel number may be
+/// written in any script ("hbo ٣"). Python's `int()` converts those; Rust has no
+/// equivalent, so the block starts are listed here and the value is the offset into the
+/// run. Regenerate with `scripts/` tooling if a new script's digits are ever added.
+const DECIMAL_BLOCK_STARTS: [u32; 77] = [
+    0x0030, 0x0660, 0x06F0, 0x07C0, 0x0966, 0x09E6, 0x0A66, 0x0AE6, 0x0B66, 0x0BE6, 0x0C66, 0x0CE6,
+    0x0D66, 0x0DE6, 0x0E50, 0x0ED0, 0x0F20, 0x1040, 0x1090, 0x17E0, 0x1810, 0x1946, 0x19D0, 0x1A80,
+    0x1A90, 0x1B50, 0x1BB0, 0x1C40, 0x1C50, 0xA620, 0xA8D0, 0xA900, 0xA9D0, 0xA9F0, 0xAA50, 0xABF0,
+    0xFF10, 0x104A0, 0x10D30, 0x10D40, 0x11066, 0x110F0, 0x11136, 0x111D0, 0x112F0, 0x11450,
+    0x114D0, 0x11650, 0x116C0, 0x116D0, 0x116DA, 0x11730, 0x118E0, 0x11950, 0x11BF0, 0x11C50,
+    0x11D50, 0x11DA0, 0x11DE0, 0x11F50, 0x16130, 0x16A60, 0x16AC0, 0x16B50, 0x16D70, 0x1CCF0,
+    0x1D7CE, 0x1D7D8, 0x1D7E2, 0x1D7EC, 0x1D7F6, 0x1E140, 0x1E2F0, 0x1E4F0, 0x1E5F1, 0x1E950,
+    0x1FBF0,
+];
+
+/// The numeric value of a decimal digit in any script, matching what Python's `int()`
+/// accepts.
+pub fn decimal_digit_value(c: char) -> Option<u32> {
+    if let Some(v) = c.to_digit(10) {
+        return Some(v);
+    }
+    let cp = c as u32;
+    let idx = DECIMAL_BLOCK_STARTS.partition_point(|&start| start <= cp);
+    if idx == 0 {
+        return None;
+    }
+    let offset = cp - DECIMAL_BLOCK_STARTS[idx - 1];
+    if offset < 10 && get_general_category(c) == G::DecimalNumber {
+        Some(offset)
+    } else {
+        None
+    }
 }
 
 /// Length in Unicode scalar values, which is what Python's `len()` counts.
@@ -121,16 +165,11 @@ pub fn process_string_for_matching(s: &str) -> String {
     tokens.join(" ")
 }
 
-/// True when a token is specific enough to matter in the subset and divergent guards.
-///
-/// Four characters is the floor, or a two-digit number (`360` distinguishes
-/// `Canal+Sport` from `Canal+Sport 360`). `live`/`now`/`new` are excluded because
-/// providers add and drop them freely.
+/// True when a token is long enough to identify a channel on its own in the subset
+/// guard. Five characters, exactly as in Janitor's `_has_token_overlap`; shorter extras
+/// such as `live`, `now` or `two` never turn a legitimate extension into a rejection.
 pub fn is_distinctive(token: &str) -> bool {
-    if NON_DISTINCTIVE_TOKENS.contains(&token) {
-        return false;
-    }
-    char_len(token) >= 4 || (is_digit(token) && char_len(token) >= 2)
+    char_len(token) >= 5
 }
 
 fn meaningful_tokens(s: &str) -> HashSet<&str> {
@@ -148,14 +187,20 @@ fn meaningful_tokens(s: &str) -> HashSet<&str> {
 ///
 /// `require_majority == true`: more than half of the smaller token set must be shared,
 /// and then three further guards run:
-///   * **subset** — one side is a strict subset and the larger side has a distinctive
-///     token the smaller lacks, so the candidate is a *more specific* channel
-///     (`Nickelodeon` vs `Nickelodeon Teen`);
+///   * **subset** — one side is a strict subset and the larger side has a distinctively
+///     long (five characters or more) token the smaller lacks, so the candidate is a
+///     *more specific* channel (`In Country Television` vs `Country Music Television`);
 ///   * **divergent** — both sides have unique tokens and at least one is four
 ///     characters or longer, so they describe different brands
 ///     (`Sky Cinema Disney` vs `Sky Cinema Decades`);
 ///   * **numeric/ordinal** — both sides have their own number word or digit
 ///     (`BBC One` vs `BBC Two`).
+///
+/// Note that Janitor's guard is *not* the one in `matching_core.py`: this plugin
+/// overrides `_has_token_overlap`, and its subset rule is a plain five-character length
+/// test rather than the core's `_is_distinctive`. The two disagree on real names —
+/// `nickelodeon` vs `nickelodeon teen` is accepted here and rejected by the core — so
+/// this ports the plugin's version.
 pub fn has_token_overlap(a: &str, b: &str, min_token_len: usize, require_majority: bool) -> bool {
     if require_majority {
         let tokens_a = meaningful_tokens(a);
@@ -215,7 +260,7 @@ pub fn has_token_overlap(a: &str, b: &str, min_token_len: usize, require_majorit
     if tokens_a.is_empty() || tokens_b.is_empty() {
         return true;
     }
-    !tokens_a.intersection(&tokens_b).next().is_none()
+    tokens_a.intersection(&tokens_b).next().is_some()
 }
 
 /// The integer value of a space-separated, purely-numeric trailing token.
@@ -224,10 +269,15 @@ pub fn has_token_overlap(a: &str, b: &str, min_token_len: usize, require_majorit
 /// `ESPN2` -> `None` because the digit is glued to the letters. Used to reject
 /// `Foo 1` against `Foo 2`.
 pub fn trailing_number(name: &str) -> Option<u32> {
-    trailing_number_re()
+    let captured = trailing_number_re()
         .captures(name)
         .and_then(|caps| caps.get(1))
-        .and_then(|m| m.as_str().parse().ok())
+        .map(|m| m.as_str().to_string())?;
+    let mut value: u32 = 0;
+    for c in captured.chars() {
+        value = value * 10 + decimal_digit_value(c)?;
+    }
+    Some(value)
 }
 
 #[cfg(test)]
@@ -306,6 +356,23 @@ mod tests {
     }
 
     #[test]
+    fn majority_mode_accepts_four_character_specialisation() {
+        // Janitor's subset guard is a five-character test, so a four-character
+        // specialisation is accepted where the shared core would reject it.
+        assert!(has_token_overlap(
+            "nickelodeon",
+            "nickelodeon teen",
+            4,
+            true
+        ));
+        assert!(has_token_overlap("discovery", "discovery life", 4, true));
+        assert!(has_token_overlap("abc", "abc kids", 4, true));
+        assert!(has_token_overlap("espn", "espn 360", 4, true));
+        // Five characters hits the subset guard and is rejected.
+        assert!(!has_token_overlap("tv5", "tv5 monde", 4, true));
+    }
+
+    #[test]
     fn majority_mode_allows_legit_extension() {
         // The only extra token is `live`, which is non-distinctive.
         assert!(has_token_overlap("abc news", "abc news live", 4, true));
@@ -320,14 +387,27 @@ mod tests {
         assert_eq!(trailing_number("ESPN"), None);
         assert_eq!(trailing_number("ESPN2"), None);
         assert_eq!(trailing_number("1"), Some(1));
+        // A Unicode decimal digit is a `\d` in Python and parses through `int()`.
+        assert_eq!(trailing_number("hbo ٣"), Some(3));
     }
 
     #[test]
     fn distinctive_rules() {
-        assert!(is_distinctive("teen"));
-        assert!(is_distinctive("360"));
+        assert!(is_distinctive("child"));
+        assert!(is_distinctive("music"));
         assert!(!is_distinctive("live"));
-        assert!(!is_distinctive("7"));
-        assert!(!is_distinctive("hd"));
+        assert!(!is_distinctive("teen"));
+        assert!(!is_distinctive("360"));
+    }
+
+    #[test]
+    fn numeric_token_rules() {
+        // Nd only; Nl/No are not digits to Python's `isdigit()` either.
+        assert!(is_digit("360"));
+        assert!(is_digit("٣"));
+        assert!(!is_digit("½"));
+        assert!(!is_digit("Ⅻ"));
+        assert!(!is_digit(""));
+        assert!(!is_digit("12a"));
     }
 }

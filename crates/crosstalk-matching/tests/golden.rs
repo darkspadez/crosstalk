@@ -57,7 +57,10 @@ fn process_string_matches_baseline() {
         assert_eq!(got, expected, "process_string({input:?})");
         checked += 1;
     }
-    assert!(checked >= 50, "expected at least 50 process_string cases");
+    assert_eq!(
+        checked, 56,
+        "the baseline holds exactly 56 process_string cases"
+    );
 }
 
 /// The token guards have no entries in the JSON baseline, so the cases verified by the
@@ -102,7 +105,14 @@ fn token_guard_cases_from_python_suite() {
         true
     ));
 
-    // Legitimate extension through a non-distinctive token.
+    // Legitimate extension: the only extra token is four characters, below the
+    // five-character subset threshold.
     assert!(has_token_overlap("abc news", "abc news live", 4, true));
     assert!(has_token_overlap("abc news", "abc live news", 4, true));
+    assert!(has_token_overlap(
+        "nickelodeon",
+        "nickelodeon teen",
+        4,
+        true
+    ));
 }
