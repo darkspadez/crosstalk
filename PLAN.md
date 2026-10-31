@@ -287,7 +287,7 @@ New repository, so everything is new. The critical paths:
 ## Steps
 
 ### Phase 0: repository
-- [ ] `git init`, move the Python plugin to `reference/`, add `.gitignore`, workspace
+- [x] `git init`, move the Python plugin to `reference/`, add `.gitignore`, workspace
       `Cargo.toml`, `rust-toolchain.toml`, CI stub (fmt, clippy, test).
 
 ### Phase 1: crosstalk-matching with parity proof
