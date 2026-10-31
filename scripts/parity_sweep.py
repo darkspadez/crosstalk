@@ -128,7 +128,9 @@ def load_python_matcher():
     sys.path.insert(0, PLUGIN_INNER)
     import fuzzy_matcher  # noqa: PLC0415
 
-    return fuzzy_matcher.FuzzyMatcher()
+    # The plugin constructs its matcher with FUZZY_MATCH_THRESHOLD (85); the class default
+    # of 80 would change every thresholded decision the sweep compares.
+    return fuzzy_matcher.FuzzyMatcher(match_threshold=85)
 
 
 def main() -> int:
@@ -137,7 +139,17 @@ def main() -> int:
     parser.add_argument("--tags", action="store_true", help="also sweep ignored tags")
     parser.add_argument("--show", type=int, default=25, help="mismatches to print")
     parser.add_argument(
-        "--pool", type=int, default=8, help="candidate pool size per match case"
+        "--pool",
+        type=int,
+        default=60,
+        help="candidate pool size per match case (larger pools are slower but exercise "
+        "sibling names, ties and ordering)",
+    )
+    parser.add_argument(
+        "--pools",
+        type=int,
+        default=1,
+        help="number of candidate pools, sampled at different offsets",
     )
     parser.add_argument(
         "--kinds",
@@ -230,24 +242,29 @@ def sweep_match(kind: str, names: list[str], matcher, args) -> int:
 
     # Deterministic candidate pools: a stride through the corpus so every query sees a
     # realistic mix of sibling names, aliases and unrelated channels.
-    pool_size = args.pool
-    pool = [names[(i * 97) % len(names)] for i in range(min(pool_size, len(names)))]
+    pool_size = min(args.pool, len(names))
     queries = names[: args.limit] if args.limit else names
     tag_sets = [set(), {"quality", "regional", "geographic", "misc"}]
+
+    pools = []
+    for p in range(max(1, args.pools)):
+        offset = (p * 7919) % max(1, len(names) - pool_size)
+        pools.append([names[(offset + i * 31) % len(names)] for i in range(pool_size)])
 
     cases = []
     for tags in tag_sets:
         for query in queries:
-            cases.append(
-                {
-                    "kind": kind,
-                    "query": query,
-                    "candidates": pool,
-                    "tags": sorted(tags),
-                }
-            )
-    print(f"[{kind}] {len(queries)} queries x {len(pool)} candidates x {len(tag_sets)} tag sets "
-          f"= {len(cases)} cases", file=sys.stderr)
+            for pool in pools:
+                cases.append(
+                    {
+                        "kind": kind,
+                        "query": query,
+                        "candidates": pool,
+                        "tags": sorted(tags),
+                    }
+                )
+    print(f"[{kind}] {len(queries)} queries x {len(pools)} pool(s) of {pool_size} x "
+          f"{len(tag_sets)} tag sets = {len(cases)} cases", file=sys.stderr)
 
     answers = run_rust(cases, args.binary)
 
@@ -344,10 +361,13 @@ def python_score(channel_name, epg_names, matcher, alias_map, tags) -> list:
             score, used = score_struct, components
 
         if score > 0:
-            results.append([epg_name, min(score, 100), " + ".join(used)])
+            # Keep the RAW score for sorting and cap only on the way out: plugin.py sorts
+            # `candidates` by score and applies `min(score, 100)` when it returns, so a
+            # 110-point structural candidate outranks a 100-point fuzzy one.
+            results.append((score, [epg_name, min(score, 100), " + ".join(used)]))
 
-    results.sort(key=lambda entry: entry[1], reverse=True)
-    return results
+    results.sort(key=lambda entry: entry[0], reverse=True)
+    return [entry for _, entry in results]
 
 
 def python_network(name: str):

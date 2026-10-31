@@ -22,7 +22,7 @@ use crate::callsign::{
     KnownCallsigns, Location,
 };
 use crate::normalize::{NormalizeFlags, Normalizer};
-use crate::pyre::{py_split_whitespace, py_trim, pythonize};
+use crate::pyre::{py_split_whitespace, pythonize};
 use crate::similarity::{calculate_similarity_cutoff, length_scaled_threshold};
 use crate::tokens::{has_token_overlap, is_digit, process_string_for_matching, trailing_number};
 use std::sync::{Arc, OnceLock};
@@ -77,6 +77,95 @@ impl MatchMethod {
     }
 }
 
+/// The accumulator `match_all_streams` uses, mirroring Python's plain `dict`.
+///
+/// Order matters: the plugin's final sort is stable, so ties come out in insertion order,
+/// which is "aliases first (already sorted), then candidate order, then callsign rescues".
+/// A `HashMap` here would shuffle tied results between runs and could change which entry a
+/// caller picks first.
+#[derive(Default)]
+struct MatchSet {
+    /// Names in insertion order; `None` marks a removed entry, which keeps the positions
+    /// of the survivors exactly as Python's dict does after a `pop`.
+    slots: Vec<Option<(String, usize, u8, MatchMethod)>>,
+    position: std::collections::HashMap<String, usize>,
+}
+
+impl MatchSet {
+    fn contains(&self, name: &str) -> bool {
+        self.position.contains_key(name)
+    }
+
+    /// Insert, or raise the score of an existing entry in place (keeping its position).
+    fn insert_if_better(&mut self, name: String, candidate: usize, score: u8, method: MatchMethod) {
+        match self
+            .position
+            .get(&name)
+            .and_then(|pos| self.slots[*pos].as_mut())
+        {
+            Some(entry) => {
+                if score > entry.2 {
+                    entry.1 = candidate;
+                    entry.2 = score;
+                    entry.3 = method;
+                }
+            }
+            None => {
+                self.position.insert(name.clone(), self.slots.len());
+                self.slots.push(Some((name, candidate, score, method)));
+            }
+        }
+    }
+
+    /// Replace the entry outright, as Python's `all_matches[x] = (...)` does.
+    fn set(&mut self, name: String, candidate: usize, score: u8, method: MatchMethod) {
+        match self
+            .position
+            .get(&name)
+            .and_then(|pos| self.slots[*pos].as_mut())
+        {
+            Some(entry) => {
+                entry.1 = candidate;
+                entry.2 = score;
+                entry.3 = method;
+            }
+            None => {
+                self.position.insert(name.clone(), self.slots.len());
+                self.slots.push(Some((name, candidate, score, method)));
+            }
+        }
+    }
+
+    fn get_score(&self, name: &str) -> Option<u8> {
+        self.position
+            .get(name)
+            .and_then(|pos| self.slots[*pos].as_ref())
+            .map(|entry| entry.2)
+    }
+
+    fn remove(&mut self, name: &str) {
+        if let Some(pos) = self.position.remove(name) {
+            self.slots[pos] = None;
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &(String, usize, u8, MatchMethod)> {
+        self.slots.iter().flatten()
+    }
+
+    fn retain_by_name(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        for (pos, slot) in self.slots.iter_mut().enumerate() {
+            if let Some(entry) = slot {
+                if !keep(&entry.0) {
+                    self.position.remove(&entry.0);
+                    *slot = None;
+                    let _ = pos;
+                }
+            }
+        }
+    }
+}
+
 /// One scored candidate from [`Matcher::match_all_streams`], ordered best first.
 #[derive(Debug, Clone)]
 pub struct Ranked {
@@ -116,7 +205,6 @@ pub struct CandidateIndex {
     callsign: Vec<Option<String>>,
     callsign_high_confidence: Vec<bool>,
     location: Vec<Location>,
-    original_tokens: Vec<Vec<String>>,
 }
 
 /// Collapse the separators the plugin ignores for its no-space comparison: any
@@ -154,12 +242,13 @@ impl CandidateIndex {
     ///
     /// Names that normalise to empty or to a single character are stored as `None`,
     /// because the plugin skips them at match time (`if not candidate_lower`).
-    pub fn build(
-        names: &[String],
-        normalizer: &Normalizer,
-        user_ignored_tags: &[&str],
-        known: &KnownCallsigns,
-    ) -> Self {
+    ///
+    /// No ignored tags are applied here, and that is not an oversight: the plugin warms
+    /// its cache with `precompute_normalizations(names)`, which passes no tags, while the
+    /// QUERY is normalised with the caller's tag set. Reproducing that asymmetry matters,
+    /// because a tag such as the literal word `quality` is stripped from the query but not
+    /// from the candidates.
+    pub fn build(names: &[String], normalizer: &Normalizer, known: &KnownCallsigns) -> Self {
         let mut index = Self {
             names: names.to_vec(),
             normalized_lower: Vec::with_capacity(names.len()),
@@ -168,11 +257,10 @@ impl CandidateIndex {
             callsign: Vec::with_capacity(names.len()),
             callsign_high_confidence: Vec::with_capacity(names.len()),
             location: Vec::with_capacity(names.len()),
-            original_tokens: Vec::with_capacity(names.len()),
         };
 
         for name in names {
-            let normalized = normalizer.normalize_name(name, user_ignored_tags);
+            let normalized = normalizer.normalize_name(name, &[]);
             let chars = normalized.chars().count();
             if chars >= 2 {
                 let lowercased = lower(&normalized);
@@ -191,12 +279,6 @@ impl CandidateIndex {
             index.callsign.push(callsign);
             index.callsign_high_confidence.push(high);
             index.location.push(extract_location(name));
-            index.original_tokens.push(
-                py_split_whitespace(&lower(name))
-                    .filter(|token| token.chars().all(|c| c.is_alphanumeric() || c == '_'))
-                    .map(str::to_string)
-                    .collect(),
-            );
         }
 
         index
@@ -238,11 +320,6 @@ impl CandidateIndex {
 
     fn processed(&self, index: usize) -> Option<&str> {
         self.processed[index].as_deref()
-    }
-
-    /// Tokens of the lowercased ORIGINAL name, used by the deterministic tie-break.
-    fn original_tokens(&self, index: usize) -> &[String] {
-        &self.original_tokens[index]
     }
 }
 
@@ -418,8 +495,9 @@ impl Matcher {
     /// The full pipeline: alias, exact, substring, token-sort fuzzy, callsign anchor and
     /// the regional filter. Returns every candidate at or above the threshold, best first.
     ///
-    /// `channel_number` enables the small channel-number boost; the plugin's EPG path
-    /// passes `None` there, and so does the default.
+    /// The channel-number boost is not applied: the plugin's EPG path passes
+    /// `channel_number=None`, so the boost never fires for these runs. Use
+    /// [`Matcher::channel_number_boost`] directly if a caller ever needs it.
     pub fn match_all_streams(
         &self,
         query: &str,
@@ -448,21 +526,14 @@ impl Matcher {
         let (query_callsign, query_high_confidence) =
             extract_callsign_with_confidence(query, &self.known);
         let query_callsign_normalized = query_callsign.as_deref().map(normalize_callsign);
-        let mut callsign_anchored: std::collections::HashSet<usize> =
+        let mut callsign_anchored: std::collections::HashSet<String> =
             std::collections::HashSet::new();
 
-        let mut all_matches: std::collections::HashMap<usize, (u8, MatchMethod)> =
-            std::collections::HashMap::new();
+        let mut all_matches = MatchSet::default();
 
         for ranked in self.alias_match(query, index, user_ignored_tags) {
-            all_matches
-                .entry(ranked.index)
-                .and_modify(|entry| {
-                    if ranked.score > entry.0 {
-                        *entry = (ranked.score, ranked.method.clone());
-                    }
-                })
-                .or_insert((ranked.score, ranked.method));
+            let name = index.name(ranked.index).to_string();
+            all_matches.insert_if_better(name, ranked.index, ranked.score, ranked.method);
         }
 
         let normalized_query = self.normalizer.normalize_name(query, user_ignored_tags);
@@ -477,7 +548,7 @@ impl Matcher {
             let processed_query = process_string_for_matching(&normalized_query);
 
             for candidate in 0..index.len() {
-                if all_matches.contains_key(&candidate) {
+                if all_matches.contains(index.name(candidate)) {
                     continue;
                 }
                 let Some((candidate_lower, candidate_nospace)) = index.normalized(candidate) else {
@@ -589,7 +660,12 @@ impl Matcher {
 
                 if let Some(method) = method {
                     if score > 0 {
-                        all_matches.insert(candidate, (score, method));
+                        all_matches.insert_if_better(
+                            index.name(candidate).to_string(),
+                            candidate,
+                            score,
+                            method,
+                        );
                     }
                 }
             }
@@ -610,17 +686,23 @@ impl Matcher {
                     if !candidate_high {
                         continue;
                     }
+                    let candidate_name = index.name(candidate).to_string();
                     if normalize_callsign(candidate_callsign) == query_normalized_callsign {
-                        let replace = match all_matches.get(&candidate) {
+                        let replace = match all_matches.get_score(&candidate_name) {
                             None => true,
-                            Some((score, _)) => *score < 95,
+                            Some(score) => score < 95,
                         };
                         if replace {
-                            all_matches.insert(candidate, (95, MatchMethod::Callsign));
+                            all_matches.set(
+                                candidate_name.clone(),
+                                candidate,
+                                95,
+                                MatchMethod::Callsign,
+                            );
                         }
-                        callsign_anchored.insert(candidate);
+                        callsign_anchored.insert(candidate_name);
                     } else {
-                        all_matches.remove(&candidate);
+                        all_matches.remove(&candidate_name);
                     }
                 }
             }
@@ -637,11 +719,11 @@ impl Matcher {
         let query_has_pacific = has("pacific") || contains_abbrev(&original_lower, "p");
 
         if query_has_east || query_has_west || query_has_pacific {
-            all_matches.retain(|candidate, _| {
-                if callsign_anchored.contains(candidate) {
+            all_matches.retain_by_name(|candidate_name| {
+                if callsign_anchored.contains(candidate_name) {
                     return true;
                 }
-                let name = lower(index.name(*candidate));
+                let name = lower(candidate_name);
                 let candidate_east = name.contains("east");
                 let candidate_west = name.contains("west") && !name.contains("western");
                 let candidate_pacific = name.contains("pacific");
@@ -658,53 +740,41 @@ impl Matcher {
             });
         } else if !user_ignored_tags.contains(&"regional") {
             // Regionless query prefers regionless candidates; the filter is dropped when it
-            // would eliminate everything, which is why this is computed separately.
-            let filtered: std::collections::HashMap<usize, (u8, MatchMethod)> = all_matches
-                .iter()
-                .filter(|(candidate, _)| {
-                    if callsign_anchored.contains(candidate) {
-                        return true;
-                    }
-                    let name = lower(index.name(**candidate));
-                    !(name.contains("pacific")
-                        || (name.contains("west") && !name.contains("western")))
-                })
-                .map(|(candidate, value)| (*candidate, value.clone()))
-                .collect();
-            if !filtered.is_empty() {
-                all_matches = filtered;
+            // would eliminate everything, which is why the survivors are counted first.
+            let keeps = |name: &str| {
+                if callsign_anchored.contains(name) {
+                    return true;
+                }
+                let lowered = lower(name);
+                !(lowered.contains("pacific")
+                    || (lowered.contains("west") && !lowered.contains("western")))
+            };
+            if all_matches.iter().any(|(name, _, _, _)| keeps(name)) {
+                all_matches.retain_by_name(keeps);
             }
         }
 
         // Deterministic tie-break: on equal score, prefer the candidate sharing more
         // ORIGINAL-name tokens with the query.
-        let query_tokens: std::collections::HashSet<&str> = py_split_whitespace(&original_lower)
-            .filter(|token| token.chars().all(|c| c.is_alphanumeric() || c == '_'))
-            .collect();
-
-        let mut results: Vec<Ranked> = all_matches
-            .into_iter()
-            .filter(|(_, (score, _))| *score >= min_score)
-            .map(|(index, (score, method))| Ranked {
-                index,
-                score,
-                method,
+        let mut results: Vec<(Ranked, usize)> = all_matches
+            .iter()
+            .filter(|(_, _, score, _)| *score >= min_score)
+            .map(|(name, candidate, score, method)| {
+                (
+                    Ranked {
+                        index: *candidate,
+                        score: *score,
+                        method: method.clone(),
+                    },
+                    ascii_token_overlap(&original_lower, name),
+                )
             })
             .collect();
 
-        results.sort_by(|a, b| {
-            let overlap = |candidate: &Ranked| {
-                index
-                    .original_tokens(candidate.index)
-                    .iter()
-                    .filter(|token| query_tokens.contains(token.as_str()))
-                    .count()
-            };
-            b.score
-                .cmp(&a.score)
-                .then_with(|| overlap(b).cmp(&overlap(a)))
-        });
-        results
+        // Stable: equal scores keep insertion order, then the original-token overlap
+        // breaks the tie, exactly as the plugin's `sort(key=(score, overlap), reverse)`.
+        results.sort_by(|a, b| b.0.score.cmp(&a.0.score).then_with(|| b.1.cmp(&a.1)));
+        results.into_iter().map(|(ranked, _)| ranked).collect()
     }
 
     /// `_channel_number_boost`: five points when a three-or-more-digit channel number
@@ -758,7 +828,7 @@ impl Matcher {
             .map(|ranked| (ranked.index, (ranked.score, ranked.method)))
             .collect();
 
-        let mut scored: Vec<Scored> = Vec::new();
+        let mut scored: Vec<(u8, Scored)> = Vec::new();
         for candidate in 0..index.len() {
             if exclude == Some(candidate) {
                 continue;
@@ -816,18 +886,59 @@ impl Matcher {
             };
 
             if score > 0 {
-                scored.push(Scored {
-                    index: candidate,
-                    score: score.min(100),
-                    components,
-                });
+                // The raw score is kept for sorting: structural signals can total 110,
+                // and the plugin sorts before capping, so a 110 structural candidate
+                // outranks a 100 fuzzy one. Capping first would silently reorder them.
+                scored.push((
+                    score,
+                    Scored {
+                        index: candidate,
+                        score,
+                        components,
+                    },
+                ));
             }
         }
 
         // Stable, so equal scores keep the candidate order, as Python's `list.sort` does.
-        scored.sort_by_key(|entry| std::cmp::Reverse(entry.score));
+        scored.sort_by_key(|(raw, _)| std::cmp::Reverse(*raw));
         scored
+            .into_iter()
+            .map(|(_, mut entry)| {
+                entry.score = entry.score.min(100);
+                entry
+            })
+            .collect()
     }
+}
+
+/// Runs of ASCII letters and digits, which is what Python's `re.findall(r'[a-z0-9]+', ...)`
+/// produces on an already-lowercased name.
+fn ascii_tokens(name_lower: &str) -> std::collections::HashSet<String> {
+    let mut tokens = std::collections::HashSet::new();
+    let mut current = String::new();
+    for c in name_lower.chars() {
+        if c.is_ascii_alphanumeric() {
+            current.push(c);
+        } else if !current.is_empty() {
+            tokens.insert(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        tokens.insert(current);
+    }
+    tokens
+}
+
+/// How many distinct ASCII tokens the candidate shares with the query. Python's
+/// deterministic tie-break compares exactly these sets.
+fn ascii_token_overlap(query_lower: &str, candidate: &str) -> usize {
+    let candidate_lower = lower(candidate);
+    let query_tokens = ascii_tokens(query_lower);
+    ascii_tokens(&candidate_lower)
+        .iter()
+        .filter(|token| query_tokens.contains(*token))
+        .count()
 }
 
 /// `(e)` / `(w)` / `(p)` region abbreviations in an already-lowercased name.
@@ -843,20 +954,6 @@ fn contains_abbrev(name: &str, letter: &str) -> bool {
     re.is_match(name).unwrap_or(false)
 }
 
-/// One candidate's fully-resolved match, for the report.
-#[derive(Debug, Clone)]
-pub struct MatchResult {
-    pub index: usize,
-    pub score: u8,
-    pub method: String,
-    pub callsign: Option<String>,
-}
-
-/// Trim a name the way the Python `lineup_name or ""` expressions do.
-pub fn query_name(name: &str) -> &str {
-    py_trim(name)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -867,7 +964,7 @@ mod tests {
 
     fn index_for(matcher: &Matcher, names: &[&str]) -> CandidateIndex {
         let owned: Vec<String> = names.iter().map(|n| n.to_string()).collect();
-        CandidateIndex::build(&owned, matcher.normalizer(), &[], matcher.known())
+        CandidateIndex::build(&owned, matcher.normalizer(), matcher.known())
     }
 
     fn best(matcher: &Matcher, query: &str, names: &[&str]) -> Option<(usize, u8, String)> {
@@ -998,6 +1095,45 @@ mod tests {
         assert_eq!(scored.len(), 1);
         assert_eq!(scored[0].score, 50);
         assert_eq!(scored[0].components, vec!["State", "City"]);
+    }
+
+    #[test]
+    fn raw_structural_score_outranks_a_fuzzy_hundred() {
+        // Callsign 50 + State 30 + City 20 + Network 10 = 110, which the plugin sorts on
+        // BEFORE capping. The first candidate's fuzzy 100 must therefore come second.
+        let m = matcher();
+        let index = index_for(&m, &["ABC - NY New York", "ABC - NY New York (WABC)"]);
+        let scored = m.score_candidates("ABC - NY New York (WABC)", &index, &[], None);
+        assert_eq!(scored[0].index, 1);
+        assert_eq!(scored[0].score, 100, "reported score is capped");
+        assert_eq!(scored[1].index, 0);
+        assert_eq!(scored[1].score, 100);
+    }
+
+    #[test]
+    fn an_empty_city_does_not_score() {
+        // `CBS - NY  (WCBS)` yields an empty city, which Python's truthiness test drops:
+        // State alone (30), not State + City (50).
+        let m = matcher();
+        let index = index_for(&m, &["CBS - NY  (WCBS)"]);
+        let scored = m.score_candidates("ABC - NY  (WABC)", &index, &[], None);
+        assert_eq!(scored.len(), 1);
+        assert_eq!(scored[0].components, vec!["State"]);
+        assert_eq!(scored[0].score, 30);
+    }
+
+    #[test]
+    fn tied_scores_keep_insertion_order_then_prefer_shared_tokens() {
+        let m = matcher();
+        // Two candidates that normalise identically tie on score; the tie-break prefers
+        // the one sharing more ASCII tokens with the original query.
+        let index = index_for(&m, &["ESPN Alt", "ESPN"]);
+        let ranked = m.match_all_streams_all("ESPN", &index, &[]);
+        assert_eq!(index.name(ranked[0].index), "ESPN");
+        // Reversing the input order must not change that.
+        let index = index_for(&m, &["ESPN", "ESPN Alt"]);
+        let ranked = m.match_all_streams_all("ESPN", &index, &[]);
+        assert_eq!(index.name(ranked[0].index), "ESPN");
     }
 
     #[test]

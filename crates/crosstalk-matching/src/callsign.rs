@@ -392,9 +392,12 @@ pub fn extract_location(channel_name: &str) -> Location {
 
     if let Ok(Some(caps)) = p1().captures(channel_name) {
         let state = caps.get(1).map(|m| m.as_str().to_string());
+        // An empty city is `""` in Python, which every use site tests for truthiness
+        // (`if location['city'] and ...`), so it is dropped here rather than passed on.
         let city = caps
             .get(2)
-            .map(|m| crate::pyre::py_trim(m.as_str()).to_string());
+            .map(|m| crate::pyre::py_trim(m.as_str()).to_string())
+            .filter(|city| !city.is_empty());
         return Location { state, city };
     }
 

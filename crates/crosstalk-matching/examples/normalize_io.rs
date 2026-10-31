@@ -90,12 +90,8 @@ fn main() {
                     std::sync::Arc::new(KnownCallsigns::shipped().cloned().unwrap_or_default()),
                     MatchOptions::default(),
                 );
-                let index = CandidateIndex::build(
-                    &candidates,
-                    matcher.normalizer(),
-                    &tag_refs,
-                    matcher.known(),
-                );
+                let index =
+                    CandidateIndex::build(&candidates, matcher.normalizer(), matcher.known());
                 // Every match, including below-threshold ones, so ordering and scores are
                 // compared too, not just which candidates survived.
                 let matches: Vec<serde_json::Value> = matcher
@@ -144,12 +140,8 @@ fn main() {
                     std::sync::Arc::new(KnownCallsigns::shipped().cloned().unwrap_or_default()),
                     MatchOptions::default(),
                 );
-                let index = CandidateIndex::build(
-                    &candidates,
-                    matcher.normalizer(),
-                    &tag_refs,
-                    matcher.known(),
-                );
+                let index =
+                    CandidateIndex::build(&candidates, matcher.normalizer(), matcher.known());
                 let scored: Vec<serde_json::Value> = matcher
                     .score_candidates(query, &index, &tag_refs, None)
                     .into_iter()

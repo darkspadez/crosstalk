@@ -82,10 +82,47 @@ pub fn is_alnum(c: char) -> bool {
 /// difference is limited to single-character superscript tokens, which no real channel
 /// name contains.
 pub fn is_digit(token: &str) -> bool {
-    !token.is_empty()
-        && token
-            .chars()
-            .all(|c| get_general_category(c) == G::DecimalNumber)
+    !token.is_empty() && token.chars().all(is_digit_char)
+}
+
+/// Non-decimal characters Python's `str.isdigit()` also accepts.
+///
+/// `str.isdigit()` is the decimal digits (Nd) plus every character whose Unicode
+/// Numeric_Type is Digit — superscripts, circled numbers, Ethiopic and Kharoshthi digits.
+/// Those are category `No`, so a decimal-only test would reject `፩` and `²` where Python
+/// accepts them. Generated from Python's own table; regenerate if a new script's digits
+/// are added.
+const DIGIT_NOT_DECIMAL_RANGES: [(u32, u32); 20] = [
+    (0xB2, 0xB3),
+    (0xB9, 0xB9),
+    (0x1369, 0x1371),
+    (0x19DA, 0x19DA),
+    (0x2070, 0x2070),
+    (0x2074, 0x2079),
+    (0x2080, 0x2089),
+    (0x2460, 0x2468),
+    (0x2474, 0x247C),
+    (0x2488, 0x2490),
+    (0x24EA, 0x24EA),
+    (0x24F5, 0x24FD),
+    (0x24FF, 0x24FF),
+    (0x2776, 0x277E),
+    (0x2780, 0x2788),
+    (0x278A, 0x2792),
+    (0x10A40, 0x10A43),
+    (0x10E60, 0x10E68),
+    (0x11052, 0x1105A),
+    (0x1F100, 0x1F10A),
+];
+
+fn is_digit_char(c: char) -> bool {
+    if get_general_category(c) == G::DecimalNumber {
+        return true;
+    }
+    let cp = c as u32;
+    DIGIT_NOT_DECIMAL_RANGES
+        .iter()
+        .any(|(start, end)| cp >= *start && cp <= *end)
 }
 
 /// Start code point of every run of ten decimal digits (Nd) in Unicode 17.
@@ -402,9 +439,15 @@ mod tests {
 
     #[test]
     fn numeric_token_rules() {
-        // Nd only; Nl/No are not digits to Python's `isdigit()` either.
         assert!(is_digit("360"));
+        // Nd of any script.
         assert!(is_digit("٣"));
+        // Numeric_Type=Digit `No` characters, which Python's `isdigit()` accepts.
+        assert!(is_digit("፩"));
+        assert!(is_digit("²"));
+        assert!(is_digit("①"));
+        assert!(is_digit("𐩀"));
+        // Not digits to Python: Numeric_Type=Numeric/None.
         assert!(!is_digit("½"));
         assert!(!is_digit("Ⅻ"));
         assert!(!is_digit(""));

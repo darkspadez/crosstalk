@@ -32,23 +32,26 @@ impl AliasMap {
             let Some(list) = value.as_array() else {
                 continue;
             };
+            // A list with any non-string element is skipped whole, as the plugin does. An
+            // empty list is kept: in a custom override it turns the built-in entry off.
+            if list.iter().any(|entry| !entry.is_string()) {
+                continue;
+            }
             let aliases: Vec<String> = list
                 .iter()
                 .filter_map(|entry| entry.as_str().map(str::to_string))
                 .collect();
-            if !aliases.is_empty() {
-                entries.insert(key.clone(), aliases);
-            }
+            entries.insert(key.clone(), aliases);
         }
         Some(Self { entries })
     }
 
     /// Merge custom aliases on top of the built-ins, replacing per key.
+    ///
+    /// An empty list is preserved rather than ignored: the plugin assigns the list
+    /// outright, so a custom entry with no aliases disables the built-in one for that key.
     pub fn with_overrides(mut self, overrides: HashMap<String, Vec<String>>) -> Self {
         for (key, aliases) in overrides {
-            if aliases.is_empty() {
-                continue;
-            }
             self.entries.insert(key, aliases);
         }
         self

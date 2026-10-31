@@ -297,7 +297,7 @@ New repository, so everything is new. The critical paths:
       helpers); golden tests for `normalize_name` + cases from `test_normalization_port.py`.
 - [x] Port `callsign.rs` (ladder, denylist, known-callsign loading, location, network);
       golden tests for `extract_callsign`.
-- [ ] Port `alias.rs` and `pipeline.rs` (`CandidateIndex`, `match_all_streams`,
+- [x] Port `alias.rs` and `pipeline.rs` (`CandidateIndex`, `match_all_streams`,
       `find_best_match`); port the behavioural cases from `test_fuzzy_matcher.py` and
       `test_regressions.py` as Rust tests.
 - [ ] Build `crosstalk simulate` and diff its per-stream CSV against `tools/match_sim.py`
