@@ -6,10 +6,13 @@
 //!   * `validate` — check configuration against Dispatcharr
 //!   * `simulate` — offline stream-to-channel match simulation (the parity oracle)
 
+mod registry;
 mod simulate;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
+use crosstalk_core::config::CrosstalkConfig;
+use crosstalk_core::jobs::JobContext;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -55,6 +58,9 @@ struct RunArgs {
     /// Change nothing; write the report only.
     #[arg(long)]
     preview: bool,
+    /// The explicit dry-run switch; `--preview` is kept for muscle memory.
+    #[arg(long = "dry-run")]
+    dry_run: bool,
 }
 
 #[derive(Args, Debug)]
@@ -152,13 +158,114 @@ fn main() -> Result<()> {
 }
 
 fn serve(_args: ServeArgs) -> Result<()> {
-    anyhow::bail!("the daemon is not built yet: this step of the rewrite covers the matcher only")
+    anyhow::bail!(
+        "the daemon is not built yet: this build covers configuration, the sub-app registry \
+         and the matcher"
+    )
 }
 
-fn run_once(_args: RunArgs) -> Result<()> {
-    anyhow::bail!("`crosstalk run` is not built yet: the daemon and sub-app registry come next")
+fn run_once(args: RunArgs) -> Result<()> {
+    let registry = registry::builtin();
+    let config = CrosstalkConfig::load(&args.config)?;
+    let (app, action) = registry
+        .find_action(&args.app, &args.action)
+        .with_context(|| {
+            format!(
+                "no action {:?} in sub-app {:?}; known apps: {}",
+                args.action,
+                args.app,
+                registry
+                    .iter()
+                    .map(|app| app.id())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
+
+    if action.kind.requires_confirmation() && !args.dry_run {
+        // A one-shot run has no dialog to confirm in, so the flag has to stand in for it.
+        // The confirmation text is printed so the consequence is still stated.
+        println!(
+            "{}\n{}",
+            action.label,
+            action.confirm.unwrap_or("This action changes data.")
+        );
+        println!("Re-run with --dry-run to change nothing.");
+    }
+
+    let context = JobContext::for_tests(config);
+    let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
+    let outcome = runtime.block_on(app.run(action.id, &context, args.dry_run))?;
+
+    println!("{}", outcome.summary);
+    for (key, value) in &outcome.counts {
+        println!("  {key}: {value}");
+    }
+    if let Some(path) = &outcome.report_path {
+        println!("  report: {}", path.display());
+    }
+    Ok(())
 }
 
-fn validate(_args: ConfigArgs) -> Result<()> {
-    anyhow::bail!("`crosstalk validate` is not built yet: it lands with the config loader")
+fn validate(args: ConfigArgs) -> Result<()> {
+    let config = CrosstalkConfig::load(&args.config)?;
+    let registry = registry::builtin();
+
+    let report = config.validate();
+    let mut failed = false;
+
+    println!("configuration: {}", args.config.display());
+    println!(
+        "dispatcharr: {} (credentials {})",
+        config.dispatcharr.api_root(),
+        if config.dispatcharr.has_credentials() {
+            "configured"
+        } else {
+            "MISSING"
+        }
+    );
+    println!(
+        "matching: databases {}, quality={} regional={} geographic={} misc={}",
+        config.matching.databases().join(","),
+        config.matching.ignore_quality_tags,
+        config.matching.ignore_regional_tags,
+        config.matching.ignore_geographic_tags,
+        config.matching.ignore_misc_tags
+    );
+    println!("threads: {}", config.jobs.resolved_worker_threads());
+
+    for warning in &report.warnings {
+        println!("warning: {warning}");
+    }
+    for error in &report.errors {
+        println!("error: {error}");
+        failed = true;
+    }
+
+    for key in registry.unknown_schedules(&config) {
+        println!("error: schedule {key:?} does not name a known <app>.<action>");
+        failed = true;
+    }
+
+    for app in registry.iter() {
+        let path = app.settings_path(&config.config_dir);
+        match app.load_settings(&path) {
+            Ok(values) => println!(
+                "app {}: {} setting(s) from {}",
+                app.id(),
+                values.iter().count(),
+                path.display()
+            ),
+            Err(error) => {
+                println!("error: app {} settings: {error:#}", app.id());
+                failed = true;
+            }
+        }
+    }
+
+    if failed {
+        anyhow::bail!("configuration has errors");
+    }
+    println!("ok");
+    Ok(())
 }

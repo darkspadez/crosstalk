@@ -1,0 +1,88 @@
+# crosstalk host configuration.
+#
+# This file holds everything the host owns: the Dispatcharr connection, the AI providers,
+# the HTTP listener, the thread pool and the shared name-matching options. Each sub-app has
+# its own file next to this one (janitor.toml, ...) for its thresholds and scope filters.
+#
+# Every value can be overridden by an environment variable named CROSSTALK_<SECTION>__<KEY>
+# in upper case, for example CROSSTALK_SERVER__PORT=9100. A double underscore separates
+# levels, which is how one value is changed in a container without editing this file.
+#
+# Copy this file to crosstalk.toml and edit it. The daemon writes back to that file when a
+# setting is changed in the web UI, and it preserves comments when it does.
+
+[server]
+# Interface to listen on. Keep the loopback default unless something in front of it
+# authenticates requests.
+bind = "127.0.0.1"
+port = 8730
+# Bearer token required on every request. Leave empty only while `bind` is loopback.
+# Prefer the environment variable named by `token_env` so the secret stays out of the file.
+token = ""
+token_env = "CROSSTALK_TOKEN"
+
+[dispatcharr]
+# Dispatcharr's base URL, without the /api suffix.
+base_url = "http://localhost:9191"
+# An API key is preferred: it does not expire, so a long-running schedule never has to
+# re-authenticate. Sent as the X-API-Key header.
+api_key = ""
+api_key_env = "CROSSTALK_DISPATCHARR_API_KEY"
+# JWT fallback, used only when no API key resolves.
+username = ""
+password = ""
+password_env = "CROSSTALK_DISPATCHARR_PASSWORD"
+# Per-request timeout in seconds.
+timeout_secs = 30
+# Cap on concurrent requests. The public TypeSafe endpoint rate-limits around eight
+# concurrent requests; Dispatcharr itself is usually fine with more.
+concurrency = 8
+
+# AI providers. A sub-app names the provider and the model in its own file; the host owns
+# the endpoint, the key and the concurrency cap, so several sub-apps share one provider
+# entry rather than each holding a copy.
+#
+# [ai.providers.typesafe]
+# kind = "typesafe"            # native System One: real probabilities and confidence
+# base_url = "https://api.typesafe.ai/v1"
+# api_key = ""
+# api_key_env = "TYPESAFE_API_KEY"
+# timeout_secs = 30
+# max_concurrency = 8
+#
+# [ai.providers.local]
+# kind = "openai_compat"       # any OpenAI-compatible chat endpoint
+# base_url = "http://localhost:11434/v1"
+# api_key_env = "OPENAI_API_KEY"
+# max_concurrency = 4
+
+[matching]
+# These four toggles live here rather than in a sub-app file, because every sub-app that
+# compares channel names must agree on them: two apps disagreeing about whether "[HD]" is
+# stripped would give two different answers for the same channel.
+ignore_quality_tags = true
+ignore_regional_tags = true
+ignore_geographic_tags = true
+ignore_misc_tags = true
+
+# Which shipped channel databases the matcher may draw reference names from. Empty means
+# the plugin's rule: every database when only one ships, otherwise the United States one.
+# Enabling a country you do not carry costs accuracy rather than gaining coverage.
+enabled_databases = ["US"]
+
+# Custom aliases, merged over the built-in table. An entry REPLACES the built-in list for
+# that key rather than adding to it, so include the built-in variants you still want.
+# [matching.custom_aliases]
+# "FOX News Channel" = ["FOX NEWS HD", "FoxNews"]
+
+[jobs]
+# Worker threads for the matching stage. 0 means one per core.
+worker_threads = 0
+# Relative paths resolve against this file's directory.
+exports_dir = "exports"
+data_dir = "data"
+
+# Schedules, as `<app>.<action>` with a five-field cron expression.
+# [schedules]
+# "janitor.automatch" = "0 4 * * *"
+# "janitor.heal" = "0 6 * * *"
