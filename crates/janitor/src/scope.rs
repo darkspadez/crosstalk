@@ -259,7 +259,7 @@ pub fn scope_entries(world: &World, filter: &str) -> ScopedEntries {
         let eligible: HashSet<i64> = world
             .sources
             .iter()
-            .filter(|source| matched.iter().any(|name| *name == source.name))
+            .filter(|source| matched.contains(&source.name))
             .map(|source| source.id)
             .collect();
         if eligible.is_empty() {
