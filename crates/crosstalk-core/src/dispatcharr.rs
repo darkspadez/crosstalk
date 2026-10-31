@@ -802,7 +802,6 @@ mod tests {
             password_env: String::new(),
             timeout_secs: 5,
             concurrency: 4,
-            ..DispatcharrConfig::default()
         }
     }
 
