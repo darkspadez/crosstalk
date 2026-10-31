@@ -8,6 +8,8 @@
 pub mod config;
 pub mod dispatcharr;
 pub mod jobs;
+pub mod runner;
+pub mod store;
 pub mod subapp;
 
 pub use config::{ConfigReport, CrosstalkConfig};
@@ -15,6 +17,8 @@ pub use dispatcharr::{
     Channel, DispatcharrClient, EpgEntry, EpgSource, HasPrograms, ProgramWindow, World,
 };
 pub use jobs::{JobContext, ProgressEvent, ProgressSink};
+pub use runner::{ActiveRun, JobRunner, StartedRun};
+pub use store::{AiDecision, RunRecord, RunRow, RunStatus, Store};
 pub use subapp::{
     ActionKind, ActionSpec, FieldKind, FieldSpec, FieldValue, JobOutcome, Registry, SettingsSchema,
     SettingsValues, SubApp,
