@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Run #{{ run.id }} - crosstalk{% endblock %}
+{% block content %}
+<h1>Run #{{ run.id }} <span class="muted">{{ run.app }} / {{ run.action }}</span></h1>
+
+<section class="card" id="run-status"
+         hx-get="/runs/{{ run.id }}/status" hx-trigger="every 2s" hx-swap="innerHTML">
+  {% include "_run_status.html" %}
+</section>
+
+<section class="card">
+  <h2>Results</h2>
+  <div id="rows" hx-get="/runs/{{ run.id }}/rows" hx-trigger="load, every 5s" hx-swap="innerHTML">
+    <p class="muted">Loading…</p>
+  </div>
+</section>
+{% endblock %}

@@ -1,0 +1,27 @@
+{% if rows.is_empty() %}
+<p class="muted">No rows recorded yet.</p>
+{% else %}
+<table>
+  <thead>
+    <tr>
+      <th>Channel</th><th>Group</th><th>Score</th><th>Method</th>
+      <th>Chosen guide</th><th>Source</th><th>Status</th><th>Reason</th><th>AI</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in rows %}
+    <tr>
+      <td>{{ row.channel_name }}</td>
+      <td class="muted">{{ row.channel_group }}</td>
+      <td>{{ row.score }}</td>
+      <td><code>{{ row.method }}</code></td>
+      <td>{{ row.epg_name }}</td>
+      <td class="muted">{{ row.epg_source }}</td>
+      <td><span class="status status-{{ row.status_class }}">{{ row.status }}</span></td>
+      <td class="muted">{{ row.reason }}</td>
+      <td class="muted">{% if let Some(ai) = row.ai_decision %}{{ ai }}{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}

@@ -13,7 +13,10 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use crosstalk_core::config::CrosstalkConfig;
 use crosstalk_core::jobs::JobContext;
+use crosstalk_core::runner::JobRunner;
+use crosstalk_core::store::Store;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -157,11 +160,84 @@ fn main() -> Result<()> {
     }
 }
 
-fn serve(_args: ServeArgs) -> Result<()> {
-    anyhow::bail!(
-        "the daemon is not built yet: this build covers configuration, the sub-app registry \
-         and the matcher"
-    )
+fn serve(args: ServeArgs) -> Result<()> {
+    let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
+    runtime.block_on(async move {
+        let config = Arc::new(CrosstalkConfig::load(&args.config)?);
+
+        // Refuse to expose an unauthenticated listener: an apply action can rewrite a guide.
+        let token = config.server.resolved_token();
+        if crosstalk_web::auth::requires_token(&config.server.bind, token.as_deref()) {
+            anyhow::bail!(
+                "server.bind is {} with no token: set server.token or server.token_env before \
+                 exposing the daemon. Anyone who can reach the port could run apply actions.",
+                config.server.bind
+            );
+        }
+
+        let store = Store::open(config.data_dir().join("crosstalk.db"))?;
+        let registry = registry::builtin();
+        let runner = JobRunner::new(registry.clone(), Arc::clone(&config), store.clone());
+
+        let (_runner, scheduler) =
+            crosstalk_core::scheduler::build(registry.clone(), Arc::clone(&config), store.clone())
+                .await?;
+
+        let state = crosstalk_web::AppState::new(registry, Arc::clone(&config), runner, store);
+        let app = crosstalk_web::router(state);
+
+        let address = format!("{}:{}", config.server.bind, config.server.port);
+        let listener = tokio::net::TcpListener::bind(&address)
+            .await
+            .with_context(|| format!("binding {address}"))?;
+
+        println!(
+            "crosstalk {} listening on http://{address}",
+            crosstalk_core::HOST_VERSION
+        );
+        if token.is_none() {
+            println!("no token configured: only a loopback listener may run without one");
+        }
+        for entry in crosstalk_core::scheduler::describe(&config) {
+            match &entry.next_run {
+                Some(next) => println!("schedule {} next runs at {next}", entry.key),
+                None => println!("schedule {} is not valid and will not run", entry.key),
+            }
+        }
+
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+            .context("serving the daemon")?;
+
+        scheduler.shutdown().await;
+        Ok(())
+    })
+}
+
+/// Wait for Ctrl-C or SIGTERM, so a container stop is a clean shutdown.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("installing the Ctrl-C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("installing the SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    println!("shutting down");
 }
 
 fn run_once(args: RunArgs) -> Result<()> {

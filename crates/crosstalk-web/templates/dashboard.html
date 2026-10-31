@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}Dashboard - crosstalk{% endblock %}
+{% block content %}
+<h1>Dashboard</h1>
+
+{% if !warnings.is_empty() %}
+<section class="card warn">
+  <h2>Needs attention</h2>
+  <ul>{% for warning in warnings %}<li>{{ warning }}</li>{% endfor %}</ul>
+</section>
+{% endif %}
+
+<section class="grid">
+  {% for app in apps %}
+  <article class="card">
+    <h2><a href="/apps/{{ app.id }}">{{ app.name }}</a></h2>
+    <p class="muted">{{ app.description }}</p>
+    <p class="row">
+      <a class="button" href="/apps/{{ app.id }}">Open</a>
+      {% if let Some(last) = app.last_run %}
+      <span class="muted">last run {{ last }}</span>
+      {% else %}
+      <span class="muted">never run</span>
+      {% endif %}
+    </p>
+  </article>
+  {% endfor %}
+</section>
+
+<section class="card">
+  <h2>Schedules</h2>
+  {% if schedules.is_empty() %}
+  <p class="muted">No schedules. Add one under <code>[schedules]</code> in <code>crosstalk.toml</code>.</p>
+  {% else %}
+  <table>
+    <thead><tr><th>Schedule</th><th>Cron</th><th>Next run</th></tr></thead>
+    <tbody>
+      {% for entry in schedules %}
+      <tr>
+        <td><code>{{ entry.key }}</code></td>
+        <td><code>{{ entry.cron }}</code></td>
+        <td>{% if let Some(next) = entry.next_run %}{{ next }}{% else %}<span class="muted">not a valid expression</span>{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="muted">Schedules fire in UTC.</p>
+  {% endif %}
+</section>
+
+<section class="card">
+  <h2>Recent runs</h2>
+  {% include "_runs_table.html" %}
+</section>
+{% endblock %}

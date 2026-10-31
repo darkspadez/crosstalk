@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block title %}{{ app.name }} - crosstalk{% endblock %}
+{% block content %}
+<h1>{{ app.name }}</h1>
+<p class="muted">{{ app.description }}</p>
+
+{% if let Some(active) = running %}
+<section class="card active">
+  <h2>Running now</h2>
+  <p>
+    <code>{{ active.action }}</code>
+    {% if let Some(percent) = active.percent() %}<progress value="{{ active.current }}" max="{{ active.total }}"></progress> {{ percent }}%{% endif %}
+    <span class="muted">{{ active.phase }}</span>
+  </p>
+  <p>
+    <a class="button" href="/runs/{{ active.run_id }}">Watch</a>
+    <form method="post" action="/runs/{{ active.run_id }}/cancel" class="inline">
+      <button type="submit" class="ghost">Cancel</button>
+    </form>
+  </p>
+</section>
+{% endif %}
+
+<section class="card">
+  <h2>Actions</h2>
+  <table class="actions">
+    <thead><tr><th>Action</th><th>What it does</th><th></th></tr></thead>
+    <tbody>
+      {% for action in actions %}
+      <tr>
+        <td><span class="tag {{ action.css }}">{{ action.label }}</span></td>
+        <td class="muted">{{ action.description }}</td>
+        <td>
+          {% if action.disabled %}
+          <span class="muted">a run is in progress</span>
+          {% else %}
+          <form method="post" action="/apps/{{ app.id }}/actions/{{ action.id }}"
+                {% if let Some(confirm) = action.confirm %}onsubmit="return confirm('{{ confirm }}')"{% endif %}>
+            <input type="hidden" name="dry_run" value="{% if action.kind_touches_channels %}false{% else %}true{% endif %}">
+            <button type="submit">Run</button>
+          </form>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="muted">
+    Button colour is the consequence: blue reads, green writes only this app's files, orange
+    writes channel data, red can remove a guide assignment. Orange and red always confirm.
+  </p>
+</section>
+
+<section class="card">
+  <h2>Recent runs</h2>
+  {% include "_runs_table.html" %}
+</section>
+{% endblock %}

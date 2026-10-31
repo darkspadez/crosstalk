@@ -17,6 +17,7 @@ crosstalk-web.workspace = true
 janitor.workspace = true
 
 anyhow.workspace = true
+axum.workspace = true
 clap.workspace = true
 csv.workspace = true
 chrono.workspace = true

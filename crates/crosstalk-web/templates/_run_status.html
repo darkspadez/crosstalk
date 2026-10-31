@@ -1,0 +1,27 @@
+<p>
+  <span class="status status-{{ run.status }}">{{ run.status }}</span>
+  {% if run.dry_run %}<span class="tag read">preview</span>{% else %}<span class="tag destructive">apply</span>{% endif %}
+  <span class="muted">started {{ run.started_at }}{% if let Some(finished) = run.finished_at %}, finished {{ finished }}{% endif %}</span>
+</p>
+{% if let Some(active) = active %}
+<p>
+  <progress value="{{ active.current }}" max="{{ active.total }}"></progress>
+  <span class="muted">{{ active.phase }}{% if let Some(percent) = active.percent() %} ({{ percent }}%){% endif %}</span>
+</p>
+{% endif %}
+{% if let Some(summary) = run.summary %}
+<p>{{ summary }}</p>
+{% endif %}
+{% if run.status.is_running() %}
+<form method="post" action="/runs/{{ run.id }}/cancel" class="inline">
+  <button type="submit" class="ghost">Cancel this run</button>
+</form>
+{% endif %}
+<p>
+  {% for (key, value) in counts %}
+  <span class="count"><strong>{{ value }}</strong> {{ key }}</span>
+  {% endfor %}
+</p>
+{% if let Some(report) = run.report_path %}
+<p><a class="button" href="/runs/{{ run.id }}/csv">Download CSV</a> <span class="muted">{{ report }}</span></p>
+{% endif %}

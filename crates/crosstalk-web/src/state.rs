@@ -1,0 +1,484 @@
+//! State the templates render, built from the registry, the runner and the store.
+//!
+//! Keeping the conversion here rather than in the route handlers means a template never has to
+//! know about `SettingsSchema`, `RunRow` or `ActionKind`, and the same view models are what the
+//! tests assert on.
+
+use crosstalk_core::config::CrosstalkConfig;
+use crosstalk_core::runner::JobRunner;
+use crosstalk_core::scheduler::ScheduleInfo;
+use crosstalk_core::store::{RunRecord, RunRow, Store};
+use crosstalk_core::subapp::{
+    ActionKind, FieldKind, FieldValue, Registry, SettingsSchema, SettingsValues,
+};
+use std::sync::Arc;
+
+/// Everything a request needs.
+#[derive(Clone)]
+pub struct AppState {
+    pub registry: Arc<Registry>,
+    pub config: Arc<CrosstalkConfig>,
+    pub runner: JobRunner,
+    pub store: Store,
+    token: Option<String>,
+}
+
+impl std::fmt::Debug for AppState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppState")
+            .field(
+                "apps",
+                &self.registry.iter().map(|app| app.id()).collect::<Vec<_>>(),
+            )
+            .field("auth", &self.token.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl AppState {
+    pub fn new(
+        registry: Registry,
+        config: Arc<CrosstalkConfig>,
+        runner: JobRunner,
+        store: Store,
+    ) -> Self {
+        let token = config.server.resolved_token();
+        Self {
+            registry: Arc::new(registry),
+            config,
+            runner,
+            store,
+            token,
+        }
+    }
+
+    /// The token a request must present, if any.
+    pub fn token(&self) -> Option<&str> {
+        self.token.as_deref()
+    }
+}
+
+/// One app on the dashboard.
+#[derive(Debug, Clone)]
+pub struct UiApp {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    /// A one-line summary of the last run.
+    pub last_run: Option<String>,
+}
+
+/// One action, with the colour and confirmation the UI needs.
+#[derive(Debug, Clone)]
+pub struct UiAction {
+    pub id: String,
+    pub label: String,
+    pub description: String,
+    /// CSS class carrying the plugin's button colour.
+    pub css: String,
+    pub confirm: Option<String>,
+    /// Whether this action can change channel data, which decides the dry-run flag.
+    pub kind_touches_channels: bool,
+    pub disabled: bool,
+}
+
+/// One setting field, ready to render.
+#[derive(Debug, Clone)]
+pub struct UiField {
+    pub id: String,
+    pub label: String,
+    pub help_text: String,
+    /// `text`, `number`, `boolean`, `json`, or `section`.
+    pub kind: String,
+    pub value: String,
+    pub checked: bool,
+    pub is_section: bool,
+}
+
+/// One app's settings form.
+#[derive(Debug, Clone)]
+pub struct UiSettings {
+    pub id: String,
+    pub name: String,
+    pub fields: Vec<UiField>,
+    pub error: Option<String>,
+}
+
+/// How a run row reads in the table.
+#[derive(Debug, Clone)]
+pub struct UiRow {
+    pub channel_name: String,
+    pub channel_group: String,
+    pub score: i64,
+    pub method: String,
+    pub epg_name: String,
+    pub epg_source: String,
+    pub status: String,
+    /// Lowercased status, for the CSS class.
+    pub status_class: String,
+    pub reason: String,
+    pub ai_decision: Option<String>,
+}
+
+/// Build the dashboard's app list.
+pub fn apps(registry: &Registry, store: &Store) -> Vec<UiApp> {
+    registry
+        .iter()
+        .map(|app| {
+            let last_run = store
+                .recent_runs_for(app.id(), 1)
+                .ok()
+                .and_then(|runs| runs.into_iter().next())
+                .map(|run| {
+                    format!(
+                        "{} {} ({})",
+                        run.action,
+                        run.status.as_str(),
+                        run.started_at
+                    )
+                });
+            UiApp {
+                id: app.id().to_string(),
+                name: app.name().to_string(),
+                description: app.description().to_string(),
+                last_run,
+            }
+        })
+        .collect()
+}
+
+/// Build one app's action list, marking them disabled while a run is in progress.
+pub fn actions(registry: &Registry, runner: &JobRunner, app_id: &str) -> Vec<UiAction> {
+    let busy = runner.is_busy(app_id);
+    match registry.get(app_id) {
+        Some(app) => app
+            .actions()
+            .into_iter()
+            .map(|action| UiAction {
+                id: action.id.to_string(),
+                label: action.label.to_string(),
+                description: action.description.to_string(),
+                css: action.kind.css_class().to_string(),
+                confirm: action.confirm.map(str::to_string),
+                kind_touches_channels: action.kind.touches_channels(),
+                disabled: busy,
+            })
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+/// The settings form for one schema, with the values as they stand.
+pub fn fields(schema: &SettingsSchema, values: &SettingsValues) -> Vec<UiField> {
+    schema
+        .fields()
+        .iter()
+        .map(|field| {
+            if field.is_section() {
+                return UiField {
+                    id: field.id.to_string(),
+                    label: field.label.to_string(),
+                    help_text: field.help_text.to_string(),
+                    kind: "section".to_string(),
+                    value: String::new(),
+                    checked: false,
+                    is_section: true,
+                };
+            }
+
+            let value = values
+                .get(field.id)
+                .cloned()
+                .unwrap_or_else(|| field.default.clone());
+            let (kind, rendered, checked) = match (&field.kind, &value) {
+                (FieldKind::Boolean, FieldValue::Boolean(flag)) => {
+                    ("boolean".to_string(), String::new(), *flag)
+                }
+                (FieldKind::Number, FieldValue::Number(number)) => {
+                    ("number".to_string(), format!("{number}"), false)
+                }
+                (FieldKind::JsonObject, FieldValue::Json(map)) => (
+                    "json".to_string(),
+                    serde_json::to_string_pretty(map).unwrap_or_else(|_| "{}".to_string()),
+                    false,
+                ),
+                (_, value) => ("text".to_string(), value.render(), false),
+            };
+
+            UiField {
+                id: field.id.to_string(),
+                label: field.label.to_string(),
+                help_text: field.help_text.to_string(),
+                kind,
+                value: rendered,
+                checked,
+                is_section: false,
+            }
+        })
+        .collect()
+}
+
+/// Build a run row for the table.
+pub fn run_row(row: &RunRow) -> UiRow {
+    UiRow {
+        channel_name: row.channel_name.clone(),
+        channel_group: row.channel_group.clone(),
+        score: row.score,
+        method: row.method.clone(),
+        epg_name: row.epg_name.clone().unwrap_or_default(),
+        epg_source: row.epg_source.clone().unwrap_or_default(),
+        status: row.status.clone(),
+        status_class: row.status.to_lowercase(),
+        reason: row.reason.clone(),
+        ai_decision: row.ai_decision.clone(),
+    }
+}
+
+pub fn rows(store: &Store, run_id: i64) -> Vec<UiRow> {
+    store
+        .rows(run_id)
+        .map(|rows| rows.iter().map(run_row).collect())
+        .unwrap_or_default()
+}
+
+/// The schedules, from the config, as the dashboard lists them.
+pub fn schedules(config: &CrosstalkConfig) -> Vec<ScheduleInfo> {
+    crosstalk_core::scheduler::describe(config)
+}
+
+/// The counts of a run, as `(key, value)` pairs, for the status panel.
+pub fn counts(run: &RunRecord) -> Vec<(String, i64)> {
+    match run.counts.as_object() {
+        Some(map) => map
+            .iter()
+            .filter_map(|(key, value)| value.as_i64().map(|value| (key.clone(), value)))
+            .filter(|(_, value)| *value != 0)
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+/// Turn submitted form fields into settings values, using the schema to know the types.
+///
+/// A checkbox that is absent means false, which is why the schema decides the type rather than
+/// the form: an unticked box sends nothing at all.
+pub fn values_from_form(
+    schema: &SettingsSchema,
+    form: &std::collections::HashMap<String, String>,
+) -> Result<SettingsValues, Vec<String>> {
+    let mut values = SettingsValues::new();
+    let mut errors = Vec::new();
+
+    for field in schema.editable() {
+        let raw = form.get(field.id);
+        match field.kind {
+            FieldKind::Boolean => {
+                let checked =
+                    raw.is_some_and(|value| value == "true" || value == "on" || value == "1");
+                values.insert(field.id, FieldValue::Boolean(checked));
+            }
+            FieldKind::Number => {
+                // A missing control means "unchanged": fall back to the field's default rather
+                // than failing the whole form.
+                let text = match raw {
+                    Some(text) => text.trim().to_string(),
+                    None => match &field.default {
+                        FieldValue::Number(number) => format!("{number}"),
+                        _ => String::new(),
+                    },
+                };
+                match text.parse::<f64>() {
+                    Ok(number) => {
+                        values.insert(field.id, FieldValue::Number(number));
+                    }
+                    Err(_) => {
+                        errors.push(format!("{} must be a number, got {text:?}", field.label))
+                    }
+                }
+            }
+            FieldKind::JsonObject => {
+                let text = raw.map(String::as_str).unwrap_or("").trim();
+                if text.is_empty() {
+                    values.insert(
+                        field.id,
+                        FieldValue::Json(std::collections::BTreeMap::new()),
+                    );
+                    continue;
+                }
+                match serde_json::from_str::<std::collections::BTreeMap<String, Vec<String>>>(text)
+                {
+                    Ok(map) => {
+                        values.insert(field.id, FieldValue::Json(map));
+                    }
+                    Err(error) => errors.push(format!(
+                        "{} must be a JSON object of name -> [aliases]: {error}",
+                        field.label
+                    )),
+                }
+            }
+            FieldKind::Text | FieldKind::Info => {
+                values.insert(field.id, FieldValue::Text(raw.cloned().unwrap_or_default()));
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(values)
+    } else {
+        Err(errors)
+    }
+}
+
+/// Whether an action, as registered, is a dry run by kind.
+pub fn is_read(kind: ActionKind) -> bool {
+    !kind.touches_channels()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crosstalk_core::subapp::{FieldSpec, SettingsSchema};
+
+    fn schema() -> SettingsSchema {
+        SettingsSchema::new(vec![
+            FieldSpec::section("_s", "Section", "help"),
+            FieldSpec::new(
+                "name",
+                "_s",
+                "Name",
+                FieldKind::Text,
+                FieldValue::Text("default".to_string()),
+            ),
+            FieldSpec::new(
+                "hours",
+                "_s",
+                "Hours",
+                FieldKind::Number,
+                FieldValue::Number(12.0),
+            ),
+            FieldSpec::new(
+                "flag",
+                "_s",
+                "Flag",
+                FieldKind::Boolean,
+                FieldValue::Boolean(true),
+            ),
+            FieldSpec::new(
+                "aliases",
+                "_s",
+                "Aliases",
+                FieldKind::JsonObject,
+                FieldValue::Json(Default::default()),
+            ),
+        ])
+    }
+
+    #[test]
+    fn fields_render_every_kind() {
+        let rendered = fields(&schema(), &SettingsValues::new());
+        assert!(rendered[0].is_section);
+        assert_eq!(rendered[1].kind, "text");
+        assert_eq!(rendered[1].value, "default");
+        assert_eq!(rendered[2].kind, "number");
+        assert_eq!(rendered[2].value, "12");
+        assert_eq!(rendered[3].kind, "boolean");
+        assert!(rendered[3].checked);
+        assert_eq!(rendered[4].kind, "json");
+        assert_eq!(rendered[4].value, "{}");
+    }
+
+    #[test]
+    fn a_form_round_trips_through_values() {
+        let mut form = std::collections::HashMap::new();
+        form.insert("name".to_string(), "Custom".to_string());
+        form.insert("hours".to_string(), "6".to_string());
+        form.insert("flag".to_string(), "true".to_string());
+        form.insert(
+            "aliases".to_string(),
+            r#"{"ESPN": ["ESPN US"]}"#.to_string(),
+        );
+
+        let values = values_from_form(&schema(), &form).expect("parses");
+        assert_eq!(values.text("name"), Some("Custom"));
+        assert_eq!(values.number("hours"), Some(6.0));
+        assert!(values.bool("flag").unwrap_or(false));
+        assert_eq!(
+            values
+                .json("aliases")
+                .and_then(|map| map.get("ESPN"))
+                .cloned(),
+            Some(vec!["ESPN US".to_string()])
+        );
+    }
+
+    #[test]
+    fn an_unticked_checkbox_is_false_not_missing() {
+        // A browser sends nothing for an unticked box, so the schema has to supply `false`.
+        let form = std::collections::HashMap::new();
+        let values = values_from_form(&schema(), &form).expect("parses");
+        assert_eq!(values.bool("flag"), Some(false));
+    }
+
+    #[test]
+    fn a_bad_number_is_reported_against_its_label() {
+        let mut form = std::collections::HashMap::new();
+        form.insert("hours".to_string(), "six".to_string());
+        let errors = values_from_form(&schema(), &form).expect_err("rejects");
+        assert!(errors[0].contains("Hours"), "{errors:?}");
+    }
+
+    #[test]
+    fn bad_alias_json_is_reported() {
+        let mut form = std::collections::HashMap::new();
+        form.insert("aliases".to_string(), "[not an object]".to_string());
+        let errors = values_from_form(&schema(), &form).expect_err("rejects");
+        assert!(errors[0].contains("Aliases"), "{errors:?}");
+    }
+
+    #[test]
+    fn an_empty_alias_box_means_none() {
+        let mut form = std::collections::HashMap::new();
+        form.insert("aliases".to_string(), "   ".to_string());
+        let values = values_from_form(&schema(), &form).expect("parses");
+        assert!(values.json("aliases").is_some_and(|map| map.is_empty()));
+    }
+
+    #[test]
+    fn run_rows_become_table_rows() {
+        let row = RunRow {
+            channel_name: "ESPN".to_string(),
+            channel_group: "Sports".to_string(),
+            score: 95,
+            method: "Callsign".to_string(),
+            epg_name: Some("ESPN HD".to_string()),
+            epg_source: Some("SD".to_string()),
+            status: "MATCHED".to_string(),
+            reason: "Excellent match".to_string(),
+            ai_decision: Some("verify: accept".to_string()),
+            ..RunRow::default()
+        };
+        let ui = run_row(&row);
+        assert_eq!(ui.status_class, "matched");
+        assert_eq!(ui.epg_name, "ESPN HD");
+
+        let empty = run_row(&RunRow::default());
+        assert_eq!(empty.epg_name, "");
+    }
+
+    #[test]
+    fn counts_skip_zeroes() {
+        let run = RunRecord {
+            id: 1,
+            app: "janitor".to_string(),
+            action: "automatch".to_string(),
+            dry_run: true,
+            started_at: String::new(),
+            finished_at: None,
+            status: crosstalk_core::store::RunStatus::Succeeded,
+            summary: None,
+            counts: serde_json::json!({"matched": 3, "skipped": 0}),
+            report_path: None,
+        };
+        assert_eq!(counts(&run), vec![("matched".to_string(), 3)]);
+    }
+}

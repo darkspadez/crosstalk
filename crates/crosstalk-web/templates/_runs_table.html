@@ -1,0 +1,22 @@
+{% if runs.is_empty() %}
+<p class="muted">No runs yet.</p>
+{% else %}
+<table>
+  <thead>
+    <tr><th>Run</th><th>App</th><th>Action</th><th>Mode</th><th>Status</th><th>Started</th><th>Summary</th></tr>
+  </thead>
+  <tbody>
+    {% for run in runs %}
+    <tr>
+      <td><a href="/runs/{{ run.id }}">#{{ run.id }}</a></td>
+      <td>{{ run.app }}</td>
+      <td><code>{{ run.action }}</code></td>
+      <td>{% if run.dry_run %}<span class="tag read">preview</span>{% else %}<span class="tag destructive">apply</span>{% endif %}</td>
+      <td><span class="status status-{{ run.status }}">{{ run.status }}</span></td>
+      <td class="muted">{{ run.started_at }}</td>
+      <td class="muted">{% if let Some(summary) = run.summary %}{{ summary }}{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}

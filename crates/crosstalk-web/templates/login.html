@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in - crosstalk</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body class="centered">
+  <main class="card narrow">
+    <h1>crosstalk</h1>
+    <p class="muted">Paste the access token from <code>crosstalk.toml</code>.</p>
+    {% if let Some(message) = error %}<p class="error">{{ message }}</p>{% endif %}
+    <form method="post" action="/login">
+      <label for="token">Access token</label>
+      <input id="token" name="token" type="password" autofocus autocomplete="current-password">
+      <button type="submit">Sign in</button>
+    </form>
+  </main>
+</body>
+</html>

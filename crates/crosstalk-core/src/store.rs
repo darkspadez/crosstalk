@@ -24,6 +24,12 @@ pub enum RunStatus {
     Cancelled,
 }
 
+impl std::fmt::Display for RunStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl RunStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -32,6 +38,11 @@ impl RunStatus {
             RunStatus::Failed => "failed",
             RunStatus::Cancelled => "cancelled",
         }
+    }
+
+    /// Whether this run is still going, for a template that must not compare strings.
+    pub fn is_running(&self) -> bool {
+        matches!(self, RunStatus::Running)
     }
 
     fn parse(text: &str) -> Self {

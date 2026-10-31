@@ -317,8 +317,8 @@ New repository, so everything is new. The critical paths:
 - [x] Settings + schema, scope resolution, EPG ordering by priority.
 - [x] Auto-match preview/apply with rayon matching stage and async validation stage.
 - [x] Scan & heal preview/apply.
-- [ ] AI verify-band and rescue gates; reason text; CSV `ai_decision` column.
-- [ ] `crosstalk run janitor ...` one-shot path and `validate`.
+- [x] AI verify-band and rescue gates; reason text; CSV `ai_decision` column.
+- [x] `crosstalk run janitor ...` one-shot path and `validate`.
 
 ### Phase 4: web UI and daemon
 - [ ] axum app, auth middleware, login page, dashboard.

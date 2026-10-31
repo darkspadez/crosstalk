@@ -1,0 +1,119 @@
+/* crosstalk: a small, plain stylesheet. The interface is mostly tables and forms, so the
+   design is typography and colour, not chrome. */
+:root {
+  --bg: #10131a;
+  --panel: #171b24;
+  --line: #262c3a;
+  --text: #e6e9ef;
+  --muted: #98a1b3;
+  --accent: #6ea8fe;
+  --read: #4a6fa5;
+  --local: #2f7d5d;
+  --write: #b4721f;
+  --danger: #b3403a;
+  --ok: #2f7d5d;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+body.centered { display: grid; place-items: center; min-height: 100vh; }
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+header.top {
+  display: flex; align-items: center; gap: 1.5rem;
+  padding: 0.9rem 1.5rem;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+header.top nav { display: flex; gap: 1rem; }
+header.top .brand { font-weight: 700; letter-spacing: 0.02em; }
+header.top .logout { margin-left: auto; }
+
+main { max-width: 1180px; margin: 1.5rem auto; padding: 0 1.5rem 4rem; }
+
+h1 { font-size: 1.5rem; margin: 0 0 1rem; }
+h2 { font-size: 1.1rem; margin: 0 0 0.75rem; }
+h3 { font-size: 0.95rem; margin: 1.25rem 0 0.25rem; text-transform: uppercase;
+     letter-spacing: 0.06em; color: var(--muted); }
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 1.1rem 1.25rem;
+  margin-bottom: 1.25rem;
+}
+.card.narrow { width: min(420px, 92vw); }
+.card.warn { border-color: var(--write); }
+.card.active { border-color: var(--accent); }
+
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem; }
+
+.muted { color: var(--muted); }
+.help { color: var(--muted); font-size: 0.85rem; margin: 0.15rem 0 0.9rem; }
+.error { color: #ff8b84; }
+.ok { color: #6fd7a8; }
+
+table { width: 100%; border-collapse: collapse; font-size: 0.92rem; }
+th { text-align: left; color: var(--muted); font-weight: 600; padding: 0.35rem 0.5rem;
+     border-bottom: 1px solid var(--line); white-space: nowrap; }
+td { padding: 0.4rem 0.5rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+tbody tr:hover { background: #1c2230; }
+table.actions td:nth-child(3) { width: 1%; white-space: nowrap; }
+
+code { font-family: var(--mono); font-size: 0.88em; background: #0e1219;
+       padding: 0.1rem 0.35rem; border-radius: 4px; }
+
+.tag {
+  display: inline-block; padding: 0.1rem 0.5rem; border-radius: 999px;
+  font-size: 0.8rem; border: 1px solid var(--line); white-space: nowrap;
+}
+.tag.action-read { border-color: var(--read); color: #b9cdf0; }
+.tag.action-local { border-color: var(--local); color: #9fe0c2; }
+.tag.action-write { border-color: var(--write); color: #f0c68a; }
+.tag.action-destructive { border-color: var(--danger); color: #f2a8a3; }
+.tag.read { border-color: var(--read); color: #b9cdf0; }
+.tag.destructive { border-color: var(--danger); color: #f2a8a3; }
+
+.status { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; }
+.status-succeeded { color: #6fd7a8; }
+.status-failed { color: #ff8b84; }
+.status-running { color: var(--accent); }
+.status-cancelled { color: var(--muted); }
+.status-matched, .status-healed { color: #6fd7a8; }
+.status-no_match, .status-no_replacement_found { color: var(--muted); }
+
+button, .button {
+  font: inherit; padding: 0.4rem 0.9rem; border-radius: 7px;
+  border: 1px solid var(--accent); background: var(--accent); color: #08111f;
+  cursor: pointer; text-decoration: none; display: inline-block;
+}
+button:hover, .button:hover { filter: brightness(1.1); text-decoration: none; }
+button.ghost { background: transparent; color: var(--text); border-color: var(--line); }
+
+form.inline { display: inline; }
+form label { display: block; margin-top: 0.6rem; font-size: 0.9rem; }
+form input[type=text], form input[type=number], form input[type=password], form textarea {
+  width: 100%; padding: 0.45rem 0.6rem; margin-top: 0.2rem;
+  background: #0e1219; color: var(--text);
+  border: 1px solid var(--line); border-radius: 7px; font: inherit;
+}
+form input[type=checkbox] { margin-top: 0.35rem; }
+form button { margin-top: 1rem; }
+
+progress { width: 220px; height: 0.7rem; vertical-align: middle; }
+
+.count { display: inline-block; margin-right: 1rem; color: var(--muted); }
+.count strong { color: var(--text); }
+
+footer { text-align: center; color: var(--muted); font-size: 0.85rem; padding: 2rem 0; }
