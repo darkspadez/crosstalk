@@ -8,6 +8,8 @@
 //! freshness watchdog are deliberately out of scope for this version, as is the anonymous
 //! usage counter.
 
+pub mod automatch;
+pub mod heal;
 pub mod scope;
 pub mod settings;
 
@@ -21,6 +23,53 @@ use std::sync::OnceLock;
 
 pub const APP_ID: &str = "janitor";
 pub const APP_NAME: &str = "EPG Janitor";
+
+/// Build the alias table for a run: the built-ins plus any custom entries in the host config.
+pub fn matcher_aliases(context: &JobContext) -> crosstalk_matching::alias::AliasMap {
+    let mut aliases = crosstalk_matching::alias::AliasMap::builtin();
+    let custom = &context.config().matching.custom_aliases;
+    if !custom.is_empty() {
+        aliases = aliases.with_overrides(
+            custom
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        );
+    }
+    aliases
+}
+
+/// The callsign allowlist for a run: the shipped FCC table plus whatever the enabled channel
+/// databases contribute.
+pub fn known_callsigns(context: &JobContext) -> crosstalk_matching::callsign::KnownCallsigns {
+    let mut known = crosstalk_matching::callsign::KnownCallsigns::shipped()
+        .cloned()
+        .unwrap_or_default();
+    let databases = context.config().matching.databases();
+    let codes: Vec<&str> = databases.iter().map(String::as_str).collect();
+    for callsign in crosstalk_matching::data::known_callsigns_for(&codes).to_vec() {
+        known.insert(&callsign);
+    }
+    known
+}
+
+/// The `user_ignored_tags` list a run passes, in the plugin's order.
+pub fn tag_list(flags: crosstalk_matching::normalize::NormalizeFlags) -> Vec<String> {
+    let mut tags = Vec::new();
+    if flags.ignore_quality {
+        tags.push("quality".to_string());
+    }
+    if flags.ignore_regional {
+        tags.push("regional".to_string());
+    }
+    if flags.ignore_geographic {
+        tags.push("geographic".to_string());
+    }
+    if flags.ignore_misc {
+        tags.push("misc".to_string());
+    }
+    tags
+}
 
 /// The action ids, as used in schedules and URLs.
 pub const ACTION_VALIDATE: &str = "validate";
@@ -166,20 +215,92 @@ impl JanitorApp {
         &self,
         action: &str,
         context: &JobContext,
-        _dry_run: bool,
+        dry_run: bool,
     ) -> Result<JobOutcome> {
         match action {
             ACTION_VALIDATE => self.validate(context),
             ACTION_STATUS => Ok(JobOutcome::new("No run has been recorded yet.")),
-            ACTION_AUTOMATCH_PREVIEW
-            | ACTION_AUTOMATCH_APPLY
-            | ACTION_HEAL_PREVIEW
-            | ACTION_HEAL_APPLY => bail!(
-                "{APP_NAME} action {action:?} needs the Dispatcharr client, which is not \
-                 wired into this build yet"
-            ),
+            ACTION_AUTOMATCH_PREVIEW => self.auto_match(context, true).await,
+            ACTION_AUTOMATCH_APPLY => self.auto_match(context, dry_run).await,
+            ACTION_HEAL_PREVIEW => self.heal(context, true).await,
+            ACTION_HEAL_APPLY => self.heal(context, dry_run).await,
             other => bail!("{APP_NAME} has no action {other:?}"),
         }
+    }
+
+    /// Preview or apply auto-match: load the world, resolve the scope, then match.
+    async fn auto_match(&self, context: &JobContext, dry_run: bool) -> Result<JobOutcome> {
+        let settings = settings::load(&self.settings_path(&context.config().config_dir))?;
+        let errors = settings::validate(&settings);
+        if !errors.is_empty() {
+            bail!("invalid settings: {}", errors.join("; "));
+        }
+
+        let client = context.dispatcharr()?;
+        context.progress(&crosstalk_core::jobs::ProgressEvent::new(
+            ACTION_AUTOMATCH_PREVIEW,
+            0,
+            0,
+            "loading Dispatcharr data",
+        ));
+        let world = client.load_world().await?;
+
+        let scoped_channels = scope::scope_channels(&world, &settings)?;
+        let scoped_entries = scope::scope_entries(&world, &settings.epg_sources_to_match);
+
+        if scoped_channels.channels.is_empty() {
+            return Ok(JobOutcome::new(
+                "No channels are in scope. Check the group, profile and source settings.",
+            ));
+        }
+        if scoped_entries.entries.is_empty() {
+            bail!(
+                "No EPG entries are eligible. Check that the sources in scope are active and \
+                 that 'EPG Sources to Match' names sources you actually have."
+            );
+        }
+
+        let result = automatch::run(
+            context,
+            &settings,
+            &world,
+            &scoped_channels,
+            &scoped_entries,
+            dry_run,
+        )
+        .await?;
+        Ok(automatch::outcome(&result, dry_run))
+    }
+
+    /// Preview or apply scan-and-heal.
+    async fn heal(&self, context: &JobContext, dry_run: bool) -> Result<JobOutcome> {
+        let settings = settings::load(&self.settings_path(&context.config().config_dir))?;
+        let errors = settings::validate(&settings);
+        if !errors.is_empty() {
+            bail!("invalid settings: {}", errors.join("; "));
+        }
+
+        let client = context.dispatcharr()?;
+        let world = client.load_world().await?;
+
+        let scoped_channels = scope::scope_channels(&world, &settings)?;
+        let filter = scope::heal_source_filter(&settings);
+        let scoped_entries = scope::scope_entries(&world, filter);
+
+        let result = heal::run(
+            context,
+            &settings,
+            &world,
+            &scoped_channels,
+            &scoped_entries,
+            dry_run,
+        )
+        .await?;
+        Ok(heal::outcome(
+            &result,
+            dry_run,
+            settings.heal_confidence_threshold,
+        ))
     }
 
     fn validate(&self, context: &JobContext) -> Result<JobOutcome> {
@@ -370,14 +491,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unimplemented_actions_say_what_is_missing() {
+    async fn an_apply_without_a_session_says_what_is_missing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let context = JobContext::for_tests(CrosstalkConfig::load(dir.path()).expect("load"));
         let error = app()
-            .dispatch(ACTION_AUTOMATCH_PREVIEW, &context, true)
+            .dispatch(ACTION_AUTOMATCH_APPLY, &context, false)
             .await
-            .expect_err("not built yet");
-        assert!(format!("{error}").contains("Dispatcharr client"));
+            .expect_err("no session");
+        // The settings load first, and with the shipped defaults they are valid, so the
+        // failure is the missing session.
+        assert!(
+            format!("{error}").contains("Dispatcharr session"),
+            "{error:#}"
+        );
     }
 
     #[tokio::test]

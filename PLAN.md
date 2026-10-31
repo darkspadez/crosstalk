@@ -314,7 +314,7 @@ New repository, so everything is new. The critical paths:
       backend; tests against recorded responses.
 
 ### Phase 3: janitor
-- [ ] Settings + schema, scope resolution, EPG ordering by priority.
+- [x] Settings + schema, scope resolution, EPG ordering by priority.
 - [ ] Auto-match preview/apply with rayon matching stage and async validation stage.
 - [ ] Scan & heal preview/apply.
 - [ ] AI verify-band and rescue gates; reason text; CSV `ai_decision` column.
