@@ -523,12 +523,10 @@ impl CrosstalkConfig {
                     "schedules.{key} must be <app>.<action>, e.g. janitor.automatch"
                 ));
             }
-            let fields = cron.split_whitespace().count();
-            if !(5..=7).contains(&fields) {
-                report.errors.push(format!(
-                    "schedules.{key} must be a cron expression of 5 to 7 fields, got {fields}: \
-                     {cron:?}"
-                ));
+            // Parsed, not merely counted: a five-field expression with a misspelled weekday
+            // would otherwise validate and then never fire.
+            if let Err(error) = crate::scheduler::parse_schedule(cron) {
+                report.errors.push(format!("schedules.{key}: {error:#}"));
             }
         }
 
@@ -937,7 +935,7 @@ enabled_databases = ["US", "UK"]
         assert!(report
             .errors
             .iter()
-            .any(|error| error.contains("5 to 7 fields")));
+            .any(|error| error.contains("cron expression")));
     }
 
     #[test]

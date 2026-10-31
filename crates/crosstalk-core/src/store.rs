@@ -135,7 +135,12 @@ impl Store {
     }
 
     fn with_connection<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-        let guard = self.connection.lock().expect("store lock");
+        // Recover from a poisoned lock rather than panicking: a poisoned store would take the
+        // whole daemon down on the next write, long after whatever panicked.
+        let guard = self
+            .connection
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         f(&guard)
     }
 
@@ -203,6 +208,14 @@ impl Store {
                     settings    TEXT NOT NULL
                 );
                 "#,
+            )?;
+            // A run left `running` by a crash or a restart can never finish, and pruning
+            // skips running rows, so it would otherwise show as live forever.
+            connection.execute(
+                "UPDATE runs SET status = 'failed', \
+                 summary = COALESCE(summary, 'the daemon restarted while this run was in progress'), \
+                 finished_at = COALESCE(finished_at, ?1) WHERE status = 'running'",
+                params![chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)],
             )?;
             Ok(())
         })
@@ -443,8 +456,9 @@ impl Store {
             let removed = connection.execute(
                 "DELETE FROM runs WHERE status != 'running' AND started_at < ?1 AND id NOT IN ( \
                      SELECT id FROM ( \
-                         SELECT id, ROW_NUMBER() OVER (PARTITION BY app ORDER BY started_at DESC) \
-                         AS position FROM runs WHERE status != 'running' \
+                         SELECT id, ROW_NUMBER() OVER (PARTITION BY app \
+                             ORDER BY started_at DESC, id DESC) AS position \
+                         FROM runs WHERE status != 'running' \
                      ) WHERE position <= ?2 \
                  )",
                 params![cutoff, keep_minimum as i64],

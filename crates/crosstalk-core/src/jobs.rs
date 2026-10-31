@@ -5,7 +5,9 @@
 //! runs from the daemon, from `crosstalk run`, and from a test.
 
 use crate::config::CrosstalkConfig;
+use crate::store::{AiDecision, RunRow, Store};
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -102,8 +104,12 @@ pub struct JobContext {
     /// one per call. `None` until a caller builds it, which keeps a dry check of the
     /// settings file from requiring a reachable server.
     dispatcharr: Option<crate::dispatcharr::DispatcharrClient>,
-    /// Cancellation flag, set when the UI cancels a run or the daemon shuts down.
-    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    /// Cancellation flag, set when the UI cancels a run or the daemon shuts down. Shared with
+    /// the runner, so cancelling actually reaches the action instead of only forgetting it.
+    cancelled: Arc<AtomicBool>,
+    /// The run this context belongs to, and where to record its rows.
+    run_id: Option<i64>,
+    store: Option<Store>,
 }
 
 impl std::fmt::Debug for JobContext {
@@ -120,7 +126,39 @@ impl JobContext {
             config,
             progress,
             dispatcharr: None,
-            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            run_id: None,
+            store: None,
+        }
+    }
+
+    /// Tie this context to a run: gives the action the shared cancel flag and a place to
+    /// record rows as they are produced, so a crash mid-run still leaves an audit trail.
+    pub fn for_run(mut self, run_id: i64, store: Store, cancelled: Arc<AtomicBool>) -> Self {
+        self.run_id = Some(run_id);
+        self.store = Some(store);
+        self.cancelled = cancelled;
+        self
+    }
+
+    /// The run id, when this context belongs to a recorded run.
+    pub fn run_id(&self) -> Option<i64> {
+        self.run_id
+    }
+
+    /// Append rows to the run record. A no-op outside a recorded run.
+    pub fn record_rows(&self, rows: &[RunRow]) -> anyhow::Result<()> {
+        match (&self.store, self.run_id) {
+            (Some(store), Some(run_id)) => store.append_rows(run_id, rows),
+            _ => Ok(()),
+        }
+    }
+
+    /// Record one AI request and its answer. A no-op outside a recorded run.
+    pub fn record_ai_decision(&self, decision: &AiDecision) -> anyhow::Result<()> {
+        match (&self.store, self.run_id) {
+            (Some(store), Some(run_id)) => store.record_ai_decision(run_id, decision),
+            _ => Ok(()),
         }
     }
 

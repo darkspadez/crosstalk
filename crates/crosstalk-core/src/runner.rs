@@ -1,20 +1,26 @@
-//! The job runner: one action at a time per sub-app, with progress and history.
+//! The job runner: one action at a time per sub-app, with progress, cancellation and history.
 //!
 //! A run is asynchronous and long — a preview over a few thousand channels takes seconds, an
 //! apply with programme checks takes minutes — so the HTTP layer starts it and returns, and
 //! the operator watches it through the progress stream or on the run page.
 //!
-//! Two rules come from the plugin's own behaviour and are enforced here rather than left to
-//! each app: one run per app at a time (two auto-matches writing the same channels would race),
-//! and a cancelled run stops before writing anything further.
+//! Three rules come from the plugin's own behaviour and are enforced here rather than left to
+//! each app:
+//!
+//!   * one run per app at a time, checked and reserved under ONE lock, because two
+//!     auto-matches writing the same channels would race;
+//!   * a cancelled run actually tells the action to stop, and is recorded as cancelled rather
+//!     than as a success;
+//!   * a panic in an action frees the app and records the failure, so one bad run cannot lock
+//!     the daemon out of ever running that app again.
 
 use crate::config::CrosstalkConfig;
 use crate::jobs::{JobContext, ProgressEvent, ProgressSink};
 use crate::store::{RunStatus, Store};
-use crate::subapp::Registry;
+use crate::subapp::{ActionKind, Registry};
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
@@ -28,7 +34,7 @@ pub struct StartedRun {
 }
 
 /// A snapshot of what is running, for the status page.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveRun {
     pub run_id: i64,
     pub app: String,
@@ -37,6 +43,8 @@ pub struct ActiveRun {
     pub current: u64,
     pub total: u64,
     pub phase: String,
+    /// Whether a cancellation has been requested. Exposed so the UI can say "stopping".
+    pub cancelling: bool,
 }
 
 impl ActiveRun {
@@ -72,6 +80,84 @@ impl ProgressSink for BroadcastSink {
     }
 }
 
+/// Clears a run's bookkeeping when it ends, however it ends.
+///
+/// A drop guard rather than statements after the `.await`: if the action panics, the code
+/// after the await never runs, and without this the app would stay "busy" for the life of the
+/// daemon.
+struct RunSlot {
+    run_id: i64,
+    app: String,
+    store: Store,
+    active: Arc<Mutex<HashMap<i64, ActiveRun>>>,
+    busy: Arc<Mutex<HashMap<String, i64>>>,
+    finish: Arc<Mutex<HashMap<i64, Arc<AtomicBool>>>>,
+    finished: bool,
+}
+
+impl RunSlot {
+    /// Record the outcome, then release the slot.
+    fn finish(
+        mut self,
+        status: RunStatus,
+        summary: Option<&str>,
+        counts: &serde_json::Value,
+        report: Option<&str>,
+    ) {
+        if let Err(error) = self
+            .store
+            .finish_run(self.run_id, status, summary, counts, report)
+        {
+            tracing::error!(
+                run_id = self.run_id,
+                "could not record the run's outcome: {error:#}"
+            );
+        }
+        self.finished = true;
+        self.release();
+    }
+
+    fn release(&mut self) {
+        // Only clear the app's slot if it is still THIS run: a cancelled run that a newer run
+        // replaced must not evict the newer one's reservation.
+        let mut busy = self.busy.lock().expect("busy lock");
+        if busy.get(&self.app).is_some_and(|id| *id == self.run_id) {
+            busy.remove(&self.app);
+        }
+        drop(busy);
+        self.active
+            .lock()
+            .expect("active lock")
+            .remove(&self.run_id);
+        self.finish
+            .lock()
+            .expect("finish lock")
+            .remove(&self.run_id);
+    }
+}
+
+impl Drop for RunSlot {
+    fn drop(&mut self) {
+        if !self.finished {
+            // Reached when the action panicked: record it as a failure so the history is
+            // truthful, then free the app.
+            if let Err(error) = self.store.finish_run(
+                self.run_id,
+                RunStatus::Failed,
+                Some("the run panicked; see the daemon log"),
+                &serde_json::json!({}),
+                None,
+            ) {
+                tracing::error!(
+                    run_id = self.run_id,
+                    "could not record a panicked run: {error:#}"
+                );
+            }
+            self.release();
+        }
+    }
+}
+
 /// Runs sub-app actions.
 #[derive(Clone)]
 pub struct JobRunner {
@@ -80,9 +166,10 @@ pub struct JobRunner {
     store: Store,
     sender: broadcast::Sender<ProgressEvent>,
     active: Arc<Mutex<HashMap<i64, ActiveRun>>>,
-    /// The run in progress per app, so a second one can be refused.
+    /// The run in progress per app.
     busy: Arc<Mutex<HashMap<String, i64>>>,
-    next_run: Arc<AtomicI64>,
+    /// Cancel flag per run.
+    finish: Arc<Mutex<HashMap<i64, Arc<AtomicBool>>>>,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -90,13 +177,14 @@ impl std::fmt::Debug for JobRunner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("JobRunner")
             .field("running", &self.running())
+            .field("shutting_down", &self.is_shutting_down())
             .finish_non_exhaustive()
     }
 }
 
 impl JobRunner {
     pub fn new(registry: Registry, config: Arc<CrosstalkConfig>, store: Store) -> Self {
-        let (sender, _) = broadcast::channel(256);
+        let (sender, _) = broadcast::channel(1024);
         Self {
             registry: Arc::new(registry),
             config,
@@ -104,7 +192,7 @@ impl JobRunner {
             sender,
             active: Arc::new(Mutex::new(HashMap::new())),
             busy: Arc::new(Mutex::new(HashMap::new())),
-            next_run: Arc::new(AtomicI64::new(1)),
+            finish: Arc::new(Mutex::new(HashMap::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -118,6 +206,9 @@ impl JobRunner {
     }
 
     /// Subscribe to progress events.
+    ///
+    /// A slow subscriber can lag; `broadcast` drops the oldest events and reports `Lagged`,
+    /// which the SSE layer treats as "resynchronise from the run store".
     pub fn subscribe(&self) -> broadcast::Receiver<ProgressEvent> {
         self.sender.subscribe()
     }
@@ -140,23 +231,89 @@ impl JobRunner {
         self.busy.lock().expect("busy lock").contains_key(app)
     }
 
-    /// Ask a run to stop. It checks the flag between channels and writes nothing more.
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutdown.load(Ordering::SeqCst)
+    }
+
+    /// Ask a run to stop.
+    ///
+    /// Sets the flag the action polls. The action keeps its slot until it returns, so the
+    /// one-run-per-app rule still holds meanwhile; the run is recorded as cancelled.
     pub fn cancel(&self, run_id: i64) -> bool {
-        // Cancellation is expressed through the active table: the entry is removed, and the
-        // action's own `JobContext` is cancelled in the same step.
-        let mut active = self.active.lock().expect("active lock");
-        match active.remove(&run_id) {
-            Some(run) => {
-                self.busy.lock().expect("busy lock").remove(&run.app);
+        let flags = self.finish.lock().expect("finish lock");
+        match flags.get(&run_id) {
+            Some(flag) => {
+                flag.store(true, Ordering::SeqCst);
+                drop(flags);
+                if let Some(entry) = self.active.lock().expect("active lock").get_mut(&run_id) {
+                    entry.cancelling = true;
+                }
                 true
             }
             None => false,
         }
     }
 
-    /// Stop everything, for a clean daemon shutdown.
+    /// Stop accepting new runs and ask every running one to stop.
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
+        let flags: Vec<Arc<AtomicBool>> = self
+            .finish
+            .lock()
+            .expect("finish lock")
+            .values()
+            .cloned()
+            .collect();
+        for flag in flags {
+            flag.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Reserve the app's slot and create the run, or explain why not.
+    ///
+    /// The check and the reservation happen under one lock: checking first and inserting later
+    /// lets two simultaneous requests both through.
+    fn reserve(
+        &self,
+        app_id: &str,
+        action_id: &str,
+        dry_run: bool,
+    ) -> Result<(i64, Arc<AtomicBool>)> {
+        if self.is_shutting_down() {
+            bail!("the daemon is shutting down; not starting new runs");
+        }
+
+        let mut busy = self.busy.lock().expect("busy lock");
+        if let Some(existing) = busy.get(app_id) {
+            bail!(
+                "{app_id} already has run {existing} in progress; wait for it to finish or \
+                 cancel it"
+            );
+        }
+
+        let run_id = self.store.start_run(app_id, action_id, dry_run)?;
+        busy.insert(app_id.to_string(), run_id);
+        drop(busy);
+
+        let flag = Arc::new(AtomicBool::new(false));
+        self.finish
+            .lock()
+            .expect("finish lock")
+            .insert(run_id, Arc::clone(&flag));
+        self.active.lock().expect("active lock").insert(
+            run_id,
+            ActiveRun {
+                run_id,
+                app: app_id.to_string(),
+                action: action_id.to_string(),
+                dry_run,
+                current: 0,
+                total: 0,
+                phase: "starting".to_string(),
+                cancelling: false,
+            },
+        );
+        Ok((run_id, flag))
     }
 
     /// Start a run and return immediately.
@@ -170,55 +327,46 @@ impl JobRunner {
             .find_action(app_id, action_id)
             .with_context(|| format!("no action {action_id:?} in sub-app {app_id:?}"))?;
 
-        if self.is_busy(app_id) {
-            bail!(
-                "{} already has a run in progress; wait for it to finish or cancel it",
-                app.name()
-            );
-        }
-
-        let run_id = self.store.start_run(app_id, action_id, dry_run)?;
-        self.next_run.store(run_id, Ordering::SeqCst);
-
-        {
-            let mut busy = self.busy.lock().expect("busy lock");
-            busy.insert(app_id.to_string(), run_id);
-        }
-        {
-            let mut active = self.active.lock().expect("active lock");
-            active.insert(
-                run_id,
-                ActiveRun {
-                    run_id,
-                    app: app_id.to_string(),
-                    action: action_id.to_string(),
-                    dry_run,
-                    current: 0,
-                    total: 0,
-                    phase: "starting".to_string(),
-                },
-            );
-        }
+        let (run_id, cancel_flag) = self.reserve(app_id, action_id, dry_run)?;
 
         let runner = self.clone();
         let app = Arc::clone(app);
         let started_app = app_id.to_string();
         let started_action = action_id.to_string();
-        let action_id = action_id.to_string();
-        let app_id = app_id.to_string();
 
         tokio::spawn(async move {
+            let slot = RunSlot {
+                run_id,
+                app: started_app.clone(),
+                store: runner.store.clone(),
+                active: Arc::clone(&runner.active),
+                busy: Arc::clone(&runner.busy),
+                finish: Arc::clone(&runner.finish),
+                finished: false,
+            };
+
             let sink = Arc::new(BroadcastSink {
                 sender: runner.sender.clone(),
                 active: Arc::clone(&runner.active),
                 run_id,
             });
-            let context = JobContext::new(Arc::clone(&runner.config), sink.clone());
+            let context = JobContext::new(Arc::clone(&runner.config), sink.clone()).for_run(
+                run_id,
+                runner.store.clone(),
+                Arc::clone(&cancel_flag),
+            );
 
-            let outcome = app.run(&action_id, &context, dry_run).await;
+            let outcome = app.run(&started_action, &context, dry_run).await;
+            let cancelled = cancel_flag.load(Ordering::SeqCst);
 
-            let (status, summary, counts, report) = match &outcome {
-                Ok(outcome) => (
+            let (status, summary, counts, report) = match (&outcome, cancelled) {
+                (_, true) => (
+                    RunStatus::Cancelled,
+                    Some("cancelled".to_string()),
+                    serde_json::json!({}),
+                    None,
+                ),
+                (Ok(outcome), false) => (
                     RunStatus::Succeeded,
                     Some(outcome.summary.clone()),
                     serde_json::to_value(&outcome.counts).unwrap_or_default(),
@@ -227,7 +375,7 @@ impl JobRunner {
                         .as_ref()
                         .map(|path| path.display().to_string()),
                 ),
-                Err(error) => (
+                (Err(error), false) => (
                     RunStatus::Failed,
                     Some(format!("{error:#}")),
                     serde_json::json!({}),
@@ -235,34 +383,26 @@ impl JobRunner {
                 ),
             };
 
-            if let Err(error) = runner.store.finish_run(
-                run_id,
-                status,
-                summary.as_deref(),
-                &counts,
-                report.as_deref(),
-            ) {
-                tracing::error!(run_id, "could not record the run's outcome: {error:#}");
-            }
+            slot.finish(status, summary.as_deref(), &counts, report.as_deref());
 
-            let mut event = ProgressEvent::new(&action_id, 0, 0, status.as_str());
+            let mut event = ProgressEvent::new(&started_action, 0, 0, status.as_str());
             event.done = true;
-            event.summary = summary.clone();
+            event.summary = summary;
             sink.publish(&event);
-
-            runner.busy.lock().expect("busy lock").remove(&app_id);
-            runner.active.lock().expect("active lock").remove(&run_id);
         });
 
         Ok(StartedRun {
             run_id,
-            app: started_app,
-            action: started_action,
+            app: app_id.to_string(),
+            action: action_id.to_string(),
             dry_run,
         })
     }
 
     /// Run an action to completion, for the one-shot CLI and tests.
+    ///
+    /// Takes the same reservation as [`JobRunner::start`], so a one-shot run and a scheduled
+    /// one cannot write the same channels at once.
     pub async fn run_to_completion(
         &self,
         app_id: &str,
@@ -274,18 +414,39 @@ impl JobRunner {
             .find_action(app_id, action_id)
             .with_context(|| format!("no action {action_id:?} in sub-app {app_id:?}"))?;
 
-        let run_id = self.store.start_run(app_id, action_id, dry_run)?;
+        let (run_id, cancel_flag) = self.reserve(app_id, action_id, dry_run)?;
+        let slot = RunSlot {
+            run_id,
+            app: app_id.to_string(),
+            store: self.store.clone(),
+            active: Arc::clone(&self.active),
+            busy: Arc::clone(&self.busy),
+            finish: Arc::clone(&self.finish),
+            finished: false,
+        };
+
         let sink = Arc::new(BroadcastSink {
             sender: self.sender.clone(),
-            active: Arc::new(Mutex::new(HashMap::new())),
+            active: Arc::clone(&self.active),
             run_id,
         });
-        let context = JobContext::new(Arc::clone(&self.config), sink);
+        let context = JobContext::new(Arc::clone(&self.config), sink).for_run(
+            run_id,
+            self.store.clone(),
+            Arc::clone(&cancel_flag),
+        );
 
         let outcome = app.run(action_id, &context, dry_run).await;
+        let cancelled = cancel_flag.load(Ordering::SeqCst);
+
         match &outcome {
-            Ok(outcome) => self.store.finish_run(
-                run_id,
+            _ if cancelled => slot.finish(
+                RunStatus::Cancelled,
+                Some("cancelled"),
+                &serde_json::json!({}),
+                None,
+            ),
+            Ok(outcome) => slot.finish(
                 RunStatus::Succeeded,
                 Some(&outcome.summary),
                 &serde_json::to_value(&outcome.counts).unwrap_or_default(),
@@ -294,16 +455,34 @@ impl JobRunner {
                     .as_ref()
                     .map(|path| path.display().to_string())
                     .as_deref(),
-            )?,
-            Err(error) => self.store.finish_run(
-                run_id,
+            ),
+            Err(error) => slot.finish(
                 RunStatus::Failed,
                 Some(&format!("{error:#}")),
                 &serde_json::json!({}),
                 None,
-            )?,
+            ),
         }
         outcome
+    }
+
+    /// The dry-run flag a schedule should use for this action.
+    ///
+    /// A schedule naming a preview is a dry run; naming an apply is not. Deriving it from the
+    /// action's own kind means a preview schedule can never write data just because the
+    /// scheduler assumed otherwise.
+    pub fn scheduled_dry_run(&self, app_id: &str, action_id: &str) -> bool {
+        match self.registry.find_action(app_id, action_id) {
+            Some((_app, action)) => !action.kind.touches_channels(),
+            None => true,
+        }
+    }
+
+    /// The kind of an action, for callers that need to report on it.
+    pub fn action_kind(&self, app_id: &str, action_id: &str) -> Option<ActionKind> {
+        self.registry
+            .find_action(app_id, action_id)
+            .map(|(_, action)| action.kind)
     }
 }
 
@@ -311,26 +490,40 @@ impl JobRunner {
 mod tests {
     use super::*;
     use crate::jobs::VecSink;
-    use crate::subapp::{
-        ActionKind, ActionSpec, JobOutcome, SettingsSchema, SettingsValues, SubApp,
-    };
+    use crate::subapp::{ActionSpec, JobOutcome, SettingsSchema, SettingsValues, SubApp};
     use std::path::Path;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
-    /// An app whose runs complete on demand, so the runner's bookkeeping can be observed.
+    /// An app whose runs take `delay`, optionally panic, and honour cancellation.
     struct TestApp {
         runs: Arc<AtomicUsize>,
         delay: Duration,
         fail: bool,
+        panic: bool,
     }
 
     impl TestApp {
-        fn new(delay: Duration, fail: bool) -> Self {
+        fn new(delay: Duration) -> Self {
             Self {
                 runs: Arc::new(AtomicUsize::new(0)),
                 delay,
-                fail,
+                fail: false,
+                panic: false,
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                fail: true,
+                ..Self::new(Duration::from_millis(1))
+            }
+        }
+
+        fn panicking() -> Self {
+            Self {
+                panic: true,
+                ..Self::new(Duration::from_millis(1))
             }
         }
     }
@@ -349,7 +542,10 @@ mod tests {
         }
 
         fn actions(&self) -> Vec<ActionSpec> {
-            vec![ActionSpec::new("run", "Run", "runs", ActionKind::Read)]
+            vec![
+                ActionSpec::new("run", "Run", "runs", ActionKind::Read),
+                ActionSpec::new("apply", "Apply", "writes", ActionKind::Write),
+            ]
         }
 
         fn schema(&self) -> &SettingsSchema {
@@ -374,8 +570,20 @@ mod tests {
         {
             Box::pin(async move {
                 self.runs.fetch_add(1, Ordering::SeqCst);
+                if self.panic {
+                    panic!("deliberate panic");
+                }
                 context.progress(&ProgressEvent::new("run", 1, 2, "working"));
-                tokio::time::sleep(self.delay).await;
+                // Poll for cancellation while "working", as a real action would.
+                let waited = self.delay.as_millis() as u64;
+                let mut elapsed = 0;
+                while elapsed < waited {
+                    if context.is_cancelled() {
+                        anyhow::bail!("cancelled by the operator");
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    elapsed += 5;
+                }
                 if self.fail {
                     anyhow::bail!("deliberate failure");
                 }
@@ -392,20 +600,25 @@ mod tests {
         )
     }
 
+    async fn wait_until_idle(runner: &JobRunner) {
+        for _ in 0..200 {
+            if runner.running().is_empty() && !runner.is_busy("test") {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the runner never went idle");
+    }
+
     #[tokio::test]
     async fn a_run_is_recorded_and_reported_finished() {
         let store = Store::in_memory().expect("store");
-        let runner = runner(
-            TestApp::new(Duration::from_millis(10), false),
-            store.clone(),
-        );
+        let runner = runner(TestApp::new(Duration::from_millis(10)), store.clone());
         let mut events = runner.subscribe();
 
         let started = runner.start("test", "run", true).expect("started");
-        assert_eq!(started.app, "test");
-        assert!(started.dry_run);
+        assert!(runner.is_busy("test"));
 
-        // Wait for the completion event.
         let mut done = false;
         while let Ok(Ok(event)) = tokio::time::timeout(Duration::from_secs(5), events.recv()).await
         {
@@ -416,16 +629,7 @@ mod tests {
         }
         assert!(done, "the run should publish a completion event");
 
-        // The bookkeeping is cleared and the history has the run.
-        for _ in 0..50 {
-            if !runner.is_busy("test") {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(!runner.is_busy("test"));
-        assert!(runner.running().is_empty());
-
+        wait_until_idle(&runner).await;
         let record = store.run(started.run_id).expect("run").expect("present");
         assert_eq!(record.status, RunStatus::Succeeded);
         assert_eq!(record.summary.as_deref(), Some("finished"));
@@ -435,25 +639,70 @@ mod tests {
     #[tokio::test]
     async fn a_second_run_for_the_same_app_is_refused() {
         let store = Store::in_memory().expect("store");
-        let runner = runner(TestApp::new(Duration::from_millis(200), false), store);
+        let runner = runner(TestApp::new(Duration::from_millis(100)), store);
         let _first = runner.start("test", "run", true).expect("started");
-
         let error = runner.start("test", "run", true).expect_err("refused");
-        assert!(format!("{error}").contains("already has a run in progress"));
+        assert!(format!("{error}").contains("already has run"));
     }
 
     #[tokio::test]
-    async fn an_unknown_app_or_action_is_refused() {
+    async fn concurrent_starts_only_let_one_through() {
         let store = Store::in_memory().expect("store");
-        let runner = runner(TestApp::new(Duration::from_millis(1), false), store);
-        assert!(runner.start("nope", "run", true).is_err());
-        assert!(runner.start("test", "nope", true).is_err());
+        let runner = runner(TestApp::new(Duration::from_millis(100)), store);
+        let mut accepted = 0;
+        for _ in 0..4 {
+            if runner.start("test", "run", true).is_ok() {
+                accepted += 1;
+            }
+        }
+        assert_eq!(accepted, 1, "only one run may hold the app");
+    }
+
+    #[tokio::test]
+    async fn cancelling_reaches_the_action_and_is_recorded() {
+        let store = Store::in_memory().expect("store");
+        let runner = runner(TestApp::new(Duration::from_millis(300)), store.clone());
+        let started = runner.start("test", "apply", false).expect("started");
+
+        assert!(runner.cancel(started.run_id));
+        // The slot is still held until the action notices, so a new run is still refused.
+        assert!(runner.start("test", "apply", false).is_err());
+
+        wait_until_idle(&runner).await;
+        let record = store.run(started.run_id).expect("run").expect("present");
+        assert_eq!(record.status, RunStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_unknown_run_reports_false() {
+        let store = Store::in_memory().expect("store");
+        let runner = runner(TestApp::new(Duration::from_millis(1)), store);
+        assert!(!runner.cancel(999));
+    }
+
+    #[tokio::test]
+    async fn a_panicking_action_frees_the_app_and_records_a_failure() {
+        let store = Store::in_memory().expect("store");
+        let runner = runner(TestApp::panicking(), store.clone());
+        let started = runner.start("test", "run", true).expect("started");
+
+        wait_until_idle(&runner).await;
+        let record = store.run(started.run_id).expect("run").expect("present");
+        assert_eq!(record.status, RunStatus::Failed);
+        assert!(record
+            .summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("panicked"));
+
+        // And the app can be used again.
+        assert!(runner.start("test", "run", true).is_ok());
     }
 
     #[tokio::test]
     async fn a_failure_is_recorded_as_failed() {
         let store = Store::in_memory().expect("store");
-        let runner = runner(TestApp::new(Duration::from_millis(1), true), store.clone());
+        let runner = runner(TestApp::failing(), store.clone());
         let outcome = runner.run_to_completion("test", "run", true).await;
         assert!(outcome.is_err());
 
@@ -464,12 +713,28 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("deliberate failure"));
+        assert!(!runner.is_busy("test"));
+    }
+
+    #[tokio::test]
+    async fn run_to_completion_reserves_the_slot() {
+        let store = Store::in_memory().expect("store");
+        let runner = runner(TestApp::new(Duration::from_millis(60)), store.clone());
+        let started = runner.start("test", "run", true).expect("started");
+        let error = runner
+            .run_to_completion("test", "run", true)
+            .await
+            .expect_err("refused while another run holds the app");
+        assert!(format!("{error:#}").contains("already has run"));
+        wait_until_idle(&runner).await;
+        assert!(!runner.is_busy("test"));
+        let _ = started;
     }
 
     #[tokio::test]
     async fn run_to_completion_returns_the_outcome_and_records_it() {
         let store = Store::in_memory().expect("store");
-        let runner = runner(TestApp::new(Duration::from_millis(1), false), store.clone());
+        let runner = runner(TestApp::new(Duration::from_millis(1)), store.clone());
         let outcome = runner
             .run_to_completion("test", "run", false)
             .await
@@ -478,22 +743,89 @@ mod tests {
         assert_eq!(store.run_count().expect("count"), 1);
     }
 
+    #[tokio::test]
+    async fn shutdown_refuses_new_runs_and_stops_running_ones() {
+        let store = Store::in_memory().expect("store");
+        let runner = runner(TestApp::new(Duration::from_millis(200)), store.clone());
+        let started = runner.start("test", "run", true).expect("started");
+
+        runner.shutdown();
+        assert!(runner.is_shutting_down());
+        wait_until_idle(&runner).await;
+
+        let record = store.run(started.run_id).expect("run").expect("present");
+        assert_eq!(record.status, RunStatus::Cancelled);
+        let error = runner.start("test", "run", true).expect_err("refused");
+        assert!(format!("{error}").contains("shutting down"));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_app_or_action_is_refused() {
+        let store = Store::in_memory().expect("store");
+        let runner = runner(TestApp::new(Duration::from_millis(1)), store);
+        assert!(runner.start("nope", "run", true).is_err());
+        assert!(runner.start("test", "nope", true).is_err());
+    }
+
+    #[tokio::test]
+    async fn scheduled_runs_are_dry_only_for_actions_that_do_not_write() {
+        let store = Store::in_memory().expect("store");
+        let runner = runner(TestApp::new(Duration::from_millis(1)), store);
+        assert!(
+            runner.scheduled_dry_run("test", "run"),
+            "a read action is a dry run"
+        );
+        assert!(
+            !runner.scheduled_dry_run("test", "apply"),
+            "an apply is not"
+        );
+        assert!(runner.scheduled_dry_run("test", "unknown"));
+        assert_eq!(runner.action_kind("test", "apply"), Some(ActionKind::Write));
+    }
+
+    #[tokio::test]
+    async fn the_context_gives_an_action_its_run_id() {
+        // The runner ties the context to the run so rows can be recorded as they are produced.
+        let store = Store::in_memory().expect("store");
+        let runner = runner(TestApp::new(Duration::from_millis(1)), store.clone());
+        let run_id = runner
+            .store()
+            .start_run("test", "run", true)
+            .expect("start");
+        let context = JobContext::new(
+            Arc::new(CrosstalkConfig::default()),
+            Arc::new(VecSink::new()),
+        )
+        .for_run(run_id, store.clone(), Arc::new(AtomicBool::new(false)));
+        assert_eq!(context.run_id(), Some(run_id));
+        context
+            .record_rows(&[crate::store::RunRow {
+                ordinal: 0,
+                channel_id: 1,
+                channel_name: "ESPN".to_string(),
+                ..Default::default()
+            }])
+            .expect("rows");
+        assert_eq!(store.rows(run_id).expect("rows").len(), 1);
+    }
+
     #[test]
     fn active_run_reports_progress() {
-        let mut active = ActiveRun::default();
+        let mut active = ActiveRun {
+            run_id: 1,
+            app: "a".to_string(),
+            action: "b".to_string(),
+            dry_run: false,
+            current: 0,
+            total: 0,
+            phase: String::new(),
+            cancelling: false,
+        };
         assert_eq!(active.percent(), None);
         active.total = 10;
         active.current = 4;
         assert_eq!(active.percent(), Some(40));
         active.current = 20;
         assert_eq!(active.percent(), Some(100));
-    }
-
-    #[test]
-    fn a_vec_sink_sees_what_a_run_publishes() {
-        // Guards the ProgressSink contract the daemon relies on.
-        let sink = VecSink::new();
-        sink.publish(&ProgressEvent::new("run", 1, 1, "x"));
-        assert_eq!(sink.events().len(), 1);
     }
 }

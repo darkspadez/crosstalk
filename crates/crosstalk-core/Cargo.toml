@@ -25,7 +25,7 @@ csv.workspace = true
 chrono.workspace = true
 tracing.workspace = true
 tokio-cron-scheduler.workspace = true
-cron = "0.12"
+croner.workspace = true
 globset.workspace = true
 
 [dev-dependencies]

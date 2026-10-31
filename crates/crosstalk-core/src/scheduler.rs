@@ -12,7 +12,7 @@
 use crate::config::CrosstalkConfig;
 use crate::runner::JobRunner;
 use anyhow::{bail, Context, Result};
-use std::str::FromStr;
+use croner::Cron;
 use std::sync::Arc;
 use tokio_cron_scheduler::{Job, JobScheduler};
 
@@ -31,16 +31,31 @@ pub struct ScheduleInfo {
 
 /// Turn a five-field cron expression into the six-field form the scheduler needs.
 ///
-/// Five fields are `minute hour day month weekday`; six add seconds at the front. Anything
-/// already six or seven fields is passed through, so a writer who wants second precision can
-/// have it.
+/// Five fields are `minute hour day month weekday`; the scheduler's parser (croner) wants
+/// seconds at the front. Six fields are passed through, so second precision is available.
+/// Seven fields are rejected: croner has no year field, so a seven-field expression would be
+/// displayed as valid and then never fire.
 pub fn normalize_cron(expression: &str) -> Result<String> {
     let fields: Vec<&str> = expression.split_whitespace().collect();
     match fields.len() {
         5 => Ok(format!("0 {}", fields.join(" "))),
-        6 | 7 => Ok(fields.join(" ")),
-        other => bail!("a cron expression needs 5 to 7 fields, got {other}: {expression:?}"),
+        6 => Ok(fields.join(" ")),
+        other => bail!("a cron expression needs 5 or 6 fields, got {other}: {expression:?}"),
     }
+}
+
+/// Parse an expression the way the scheduler will.
+///
+/// The scheduler uses croner, and croner's rules differ from the `cron` crate's: 0 and 7 are
+/// both Sunday, 1 is Monday, and day-of-month/day-of-week are ORed rather than ANDed. Parsing
+/// with the same library is the only way the "next run" the UI shows can be the run that
+/// actually happens.
+pub fn parse_schedule(expression: &str) -> Result<Cron> {
+    let normalized = normalize_cron(expression)?;
+    Cron::new(&normalized)
+        .with_seconds_required()
+        .parse()
+        .with_context(|| format!("invalid cron expression {expression:?}"))
 }
 
 /// Split `app.action` into its halves.
@@ -79,11 +94,10 @@ pub fn describe(config: &CrosstalkConfig) -> Vec<ScheduleInfo> {
 
 /// A schedule's next firing time, as an ISO 8601 instant.
 fn next_run(expression: &str) -> Option<String> {
-    let normalized = normalize_cron(expression).ok()?;
-    let schedule = cron::Schedule::from_str(&normalized).ok()?;
+    let schedule = parse_schedule(expression).ok()?;
     schedule
-        .upcoming(chrono::Utc)
-        .next()
+        .find_next_occurrence(&chrono::Utc::now(), false)
+        .ok()
         .map(|instant| instant.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
 }
 
@@ -126,17 +140,25 @@ impl Scheduler {
                     continue;
                 }
             };
+            if let Err(error) = parse_schedule(expression) {
+                // Skipping rather than failing: a typo in one schedule must not stop the
+                // daemon or the other schedules. `crosstalk validate` reports it as an error.
+                tracing::warn!("schedule {key:?}: {error:#}; ignoring it");
+                continue;
+            }
 
             let job_runner = runner.clone();
             let app = app.to_string();
             let action = action.to_string();
+            let dry_run = runner.scheduled_dry_run(&app, &action);
             let job = Job::new_async(normalized.as_str(), move |_uuid, _lock| {
                 let runner = job_runner.clone();
                 let app = app.clone();
                 let action = action.clone();
                 Box::pin(async move {
-                    // A scheduled run is an apply: the point of a schedule is that it acts.
-                    match runner.start(&app, &action, false) {
+                    // The flag comes from the action's own kind, so a schedule naming a
+                    // preview stays a preview instead of writing because a schedule said so.
+                    match runner.start(&app, &action, dry_run) {
                         Ok(started) => tracing::info!(
                             app,
                             action,
@@ -162,6 +184,9 @@ impl Scheduler {
     }
 
     /// Stop every armed job.
+    ///
+    /// Schedules fire in UTC; that is the scheduler's behaviour and is worth knowing when an
+    /// expression is written for local time.
     pub async fn shutdown(mut self) {
         if let Err(error) = self.inner.shutdown().await {
             tracing::warn!("shutting the scheduler down: {error:#}");
@@ -202,18 +227,42 @@ mod tests {
     }
 
     #[test]
-    fn six_and_seven_field_expressions_pass_through() {
+    fn six_field_expressions_pass_through() {
         assert_eq!(normalize_cron("30 0 4 * * *").expect("ok"), "30 0 4 * * *");
-        assert_eq!(
-            normalize_cron("0 0 4 * * * 2027").expect("ok"),
-            "0 0 4 * * * 2027"
-        );
     }
 
     #[test]
-    fn a_short_or_long_expression_is_rejected() {
+    fn a_short_or_seven_field_expression_is_rejected() {
         assert!(normalize_cron("* * *").is_err());
-        assert!(normalize_cron("* * * * * * * *").is_err());
+        // Seven fields would carry a year, which the scheduler's parser has no field for.
+        assert!(normalize_cron("0 0 4 * * * 2027").is_err());
+    }
+
+    #[test]
+    fn parsing_agrees_with_the_scheduler_about_weekdays() {
+        // croner counts 1 as Monday and 0 or 7 as Sunday, which is the opposite of the `cron`
+        // crate's numbering. Both must give the same next run for the same expression.
+        for expression in ["0 4 * * 1", "0 4 * * 0", "0 4 * * 7", "0 4 * * MON"] {
+            let next = next_run(expression).unwrap_or_else(|| panic!("{expression} parses"));
+            let parsed: chrono::DateTime<chrono::Utc> = next.parse().expect("iso");
+            assert_eq!(parsed.format("%H:%M").to_string(), "04:00");
+        }
+        // 1 is Monday.
+        let monday = next_run("0 4 * * 1").expect("next");
+        let parsed: chrono::DateTime<chrono::Utc> = monday.parse().expect("iso");
+        assert_eq!(parsed.format("%A").to_string(), "Monday");
+        // 0 and 7 are Sunday.
+        for expression in ["0 4 * * 0", "0 4 * * 7"] {
+            let sunday = next_run(expression).expect("next");
+            let parsed: chrono::DateTime<chrono::Utc> = sunday.parse().expect("iso");
+            assert_eq!(parsed.format("%A").to_string(), "Sunday", "{expression}");
+        }
+    }
+
+    #[test]
+    fn a_misspelled_weekday_is_rejected_by_the_real_parser() {
+        assert!(parse_schedule("0 4 * * MONDAY").is_err());
+        assert!(parse_schedule("0 4 * * MON").is_ok());
     }
 
     #[test]
