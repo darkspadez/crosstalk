@@ -98,6 +98,10 @@ impl ProgressSink for VecSink {
 pub struct JobContext {
     config: Arc<CrosstalkConfig>,
     progress: Arc<dyn ProgressSink>,
+    /// The Dispatcharr session, shared by every action so a run costs one login rather than
+    /// one per call. `None` until a caller builds it, which keeps a dry check of the
+    /// settings file from requiring a reachable server.
+    dispatcharr: Option<crate::dispatcharr::DispatcharrClient>,
     /// Cancellation flag, set when the UI cancels a run or the daemon shuts down.
     cancelled: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -115,8 +119,41 @@ impl JobContext {
         Self {
             config,
             progress,
+            dispatcharr: None,
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Attach a Dispatcharr session.
+    pub fn with_dispatcharr(mut self, client: crate::dispatcharr::DispatcharrClient) -> Self {
+        self.dispatcharr = Some(client);
+        self
+    }
+
+    /// Build the session from the configuration, if there are credentials to build it with.
+    pub fn connect(mut self) -> anyhow::Result<Self> {
+        if !self.config.dispatcharr.has_credentials() {
+            anyhow::bail!(
+                "no Dispatcharr credentials: set dispatcharr.api_key or username/password"
+            );
+        }
+        let client = crate::dispatcharr::DispatcharrClient::new(&self.config.dispatcharr)?;
+        self.dispatcharr = Some(client);
+        Ok(self)
+    }
+
+    /// The session, or an error explaining what is missing.
+    pub fn dispatcharr(&self) -> anyhow::Result<&crate::dispatcharr::DispatcharrClient> {
+        self.dispatcharr.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "this run has no Dispatcharr session; build the context with `connect()`"
+            )
+        })
+    }
+
+    /// Whether a session is attached.
+    pub fn has_dispatcharr(&self) -> bool {
+        self.dispatcharr.is_some()
     }
 
     /// A context that discards progress: the one-shot CLI path, and tests.

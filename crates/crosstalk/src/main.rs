@@ -210,7 +210,14 @@ fn run_once(args: RunArgs) -> Result<()> {
         );
     }
 
+    // Only connect when the action needs Dispatcharr, so `validate` still works on a host
+    // that cannot reach it yet.
     let context = JobContext::headless(config);
+    let context = if action.id == "validate" {
+        context
+    } else {
+        context.connect()?
+    };
     let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
     let outcome = runtime.block_on(app.run(action.id, &context, args.dry_run))?;
 

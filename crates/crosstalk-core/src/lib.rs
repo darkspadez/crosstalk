@@ -6,10 +6,14 @@
 //! without either knowing about the other.
 
 pub mod config;
+pub mod dispatcharr;
 pub mod jobs;
 pub mod subapp;
 
 pub use config::{ConfigReport, CrosstalkConfig};
+pub use dispatcharr::{
+    Channel, DispatcharrClient, EpgEntry, EpgSource, HasPrograms, ProgramWindow, World,
+};
 pub use jobs::{JobContext, ProgressEvent, ProgressSink};
 pub use subapp::{
     ActionKind, ActionSpec, FieldKind, FieldSpec, FieldValue, JobOutcome, Registry, SettingsSchema,

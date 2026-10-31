@@ -305,7 +305,7 @@ New repository, so everything is new. The critical paths:
 
 ### Phase 2: crosstalk-core
 - [x] Config loading + write-back, `SubApp` trait + registry, `SettingsSchema`.
-- [ ] Dispatcharr client (auth, channels, groups, profiles, sources, epgdata pagination,
+- [x] Dispatcharr client (auth, channels, groups, profiles, sources, epgdata pagination,
       program search memo, batch-set-epg) with a mock server test (`wiremock`).
 - [ ] SQLite store + migrations; job runner with progress channel; scheduler.
 - [ ] CSV preamble/writer/retention port with the `test_csv_retention.py` cases.
