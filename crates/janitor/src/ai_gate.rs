@@ -92,10 +92,7 @@ impl GateOutcome {
 ///
 /// Returns the slice of `scored` worth sending, and why. Empty when the heuristics are
 /// confident enough that a request would be wasted.
-pub fn shortlist(
-    scored: &[Scored],
-    settings: &AiSettings,
-) -> Option<(GateReason, Vec<usize>)> {
+pub fn shortlist(scored: &[Scored], settings: &AiSettings) -> Option<(GateReason, Vec<usize>)> {
     if !settings.enabled || scored.is_empty() {
         return None;
     }
