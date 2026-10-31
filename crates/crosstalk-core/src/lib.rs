@@ -6,6 +6,7 @@
 //! without either knowing about the other.
 
 pub mod config;
+pub mod csv_report;
 pub mod dispatcharr;
 pub mod jobs;
 pub mod runner;
@@ -14,6 +15,10 @@ pub mod store;
 pub mod subapp;
 
 pub use config::{ConfigReport, CrosstalkConfig};
+pub use csv_report::{
+    exports_to_delete, is_our_export, preamble, prune_exports, report_path, write_report,
+    ExportFile,
+};
 pub use dispatcharr::{
     Channel, DispatcharrClient, EpgEntry, EpgSource, HasPrograms, ProgramWindow, World,
 };
