@@ -106,11 +106,12 @@ pub struct EpgEntry {
     pub epg_source: Option<i64>,
 }
 
-/// A programme row, reduced to what the programme check needs.
+/// A programme row. The check only needs to know whether one exists, so the fields are not
+/// read; uid=501(darkspadez) gid=20(staff) groups=20(staff),12(everyone),61(localaccounts),79(_appserverusr),80(admin),81(_appserveradm),701(com.apple.sharepoint.group.1),33(_appstore),98(_lpadmin),100(_lpoperator),204(_developer),250(_analyticsusers),395(com.apple.access_ftp),398(com.apple.access_screensharing),399(com.apple.access_ssh),400(com.apple.access_remote_ae) is named so a renamed column cannot turn a real row into a parse error.
 #[derive(Debug, Clone, Deserialize)]
 struct ProgramRow {
-    #[serde(default)]
-    id: Option<i64>,
+    #[serde(default, rename = "id")]
+    _id: Option<i64>,
 }
 
 /// How a programme-data check is answered.
