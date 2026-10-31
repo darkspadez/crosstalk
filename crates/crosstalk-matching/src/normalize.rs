@@ -28,7 +28,8 @@ use crate::pyre::{
 };
 use fancy_regex::Regex as FancyRegex;
 use regex::Regex;
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 use unicode_general_category::{get_general_category, GeneralCategory};
 use unicode_names2::name as unicode_name;
 use unicode_normalization::UnicodeNormalization;
@@ -508,32 +509,63 @@ impl Normalizer {
     /// the literal path, where Python's `\s*` pattern deletes every whitespace character
     /// rather than doing nothing.
     fn apply_ignored_tag(&self, name: &str, tag: &str) -> String {
-        let escaped = python_escape(tag);
-        let bracketed =
-            tag.contains('[') || tag.contains(']') || tag.contains('(') || tag.contains(')');
-        // Python tests `re.match(r'^\w+$', tag)`, which does not match an empty tag, so
-        // an empty tag takes the literal path and deletes the name's whitespace.
-        let bare_word =
-            !tag.is_empty() && !bracketed && tag.chars().all(|c| is_py_word_char(c) || c == '_');
-
-        let pattern = if bare_word {
-            format!("(?i){PY_BOUNDARY}{escaped}{PY_BOUNDARY}")
-        } else {
-            format!("(?i){escaped}{PY_SPACE}*")
+        let Some(re) = tag_regex(tag) else {
+            return name.to_string();
         };
-        // Already written against the Python-compatible constants, so it must not go
-        // through `pythonize` a second time.
-        match FancyRegex::new(&pattern) {
-            Ok(re) => re
-                .try_replacen(name, 0, "")
-                .map(|cow| cow.into_owned())
-                .unwrap_or_else(|_| name.to_string()),
-            Err(_) => name.to_string(),
-        }
+        re.try_replacen(name, 0, "")
+            .map(|cow| cow.into_owned())
+            .unwrap_or_else(|_| name.to_string())
     }
 }
 
-/// Python's `\w` character class, used by the `^\w+$` bare-word test.
+/// Compile (and cache) the pattern for one user-configured tag.
+///
+/// The cache is not an optimisation detail: `fancy_regex` compilation costs tens of
+/// milliseconds, and a run normalises tens of thousands of names against the same
+/// handful of tags, so compiling per call would dominate the run.
+fn tag_regex(tag: &str) -> Option<std::sync::Arc<FancyRegex>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<std::sync::Arc<FancyRegex>>>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+
+    if let Some(cached) = cache.lock().expect("tag cache").get(tag) {
+        return cached.clone();
+    }
+
+    let bracketed =
+        tag.contains('[') || tag.contains(']') || tag.contains('(') || tag.contains(')');
+    // Python tests `re.match(r'^\w+$', tag)`, which does not match an empty tag, so an
+    // empty tag takes the literal path and deletes the name's whitespace.
+    let bare_word =
+        !tag.is_empty() && !bracketed && tag.chars().all(|c| is_py_word_char(c) || c == '_');
+
+    let literal = ci_literal(tag);
+    let pattern = if bare_word {
+        format!("(?i){PY_BOUNDARY}{literal}{PY_BOUNDARY}")
+    } else {
+        format!("(?i){literal}{PY_SPACE}*")
+    };
+    let compiled = FancyRegex::new(&pattern).ok().map(std::sync::Arc::new);
+
+    cache
+        .lock()
+        .expect("tag cache")
+        .insert(tag.to_string(), compiled.clone());
+    compiled
+}
+
+/// Escape a literal for a case-insensitive pattern, keeping Python's `(?i)` meaning for
+/// the letters `i`/`I`, which also match the Turkish dotless `ı` and dotted `İ`.
+fn ci_literal(literal: &str) -> String {
+    let mut out = String::with_capacity(literal.len() + 4);
+    for c in literal.chars() {
+        match c {
+            'i' | 'I' | '\u{131}' | '\u{130}' => out.push_str("[iI\u{131}\u{130}]"),
+            other => out.push_str(&python_escape(&other.to_string())),
+        }
+    }
+    out
+}
 fn is_py_word_char(c: char) -> bool {
     matches!(
         get_general_category(c),

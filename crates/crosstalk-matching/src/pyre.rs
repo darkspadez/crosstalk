@@ -28,16 +28,102 @@ pub const PY_SPACE: &str = r"[\s\x{1c}-\x{1f}]";
 
 /// Rewrite a Python pattern so the Rust engine gives it Python's meaning.
 pub fn pythonize(pattern: &str) -> String {
-    pattern.replace(r"\b", PY_BOUNDARY).replace(r"\s", PY_SPACE)
+    let mut out = String::with_capacity(pattern.len() * 2);
+    let mut chars = pattern.chars().peekable();
+    let mut in_class = false;
+
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                // Inside a class `\b` is a backspace, not a word boundary: leave it.
+                Some('b') if !in_class => out.push_str(PY_BOUNDARY),
+                Some('s') => {
+                    if in_class {
+                        out.push_str(r"\s\x{1c}-\x{1f}");
+                    } else {
+                        out.push_str(PY_SPACE);
+                    }
+                }
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+            continue;
+        }
+        match c {
+            '[' if !in_class => {
+                in_class = true;
+                out.push(c);
+            }
+            ']' if in_class => {
+                in_class = false;
+                out.push(c);
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Widen the letter classes that contain an `i` so Python's `(?i)` dotless-`ı` behaviour
 /// is reproduced. Paired with a `(?i)` prefix.
 pub fn widen_case_insensitive_i(pattern: &str) -> String {
-    pattern
-        .replace("[A-Z]", "[A-Z\u{131}\u{130}]")
-        .replace("[Ii]", "[Ii\u{131}\u{130}]")
-        .replace("[pi]", "[pi\u{131}\u{130}]")
+    const EXTRAS: &str = "\u{131}\u{130}";
+
+    let mut out = String::with_capacity(pattern.len() + 16);
+    let mut chars = pattern.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c != '[' {
+            out.push(c);
+            continue;
+        }
+
+        // Buffer the whole class so the decision is made once, on its full text.
+        let mut class = String::from("[");
+        let mut closed = false;
+        while let Some(inner) = chars.next() {
+            class.push(inner);
+            if inner == ']' {
+                closed = true;
+                break;
+            }
+        }
+        if !closed {
+            out.push_str(&class);
+            break;
+        }
+
+        let already = class.contains('\u{131}') || class.contains('\u{130}') || class.contains('ı');
+        if already {
+            out.push_str(&class);
+            continue;
+        }
+
+        let mut widened = String::with_capacity(class.len() + 16);
+        let mut previous_was_range = false;
+        let mut inner = class.chars().peekable();
+        while let Some(ch) = inner.next() {
+            widened.push(ch);
+            match ch {
+                'i' | 'I' => {
+                    widened.push_str(EXTRAS);
+                    previous_was_range = false;
+                }
+                // `A-Z` / `a-z` under Python's (?i) admits the Turkish pair as well.
+                'Z' | 'z' if previous_was_range => {
+                    widened.push_str(EXTRAS);
+                    previous_was_range = false;
+                }
+                '-' => previous_was_range = true,
+                _ => previous_was_range = false,
+            }
+        }
+        out.push_str(&widened);
+    }
+    out
 }
 
 /// Python's `str.isspace()`, which includes the C0 separators.
@@ -60,11 +146,17 @@ pub fn py_trim_start(s: &str) -> &str {
     s.trim_start_matches(py_is_space)
 }
 
-/// Python's `re.escape`, which escapes whitespace as well as the metacharacters.
+/// Python's `re.escape`.
+///
+/// Python escapes the regex metacharacters plus ASCII whitespace, and nothing else. That
+/// distinction is load-bearing here: escaping a character the Rust engine gives a meaning
+/// changes the pattern, and `<` is the case that bites — `\<` is a word-boundary
+/// assertion in `fancy_regex`, so an escaped `<HD>` tag would never match.
 pub fn python_escape(literal: &str) -> String {
+    const SPECIAL: &str = r"()[]{}?*+-|^$\.&~#";
     let mut out = String::with_capacity(literal.len());
     for c in literal.chars() {
-        if c.is_ascii_punctuation() || c.is_whitespace() {
+        if SPECIAL.contains(c) || (c.is_ascii() && c.is_ascii_whitespace()) {
             out.push('\\');
         }
         out.push(c);
@@ -117,6 +209,9 @@ mod tests {
         assert_eq!(python_escape("[HD]"), r"\[HD\]");
         assert_eq!(python_escape("HD"), "HD");
         assert_eq!(python_escape(""), "");
+        // `<` and `>` are NOT escaped: `\<` would be a word boundary in the engine.
+        assert_eq!(python_escape("<HD>"), "<HD>");
+        assert_eq!(python_escape("a>b"), "a>b");
     }
 
     #[test]

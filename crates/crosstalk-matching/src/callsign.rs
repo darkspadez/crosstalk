@@ -213,9 +213,13 @@ fn ladder() -> &'static Ladder {
         };
         Ladder {
             strip_d_prefix: Regex::new(r"^D\d+-").expect("static regex"),
-            strip_us_prefix: Regex::new(
-                r"(?i)^USA?[\s\x{1c}-\x{1f}]*[^a-zA-Z0-9]*[\s\x{1c}-\x{1f}]*",
-            )
+            // `^USA?\s*[^a-zA-Z0-9]*\s*`. The negated class matters: under Python's
+            // `(?i)` it also excludes `ı`/`İ`, so without the widening `US ıWABC` would
+            // lose its prefix and find a callsign where the plugin finds none.
+            strip_us_prefix: Regex::new(&format!(
+                "(?i){}",
+                widen_case_insensitive_i(&pythonize(r"^USA?\s*[^a-zA-Z0-9]*\s*"))
+            ))
             .expect("static regex"),
             paren_four: ci(r"\(([KW][A-Z]{3})(?:-[A-Z\s]+)?\)"),
             paren_three: ci(r"\(([KW][A-Z]{2})\)"),
@@ -347,7 +351,7 @@ pub fn network_keyword(channel_name: &str) -> Option<String> {
     let re = RE.get_or_init(|| {
         Regex::new(&format!(
             "(?i){}",
-            pythonize(r"\b(ABC|NBC|CBS|FOX|PBS|CW|ION|MNT|IND)\b")
+            pythonize(r"\b(ABC|NBC|CBS|FOX|PBS|CW|[iIıİ]ON|MNT|[iIıİ]ND)\b")
         ))
         .expect("static regex")
     });

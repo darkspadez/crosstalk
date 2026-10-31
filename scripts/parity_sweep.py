@@ -57,6 +57,14 @@ ADVERSARIAL = [
     "\U0001f174\U0001f182\U0001f17f\U0001f175", "\u2460 Channel", "Channel \u00b2",
     # Non-Latin scripts.
     "Россия 1", "beИN SPORTS", "日本 NHK", "العربية", "हिंदी समाचार",
+    # Turkish dotless/dotted i and the Kelvin sign: Python's (?i) matches these wherever
+    # `i`/`I` can match, Rust's simple case folding does not.
+    "US \u0131WABC", "US\u0131KGTV (ABC)", "(WABC-\u0130)", "WABC (AB\u0131)",
+    "ABC WABC.\u0131o", "network \u0131on", "\u0130ND", "\u212aGTV (ABC)",
+    "D\u0131:ITV114", "BBC Tr\u0131:avel (12)",
+    # Angle brackets: Python's re.escape leaves them alone, and an escaped `<` would be
+    # a word boundary in the Rust engine, so a `<HD>` tag must still be strippable.
+    "Foo <HD> Bar", "a>b channel",
     # Accents: NFKD splits these into letter + combining mark, which is where the two
     # regex engines disagree about word boundaries unless the port compensates.
     "T\u00e9l\u00e9-Qu\u00e9bec", "\u00e9HD ", "\u00e7ten", "M\u00fcnchen TV",
@@ -81,6 +89,8 @@ TAG_SETS = [
     ["[FOO]"],
     [""],
     ["HD", "CNN"],
+    ["<HD>"],
+    ["\u0131"],
 ]
 
 
@@ -184,8 +194,14 @@ def sweep_per_name(kind: str, names: list[str], matcher, args) -> int:
     mismatches = []
     for name, answer in zip(names, answers):
         if kind == "callsign":
-            expected = matcher.extract_callsign(name)
-            got = answer.get("callsign")
+            # Compare the confidence flag too: eight of the divergences found in review
+            # differed only in the flag, so comparing the callsign alone would hide them.
+            expected_call, expected_high = matcher._compute_callsign_with_confidence(name)
+            expected = {"callsign": expected_call, "high_confidence": expected_high}
+            got = {
+                "callsign": answer.get("callsign"),
+                "high_confidence": answer.get("high_confidence"),
+            }
         elif kind == "network":
             expected = python_network(name)
             got = answer.get("network")

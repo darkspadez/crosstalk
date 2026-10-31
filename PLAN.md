@@ -295,7 +295,7 @@ New repository, so everything is new. The critical paths:
       token guards from `matcher_golden_baseline.json`.
 - [x] Port `normalize.rs` (all tables, lookaround patterns via `fancy-regex`, Unicode
       helpers); golden tests for `normalize_name` + cases from `test_normalization_port.py`.
-- [ ] Port `callsign.rs` (ladder, denylist, known-callsign loading, location, network);
+- [x] Port `callsign.rs` (ladder, denylist, known-callsign loading, location, network);
       golden tests for `extract_callsign`.
 - [ ] Port `alias.rs` and `pipeline.rs` (`CandidateIndex`, `match_all_streams`,
       `find_best_match`); port the behavioural cases from `test_fuzzy_matcher.py` and
