@@ -5,6 +5,7 @@
 //! it locks the Python matcher's output. Any divergence here is a port bug, not a
 //! design choice.
 
+use crosstalk_matching::normalize::{NormalizeFlags, Normalizer};
 use crosstalk_matching::similarity::calculate_similarity;
 use crosstalk_matching::tokens::{has_token_overlap, process_string_for_matching};
 use serde_json::Value;
@@ -115,4 +116,44 @@ fn token_guard_cases_from_python_suite() {
         4,
         true
     ));
+}
+
+#[test]
+fn normalize_name_matches_baseline() {
+    let data = baseline();
+    let combos = data["normalize_name"].as_object().expect("object");
+    assert_eq!(combos.len(), 2, "the baseline holds two flag combinations");
+
+    let normalizers = [
+        (
+            "all_on",
+            Normalizer::new(NormalizeFlags {
+                ignore_quality: true,
+                ignore_regional: true,
+                ignore_geographic: true,
+                ignore_misc: true,
+            }),
+        ),
+        (
+            "regional_off",
+            Normalizer::new(NormalizeFlags {
+                ignore_quality: true,
+                ignore_regional: false,
+                ignore_geographic: true,
+                ignore_misc: true,
+            }),
+        ),
+    ];
+
+    let mut checked = 0;
+    for (label, normalizer) in normalizers {
+        let cases = combos[label].as_object().expect("flag combo object");
+        for (input, expected) in cases {
+            let expected = expected.as_str().expect("string");
+            let got = normalizer.normalize_name(input, &[]);
+            assert_eq!(got, expected, "normalize_name({input:?}) with {label}");
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 112, "56 names across two flag combinations");
 }
