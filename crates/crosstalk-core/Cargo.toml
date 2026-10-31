@@ -10,6 +10,7 @@ description = "Host services shared by every crosstalk sub-app"
 crosstalk-matching.workspace = true
 
 anyhow.workspace = true
+async-trait = { workspace = true }
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
