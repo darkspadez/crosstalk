@@ -84,7 +84,7 @@ pub fn widen_case_insensitive_i(pattern: &str) -> String {
         // Buffer the whole class so the decision is made once, on its full text.
         let mut class = String::from("[");
         let mut closed = false;
-        while let Some(inner) = chars.next() {
+        for inner in chars.by_ref() {
             class.push(inner);
             if inner == ']' {
                 closed = true;
