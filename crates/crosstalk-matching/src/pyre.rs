@@ -105,7 +105,7 @@ pub fn widen_case_insensitive_i(pattern: &str) -> String {
         let mut widened = String::with_capacity(class.len() + 16);
         let mut previous_was_range = false;
         let mut inner = class.chars().peekable();
-        while let Some(ch) = inner.next() {
+        for ch in inner {
             widened.push(ch);
             match ch {
                 'i' | 'I' => {
