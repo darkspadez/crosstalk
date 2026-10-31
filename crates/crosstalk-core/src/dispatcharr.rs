@@ -5,13 +5,18 @@
 //! here: channels, groups, profiles, EPG sources, EPG entries, and the one write (assign EPG
 //! to channels).
 //!
-//! Two shapes of the API are load-bearing and easy to get wrong:
+//! Three shapes of the API are load-bearing and easy to get wrong:
 //!
 //!   * the channel list is only paginated when a `page` or `page_size` parameter is present,
-//!     so asking for it plainly returns everything;
+//!     AND it hides channels with `hidden_from_output` unless `visibility_filter=all` is sent.
+//!     The plugin read `Channel.objects.all()`, so the filter has to be sent explicitly or a
+//!     hidden channel would silently drop out of scope.
+//!   * the EPG entry list is NOT paginated upstream; some builds answer with an envelope, so
+//!     both shapes are accepted.
 //!   * the programme search has no `epg_id` filter, so the programme-data check is keyed on
-//!     `(tvg_id, epg_source)`. It is the expensive call — it is the only thing the plugin did
-//!     in-process that costs a round trip here — so it is memoised and gated by a semaphore.
+//!     `(tvg_id, source)`, which `EPGData.unique_together` makes unique. It is the expensive
+//!     call — the only thing the plugin did in-process that costs a round trip here — so it is
+//!     memoised per window and gated by a semaphore.
 
 use crate::config::DispatcharrConfig;
 use anyhow::{bail, Context, Result};
@@ -19,6 +24,12 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
+
+/// Attempts per request, for the statuses and failures that are worth retrying.
+const MAX_ATTEMPTS: u32 = 3;
+/// Base backoff; doubled per attempt.
+const RETRY_BASE: Duration = Duration::from_millis(250);
 
 /// One channel, as the matcher needs it.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -30,19 +41,32 @@ pub struct Channel {
     pub channel_number: Option<serde_json::Value>,
     #[serde(default)]
     pub channel_group_id: Option<i64>,
-    /// The EPG entry currently assigned, if any.
+    /// The EPG entry assigned on the channel's own column.
     #[serde(default)]
     pub epg_data_id: Option<i64>,
-    /// Present in newer Dispatcharr builds: an override can pin the EPG without changing the
-    /// channel's own column. The effective value is what the UI shows.
+    /// An override can pin a different EPG without changing the column. Newer builds only.
     #[serde(default)]
     pub effective_epg_data_id: Option<i64>,
 }
 
 impl Channel {
-    /// The EPG entry this channel is actually on.
+    /// The EPG entry this channel is on, by its own column.
+    ///
+    /// The raw column is what the plugin compares against and what `batch-set-epg` writes, so
+    /// it is what a run must reason about. Reporting the override here would make a preview
+    /// claim a channel is on one guide while the write changes another.
     pub fn current_epg_id(&self) -> Option<i64> {
-        self.effective_epg_data_id.or(self.epg_data_id)
+        self.epg_data_id
+    }
+
+    /// Whether an override is pinning a different EPG. Such a channel is skipped and
+    /// reported, because writing its column would change nothing the operator can see.
+    pub fn has_epg_override(&self) -> bool {
+        match (self.epg_data_id, self.effective_epg_data_id) {
+            (Some(raw), Some(effective)) => raw != effective,
+            (None, Some(_)) => true,
+            _ => false,
+        }
     }
 
     /// The channel number as the reports print it.
@@ -94,20 +118,29 @@ fn default_true() -> bool {
     true
 }
 
-/// One EPG entry: a channel inside a guide source.
+/// An EPG entry: a channel inside a guide source.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct EpgEntry {
     pub id: i64,
     #[serde(default)]
     pub name: String,
-    #[serde(default)]
+    /// `EPGData.tvg_id` is nullable upstream, and a single null would otherwise fail the
+    /// whole listing.
+    #[serde(default, deserialize_with = "null_to_empty")]
     pub tvg_id: String,
     #[serde(default)]
     pub epg_source: Option<i64>,
 }
 
+fn null_to_empty<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 /// A programme row. The check only needs to know whether one exists, so the fields are not
-/// read; uid=501(darkspadez) gid=20(staff) groups=20(staff),12(everyone),61(localaccounts),79(_appserverusr),80(admin),81(_appserveradm),701(com.apple.sharepoint.group.1),33(_appstore),98(_lpadmin),100(_lpoperator),204(_developer),250(_analyticsusers),395(com.apple.access_ftp),398(com.apple.access_screensharing),399(com.apple.access_ssh),400(com.apple.access_remote_ae) is named so a renamed column cannot turn a real row into a parse error.
+/// read; `id` is named so a renamed column cannot turn a real row into a parse error.
 #[derive(Debug, Clone, Deserialize)]
 struct ProgramRow {
     #[serde(default, rename = "id")]
@@ -121,17 +154,39 @@ pub enum HasPrograms {
     No,
 }
 
+/// Where the credentials come from.
+#[derive(Debug, Clone, Default)]
+struct Credentials {
+    api_key: Option<String>,
+    username: String,
+    password: Option<String>,
+    /// The JWT, when logging in rather than using an API key.
+    token: Arc<tokio::sync::RwLock<Option<String>>>,
+    refresh: Arc<tokio::sync::RwLock<Option<String>>>,
+}
+
+impl Credentials {
+    fn uses_api_key(&self) -> bool {
+        self.api_key.is_some()
+    }
+
+    fn can_log_in(&self) -> bool {
+        !self.username.trim().is_empty() && self.password.is_some()
+    }
+}
+
 /// The client.
 ///
-/// Cheap to clone: the HTTP connection pool is shared, so a run's threads can each hold a
-/// handle without duplicating sockets.
+/// Cheap to clone: the HTTP connection pool and the token are shared, so a run's threads can
+/// each hold a handle without duplicating sockets or logging in again.
 #[derive(Clone)]
 pub struct DispatcharrClient {
     http: reqwest::Client,
     base: String,
-    /// Memoised programme checks, keyed by `(tvg_id, source id)`.
-    program_cache: Arc<dashmap::DashMap<(String, i64), HasPrograms>>,
-    /// Caps concurrent programme checks: the endpoint is the one call that scales with the
+    credentials: Arc<Credentials>,
+    /// Memoised programme checks, keyed by `(tvg_id, source, window start, window end)`.
+    program_cache: Arc<dashmap::DashMap<(String, i64, String, String), HasPrograms>>,
+    /// Caps concurrent programme checks: that endpoint is the one call that scales with the
     /// candidate count, and Dispatcharr is a single Django process.
     permits: Arc<tokio::sync::Semaphore>,
     channel_cache: Arc<dashmap::DashMap<i64, Channel>>,
@@ -141,6 +196,14 @@ impl std::fmt::Debug for DispatcharrClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DispatcharrClient")
             .field("base", &self.base)
+            .field(
+                "auth",
+                &if self.credentials.uses_api_key() {
+                    "api-key"
+                } else {
+                    "jwt"
+                },
+            )
             .finish_non_exhaustive()
     }
 }
@@ -148,26 +211,34 @@ impl std::fmt::Debug for DispatcharrClient {
 impl DispatcharrClient {
     /// Build a client from the host configuration.
     ///
-    /// The API key is preferred and sent as `X-API-Key`, which never expires; otherwise the
-    /// client logs in once and keeps the access token.
+    /// An API key is used when configured, because it does not expire. Otherwise the client
+    /// logs in with the username and password and refreshes the token when it lapses.
     pub fn new(config: &DispatcharrConfig) -> Result<Self> {
-        let mut headers = reqwest::header::HeaderMap::new();
-        if let Some(key) = config.resolved_api_key() {
-            let value = reqwest::header::HeaderValue::from_str(&key)
-                .context("the Dispatcharr API key is not a valid header value")?;
-            headers.insert("X-API-Key", value);
-        }
-
         let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(config.timeout_secs.max(1)))
-            .default_headers(headers)
+            // Per-request timeout. The bulk listings run inside it: a full channel list on a
+            // large instance is a few megabytes, not a hang.
+            .timeout(Duration::from_secs(config.timeout_secs.max(1)))
             .user_agent(concat!("crosstalk/", env!("CARGO_PKG_VERSION")))
             .build()
             .context("building the HTTP client")?;
 
+        let api_key = config.resolved_api_key();
+        if let Some(key) = api_key.as_deref() {
+            // Fail here rather than on the first request, with a message about the key.
+            reqwest::header::HeaderValue::from_str(key)
+                .context("the Dispatcharr API key is not a valid header value")?;
+        }
+
         Ok(Self {
             http,
             base: config.api_root(),
+            credentials: Arc::new(Credentials {
+                api_key,
+                username: config.username.trim().to_string(),
+                password: config.resolved_password(),
+                token: Arc::new(tokio::sync::RwLock::new(None)),
+                refresh: Arc::new(tokio::sync::RwLock::new(None)),
+            }),
             program_cache: Arc::new(dashmap::DashMap::new()),
             permits: Arc::new(tokio::sync::Semaphore::new(config.concurrency.max(1))),
             channel_cache: Arc::new(dashmap::DashMap::new()),
@@ -179,48 +250,206 @@ impl DispatcharrClient {
         &self.base
     }
 
-    /// A GET returning JSON, with the status checked and the body included on failure.
+    /// Obtain a token up front when logging in, so a bad password fails immediately rather
+    /// than on the ninth candidate.
+    pub async fn authenticate(&self) -> Result<()> {
+        if self.credentials.uses_api_key() {
+            return Ok(());
+        }
+        if !self.credentials.can_log_in() {
+            bail!(
+                "no Dispatcharr credentials: set dispatcharr.api_key, or dispatcharr.username \
+                 and dispatcharr.password"
+            );
+        }
+        self.log_in().await.map(|_| ())
+    }
+
+    /// POST `/accounts/token/` and keep the access and refresh tokens.
+    async fn log_in(&self) -> Result<String> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            username: &'a str,
+            password: &'a str,
+        }
+        #[derive(Deserialize)]
+        struct Tokens {
+            access: String,
+            #[serde(default)]
+            refresh: Option<String>,
+        }
+
+        let password = self
+            .credentials
+            .password
+            .clone()
+            .context("no password configured")?;
+        let url = format!("{}/accounts/token/", self.base);
+        let response = self
+            .http
+            .post(&url)
+            .json(&Body {
+                username: &self.credentials.username,
+                password: &password,
+            })
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            bail!(
+                "Dispatcharr login failed for user {:?} ({status}). Check \
+                 dispatcharr.username and dispatcharr.password. Response: {}",
+                self.credentials.username,
+                truncate(&body, 300)
+            );
+        }
+        let tokens: Tokens = serde_json::from_str(&body)
+            .with_context(|| format!("POST {url} returned an unexpected body"))?;
+        *self.credentials.token.write().await = Some(tokens.access.clone());
+        if tokens.refresh.is_some() {
+            *self.credentials.refresh.write().await = tokens.refresh;
+        }
+        Ok(tokens.access)
+    }
+
+    /// Trade the refresh token for a new access token.
+    async fn refresh_token(&self) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Tokens {
+            access: String,
+        }
+
+        let refresh = self
+            .credentials
+            .refresh
+            .read()
+            .await
+            .clone()
+            .context("no refresh token")?;
+        let url = format!("{}/accounts/token/refresh/", self.base);
+        let response = self
+            .http
+            .post(&url)
+            .json(&serde_json::json!({ "refresh": refresh }))
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            // A refresh token can also lapse, and the fallback is a fresh login.
+            return self.log_in().await;
+        }
+        let tokens: Tokens = serde_json::from_str(&body)
+            .with_context(|| format!("POST {url} returned an unexpected body"))?;
+        *self.credentials.token.write().await = Some(tokens.access.clone());
+        Ok(tokens.access)
+    }
+
+    /// The authorization header to send, logging in first if nothing is available yet.
+    async fn authorization(&self) -> Result<Option<String>> {
+        if let Some(key) = self.credentials.api_key.as_deref() {
+            return Ok(Some(format!("ApiKey {key}")));
+        }
+        if let Some(token) = self.credentials.token.read().await.clone() {
+            return Ok(Some(format!("Bearer {token}")));
+        }
+        Ok(Some(format!("Bearer {}", self.log_in().await?)))
+    }
+
+    /// Send a GET, retrying the failures worth retrying and re-authenticating once on 401.
     async fn get_json<T: DeserializeOwned>(
         &self,
         path: &str,
         query: &[(&str, String)],
     ) -> Result<T> {
         let url = format!("{}{}", self.base, path);
-        let response = self
-            .http
-            .get(&url)
-            .query(query)
-            .send()
-            .await
-            .with_context(|| format!("GET {url}"))?;
+        let mut refreshed = false;
+        let mut attempt = 0;
 
-        let status = response.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            let body = response.text().await.unwrap_or_default();
-            bail!(
-                "Dispatcharr rejected the credentials for {url} ({status}). Check \
-                 dispatcharr.api_key, or the username and password. Response: {}",
-                truncate(&body, 400)
-            );
+        loop {
+            attempt += 1;
+            let authorization = self.authorization().await?;
+            let mut request = self.http.get(&url).query(query);
+            if let Some(value) = authorization.as_deref() {
+                request = request.header(reqwest::header::AUTHORIZATION, value);
+                // The API key goes in its own header; `ApiKey`/`Bearer` in Authorization is
+                // the documented alternative and is what the server accepts for both.
+            }
+
+            let outcome = request.send().await;
+            match outcome {
+                Ok(response) => {
+                    let status = response.status();
+
+                    if status == reqwest::StatusCode::UNAUTHORIZED && !refreshed {
+                        refreshed = true;
+                        if !self.credentials.uses_api_key() {
+                            self.refresh_token().await?;
+                        }
+                        continue;
+                    }
+
+                    if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    {
+                        if attempt < MAX_ATTEMPTS {
+                            let retry_after = response
+                                .headers()
+                                .get(reqwest::header::RETRY_AFTER)
+                                .and_then(|value| value.to_str().ok())
+                                .and_then(|value| value.parse::<u64>().ok())
+                                .map(Duration::from_secs)
+                                .unwrap_or_else(|| RETRY_BASE * 2u32.pow(attempt - 1));
+                            tokio::time::sleep(retry_after).await;
+                            continue;
+                        }
+                    }
+
+                    if status == reqwest::StatusCode::UNAUTHORIZED
+                        || status == reqwest::StatusCode::FORBIDDEN
+                    {
+                        let body = response.text().await.unwrap_or_default();
+                        bail!(
+                            "Dispatcharr rejected the credentials for {url} ({status}). Check \
+                             dispatcharr.api_key, or the username and password, and that the \
+                             account is an administrator. Response: {}",
+                            truncate(&body, 300)
+                        );
+                    }
+                    if !status.is_success() {
+                        let body = response.text().await.unwrap_or_default();
+                        bail!("GET {url} failed with {status}: {}", truncate(&body, 300));
+                    }
+                    return response
+                        .json::<T>()
+                        .await
+                        .with_context(|| format!("GET {url} returned an unexpected body"));
+                }
+                Err(error) => {
+                    // A connection error is usually a restarting container: worth retrying.
+                    if attempt < MAX_ATTEMPTS && (error.is_connect() || error.is_timeout()) {
+                        tokio::time::sleep(RETRY_BASE * 2u32.pow(attempt - 1)).await;
+                        continue;
+                    }
+                    return Err(error).with_context(|| format!("GET {url}"));
+                }
+            }
         }
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            bail!("GET {url} failed with {status}: {}", truncate(&body, 400));
-        }
-        response
-            .json::<T>()
-            .await
-            .with_context(|| format!("GET {url} returned an unexpected body"))
     }
 
-    /// Every channel.
+    /// Every channel, hidden ones included.
     ///
-    /// The API returns the whole list when no paging parameter is sent, which is what a run
-    /// wants: scope filtering happens here, not on the server, because the group and profile
-    /// filters accept wildcards.
+    /// `visibility_filter=all` is not optional: the list endpoint hides channels whose
+    /// `hidden_from_output` is set unless it is sent, and the plugin read every channel.
     pub async fn channels(&self) -> Result<Vec<Channel>> {
         let channels: Vec<Channel> = self
-            .get_json("/channels/channels/", &[])
+            .get_json(
+                "/channels/channels/",
+                &[("visibility_filter", "all".to_string())],
+            )
             .await
             .context("listing channels")?;
         for channel in &channels {
@@ -265,10 +494,12 @@ impl DispatcharrClient {
             .context("listing EPG sources")
     }
 
-    /// Every EPG entry, walking the paginated endpoint.
+    /// Every EPG entry.
     ///
-    /// The entries endpoint IS paginated, and Dispatcharr's default page is small, so a
-    /// single request would silently match against a fraction of the guide data.
+    /// Upstream this endpoint is not paginated, so a bare array is the normal answer. Some
+    /// builds put it behind a page envelope, so both shapes are accepted; a page parameter is
+    /// sent because a build that does paginate would otherwise silently return only the first
+    /// page.
     pub async fn epg_entries(&self) -> Result<Vec<EpgEntry>> {
         #[derive(Deserialize)]
         struct Page {
@@ -278,14 +509,11 @@ impl DispatcharrClient {
             next: Option<serde_json::Value>,
         }
 
-        /// Dispatcharr paginates this endpoint, but a build with pagination disabled
-        /// answers with a bare array; both shapes have to work, or the run would silently
-        /// match against nothing.
         #[derive(Deserialize)]
         #[serde(untagged)]
         enum Payload {
-            Paged(Page),
             Bare(Vec<EpgEntry>),
+            Paged(Page),
         }
 
         let mut entries = Vec::new();
@@ -307,14 +535,14 @@ impl DispatcharrClient {
                     entries.extend(list);
                     break;
                 }
-                Payload::Paged(page_payload) => {
-                    entries.extend(page_payload.results);
-                    if page_payload.next.is_none_or(|next| next.is_null()) {
+                Payload::Paged(envelope) => {
+                    entries.extend(envelope.results);
+                    if envelope.next.is_none_or(|next| next.is_null()) {
                         break;
                     }
                     page += 1;
-                    if page > 10_000 {
-                        bail!("the EPG entry list did not terminate after 10000 pages");
+                    if page > 1_000 {
+                        bail!("the EPG entry list did not terminate after 1000 pages");
                     }
                 }
             }
@@ -322,23 +550,46 @@ impl DispatcharrClient {
         Ok(entries)
     }
 
+    /// The signed-in user's level, `10` being administrator.
+    ///
+    /// Worth asking: with a non-administrator key, the programme search only returns
+    /// programmes for guide data already mapped to a channel, so every candidate for a channel
+    /// with no guide would come back empty and a preview would look like it found nothing.
+    pub async fn user_level(&self) -> Result<i64> {
+        #[derive(Deserialize)]
+        struct Me {
+            #[serde(default)]
+            user_level: i64,
+        }
+        let me: Me = self
+            .get_json("/accounts/users/me/", &[])
+            .await
+            .context("reading the current user")?;
+        Ok(me.user_level)
+    }
+
     /// Whether an EPG entry has any programme inside the window.
     ///
-    /// Memoised: a run checks the same entry once per channel that considers it, and the
-    /// answer cannot change during a run.
+    /// Memoised on the entry AND the window: a run asks the same question many times, but a
+    /// later run with a different window must not inherit an old answer.
     pub async fn has_programs(
         &self,
         tvg_id: &str,
         epg_source: i64,
-        window: ProgramWindow,
+        window: &ProgramWindow,
     ) -> Result<HasPrograms> {
         if tvg_id.is_empty() {
-            // Nothing to ask about: an entry with no tvg_id cannot carry programmes keyed by
-            // one, and the plugin's own query would filter on an empty string.
+            // Nothing to ask about: programmes are keyed by tvg_id, and the plugin's own
+            // query would filter on an empty string.
             return Ok(HasPrograms::No);
         }
 
-        let key = (tvg_id.to_string(), epg_source);
+        let key = (
+            tvg_id.to_string(),
+            epg_source,
+            window.start.clone(),
+            window.end.clone(),
+        );
         if let Some(cached) = self.program_cache.get(&key) {
             return Ok(*cached);
         }
@@ -381,9 +632,13 @@ impl DispatcharrClient {
     /// Assign EPG entries to channels.
     ///
     /// Dispatcharr queues the programme parse for every changed entry itself, which is the
-    /// step the plugin had to trigger by hand through a Django signal.
+    /// step the plugin had to trigger by hand through a Django signal. `channels_updated` can
+    /// legitimately be smaller than the number of associations: a channel already on that
+    /// entry is skipped upstream, and that is not an error.
     pub async fn batch_set_epg(&self, associations: &[(i64, i64)]) -> Result<usize> {
         if associations.is_empty() {
+            // Upstream rejects an empty list with 400; a run with nothing to write is a
+            // no-op, not a failure.
             return Ok(0);
         }
 
@@ -411,10 +666,12 @@ impl DispatcharrClient {
         });
 
         let url = format!("{}/channels/channels/batch-set-epg/", self.base);
-        let response = self
-            .http
-            .post(&url)
-            .json(&body)
+        let authorization = self.authorization().await?;
+        let mut request = self.http.post(&url).json(&body);
+        if let Some(value) = authorization.as_deref() {
+            request = request.header(reqwest::header::AUTHORIZATION, value);
+        }
+        let response = request
             .send()
             .await
             .with_context(|| format!("POST {url}"))?;
@@ -422,7 +679,7 @@ impl DispatcharrClient {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
         if !status.is_success() {
-            bail!("POST {url} failed with {status}: {}", truncate(&text, 400));
+            bail!("POST {url} failed with {status}: {}", truncate(&text, 300));
         }
         let parsed: Response = serde_json::from_str(&text).with_context(|| {
             format!(
@@ -431,7 +688,7 @@ impl DispatcharrClient {
             )
         })?;
         if !parsed.success {
-            bail!("POST {url} reported failure: {}", truncate(&text, 400));
+            bail!("POST {url} reported failure: {}", truncate(&text, 300));
         }
         Ok(parsed.channels_updated.max(0) as usize)
     }
@@ -464,9 +721,9 @@ struct PaginatedPrograms {
 /// The programme-data window: programmes overlapping `[start, end)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProgramWindow {
-    /// ISO 8601 instant, sent as `end_after`.
+    /// ISO 8601 instant, sent as `end_after` (`end_time >= start`).
     pub start: String,
-    /// ISO 8601 instant, sent as `start_before`.
+    /// ISO 8601 instant, sent as `start_before` (`start_time <= end`).
     pub end: String,
 }
 
@@ -521,7 +778,7 @@ fn truncate(text: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::matchers::{body_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn config(base_url: &str) -> DispatcharrConfig {
@@ -534,12 +791,27 @@ mod tests {
         }
     }
 
+    fn password_config(base_url: &str) -> DispatcharrConfig {
+        DispatcharrConfig {
+            base_url: base_url.to_string(),
+            api_key: String::new(),
+            api_key_env: String::new(),
+            username: "admin".to_string(),
+            password: "hunter2".to_string(),
+            password_env: String::new(),
+            timeout_secs: 5,
+            concurrency: 4,
+            ..DispatcharrConfig::default()
+        }
+    }
+
     #[tokio::test]
-    async fn channels_are_sent_an_api_key_and_parsed() {
+    async fn channels_ask_for_hidden_ones_too() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/channels/channels/"))
-            .and(header("X-API-Key", "test-key"))
+            .and(query_param("visibility_filter", "all"))
+            .and(header("Authorization", "ApiKey test-key"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
                 {"id": 1, "name": "ESPN HD", "channel_number": 101, "channel_group_id": 3, "epg_data_id": 9},
                 {"id": 2, "name": "CNN", "channel_number": "102", "epg_data_id": null}
@@ -557,15 +829,32 @@ mod tests {
         assert_eq!(client.channel(1).expect("cached").name, "ESPN HD");
     }
 
-    #[tokio::test]
-    async fn effective_epg_id_wins_over_the_column() {
+    #[test]
+    fn the_raw_epg_column_is_what_a_run_reasons_about() {
         let channel = Channel {
             id: 1,
             epg_data_id: Some(5),
             effective_epg_data_id: Some(7),
             ..Channel::default()
         };
-        assert_eq!(channel.current_epg_id(), Some(7));
+        assert_eq!(channel.current_epg_id(), Some(5));
+        assert!(channel.has_epg_override());
+
+        let plain = Channel {
+            id: 2,
+            epg_data_id: Some(5),
+            effective_epg_data_id: Some(5),
+            ..Channel::default()
+        };
+        assert!(!plain.has_epg_override());
+
+        let override_only = Channel {
+            id: 3,
+            epg_data_id: None,
+            effective_epg_data_id: Some(7),
+            ..Channel::default()
+        };
+        assert!(override_only.has_epg_override());
     }
 
     #[tokio::test]
@@ -580,21 +869,132 @@ mod tests {
         let error = client.channels().await.expect_err("401");
         let message = format!("{error:#}");
         assert!(message.contains("dispatcharr.api_key"), "{message}");
+        assert!(message.contains("administrator"), "{message}");
     }
 
     #[tokio::test]
-    async fn epg_entries_walk_every_page() {
+    async fn logging_in_trades_the_password_for_a_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/accounts/token/"))
+            .and(body_json(serde_json::json!({
+                "username": "admin",
+                "password": "hunter2"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access": "access-token",
+                "refresh": "refresh-token"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/channels/groups/"))
+            .and(header("Authorization", "Bearer access-token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!([{"id": 1, "name": "Sports"}])),
+            )
+            .mount(&server)
+            .await;
+
+        let client = DispatcharrClient::new(&password_config(&server.uri())).expect("client");
+        client.authenticate().await.expect("logs in");
+        let groups = client.groups().await.expect("groups");
+        assert_eq!(groups.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_lapsed_token_is_refreshed_once() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/accounts/token/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access": "stale",
+                "refresh": "refresh-token"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/accounts/token/refresh/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"access": "fresh"})),
+            )
+            .mount(&server)
+            .await;
+        // The first call with `stale` is rejected; the retry with `fresh` succeeds.
+        Mock::given(method("GET"))
+            .and(path("/api/epg/sources/"))
+            .and(header("Authorization", "Bearer stale"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/epg/sources/"))
+            .and(header("Authorization", "Bearer fresh"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!([{"id": 1, "name": "SD"}])),
+            )
+            .mount(&server)
+            .await;
+
+        let client = DispatcharrClient::new(&password_config(&server.uri())).expect("client");
+        let sources = client.epg_sources().await.expect("refreshes");
+        assert_eq!(sources.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_bad_password_fails_on_login_not_later() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/accounts/token/"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("{\"detail\":\"no\"}"))
+            .mount(&server)
+            .await;
+        let client = DispatcharrClient::new(&password_config(&server.uri())).expect("client");
+        let error = client.authenticate().await.expect_err("401");
+        assert!(format!("{error}").contains("login failed"));
+    }
+
+    #[tokio::test]
+    async fn no_credentials_at_all_says_so() {
+        let config = DispatcharrConfig {
+            api_key: String::new(),
+            api_key_env: String::new(),
+            ..DispatcharrConfig::default()
+        };
+        let client = DispatcharrClient::new(&config).expect("client");
+        let error = client.authenticate().await.expect_err("no credentials");
+        assert!(format!("{error}").contains("no Dispatcharr credentials"));
+    }
+
+    #[tokio::test]
+    async fn epg_entries_accept_a_bare_array_with_a_null_tvg_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/epg/epgdata/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": 1, "name": "ESPN", "tvg_id": "espn.us", "epg_source": 4},
+                {"id": 2, "name": "Nameless", "tvg_id": null, "epg_source": 4}
+            ])))
+            .mount(&server)
+            .await;
+
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        let entries = client.epg_entries().await.expect("entries");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].tvg_id, "");
+    }
+
+    #[tokio::test]
+    async fn epg_entries_also_walk_a_page_envelope() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/epg/epgdata/"))
             .and(query_param("page", "1"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "count": 3,
                 "next": "http://x/api/epg/epgdata/?page=2",
-                "results": [
-                    {"id": 1, "name": "ESPN", "tvg_id": "espn.us", "epg_source": 4},
-                    {"id": 2, "name": "CNN", "tvg_id": "cnn.us", "epg_source": 4}
-                ]
+                "results": [{"id": 1, "name": "ESPN", "tvg_id": "espn.us", "epg_source": 4}]
             })))
             .mount(&server)
             .await;
@@ -602,34 +1002,16 @@ mod tests {
             .and(path("/api/epg/epgdata/"))
             .and(query_param("page", "2"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "count": 3,
                 "next": null,
-                "results": [{"id": 3, "name": "BBC One", "tvg_id": "bbc1.uk", "epg_source": 5}]
+                "results": [{"id": 2, "name": "BBC One", "tvg_id": "bbc1.uk", "epg_source": 5}]
             })))
             .mount(&server)
             .await;
 
         let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
         let entries = client.epg_entries().await.expect("entries");
-        assert_eq!(entries.len(), 3);
-        assert_eq!(entries[2].name, "BBC One");
-        assert_eq!(entries[2].epg_source, Some(5));
-    }
-
-    #[tokio::test]
-    async fn epg_entries_accept_a_bare_array() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/api/epg/epgdata/"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {"id": 1, "name": "ESPN", "tvg_id": "espn.us", "epg_source": 4}
-            ])))
-            .mount(&server)
-            .await;
-
-        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
-        let entries = client.epg_entries().await.expect("entries");
-        assert_eq!(entries.len(), 1);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].name, "BBC One");
     }
 
     #[tokio::test]
@@ -654,7 +1036,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn programme_checks_are_memoised() {
+    async fn programme_checks_are_memoised_per_window() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/epg/programs/search/"))
@@ -663,7 +1045,7 @@ mod tests {
                 "count": 1,
                 "results": [{"id": 42}]
             })))
-            .expect(1)
+            .expect(2)
             .mount(&server)
             .await;
 
@@ -671,15 +1053,27 @@ mod tests {
         let window = ProgramWindow::ahead(12);
         assert_eq!(
             client
-                .has_programs("espn.us", 4, window.clone())
+                .has_programs("espn.us", 4, &window)
                 .await
                 .expect("yes"),
             HasPrograms::Yes
         );
-        // The second call is served from the cache: the mock allows exactly one request.
+        // Same window: served from the cache.
         assert_eq!(
             client
-                .has_programs("espn.us", 4, window)
+                .has_programs("espn.us", 4, &window)
+                .await
+                .expect("yes"),
+            HasPrograms::Yes
+        );
+        // A different window must not inherit the old answer, so this one goes out.
+        let other = ProgramWindow {
+            start: "2026-01-01T00:00:00Z".to_string(),
+            end: "2026-01-02T00:00:00Z".to_string(),
+        };
+        assert_eq!(
+            client
+                .has_programs("espn.us", 4, &other)
                 .await
                 .expect("yes"),
             HasPrograms::Yes
@@ -701,7 +1095,7 @@ mod tests {
         let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
         assert_eq!(
             client
-                .has_programs("empty.us", 4, ProgramWindow::ahead(12))
+                .has_programs("empty.us", 4, &ProgramWindow::ahead(12))
                 .await
                 .expect("no"),
             HasPrograms::No
@@ -711,11 +1105,11 @@ mod tests {
     #[tokio::test]
     async fn an_entry_without_a_tvg_id_costs_no_request() {
         let server = MockServer::start().await;
-        // No mock mounted: any request would fail the test with a 404.
+        // No mock mounted: any request would fail with a 404.
         let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
         assert_eq!(
             client
-                .has_programs("", 4, ProgramWindow::ahead(12))
+                .has_programs("", 4, &ProgramWindow::ahead(12))
                 .await
                 .expect("no"),
             HasPrograms::No
@@ -723,11 +1117,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_transient_server_error_is_retried() {
+        let server = MockServer::start().await;
+        // The first response is a 503; wiremock serves mocks in registration order when they
+        // are equally specific, so the second one answers the retry.
+        Mock::given(method("GET"))
+            .and(path("/api/epg/sources/"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/epg/sources/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!([{"id": 1, "name": "SD"}])),
+            )
+            .mount(&server)
+            .await;
+
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        let sources = client.epg_sources().await.expect("retried");
+        assert_eq!(sources.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn user_level_comes_from_the_me_endpoint() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/accounts/users/me/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": 1, "user_level": 10})),
+            )
+            .mount(&server)
+            .await;
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        assert_eq!(client.user_level().await.expect("level"), 10);
+    }
+
+    #[tokio::test]
     async fn batch_set_epg_posts_associations_and_counts_updates() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/channels/channels/batch-set-epg/"))
-            .and(wiremock::matchers::body_json(serde_json::json!({
+            .and(body_json(serde_json::json!({
                 "associations": [
                     {"channel_id": 1, "epg_data_id": 10},
                     {"channel_id": 2, "epg_data_id": 11}
@@ -735,15 +1169,19 @@ mod tests {
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "success": true,
-                "channels_updated": 2,
+                "channels_updated": 1,
                 "programs_refreshed": 2
             })))
             .mount(&server)
             .await;
 
         let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
-        let updated = client.batch_set_epg(&[(1, 10), (2, 11)]).await.expect("ok");
-        assert_eq!(updated, 2);
+        // One channel was already on that entry upstream, so fewer updates than associations
+        // is normal and must not read as a failure.
+        assert_eq!(
+            client.batch_set_epg(&[(1, 10), (2, 11)]).await.expect("ok"),
+            1
+        );
     }
 
     #[tokio::test]
@@ -789,10 +1227,9 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/api/channels/profiles/"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!([{"id": 1, "name": "All"}])),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": 1, "name": "All", "channels": [1]}
+            ])))
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -804,10 +1241,9 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/api/epg/epgdata/"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "next": null,
-                "results": [{"id": 7, "name": "ESPN", "tvg_id": "espn.us", "epg_source": 4}]
-            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": 7, "name": "ESPN", "tvg_id": "espn.us", "epg_source": 4}
+            ])))
             .mount(&server)
             .await;
 

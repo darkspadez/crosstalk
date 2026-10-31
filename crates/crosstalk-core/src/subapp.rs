@@ -66,6 +66,8 @@ pub struct ActionSpec {
     pub kind: ActionKind,
     /// Extra sentence shown in the confirmation dialog.
     pub confirm: Option<&'static str>,
+    /// Whether running it needs a reachable Dispatcharr.
+    pub needs_dispatcharr: bool,
 }
 
 impl ActionSpec {
@@ -81,7 +83,14 @@ impl ActionSpec {
             description,
             kind,
             confirm: None,
+            needs_dispatcharr: true,
         }
+    }
+
+    /// Mark an action that works entirely offline, so it does not demand credentials.
+    pub fn offline(mut self) -> Self {
+        self.needs_dispatcharr = false;
+        self
     }
 
     pub fn with_confirm(mut self, message: &'static str) -> Self {

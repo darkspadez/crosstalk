@@ -33,7 +33,7 @@ enum Command {
     Serve(ServeArgs),
     /// Run one sub-app action once and exit.
     Run(RunArgs),
-    /// Validate configuration and Dispatcharr connectivity.
+    /// Validate the configuration files and each sub-app's settings.
     Validate(ConfigArgs),
     /// Offline stream-to-channel match simulation.
     Simulate(SimulateArgs),
@@ -213,10 +213,10 @@ fn run_once(args: RunArgs) -> Result<()> {
     // Only connect when the action needs Dispatcharr, so `validate` still works on a host
     // that cannot reach it yet.
     let context = JobContext::headless(config);
-    let context = if action.id == "validate" {
-        context
-    } else {
+    let context = if action.needs_dispatcharr {
         context.connect()?
+    } else {
+        context
     };
     let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
     let outcome = runtime.block_on(app.run(action.id, &context, args.dry_run))?;

@@ -58,15 +58,20 @@ impl SubApp for JanitorApp {
             ActionSpec::new(
                 ACTION_VALIDATE,
                 "Validate Settings",
-                "Check the settings and the connection to Dispatcharr.",
+                "Check the settings for consistency. Reach Dispatcharr separately, by                  previewing a run.",
                 ActionKind::Read,
-            ),
+            )
+            // Settings validation is local: it must work on a host that cannot reach
+            // Dispatcharr yet, which is exactly when an operator runs it.
+            .offline(),
             ActionSpec::new(
                 ACTION_STATUS,
                 "Status / Last Results",
                 "Show what the last run did, and whether a run is in progress.",
                 ActionKind::Read,
-            ),
+            )
+            // Reads the run store, not Dispatcharr.
+            .offline(),
             ActionSpec::new(
                 ACTION_AUTOMATCH_PREVIEW,
                 "Preview Auto-Match (Dry Run)",
