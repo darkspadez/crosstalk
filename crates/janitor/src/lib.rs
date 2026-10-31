@@ -8,6 +8,7 @@
 //! freshness watchdog are deliberately out of scope for this version, as is the anonymous
 //! usage counter.
 
+pub mod ai_gate;
 pub mod automatch;
 pub mod heal;
 pub mod scope;
@@ -260,9 +261,24 @@ impl JanitorApp {
             );
         }
 
+        // Built once per run: one session, one concurrency cap, one audit trail.
+        let ai = crosstalk_core::ai::AiService::from_config(context.config());
+        let ai = if settings.ai.enabled && ai.has(&settings.ai.provider) {
+            Some(ai)
+        } else {
+            if settings.ai.enabled {
+                tracing::warn!(
+                    "ai.enabled is on but provider {:?} is not configured; matching without it",
+                    settings.ai.provider
+                );
+            }
+            None
+        };
+
         let result = automatch::run(
             context,
             &settings,
+            ai.as_ref(),
             &world,
             &scoped_channels,
             &scoped_entries,

@@ -1229,6 +1229,7 @@ name = "janitor"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "crosstalk-core",
  "crosstalk-matching",

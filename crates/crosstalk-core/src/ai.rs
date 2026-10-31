@@ -89,7 +89,10 @@ pub struct NoulCriteria {
 }
 
 /// One request: a state, and the questions to ask about it.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Serializable so the audit trail can store exactly what was asked, which is the only way to
+/// explain an AI decision months later.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DecisionRequest {
     /// The provider name from `[ai.providers]`.
     pub provider: String,

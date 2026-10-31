@@ -13,6 +13,7 @@
 //! Both stages stay faithful to the plugin's order: the highest-scoring candidate that both
 //! clears the threshold and has programmes is the one that wins.
 
+use crate::ai_gate;
 use crate::scope::{ScopedChannels, ScopedEntries};
 use crate::settings::JanitorSettings;
 use anyhow::{Context, Result};
@@ -114,6 +115,7 @@ pub struct AutoMatchOutcome {
 pub async fn run(
     context: &JobContext,
     settings: &JanitorSettings,
+    ai: Option<&crosstalk_core::ai::AiService>,
     world: &World,
     scoped_channels: &ScopedChannels,
     scoped_entries: &ScopedEntries,
@@ -223,31 +225,98 @@ pub async fn run(
         let mut chosen: Option<(&Scored, &EpgEntry, HasPrograms)> = None;
         let mut best_rejected: Option<u8> = None;
 
-        for candidate in &ranked {
-            let Some(entry) = scoped_entries.entries.get(candidate.index) else {
-                continue;
-            };
-            if candidate.score >= threshold {
-                if allow_without_programs {
-                    chosen = Some((candidate, entry, HasPrograms::Yes));
-                    break;
-                }
-                let Some(source) = entry.epg_source else {
-                    continue;
-                };
-                let has = client
-                    .has_programs(&entry.tvg_id, source, &window)
-                    .await
-                    .unwrap_or(HasPrograms::No);
-                match has {
-                    HasPrograms::Yes => {
+        // A high-confidence heuristic match is the fast path: validate it and move on. Only a
+        // channel the heuristics are unsure about reaches the model.
+        // A heuristic result that already clears the threshold is a confident match and is
+        // never re-checked by the model.
+        let already_confident = ranked.first().is_some_and(|entry| entry.score >= threshold);
+        let gate = if already_confident {
+            None
+        } else {
+            ai_gate::shortlist(&ranked, &settings.ai)
+        };
+
+        let mut ai_outcome = None;
+        if let Some((reason, offered)) = gate {
+            let outcome = ai_gate::ask(
+                ai,
+                channel,
+                &scoped_entries.entries,
+                &ranked,
+                &offered,
+                reason,
+                &settings.ai,
+            )
+            .await;
+            if outcome.answered {
+                row.ai_decision = Some(outcome.decision.clone());
+                let decision_index = outcome.accepted;
+                ai_outcome = Some((outcome, decision_index));
+            } else {
+                row.ai_decision = Some(outcome.decision.clone());
+            }
+        }
+
+        // An accepted AI candidate replaces the heuristic search order: the model's pick is
+        // the one to validate, and if it has no programmes the channel is left alone.
+        if let Some((_outcome, Some(position))) = ai_outcome.clone() {
+            if let Some(candidate) = ranked.get(position) {
+                if let Some(entry) = scoped_entries.entries.get(candidate.index) {
+                    let has = if allow_without_programs {
+                        HasPrograms::Yes
+                    } else {
+                        match entry.epg_source {
+                            Some(source) => client
+                                .has_programs(&entry.tvg_id, source, &window)
+                                .await
+                                .unwrap_or(HasPrograms::No),
+                            None => HasPrograms::No,
+                        }
+                    };
+                    if has == HasPrograms::Yes {
                         chosen = Some((candidate, entry, has));
-                        break;
-                    }
-                    HasPrograms::No => {
+                    } else {
                         best_rejected = Some(candidate.score);
                     }
                 }
+            }
+            if let Some(outcome) = ai_outcome.as_ref() {
+                context.record_ai_decision(
+                    &outcome.0.to_store(rows.len() as i64, &settings.ai.provider),
+                )?;
+            }
+        } else {
+            for candidate in &ranked {
+                let Some(entry) = scoped_entries.entries.get(candidate.index) else {
+                    continue;
+                };
+                if candidate.score >= threshold {
+                    if allow_without_programs {
+                        chosen = Some((candidate, entry, HasPrograms::Yes));
+                        break;
+                    }
+                    let Some(source) = entry.epg_source else {
+                        continue;
+                    };
+                    let has = client
+                        .has_programs(&entry.tvg_id, source, &window)
+                        .await
+                        .unwrap_or(HasPrograms::No);
+                    match has {
+                        HasPrograms::Yes => {
+                            chosen = Some((candidate, entry, has));
+                            break;
+                        }
+                        HasPrograms::No => {
+                            best_rejected = Some(candidate.score);
+                        }
+                    }
+                }
+            }
+            if let Some(outcome) = ai_outcome.as_ref() {
+                context.record_ai_decision(
+                    &outcome.0.to_store(rows.len() as i64, &settings.ai.provider),
+                )?;
             }
         }
 
@@ -255,6 +324,11 @@ pub async fn run(
             Some((candidate, entry, _)) => {
                 row.score = candidate.score;
                 row.method = candidate.method_label();
+                if ai_outcome.as_ref().is_some_and(|(outcome, accepted)| {
+                    accepted.is_some() && outcome.accepted.is_some()
+                }) {
+                    row.method = format!("{} + AI", row.method);
+                }
                 row.epg_data_id = Some(entry.id);
                 row.epg_channel_name = Some(entry.name.clone());
                 row.epg_source_name = entry
@@ -574,18 +648,39 @@ mod tests {
     use super::*;
     use crosstalk_core::dispatcharr::{Channel, ChannelGroup, DispatcharrClient, EpgSource};
     use crosstalk_core::jobs::VecSink;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// A world with two channels and two guide entries, served over HTTP so the run goes
     /// through the real client path.
     async fn fixture(programs_for: &str) -> (MockServer, World, JobContext) {
+        fixture_named(programs_for, "ESPN").await
+    }
+
+    /// Same fixture, with the guide entry named so a test can land in the verify band: `ESPN`
+    /// scores 100 against `ESPN HD`, while `ESPNX` scores 80.
+    async fn fixture_named(
+        programs_for: &str,
+        entry_name: &str,
+    ) -> (MockServer, World, JobContext) {
+        fixture_full(programs_for, entry_name, "ESPN HD").await
+    }
+
+    /// The same, with the channel name chosen too.
+    async fn fixture_full(
+        programs_for: &str,
+        entry_name: &str,
+        channel_name: &str,
+    ) -> (MockServer, World, JobContext) {
         let server = MockServer::start().await;
 
         Mock::given(method("GET"))
             .and(path("/api/channels/channels/"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {"id": 1, "name": "ESPN HD", "channel_number": 101, "channel_group_id": 10},
+                {"id": 1, "name": channel_name, "channel_number": 101, "channel_group_id": 10},
                 {"id": 2, "name": "Nothing Like It", "channel_number": 102, "channel_group_id": 10}
             ])))
             .mount(&server)
@@ -613,7 +708,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/epg/epgdata/"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {"id": 7, "name": "ESPN", "tvg_id": "espn.us", "epg_source": 4}
+                {"id": 7, "name": entry_name, "tvg_id": "espn.us", "epg_source": 4}
             ])))
             .mount(&server)
             .await;
@@ -648,7 +743,7 @@ mod tests {
             channels: vec![
                 Channel {
                     id: 1,
-                    name: "ESPN HD".to_string(),
+                    name: channel_name.to_string(),
                     channel_number: Some(serde_json::json!(101)),
                     channel_group_id: Some(10),
                     ..Channel::default()
@@ -673,7 +768,7 @@ mod tests {
             }],
             entries: vec![EpgEntry {
                 id: 7,
-                name: "ESPN".to_string(),
+                name: entry_name.to_string(),
                 tvg_id: "espn.us".to_string(),
                 epg_source: Some(4),
             }],
@@ -712,7 +807,7 @@ mod tests {
         let settings = JanitorSettings::default();
         let (channels, entries) = scoped(&world);
 
-        let result = run(&context, &settings, &world, &channels, &entries, true)
+        let result = run(&context, &settings, None, &world, &channels, &entries, true)
             .await
             .expect("preview");
 
@@ -750,9 +845,11 @@ mod tests {
         let settings = JanitorSettings::default();
         let (channels, entries) = scoped(&world);
 
-        let result = run(&context, &settings, &world, &channels, &entries, false)
-            .await
-            .expect("apply");
+        let result = run(
+            &context, &settings, None, &world, &channels, &entries, false,
+        )
+        .await
+        .expect("apply");
         assert_eq!(result.applied, 1);
     }
 
@@ -763,7 +860,7 @@ mod tests {
         let settings = JanitorSettings::default();
         let (channels, entries) = scoped(&world);
 
-        let result = run(&context, &settings, &world, &channels, &entries, true)
+        let result = run(&context, &settings, None, &world, &channels, &entries, true)
             .await
             .expect("preview");
         let espn = result
@@ -783,7 +880,7 @@ mod tests {
             ..JanitorSettings::default()
         };
         let (channels, entries) = scoped(&world);
-        let result = run(&context, &settings, &world, &channels, &entries, true)
+        let result = run(&context, &settings, None, &world, &channels, &entries, true)
             .await
             .expect("preview");
         let espn = result
@@ -795,6 +892,186 @@ mod tests {
         assert!(espn.reason.contains("[program data check skipped]"));
     }
 
+    /// A decider that answers every request with a fixed probability, and counts calls.
+    struct FixedDecider {
+        probability: f64,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crosstalk_core::ai::Decider for FixedDecider {
+        fn provider(&self) -> &str {
+            "typesafe"
+        }
+
+        fn calibrated(&self) -> bool {
+            true
+        }
+
+        async fn decide(
+            &self,
+            request: &crosstalk_core::ai::DecisionRequest,
+        ) -> Result<crosstalk_core::ai::DecisionResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut answers = std::collections::BTreeMap::new();
+            // Pick the first candidate offered, and answer yes to it.
+            if let Some((id, _)) = request
+                .questions
+                .iter()
+                .find(|(id, _)| id.starts_with("same_") && id.as_str() != "same_network")
+            {
+                answers.insert(
+                    "best".to_string(),
+                    crosstalk_core::ai::Answer::Choice {
+                        choice: id.replacen("same_", "candidate_", 1),
+                        confidence: 0.9,
+                        probabilities: Default::default(),
+                    },
+                );
+                answers.insert(
+                    id.clone(),
+                    crosstalk_core::ai::Answer::Noul {
+                        noul: self.probability,
+                    },
+                );
+            }
+            Ok(crosstalk_core::ai::DecisionResponse {
+                model: "stub".to_string(),
+                answers,
+                input_tokens: 10,
+                output_tokens: 2,
+                latency_ms: 1,
+                calibrated: true,
+            })
+        }
+    }
+
+    fn ai_settings(
+        probability: f64,
+        calls: Arc<AtomicUsize>,
+    ) -> (crosstalk_core::ai::AiService, JanitorSettings) {
+        let service = crosstalk_core::ai::AiService::with_decider(
+            "typesafe",
+            Arc::new(FixedDecider { probability, calls }),
+        );
+        let settings = JanitorSettings {
+            ai: crate::settings::AiSettings {
+                enabled: true,
+                provider: "typesafe".to_string(),
+                model: "stub".to_string(),
+                ..crate::settings::AiSettings::default()
+            },
+            ..JanitorSettings::default()
+        };
+        (service, settings)
+    }
+
+    #[tokio::test]
+    async fn a_confident_match_never_calls_the_model() {
+        let (_server, world, context) = fixture("espn.us").await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (service, settings) = ai_settings(0.99, Arc::clone(&calls));
+        let (channels, entries) = scoped(&world);
+
+        let result = run(
+            &context,
+            &settings,
+            Some(&service),
+            &world,
+            &channels,
+            &entries,
+            true,
+        )
+        .await
+        .expect("preview");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "the heuristics were sure");
+        let espn = result
+            .rows
+            .iter()
+            .find(|row| row.channel_name == "ESPN HD")
+            .expect("row");
+        assert_eq!(espn.epg_data_id, Some(7));
+        assert!(espn.ai_decision.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_borderline_match_is_verified_by_the_model() {
+        // `ESPNX` scores 80 against `ESPN HD`: inside the verify band and below the threshold,
+        // which is exactly the case the model exists for.
+        // A shared but LOW-confidence callsign (mid-name, no parentheses) plus a shared state
+        // scores 80: inside the band, below the 95 threshold, and exactly what the model is
+        // for. A parenthesised callsign would anchor at 95 and never reach the model.
+        let (_server, world, context) = fixture_full(
+            "espn.us",
+            "XYZ WABC - IL Shelbyville",
+            "ABC WABC - IL Springfield",
+        )
+        .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (service, settings) = ai_settings(0.95, Arc::clone(&calls));
+        let (channels, entries) = scoped(&world);
+
+        let result = run(
+            &context,
+            &settings,
+            Some(&service),
+            &world,
+            &channels,
+            &entries,
+            true,
+        )
+        .await
+        .expect("preview");
+        assert!(calls.load(Ordering::SeqCst) >= 1, "the model was asked");
+        let espn = result
+            .rows
+            .iter()
+            .find(|row| row.channel_name == "ABC WABC - IL Springfield")
+            .expect("row");
+        assert_eq!(espn.epg_data_id, Some(7), "the model's pick was accepted");
+        assert!(espn.method.contains("+ AI"), "{}", espn.method);
+        assert!(espn
+            .ai_decision
+            .as_deref()
+            .unwrap_or_default()
+            .contains("accept"));
+    }
+
+    #[tokio::test]
+    async fn a_model_that_says_no_leaves_the_channel_unmatched() {
+        let (_server, world, context) = fixture_full(
+            "espn.us",
+            "XYZ WABC - IL Shelbyville",
+            "ABC WABC - IL Springfield",
+        )
+        .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (service, settings) = ai_settings(0.05, Arc::clone(&calls));
+        let (channels, entries) = scoped(&world);
+
+        let result = run(
+            &context,
+            &settings,
+            Some(&service),
+            &world,
+            &channels,
+            &entries,
+            true,
+        )
+        .await
+        .expect("preview");
+        let espn = result
+            .rows
+            .iter()
+            .find(|row| row.channel_name == "ABC WABC - IL Springfield")
+            .expect("row");
+        assert_eq!(espn.epg_data_id, None);
+        assert!(
+            espn.ai_decision.is_some(),
+            "the decision is recorded even when it is no"
+        );
+    }
+
     #[tokio::test]
     async fn an_epg_override_is_skipped_rather_than_bypassed() {
         let (_server, mut world, context) = fixture("espn.us").await;
@@ -803,7 +1080,7 @@ mod tests {
         let settings = JanitorSettings::default();
         let (channels, entries) = scoped(&world);
 
-        let result = run(&context, &settings, &world, &channels, &entries, true)
+        let result = run(&context, &settings, None, &world, &channels, &entries, true)
             .await
             .expect("preview");
         let espn = result
