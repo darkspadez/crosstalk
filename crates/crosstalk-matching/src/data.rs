@@ -120,3 +120,56 @@ mod tests {
         }
     }
 }
+
+/// Callsigns implied by the channel databases for `codes`.
+///
+/// Mirrors `FuzzyMatcher.reload_databases` + `_get_known_callsigns`: entries whose `type`
+/// mentions `broadcast` feed the broadcast loop, everything else the premium loop. Only
+/// the codes named are read, so a single-region run does not pay for the other databases.
+pub fn known_callsigns_for(codes: &[&str]) -> crate::callsign::KnownCallsigns {
+    let mut known = crate::callsign::KnownCallsigns::new();
+    for code in codes {
+        let Some(json) = channel_database_json(code) else {
+            continue;
+        };
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json) else {
+            continue;
+        };
+        let Some(channels) = parsed.get("channels").and_then(|value| value.as_array()) else {
+            continue;
+        };
+        for channel in channels {
+            let kind = channel
+                .get("type")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_lowercase();
+            let name = channel.get("channel_name").and_then(|value| value.as_str());
+            if kind.contains("broadcast") {
+                let callsign = channel.get("callsign").and_then(|value| value.as_str());
+                known.add_broadcast_entry(callsign, name);
+            } else if let Some(name) = name {
+                known.add_premium_entry(name);
+            }
+        }
+    }
+    known
+}
+
+#[cfg(test)]
+mod database_callsign_tests {
+    use super::*;
+
+    #[test]
+    fn known_callsigns_pick_up_station_format_names() {
+        let known = known_callsigns_for(&["US"]);
+        assert!(!known.is_empty());
+        // The FCC file already has these; the point is that the loader runs and merges.
+        assert!(known.contains("WABC") || known.contains("KGTV"));
+    }
+
+    #[test]
+    fn unknown_country_contributes_nothing() {
+        assert!(known_callsigns_for(&["ZZ"]).is_empty());
+    }
+}

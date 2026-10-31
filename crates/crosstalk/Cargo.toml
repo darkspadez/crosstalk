@@ -18,6 +18,9 @@ janitor.workspace = true
 
 anyhow.workspace = true
 clap.workspace = true
+csv.workspace = true
+chrono.workspace = true
+fancy-regex.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

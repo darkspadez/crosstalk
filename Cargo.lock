@@ -504,10 +504,13 @@ name = "crosstalk"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "crosstalk-core",
  "crosstalk-matching",
  "crosstalk-web",
+ "csv",
+ "fancy-regex",
  "janitor",
  "serde_json",
  "tokio",

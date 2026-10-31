@@ -85,81 +85,78 @@ impl MatchMethod {
 /// caller picks first.
 #[derive(Default)]
 struct MatchSet {
-    /// Names in insertion order; `None` marks a removed entry, which keeps the positions
-    /// of the survivors exactly as Python's dict does after a `pop`.
-    slots: Vec<Option<(String, usize, u8, MatchMethod)>>,
-    position: std::collections::HashMap<String, usize>,
+    /// Candidates in insertion order; `None` marks a removed entry, which keeps the
+    /// positions of the survivors exactly as Python's dict does after a `pop`.
+    slots: Vec<Option<(usize, u8, MatchMethod)>>,
+    position: std::collections::HashMap<usize, usize>,
 }
 
 impl MatchSet {
-    fn contains(&self, name: &str) -> bool {
-        self.position.contains_key(name)
+    fn contains(&self, candidate: usize) -> bool {
+        self.position.contains_key(&candidate)
     }
 
     /// Insert, or raise the score of an existing entry in place (keeping its position).
-    fn insert_if_better(&mut self, name: String, candidate: usize, score: u8, method: MatchMethod) {
+    fn insert_if_better(&mut self, candidate: usize, score: u8, method: MatchMethod) {
         match self
             .position
-            .get(&name)
+            .get(&candidate)
             .and_then(|pos| self.slots[*pos].as_mut())
         {
             Some(entry) => {
-                if score > entry.2 {
-                    entry.1 = candidate;
-                    entry.2 = score;
-                    entry.3 = method;
+                if score > entry.1 {
+                    entry.1 = score;
+                    entry.2 = method;
                 }
             }
             None => {
-                self.position.insert(name.clone(), self.slots.len());
-                self.slots.push(Some((name, candidate, score, method)));
+                self.position.insert(candidate, self.slots.len());
+                self.slots.push(Some((candidate, score, method)));
             }
         }
     }
 
     /// Replace the entry outright, as Python's `all_matches[x] = (...)` does.
-    fn set(&mut self, name: String, candidate: usize, score: u8, method: MatchMethod) {
+    fn set(&mut self, candidate: usize, score: u8, method: MatchMethod) {
         match self
             .position
-            .get(&name)
+            .get(&candidate)
             .and_then(|pos| self.slots[*pos].as_mut())
         {
             Some(entry) => {
-                entry.1 = candidate;
-                entry.2 = score;
-                entry.3 = method;
+                entry.1 = score;
+                entry.2 = method;
             }
             None => {
-                self.position.insert(name.clone(), self.slots.len());
-                self.slots.push(Some((name, candidate, score, method)));
+                self.position.insert(candidate, self.slots.len());
+                self.slots.push(Some((candidate, score, method)));
             }
         }
     }
 
-    fn get_score(&self, name: &str) -> Option<u8> {
+    fn get_score(&self, candidate: usize) -> Option<u8> {
         self.position
-            .get(name)
+            .get(&candidate)
             .and_then(|pos| self.slots[*pos].as_ref())
-            .map(|entry| entry.2)
+            .map(|entry| entry.1)
     }
 
-    fn remove(&mut self, name: &str) {
-        if let Some(pos) = self.position.remove(name) {
+    fn remove(&mut self, candidate: usize) {
+        if let Some(pos) = self.position.remove(&candidate) {
             self.slots[pos] = None;
         }
     }
 
-    fn iter(&self) -> impl Iterator<Item = &(String, usize, u8, MatchMethod)> {
+    fn iter(&self) -> impl Iterator<Item = &(usize, u8, MatchMethod)> {
         self.slots.iter().flatten()
     }
 
-    fn retain_by_name(&mut self, mut keep: impl FnMut(&str) -> bool) {
-        for (pos, slot) in self.slots.iter_mut().enumerate() {
+    fn retain(&mut self, mut keep: impl FnMut(usize) -> bool) {
+        for slot in self.slots.iter_mut() {
             if let Some(entry) = slot {
-                if !keep(&entry.0) {
+                if !keep(entry.0) {
                     self.position.remove(&entry.0);
                     *slot = None;
-                    let _ = pos;
                 }
             }
         }
@@ -205,6 +202,14 @@ pub struct CandidateIndex {
     callsign: Vec<Option<String>>,
     callsign_high_confidence: Vec<bool>,
     location: Vec<Location>,
+    /// Whether the ORIGINAL name carries a `+N` time-shift marker. Precomputed because
+    /// the guard runs once per candidate per query, which is the hot loop.
+    is_shift: Vec<bool>,
+    /// Digit tokens of the normalized name, precomputed for the digit-token guard.
+    digit_tokens: Vec<Vec<String>>,
+    /// Index of the first candidate carrying this name. The plugin keys its results by
+    /// NAME, so a duplicate name can only ever produce one entry; this is that key.
+    first_of_name: Vec<usize>,
 }
 
 /// Collapse the separators the plugin ignores for its no-space comparison: any
@@ -257,7 +262,12 @@ impl CandidateIndex {
             callsign: Vec::with_capacity(names.len()),
             callsign_high_confidence: Vec::with_capacity(names.len()),
             location: Vec::with_capacity(names.len()),
+            is_shift: Vec::with_capacity(names.len()),
+            digit_tokens: Vec::with_capacity(names.len()),
+            first_of_name: Vec::with_capacity(names.len()),
         };
+        let mut seen_names: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
 
         for name in names {
             let normalized = normalizer.normalize_name(name, &[]);
@@ -279,6 +289,24 @@ impl CandidateIndex {
             index.callsign.push(callsign);
             index.callsign_high_confidence.push(high);
             index.location.push(extract_location(name));
+            index.is_shift.push(is_time_shift(name));
+            index.digit_tokens.push(
+                index
+                    .normalized_lower
+                    .last()
+                    .and_then(|entry| entry.as_deref())
+                    .map(|lowered| {
+                        py_split_whitespace(lowered)
+                            .filter(|token| is_digit(token))
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            );
+            let next_index = index.first_of_name.len();
+            index
+                .first_of_name
+                .push(*seen_names.entry(name.clone()).or_insert(next_index));
         }
 
         index
@@ -320,6 +348,12 @@ impl CandidateIndex {
 
     fn processed(&self, index: usize) -> Option<&str> {
         self.processed[index].as_deref()
+    }
+
+    /// The candidate that represents this name in the results, which is the first one
+    /// carrying it.
+    fn representative(&self, index: usize) -> usize {
+        self.first_of_name[index]
     }
 }
 
@@ -526,14 +560,17 @@ impl Matcher {
         let (query_callsign, query_high_confidence) =
             extract_callsign_with_confidence(query, &self.known);
         let query_callsign_normalized = query_callsign.as_deref().map(normalize_callsign);
-        let mut callsign_anchored: std::collections::HashSet<String> =
+        let mut callsign_anchored: std::collections::HashSet<usize> =
             std::collections::HashSet::new();
 
         let mut all_matches = MatchSet::default();
 
         for ranked in self.alias_match(query, index, user_ignored_tags) {
-            let name = index.name(ranked.index).to_string();
-            all_matches.insert_if_better(name, ranked.index, ranked.score, ranked.method);
+            all_matches.insert_if_better(
+                index.representative(ranked.index),
+                ranked.score,
+                ranked.method,
+            );
         }
 
         let normalized_query = self.normalizer.normalize_name(query, user_ignored_tags);
@@ -548,7 +585,8 @@ impl Matcher {
             let processed_query = process_string_for_matching(&normalized_query);
 
             for candidate in 0..index.len() {
-                if all_matches.contains(index.name(candidate)) {
+                let representative = index.representative(candidate);
+                if all_matches.contains(representative) {
                     continue;
                 }
                 let Some((candidate_lower, candidate_nospace)) = index.normalized(candidate) else {
@@ -570,18 +608,18 @@ impl Matcher {
                 // OTA names carry the broadcast number while the guide entry does not
                 // (`ABC 7 (KGO) San Francisco` vs `ABC San Francisco`).
                 if !query_digits.is_empty() {
-                    let candidate_digits: Vec<&str> = py_split_whitespace(candidate_lower)
-                        .filter(|token| is_digit(token))
-                        .collect();
+                    let candidate_digits = &index.digit_tokens[candidate];
                     if !candidate_digits.is_empty()
-                        && !candidate_digits.iter().any(|c| query_digits.contains(c))
+                        && !candidate_digits
+                            .iter()
+                            .any(|token| query_digits.contains(&token.as_str()))
                     {
                         continue;
                     }
                 }
 
                 // Time-shift guard: a `+1` channel only matches `+1` candidates.
-                if query_is_shift != is_time_shift(index.name(candidate)) {
+                if query_is_shift != index.is_shift[candidate] {
                     continue;
                 }
 
@@ -660,12 +698,7 @@ impl Matcher {
 
                 if let Some(method) = method {
                     if score > 0 {
-                        all_matches.insert_if_better(
-                            index.name(candidate).to_string(),
-                            candidate,
-                            score,
-                            method,
-                        );
+                        all_matches.insert_if_better(representative, score, method);
                     }
                 }
             }
@@ -686,23 +719,18 @@ impl Matcher {
                     if !candidate_high {
                         continue;
                     }
-                    let candidate_name = index.name(candidate).to_string();
+                    let representative = index.representative(candidate);
                     if normalize_callsign(candidate_callsign) == query_normalized_callsign {
-                        let replace = match all_matches.get_score(&candidate_name) {
+                        let replace = match all_matches.get_score(representative) {
                             None => true,
                             Some(score) => score < 95,
                         };
                         if replace {
-                            all_matches.set(
-                                candidate_name.clone(),
-                                candidate,
-                                95,
-                                MatchMethod::Callsign,
-                            );
+                            all_matches.set(representative, 95, MatchMethod::Callsign);
                         }
-                        callsign_anchored.insert(candidate_name);
+                        callsign_anchored.insert(representative);
                     } else {
-                        all_matches.remove(&candidate_name);
+                        all_matches.remove(representative);
                     }
                 }
             }
@@ -719,11 +747,11 @@ impl Matcher {
         let query_has_pacific = has("pacific") || contains_abbrev(&original_lower, "p");
 
         if query_has_east || query_has_west || query_has_pacific {
-            all_matches.retain_by_name(|candidate_name| {
-                if callsign_anchored.contains(candidate_name) {
+            all_matches.retain(|candidate| {
+                if callsign_anchored.contains(&candidate) {
                     return true;
                 }
-                let name = lower(candidate_name);
+                let name = lower(index.name(candidate));
                 let candidate_east = name.contains("east");
                 let candidate_west = name.contains("west") && !name.contains("western");
                 let candidate_pacific = name.contains("pacific");
@@ -741,16 +769,19 @@ impl Matcher {
         } else if !user_ignored_tags.contains(&"regional") {
             // Regionless query prefers regionless candidates; the filter is dropped when it
             // would eliminate everything, which is why the survivors are counted first.
-            let keeps = |name: &str| {
-                if callsign_anchored.contains(name) {
+            let keeps = |candidate: usize| {
+                if callsign_anchored.contains(&candidate) {
                     return true;
                 }
-                let lowered = lower(name);
+                let lowered = lower(index.name(candidate));
                 !(lowered.contains("pacific")
                     || (lowered.contains("west") && !lowered.contains("western")))
             };
-            if all_matches.iter().any(|(name, _, _, _)| keeps(name)) {
-                all_matches.retain_by_name(keeps);
+            if all_matches
+                .iter()
+                .any(|(candidate, _, _)| keeps(*candidate))
+            {
+                all_matches.retain(keeps);
             }
         }
 
@@ -758,15 +789,15 @@ impl Matcher {
         // ORIGINAL-name tokens with the query.
         let mut results: Vec<(Ranked, usize)> = all_matches
             .iter()
-            .filter(|(_, _, score, _)| *score >= min_score)
-            .map(|(name, candidate, score, method)| {
+            .filter(|(_, score, _)| *score >= min_score)
+            .map(|(candidate, score, method)| {
                 (
                     Ranked {
                         index: *candidate,
                         score: *score,
                         method: method.clone(),
                     },
-                    ascii_token_overlap(&original_lower, name),
+                    ascii_token_overlap(&original_lower, index.name(*candidate)),
                 )
             })
             .collect();

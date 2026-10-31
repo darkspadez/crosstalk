@@ -96,24 +96,32 @@ impl KnownCallsigns {
         Self { callsigns }
     }
 
-    /// Add the callsigns implied by one channel-database entry.
+    /// Contribute one `broadcast_channels` entry.
     ///
-    /// A broadcast entry carries a `callsign`; a premium entry is station format only
-    /// when its name starts with a callsign followed by `(` or `-` (`KGTV (ABC)`,
-    /// `WPLG-DT`). Requiring that shape is what keeps `WORLD Fishing Network` out.
-    pub fn add_database_entry(&mut self, callsign: Option<&str>, name: Option<&str>) {
-        if let Some(callsign) = callsign {
-            let upper = callsign.trim().to_uppercase();
-            if let Some(base) = leading_callsign(&upper) {
-                self.callsigns.insert(base);
-            }
+    /// Python uses `callsign or channel_name`, uppercased without trimming, then
+    /// `re.match(r'([KW][A-Z]{2,4})\b', token)`. That trailing word boundary is why
+    /// `KAALTV` contributes nothing: there is no boundary after `KAAL` inside the word.
+    pub fn add_broadcast_entry(&mut self, callsign: Option<&str>, channel_name: Option<&str>) {
+        let token = callsign
+            .filter(|value| !value.is_empty())
+            .or_else(|| channel_name.filter(|value| !value.is_empty()))
+            .unwrap_or("");
+        let upper = token.to_uppercase();
+        if let Some(base) = broadcast_leading_callsign(&upper) {
+            self.callsigns.insert(base);
         }
-        if let Some(name) = name {
-            let upper = name.trim().to_uppercase();
-            if station_format(&upper) {
-                if let Some(base) = leading_callsign(&upper) {
-                    self.callsigns.insert(base);
-                }
+    }
+
+    /// Contribute one premium/cable entry.
+    ///
+    /// Python uppercases the name without trimming and requires station format:
+    /// `re.match(r'^([KW][A-Z]{2,4})(?:-(?:TV|CD|LP|DT|LD)\d?)?\s*[(\-]', name)`. That
+    /// shape test is what keeps `WORLD Fishing Network` out of the allowlist.
+    pub fn add_premium_entry(&mut self, channel_name: &str) {
+        let upper = channel_name.to_uppercase();
+        if station_format(&upper) {
+            if let Some(base) = premium_leading_callsign(&upper) {
+                self.callsigns.insert(base);
             }
         }
     }
@@ -134,6 +142,11 @@ impl KnownCallsigns {
         self.callsigns.len()
     }
 
+    /// Every callsign held, for merging two allowlists.
+    pub fn to_vec(&self) -> Vec<String> {
+        self.callsigns.iter().cloned().collect()
+    }
+
     /// The shipped FCC allowlist, parsed once. `None` when the file is missing from the
     /// build, which only ever costs matches; callers fall back to the database-derived
     /// callsigns alone.
@@ -149,12 +162,26 @@ impl KnownCallsigns {
 }
 
 /// The leading `K`/`W` callsign of an uppercased station-format string.
-fn leading_callsign(upper: &str) -> Option<String> {
+/// Leading callsign of an uppercased broadcast token: `^([KW][A-Z]{2,4})\b`.
+///
+/// Case-sensitive, like the plugin, because the input is already uppercased.
+fn broadcast_leading_callsign(upper: &str) -> Option<String> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re =
+        RE.get_or_init(|| Regex::new(&pythonize(r"^([KW][A-Z]{2,4})\b")).expect("static regex"));
+    re.captures(upper)
+        .ok()
+        .flatten()
+        .and_then(|caps| caps.get(1))
+        .map(|m| m.as_str().to_string())
+}
+
+/// Leading callsign of an uppercased premium name, station format only.
+fn premium_leading_callsign(upper: &str) -> Option<String> {
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
-        Regex::new(&format!(
-            "(?i){}",
-            widen_case_insensitive_i(&pythonize(r"^([KW][A-Z]{2,4})"))
+        Regex::new(&pythonize(
+            r"^([KW][A-Z]{2,4})(?:-(?:TV|CD|LP|DT|LD)\d?)?\s*[(\-]",
         ))
         .expect("static regex")
     });
@@ -162,18 +189,15 @@ fn leading_callsign(upper: &str) -> Option<String> {
         .ok()
         .flatten()
         .and_then(|caps| caps.get(1))
-        .map(|m| m.as_str().to_uppercase())
+        .map(|m| m.as_str().to_string())
 }
 
 /// Whether an uppercased name uses station format: a callsign followed by `(` or `-`.
 fn station_format(upper: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
-        Regex::new(&format!(
-            "(?i){}",
-            widen_case_insensitive_i(&pythonize(
-                r"^([KW][A-Z]{2,4})(?:-(?:TV|CD|LP|DT|LD)\d?)?\s*[(\-]"
-            ))
+        Regex::new(&pythonize(
+            r"^([KW][A-Z]{2,4})(?:-(?:TV|CD|LP|DT|LD)\d?)?\s*[(\-]",
         ))
         .expect("static regex")
     });
@@ -592,15 +616,28 @@ mod tests {
     #[test]
     fn database_entries_contribute_station_format_callsigns() {
         let mut known = KnownCallsigns::new();
-        known.add_database_entry(Some("KAAL-TV"), None);
-        known.add_database_entry(None, Some("KGTV (ABC)"));
-        known.add_database_entry(None, Some("WPLG-DT"));
+        known.add_broadcast_entry(Some("KAAL-TV"), None);
+        known.add_broadcast_entry(None, Some("WABC News"));
+        known.add_premium_entry("KGTV (ABC)");
+        known.add_premium_entry("WPLG-DT");
         // Not station format, so not a callsign.
-        known.add_database_entry(None, Some("WORLD Fishing Network"));
+        known.add_premium_entry("WORLD Fishing Network");
         assert!(known.contains("KAAL"));
+        assert!(known.contains("WABC"));
         assert!(known.contains("KGTV"));
         assert!(known.contains("WPLG"));
         assert!(!known.contains("WORLD"));
+
+        // A glued token has no word boundary after the callsign, so it contributes
+        // nothing: this mirrors the plugin's `\b`.
+        let mut glued = KnownCallsigns::new();
+        glued.add_broadcast_entry(Some("KAALTV"), None);
+        assert!(!glued.contains("KAAL"));
+
+        // The plugin does not trim, so a leading space excludes the entry.
+        let mut spaced = KnownCallsigns::new();
+        spaced.add_premium_entry(" KGTV (ABC)");
+        assert!(!spaced.contains("KGTV"));
     }
 
     #[test]
