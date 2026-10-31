@@ -300,7 +300,7 @@ New repository, so everything is new. The critical paths:
 - [x] Port `alias.rs` and `pipeline.rs` (`CandidateIndex`, `match_all_streams`,
       `find_best_match`); port the behavioural cases from `test_fuzzy_matcher.py` and
       `test_regressions.py` as Rust tests.
-- [ ] Build `crosstalk simulate` and diff its per-stream CSV against `tools/match_sim.py`
+- [x] Build `crosstalk simulate` and diff its per-stream CSV against `tools/match_sim.py`
       on the same inputs. Exit criterion: identical scores and methods on the full table.
 
 ### Phase 2: crosstalk-core

@@ -10,7 +10,6 @@ mod simulate;
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
-use crosstalk_matching::normalize::NormalizeFlags;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -94,7 +93,7 @@ struct SimulateArgs {
     #[arg(long)]
     countries: Option<String>,
     /// Directory to write the report files into.
-    #[arg(long, default_value = "sim-out")]
+    #[arg(long, default_value = "tools/sim-out")]
     out: PathBuf,
     /// Do not strip quality tags before comparing.
     #[arg(long = "no-ignore-quality")]
@@ -115,12 +114,12 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Simulate(args) => {
-            let flags = NormalizeFlags {
-                ignore_quality: !args.no_ignore_quality,
-                ignore_regional: !args.no_ignore_regional,
-                ignore_geographic: !args.no_ignore_geographic,
-                ignore_misc: !args.no_ignore_misc,
-            };
+            let tags = [
+                !args.no_ignore_quality,
+                !args.no_ignore_regional,
+                !args.no_ignore_geographic,
+                !args.no_ignore_misc,
+            ];
             let options = simulate::SimulateOptions {
                 channels: args.channels,
                 streams: args.streams,
@@ -132,11 +131,19 @@ fn main() -> Result<()> {
                 custom_aliases: args.custom_aliases,
                 countries: args.countries,
                 out: args.out,
-                flags,
+                tags,
             };
-            let out = simulate::run(&options)?;
-            println!("reports written to {}", simulate::display(&out));
-            Ok(())
+            match simulate::run(&options) {
+                Ok(out) => {
+                    println!("reports written to {}", simulate::display(&out));
+                    Ok(())
+                }
+                Err(error) => {
+                    // The Python tool exits 2 for every handled error.
+                    eprintln!("error: {error:#}");
+                    std::process::exit(2);
+                }
+            }
         }
         Command::Serve(args) => serve(args),
         Command::Run(args) => run_once(args),

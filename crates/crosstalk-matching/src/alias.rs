@@ -20,6 +20,30 @@ impl AliasMap {
         Self::from_json(crate::data::ALIASES_JSON).unwrap_or_default()
     }
 
+    /// Parse a JSON object of `name -> [aliases]` into override entries, applying the
+    /// plugin's validation: a value that is not an array of strings is skipped whole, and
+    /// an empty array is kept so it can disable a built-in entry.
+    pub fn overrides_from_json(json: &str) -> Option<HashMap<String, Vec<String>>> {
+        let value: serde_json::Value = serde_json::from_str(json).ok()?;
+        let object = value.as_object()?;
+        let mut overrides = HashMap::with_capacity(object.len());
+        for (key, value) in object {
+            let Some(list) = value.as_array() else {
+                continue;
+            };
+            if list.iter().any(|entry| !entry.is_string()) {
+                continue;
+            }
+            overrides.insert(
+                key.clone(),
+                list.iter()
+                    .filter_map(|entry| entry.as_str().map(str::to_string))
+                    .collect(),
+            );
+        }
+        Some(overrides)
+    }
+
     /// Parse a JSON object of `name -> [aliases]`.
     ///
     /// Entries whose value is not an array of strings are skipped rather than failing the

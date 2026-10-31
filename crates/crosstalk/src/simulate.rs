@@ -46,8 +46,8 @@ pub fn parse_m3u(text: &str) -> Vec<StreamEntry> {
     let attr_re = FancyRegex::new(r#"([\w-]+)="([^"]*)""#).expect("static regex");
 
     let mut entries = Vec::new();
-    for line in text.split('\n') {
-        let line = line.trim();
+    for line in crosstalk_matching::pyre::py_splitlines(text) {
+        let line = crosstalk_matching::pyre::py_trim(line);
         if !line.starts_with("#EXTINF:") {
             continue;
         }
@@ -56,7 +56,7 @@ pub fn parse_m3u(text: &str) -> Vec<StreamEntry> {
             .ok()
             .flatten()
             .and_then(|caps| caps.get(1))
-            .map(|m| m.as_str().trim().to_string())
+            .map(|m| crosstalk_matching::pyre::py_trim(m.as_str()).to_string())
         else {
             continue;
         };
@@ -88,11 +88,18 @@ const CHANNEL_COL_CANDIDATES: [&str; 3] = ["channel_name", "channel name", "name
 /// de-duplicating.
 pub fn parse_channels_csv(text: &str, channel_col: Option<&str>) -> Result<Vec<String>> {
     let text = text.trim_start_matches('\u{feff}');
-    let data: String = text
-        .lines()
+    // `splitlines()` semantics, then re-joined with `\n`, because the plugin feeds a
+    // rebuilt string to `csv.DictReader`.
+    let lines: Vec<&str> = crosstalk_matching::pyre::py_splitlines(text)
+        .into_iter()
         .filter(|line| !line.trim_start().starts_with('#'))
-        .collect::<Vec<_>>()
-        .join("\n");
+        .collect();
+    if lines.first().is_some_and(|line| line.trim().is_empty()) {
+        // Python hands the blank line to `DictReader` as the header, which leaves no
+        // columns, so the column autodetect fails and the tool exits 2.
+        bail!("CSV has no non-comment rows");
+    }
+    let data: String = lines.join("\n");
     if data.trim().is_empty() {
         bail!("CSV has no non-comment rows");
     }
@@ -124,9 +131,14 @@ pub fn parse_channels_csv(text: &str, channel_col: Option<&str>) -> Result<Vec<S
                 )
             })?,
     };
+    // Python's DictReader keeps the LAST column when a header repeats, because it zips
+    // the names into a dict.
     let index = headers
         .iter()
-        .position(|header| header == column)
+        .enumerate()
+        .filter(|(_, header)| *header == column)
+        .map(|(position, _)| position)
+        .last()
         .expect("column exists");
 
     let mut seen = std::collections::HashSet::new();
@@ -211,7 +223,9 @@ pub struct SimulateOptions {
     pub custom_aliases: Option<String>,
     pub countries: Option<String>,
     pub out: PathBuf,
-    pub flags: NormalizeFlags,
+    /// Which `user_ignored_tags` the run passes, in the plugin's order:
+    /// `[quality, regional, geographic, misc]`.
+    pub tags: [bool; 4],
 }
 
 /// Read inputs, run the simulation and write the five report files.
@@ -247,11 +261,17 @@ pub fn run(options: &SimulateOptions) -> Result<PathBuf> {
         bail!("no stream names after parsing/filter");
     }
 
+    // Custom aliases MERGE over the built-in table, replacing per key; they do not
+    // replace it. A file with one entry must still keep the other 200-odd entries.
     let alias_map = match options.custom_aliases.as_deref() {
         Some(path) if !path.trim().is_empty() => {
             let text = std::fs::read_to_string(path)
                 .with_context(|| format!("reading custom aliases {path}"))?;
-            AliasMap::from_json(&text).unwrap_or_else(AliasMap::builtin)
+            let text = text.trim_start_matches('\u{feff}');
+            match AliasMap::overrides_from_json(text) {
+                Some(overrides) => AliasMap::builtin().with_overrides(overrides),
+                None => AliasMap::builtin(),
+            }
         }
         _ => AliasMap::builtin(),
     };
@@ -273,8 +293,12 @@ pub fn run(options: &SimulateOptions) -> Result<PathBuf> {
         merged.insert(&callsign);
     }
 
+    // The plugin's `FuzzyMatcher` keeps its `ignore_*` attributes at their defaults; the
+    // `--no-ignore-*` flags only change the `user_ignored_tags` list handed to
+    // `match_all_streams`. Passing them as NormalizeFlags would change normalisation
+    // itself and diverge from the tool on every non-default run.
     let matcher = Matcher::new(
-        options.flags,
+        NormalizeFlags::default(),
         alias_map.clone(),
         Arc::new(merged),
         MatchOptions {
@@ -282,7 +306,7 @@ pub fn run(options: &SimulateOptions) -> Result<PathBuf> {
         },
     );
 
-    let tags = tag_list(options.flags);
+    let tags = tag_list(&options.tags);
     let tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
     let per_stream = simulate(&channel_names, &stream_names, &matcher, &tag_refs);
 
@@ -297,19 +321,13 @@ pub fn run(options: &SimulateOptions) -> Result<PathBuf> {
 }
 
 /// The plugin orders its ignored tags `quality, regional, geographic, misc`.
-fn tag_list(flags: NormalizeFlags) -> Vec<String> {
+fn tag_list(enabled: &[bool; 4]) -> Vec<String> {
+    let names = ["quality", "regional", "geographic", "misc"];
     let mut tags = Vec::new();
-    if flags.ignore_quality {
-        tags.push("quality".to_string());
-    }
-    if flags.ignore_regional {
-        tags.push("regional".to_string());
-    }
-    if flags.ignore_geographic {
-        tags.push("geographic".to_string());
-    }
-    if flags.ignore_misc {
-        tags.push("misc".to_string());
+    for (index, name) in names.iter().enumerate() {
+        if enabled[index] {
+            tags.push((*name).to_string());
+        }
     }
     tags
 }
@@ -450,7 +468,7 @@ fn write_reports(
          \n\
          Run config: alias_entries={}, channels={}, ignored_tags={}, margin={}, streams={}, threshold={}, top_n={}\n",
         options.threshold,
-        options.threshold.saturating_sub(options.margin),
+        i32::from(options.threshold) - i32::from(options.margin),
         options.threshold,
         alias_map.len(),
         channel_names.len(),
@@ -554,14 +572,20 @@ mod tests {
 
     #[test]
     fn tag_list_follows_the_flag_order_the_plugin_uses() {
-        let tags = tag_list(NormalizeFlags::default());
-        assert_eq!(tags, vec!["quality", "regional", "geographic", "misc"]);
-        let tags = tag_list(NormalizeFlags {
-            ignore_quality: false,
-            ignore_regional: true,
-            ignore_geographic: false,
-            ignore_misc: true,
-        });
-        assert_eq!(tags, vec!["regional", "misc"]);
+        assert_eq!(
+            tag_list(&[true, true, true, true]),
+            vec!["quality", "regional", "geographic", "misc"]
+        );
+        assert_eq!(
+            tag_list(&[false, true, false, true]),
+            vec!["regional", "misc"]
+        );
+        assert!(tag_list(&[false, false, false, false]).is_empty());
+    }
+
+    #[test]
+    fn splitlines_follows_python() {
+        let lines = crosstalk_matching::pyre::py_splitlines("a\rb\nc\r\nd\u{2028}e");
+        assert_eq!(lines, vec!["a", "b", "c", "d", "e"]);
     }
 }

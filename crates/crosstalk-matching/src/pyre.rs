@@ -146,6 +146,52 @@ pub fn py_trim_start(s: &str) -> &str {
     s.trim_start_matches(py_is_space)
 }
 
+/// Python's `str.splitlines()`: splits on `\n`, `\r`, `\r\n`, `\v`, `\f`, `\x1c`-`\x1e`,
+/// `\x85`, U+2028 and U+2029.
+///
+/// The extra terminators matter for the M3U and CSV readers, which use `splitlines()`:
+/// a lone `\r` or a U+2028 inside a name splits a line in Python and not in Rust, which
+/// changes the parsed stream set.
+pub fn py_splitlines(text: &str) -> Vec<&str> {
+    fn is_break(c: char) -> bool {
+        matches!(
+            c,
+            '\n' | '\r'
+                | '\u{b}'
+                | '\u{c}'
+                | '\u{1c}'
+                | '\u{1d}'
+                | '\u{1e}'
+                | '\u{85}'
+                | '\u{2028}'
+                | '\u{2029}'
+        )
+    }
+
+    let mut lines = Vec::new();
+    let mut start = 0;
+    let mut chars = text.char_indices().peekable();
+    while let Some((index, c)) = chars.next() {
+        if !is_break(c) {
+            continue;
+        }
+        lines.push(&text[start..index]);
+        // `\r\n` is a single break.
+        if c == '\r' {
+            if let Some((next_index, '\n')) = chars.peek().copied() {
+                chars.next();
+                start = next_index + 1;
+                continue;
+            }
+        }
+        start = index + c.len_utf8();
+    }
+    if start < text.len() {
+        lines.push(&text[start..]);
+    }
+    lines
+}
+
 /// Python's `re.escape`.
 ///
 /// Python escapes the regex metacharacters plus ASCII whitespace, and nothing else. That
