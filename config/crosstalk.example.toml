@@ -82,7 +82,8 @@ worker_threads = 0
 exports_dir = "exports"
 data_dir = "data"
 
-# Schedules, as `<app>.<action>` with a five-field cron expression.
+# Schedules, as `<app>.<action>` with a cron expression. Five fields (minute hour day month
+# weekday) is what most people write; the scheduler accepts up to seven.
 # [schedules]
-# "janitor.automatch" = "0 4 * * *"
-# "janitor.heal" = "0 6 * * *"
+# "janitor.automatch_apply" = "0 4 * * *"
+# "janitor.heal_apply" = "0 6 * * *"

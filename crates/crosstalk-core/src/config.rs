@@ -20,6 +20,27 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+/// Accept a TOML string, or a scalar figment inferred a type for.
+///
+/// An environment override is untyped text, and figment guesses: `CROSSTALK_TOKEN=123456`
+/// arrives as a number, which would fail to deserialize into a `String` and take the whole
+/// configuration down. Reading it back through this keeps a digits-only or `true`-shaped
+/// secret working.
+fn string_or_scalar<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(match value {
+        serde_json::Value::String(text) => text,
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::Bool(flag) => flag.to_string(),
+        serde_json::Value::Number(number) => number.to_string(),
+        other => other.to_string(),
+    })
+}
+
 /// Where the daemon listens, and how it authenticates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -29,8 +50,10 @@ pub struct ServerConfig {
     pub port: u16,
     /// Bearer token required for every request when set. Empty means "no token", which is
     /// only safe while `bind` is a loopback address.
+    #[serde(deserialize_with = "string_or_scalar")]
     pub token: String,
     /// Read the token from this environment variable instead of the file.
+    #[serde(deserialize_with = "string_or_scalar")]
     pub token_env: String,
 }
 
@@ -63,13 +86,19 @@ impl ServerConfig {
 #[serde(default)]
 pub struct DispatcharrConfig {
     /// Base URL, without the `/api` suffix: `http://dispatcharr:9191`.
+    #[serde(deserialize_with = "string_or_scalar")]
     pub base_url: String,
     /// API key, sent as `X-API-Key`. Preferred: it does not expire.
+    #[serde(deserialize_with = "string_or_scalar")]
     pub api_key: String,
+    #[serde(deserialize_with = "string_or_scalar")]
     pub api_key_env: String,
     /// JWT fallback when no API key is configured.
+    #[serde(deserialize_with = "string_or_scalar")]
     pub username: String,
+    #[serde(deserialize_with = "string_or_scalar")]
     pub password: String,
+    #[serde(deserialize_with = "string_or_scalar")]
     pub password_env: String,
     /// Per-request timeout.
     pub timeout_secs: u64,
@@ -104,7 +133,7 @@ impl DispatcharrConfig {
     /// The API root every request is built from.
     pub fn api_root(&self) -> String {
         let base = self.base_url.trim().trim_end_matches('/');
-        if base.ends_with("/api") {
+        if base.to_lowercase().ends_with("/api") {
             base.to_string()
         } else {
             format!("{base}/api")
@@ -120,16 +149,35 @@ impl DispatcharrConfig {
 
 /// One AI provider endpoint. No model names here: a sub-app names the model, the host owns
 /// the connection.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AiProviderConfig {
     /// `typesafe` (native System One) or `openai_compat`.
     pub kind: String,
+    #[serde(deserialize_with = "string_or_scalar")]
     pub base_url: String,
+    #[serde(deserialize_with = "string_or_scalar")]
     pub api_key: String,
+    #[serde(deserialize_with = "string_or_scalar")]
     pub api_key_env: String,
     pub timeout_secs: u64,
     pub max_concurrency: usize,
+}
+
+impl Default for AiProviderConfig {
+    fn default() -> Self {
+        // Zero here would mean a zero timeout and a zero-permit semaphore: a request that
+        // never starts and never times out. `#[serde(default)]` takes missing fields from
+        // this impl, so a provider written without these keys still gets usable values.
+        Self {
+            kind: "typesafe".to_string(),
+            base_url: String::new(),
+            api_key: String::new(),
+            api_key_env: String::new(),
+            timeout_secs: 30,
+            max_concurrency: 8,
+        }
+    }
 }
 
 impl AiProviderConfig {
@@ -203,15 +251,22 @@ impl MatchingConfig {
     /// An explicit list wins. An empty list falls back to the plugin's rule: every
     /// database when only one ships, otherwise the United States one.
     pub fn databases(&self) -> Vec<String> {
+        let available = crosstalk_matching::data::available_database_codes();
         if !self.enabled_databases.is_empty() {
-            return self
+            // Deduplicated, restricted to codes that actually ship, and sorted, which is
+            // what `_select_enabled_databases` does: a stored code for a database that no
+            // longer ships must not be reported as loaded forever.
+            let mut codes: Vec<String> = self
                 .enabled_databases
                 .iter()
                 .map(|code| code.trim().to_uppercase())
+                .filter(|code| code.is_empty() || available.contains(&code.as_str()))
                 .filter(|code| !code.is_empty())
                 .collect();
+            codes.sort();
+            codes.dedup();
+            return codes;
         }
-        let available = crosstalk_matching::data::available_database_codes();
         if available.len() == 1 {
             available.iter().map(|code| code.to_string()).collect()
         } else {
@@ -269,6 +324,10 @@ pub struct CrosstalkConfig {
     /// Directory the configuration was loaded from. Not part of the file.
     #[serde(skip)]
     pub config_dir: PathBuf,
+    /// How many environment overrides were applied when loading. Non-zero means the value
+    /// in memory is not the value in the file, so it must never be written back.
+    #[serde(skip)]
+    pub env_overrides: usize,
 }
 
 impl CrosstalkConfig {
@@ -279,6 +338,26 @@ impl CrosstalkConfig {
     /// up.
     pub fn load(dir: impl AsRef<Path>) -> Result<Self> {
         Self::load_prefixed(dir, "CROSSTALK_")
+    }
+
+    /// The configuration exactly as the file holds it, with no environment overrides.
+    ///
+    /// This is what must be SAVED. Writing the effective configuration would copy every
+    /// secret the environment supplied into the file, which is the opposite of why those
+    /// secrets are in the environment.
+    pub fn load_file(dir: impl AsRef<Path>) -> Result<Self> {
+        let dir = dir.as_ref().to_path_buf();
+        let path = dir.join("crosstalk.toml");
+        let mut config = if path.exists() {
+            let text = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            toml::from_str::<Self>(&text).with_context(|| format!("parsing {}", path.display()))?
+        } else {
+            Self::default()
+        };
+        config.config_dir = dir;
+        config.env_overrides = 0;
+        Ok(config)
     }
 
     /// [`CrosstalkConfig::load`] with a caller-chosen environment prefix.
@@ -306,6 +385,7 @@ impl CrosstalkConfig {
     /// A double underscore separates nested keys, which keeps a container deployment from
     /// having to bind-mount a file to change one value.
     fn apply_env_overrides(&mut self, env_prefix: &str) -> Result<()> {
+        let before = toml::to_string(self).unwrap_or_default();
         use figment::providers::{Env, Serialized};
         use figment::Figment;
 
@@ -319,8 +399,11 @@ impl CrosstalkConfig {
             }
         };
         let dir = std::mem::take(&mut self.config_dir);
+        let overrides = self.env_overrides;
         *self = merged;
         self.config_dir = dir;
+        let after = toml::to_string(self).unwrap_or_default();
+        self.env_overrides = overrides + usize::from(before != after);
         Ok(())
     }
 
@@ -354,8 +437,8 @@ impl CrosstalkConfig {
             report
                 .errors
                 .push("dispatcharr.base_url is empty".to_string());
-        } else if !(self.dispatcharr.base_url.starts_with("http://")
-            || self.dispatcharr.base_url.starts_with("https://"))
+        } else if !(self.dispatcharr.base_url.trim().starts_with("http://")
+            || self.dispatcharr.base_url.trim().starts_with("https://"))
         {
             report
                 .errors
@@ -391,12 +474,31 @@ impl CrosstalkConfig {
                     provider.kind
                 ));
             }
+            // An environment override is lowercased on its way in, so a mixed-case provider
+            // name cannot be reached by `CROSSTALK_AI__PROVIDERS__<NAME>__...`.
+            if name != &name.to_lowercase() {
+                report.errors.push(format!(
+                    "ai.providers.{name}: provider names must be lowercase so environment \
+                     overrides can address them"
+                ));
+            }
             if provider.base_url.trim().is_empty() {
                 report
                     .errors
                     .push(format!("ai.providers.{name}.base_url is empty"));
             }
-            if provider.resolved_api_key().is_none() {
+            if provider.timeout_secs == 0 {
+                report.errors.push(format!(
+                    "ai.providers.{name}.timeout_secs must be at least 1"
+                ));
+            }
+            if provider.max_concurrency == 0 {
+                report.errors.push(format!(
+                    "ai.providers.{name}.max_concurrency must be at least 1"
+                ));
+            }
+            if provider.resolved_api_key().is_none() && provider.kind == "typesafe" {
+                // A local openai_compat endpoint may need no key at all; a hosted one does.
                 report.warnings.push(format!(
                     "ai.providers.{name} has no api_key; AI features that use it will be skipped"
                 ));
@@ -421,9 +523,11 @@ impl CrosstalkConfig {
                     "schedules.{key} must be <app>.<action>, e.g. janitor.automatch"
                 ));
             }
-            if cron.split_whitespace().count() < 5 {
+            let fields = cron.split_whitespace().count();
+            if !(5..=7).contains(&fields) {
                 report.errors.push(format!(
-                    "schedules.{key} is not a 5-field cron expression: {cron:?}"
+                    "schedules.{key} must be a cron expression of 5 to 7 fields, got {fields}: \
+                     {cron:?}"
                 ));
             }
         }
@@ -431,10 +535,103 @@ impl CrosstalkConfig {
         report
     }
 
-    /// Write the config back to `<dir>/crosstalk.toml`, preserving comments.
+    /// Write the config back to `path`, preserving comments.
+    ///
+    /// Refuses a configuration that had environment overrides applied: those values came
+    /// from the environment, and writing them here would put a secret in a file.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
+        if self.env_overrides > 0 {
+            anyhow::bail!(
+                "refusing to save a configuration that had environment overrides applied: \
+                 save a `load_file` configuration instead"
+            );
+        }
         save_with_comments(path.as_ref(), self)
     }
+}
+
+/// The host's own settings form: the shared matching options.
+///
+/// These live in the host file, so they need a schema of their own; without one the UI has
+/// nothing to render and the CSV preamble cannot report them under the names operators know.
+pub fn matching_schema() -> crate::subapp::SettingsSchema {
+    use crate::subapp::{FieldKind, FieldSpec, FieldValue, SettingsSchema};
+
+    SettingsSchema::new(vec![
+        FieldSpec::section(
+            "_section_normalization",
+            "Normalization Toggles",
+            "Which kinds of tag are stripped from channel and guide names before they are \
+             compared. This affects matching only: channel names in Dispatcharr are never \
+             rewritten by these settings.",
+        ),
+        FieldSpec::new(
+            "matching.ignore_quality_tags",
+            "_section_normalization",
+            "Ignore Quality Tags",
+            FieldKind::Boolean,
+            FieldValue::Boolean(true),
+        )
+        .with_help("Strip [HD], [4K], [UHD], [SD], (Backup) and similar before comparing."),
+        FieldSpec::new(
+            "matching.ignore_regional_tags",
+            "_section_normalization",
+            "Ignore Regional Tags",
+            FieldKind::Boolean,
+            FieldValue::Boolean(true),
+        )
+        .with_help(
+            "Strip East/West/Pacific/Central/Mountain/Atlantic. The regional differentiation \
+             filter still runs when a name explicitly carries a regional marker.",
+        ),
+        FieldSpec::new(
+            "matching.ignore_geographic_tags",
+            "_section_normalization",
+            "Ignore Geographic Prefixes",
+            FieldKind::Boolean,
+            FieldValue::Boolean(true),
+        )
+        .with_help("Strip country-code prefixes such as 'US:' and '[CA]'."),
+        FieldSpec::new(
+            "matching.ignore_misc_tags",
+            "_section_normalization",
+            "Ignore Miscellaneous Tags",
+            FieldKind::Boolean,
+            FieldValue::Boolean(true),
+        )
+        .with_help("Strip single-letter tags like (A), and other parenthesised noise."),
+        FieldSpec::section(
+            "_section_databases",
+            "Channel Databases",
+            "Which shipped reference lists the matcher may draw names from. These are not \
+             your Dispatcharr channels. Enabling a country you do not carry costs accuracy \
+             rather than gaining coverage, because it adds names to match against.",
+        ),
+        FieldSpec::new(
+            "matching.enabled_databases",
+            "_section_databases",
+            "Enabled Databases",
+            FieldKind::Text,
+            FieldValue::Text("US".to_string()),
+        )
+        .with_placeholder("US, UK, CA")
+        .with_help("Comma-separated country codes. Empty uses the default set."),
+        FieldSpec::section(
+            "_section_aliases",
+            "Custom Aliases",
+            "Alternate names for channels whose names differ between your provider and the \
+             guide. A key REPLACES the built-in list for that name rather than adding to it, \
+             so include the built-in variants you still want.",
+        ),
+        FieldSpec::new(
+            "matching.custom_aliases",
+            "_section_aliases",
+            "Custom Channel Aliases (JSON)",
+            FieldKind::JsonObject,
+            FieldValue::Json(std::collections::BTreeMap::new()),
+        )
+        .with_placeholder("{\"FOX News Channel\": [\"FOX NEWS HD\", \"FoxNews\"]}"),
+    ])
 }
 
 /// Result of [`CrosstalkConfig::validate`].
@@ -465,14 +662,37 @@ pub fn save_with_comments<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         .parse()
         .with_context(|| format!("re-parsing serialised config for {}", path.display()))?;
 
-    let existing = std::fs::read_to_string(path).unwrap_or_default();
-    let mut document: toml_edit::DocumentMut = existing
-        .parse()
-        .unwrap_or_else(|_| toml_edit::DocumentMut::new());
+    let existing = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+
+    // A file that does not parse is left alone rather than replaced: overwriting it would
+    // destroy the comments and values the operator wrote, and they would not know why.
+    let mut document: toml_edit::DocumentMut = if existing.trim().is_empty() {
+        toml_edit::DocumentMut::new()
+    } else {
+        existing.parse().with_context(|| {
+            format!(
+                "{} is not valid TOML; refusing to overwrite it. Fix the file, then save again",
+                path.display()
+            )
+        })?
+    };
 
     merge_document(&mut document, table);
-    std::fs::write(path, document.to_string())
-        .with_context(|| format!("writing {}", path.display()))?;
+
+    // Write through a temporary file in the same directory, so an interrupted write cannot
+    // leave a half-written configuration behind.
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(directory)
+        .with_context(|| format!("creating {}", directory.display()))?;
+    let temporary = path.with_extension("toml.tmp");
+    std::fs::write(&temporary, document.to_string())
+        .with_context(|| format!("writing {}", temporary.display()))?;
+    std::fs::rename(&temporary, path)
+        .with_context(|| format!("renaming {} to {}", temporary.display(), path.display()))?;
     Ok(())
 }
 
@@ -481,14 +701,31 @@ pub fn save_with_comments<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 /// Keys are matched by path, so a comment above `[server] port = 8730` survives a change
 /// to the port.
 fn merge_document(target: &mut toml_edit::DocumentMut, source: toml_edit::DocumentMut) {
-    merge_table(target.as_table_mut(), source.as_table());
+    // `prune = false` at the root: a top-level key this struct does not know about (a
+    // section from a newer version, or an operator's own note) is preserved. Nested tables
+    // are pruned, because those are the ones the form can actually edit.
+    merge_table(target.as_table_mut(), source.as_table(), false);
 }
 
-fn merge_table(target: &mut toml_edit::Table, source: &toml_edit::Table) {
+fn merge_table(target: &mut toml_edit::Table, source: &toml_edit::Table, prune: bool) {
+    // Inside a table the source describes, the source is authoritative: a key that is no
+    // longer in it was deleted in memory, and leaving it behind would make a removal
+    // impossible from the UI.
+    if prune {
+        let stale: Vec<String> = target
+            .iter()
+            .filter(|(key, _)| !source.contains_key(key))
+            .map(|(key, _)| key.to_string())
+            .collect();
+        for key in stale {
+            target.remove(&key);
+        }
+    }
+
     for (key, source_item) in source {
         match (target.get_mut(key), source_item) {
             (Some(toml_edit::Item::Table(target_table)), toml_edit::Item::Table(source_table)) => {
-                merge_table(target_table, source_table);
+                merge_table(target_table, source_table, true);
             }
             (Some(target_item), source_item) => {
                 let decoration = target_item.as_value().map(|value| value.decor().clone());
@@ -583,7 +820,8 @@ enabled_databases = ["US", "UK"]
             Some("abc123")
         );
         assert!(!config.matching.ignore_quality_tags);
-        assert_eq!(config.matching.databases(), vec!["US", "UK"]);
+        // Sorted, like the plugin's own `enabled.sort()`.
+        assert_eq!(config.matching.databases(), vec!["UK", "US"]);
         assert_eq!(
             config.matching.custom_aliases.get("Fox News Channel"),
             Some(&vec!["FNC".to_string()])
@@ -699,7 +937,7 @@ enabled_databases = ["US", "UK"]
         assert!(report
             .errors
             .iter()
-            .any(|error| error.contains("5-field cron")));
+            .any(|error| error.contains("5 to 7 fields")));
     }
 
     #[test]
@@ -708,10 +946,212 @@ enabled_databases = ["US", "UK"]
         // Twelve databases ship, so the plugin's rule picks the US one.
         assert_eq!(config.databases(), vec!["US".to_string()]);
         let config = MatchingConfig {
-            enabled_databases: vec!["uk".to_string(), " us ".to_string(), "".to_string()],
+            enabled_databases: vec![
+                "uk".to_string(),
+                " us ".to_string(),
+                "".to_string(),
+                "ZZ".to_string(),
+                "UK".to_string(),
+            ],
             ..MatchingConfig::default()
         };
+        // Uppercased, restricted to shipped codes, deduplicated, sorted.
         assert_eq!(config.databases(), vec!["UK".to_string(), "US".to_string()]);
+    }
+
+    #[test]
+    fn an_effective_config_refuses_to_be_saved() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            "[dispatcharr]\napi_key = \"\"\n",
+        );
+        std::env::set_var("CROSSTALK_TESTSAVE_DISPATCHARR__API_KEY", "from-env");
+        let effective =
+            CrosstalkConfig::load_prefixed(dir.path(), "CROSSTALK_TESTSAVE_").expect("load");
+        std::env::remove_var("CROSSTALK_TESTSAVE_DISPATCHARR__API_KEY");
+        assert_eq!(effective.env_overrides, 1);
+        assert_eq!(
+            effective.dispatcharr.resolved_api_key().as_deref(),
+            Some("from-env")
+        );
+
+        // Writing it back would put the environment's secret in the file.
+        let error = effective
+            .save(dir.path().join("crosstalk.toml"))
+            .expect_err("refuses");
+        assert!(format!("{error}").contains("environment overrides"));
+        let text = std::fs::read_to_string(dir.path().join("crosstalk.toml")).expect("read");
+        assert!(!text.contains("from-env"), "{text}");
+    }
+
+    #[test]
+    fn load_file_ignores_the_environment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            "[dispatcharr]\napi_key = \"file-key\"\n",
+        );
+        std::env::set_var("CROSSTALK_FILEONLY_DISPATCHARR__API_KEY", "env-key");
+        let file_only =
+            CrosstalkConfig::load_prefixed(dir.path(), "CROSSTALK_FILEONLY_").expect("load");
+        std::env::remove_var("CROSSTALK_FILEONLY_DISPATCHARR__API_KEY");
+        assert_eq!(file_only.env_overrides, 1);
+
+        let plain = CrosstalkConfig::load_file(dir.path()).expect("load_file");
+        assert_eq!(plain.env_overrides, 0);
+        assert_eq!(
+            plain.dispatcharr.resolved_api_key().as_deref(),
+            Some("file-key")
+        );
+        // And it saves.
+        plain
+            .save(dir.path().join("crosstalk.toml"))
+            .expect("saves");
+    }
+
+    #[test]
+    fn saving_removes_entries_deleted_in_memory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("crosstalk.toml");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            r#"
+[ai.providers.typesafe]
+kind = "typesafe"
+base_url = "https://api.typesafe.ai/v1"
+
+[matching.custom_aliases]
+"ESPN" = ["ESPN US"]
+
+[schedules]
+"janitor.automatch" = "0 4 * * *"
+"#,
+        );
+
+        let mut config = CrosstalkConfig::load_file(dir.path()).expect("load");
+        config.ai.providers.clear();
+        config.matching.custom_aliases.clear();
+        config.schedules.clear();
+        config.save(&path).expect("save");
+
+        let reloaded = CrosstalkConfig::load_file(dir.path()).expect("reload");
+        assert!(reloaded.ai.providers.is_empty());
+        assert!(reloaded.matching.custom_aliases.is_empty());
+        assert!(reloaded.schedules.is_empty());
+    }
+
+    #[test]
+    fn saving_preserves_unknown_top_level_keys() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("crosstalk.toml");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            "# operator note\n[future_section]\nthing = 1\n",
+        );
+        let config = CrosstalkConfig::load_file(dir.path()).expect("load");
+        config.save(&path).expect("save");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.contains("# operator note"), "{text}");
+        assert!(text.contains("[future_section]"), "{text}");
+    }
+
+    #[test]
+    fn saving_refuses_a_file_that_does_not_parse() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("crosstalk.toml");
+        std::fs::write(&path, "# keep me\n[server\nport = 1\n").expect("seed");
+        let error = CrosstalkConfig::default().save(&path).expect_err("refuses");
+        assert!(format!("{error}").contains("not valid TOML"));
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.contains("# keep me"), "{text}");
+    }
+
+    #[test]
+    fn a_numeric_secret_in_the_environment_still_loads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "crosstalk.toml", "[server]\nport = 1\n");
+        std::env::set_var("CROSSTALK_TESTDIGITS_SERVER__TOKEN", "123456");
+        let config = CrosstalkConfig::load_prefixed(dir.path(), "CROSSTALK_TESTDIGITS_")
+            .expect("a digits-only token must not be read as a number");
+        std::env::remove_var("CROSSTALK_TESTDIGITS_SERVER__TOKEN");
+        assert_eq!(config.server.resolved_token().as_deref(), Some("123456"));
+    }
+
+    #[test]
+    fn provider_names_must_be_lowercase_for_env_overrides() {
+        let mut config = CrosstalkConfig::default();
+        config.dispatcharr.api_key = "k".to_string();
+        config.ai.providers.insert(
+            "TypeSafe".to_string(),
+            AiProviderConfig {
+                base_url: "https://api.typesafe.ai/v1".to_string(),
+                api_key: "k".to_string(),
+                ..AiProviderConfig::default()
+            },
+        );
+        let report = config.validate();
+        assert!(report
+            .errors
+            .iter()
+            .any(|error| error.contains("must be lowercase")));
+    }
+
+    #[test]
+    fn provider_numeric_defaults_are_usable() {
+        let provider = AiProviderConfig::default();
+        assert_eq!(provider.timeout_secs, 30);
+        assert_eq!(provider.max_concurrency, 8);
+
+        let mut config = CrosstalkConfig::default();
+        config.dispatcharr.api_key = "k".to_string();
+        config.ai.providers.insert(
+            "zeroed".to_string(),
+            AiProviderConfig {
+                base_url: "https://example.invalid".to_string(),
+                api_key: "k".to_string(),
+                timeout_secs: 0,
+                max_concurrency: 0,
+                ..AiProviderConfig::default()
+            },
+        );
+        let report = config.validate();
+        assert!(report
+            .errors
+            .iter()
+            .any(|error| error.contains("timeout_secs")));
+        assert!(report
+            .errors
+            .iter()
+            .any(|error| error.contains("max_concurrency")));
+    }
+
+    #[test]
+    fn the_host_matching_schema_covers_every_matching_option() {
+        use crate::subapp::FieldValue;
+        let schema = matching_schema();
+        let ids: Vec<&str> = schema.editable().map(|field| field.id).collect();
+        assert!(ids.contains(&"matching.ignore_quality_tags"));
+        assert!(ids.contains(&"matching.ignore_regional_tags"));
+        assert!(ids.contains(&"matching.ignore_geographic_tags"));
+        assert!(ids.contains(&"matching.ignore_misc_tags"));
+        assert!(ids.contains(&"matching.enabled_databases"));
+        assert!(ids.contains(&"matching.custom_aliases"));
+        // Every field carries a default of the right shape, so the form can render.
+        for field in schema.editable() {
+            let matches = matches!(
+                (&field.kind, &field.default),
+                (crate::subapp::FieldKind::Text, FieldValue::Text(_))
+                    | (crate::subapp::FieldKind::Number, FieldValue::Number(_))
+                    | (crate::subapp::FieldKind::Boolean, FieldValue::Boolean(_))
+                    | (crate::subapp::FieldKind::JsonObject, FieldValue::Json(_))
+            );
+            assert!(matches, "{} has a mismatched default", field.id);
+        }
     }
 
     #[test]

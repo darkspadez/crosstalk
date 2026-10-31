@@ -393,6 +393,21 @@ pub trait SubApp: Send + Sync {
     /// Write settings back, preserving comments.
     fn save_settings(&self, path: &Path, values: &SettingsValues) -> Result<()>;
 
+    /// Check the settings file on disk, without writing anything.
+    ///
+    /// The default loads the file and runs the schema over its values, which catches a
+    /// hand-edited file whose types no longer match. An app with cross-field rules should
+    /// override it and keep the same behaviour.
+    fn validate_settings(&self, path: &Path) -> Result<()> {
+        let values = self.load_settings(path)?;
+        let errors = self.schema().validate(&values);
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!("{}", errors.join("; "))
+        }
+    }
+
     /// Run one action. `dry_run` is set for a preview.
     fn run<'a>(
         &'a self,
@@ -410,6 +425,16 @@ pub struct Registry {
 
 impl Registry {
     pub fn new(apps: Vec<Arc<dyn SubApp>>) -> Self {
+        // A duplicate id would make `get` return the first quietly, and the second app
+        // would be unreachable from the UI, the CLI and the scheduler.
+        let mut seen = std::collections::HashSet::new();
+        for app in &apps {
+            assert!(
+                seen.insert(app.id()),
+                "two sub-apps share the id {:?}",
+                app.id()
+            );
+        }
         Self { apps }
     }
 
@@ -425,7 +450,7 @@ impl Registry {
         self.apps.is_empty()
     }
 
-    /// Locate an action by `<app>/<action>` or `<app>.<action>`.
+    /// Locate one app's action by app id and action id.
     pub fn find_action(&self, app: &str, action: &str) -> Option<(&Arc<dyn SubApp>, ActionSpec)> {
         let app = self.get(app)?;
         let spec = app.actions().into_iter().find(|entry| entry.id == action)?;

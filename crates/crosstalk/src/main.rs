@@ -55,12 +55,12 @@ struct RunArgs {
     /// Directory holding the configuration files.
     #[arg(long, default_value = "config", env = "CROSSTALK_CONFIG_DIR")]
     config: PathBuf,
-    /// Change nothing; write the report only.
-    #[arg(long)]
-    preview: bool,
-    /// The explicit dry-run switch; `--preview` is kept for muscle memory.
-    #[arg(long = "dry-run")]
+    /// Change nothing; write the report only. `--preview` is accepted as a synonym.
+    #[arg(long = "dry-run", alias = "preview")]
     dry_run: bool,
+    /// Confirm an action that changes data. Without it, such an action is refused.
+    #[arg(long, short = 'y')]
+    yes: bool,
 }
 
 #[derive(Args, Debug)]
@@ -182,18 +182,35 @@ fn run_once(args: RunArgs) -> Result<()> {
             )
         })?;
 
-    if action.kind.requires_confirmation() && !args.dry_run {
+    // An apply action run with --dry-run may not honour the flag: it is a different entry
+    // point. Redirect it to the preview action instead of trusting it to behave.
+    let action = if args.dry_run {
+        match preview_counterpart(action.id) {
+            Some(preview_id) => registry
+                .find_action(&args.app, preview_id)
+                .map(|(_, preview)| preview)
+                .unwrap_or(action),
+            None => action,
+        }
+    } else {
+        action
+    };
+
+    if action.kind.requires_confirmation() && !args.yes {
         // A one-shot run has no dialog to confirm in, so the flag has to stand in for it.
-        // The confirmation text is printed so the consequence is still stated.
         println!(
             "{}\n{}",
             action.label,
             action.confirm.unwrap_or("This action changes data.")
         );
-        println!("Re-run with --dry-run to change nothing.");
+        anyhow::bail!(
+            "refusing to run {:?} without --yes: it changes data. Add --yes to proceed, or \
+             --dry-run to change nothing",
+            action.id
+        );
     }
 
-    let context = JobContext::for_tests(config);
+    let context = JobContext::headless(config);
     let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
     let outcome = runtime.block_on(app.run(action.id, &context, args.dry_run))?;
 
@@ -205,6 +222,15 @@ fn run_once(args: RunArgs) -> Result<()> {
         println!("  report: {}", path.display());
     }
     Ok(())
+}
+
+/// The preview action that stands in for an apply action.
+fn preview_counterpart(action: &str) -> Option<&'static str> {
+    match action {
+        "automatch_apply" => Some("automatch_preview"),
+        "heal_apply" => Some("heal_preview"),
+        _ => None,
+    }
 }
 
 fn validate(args: ConfigArgs) -> Result<()> {
@@ -249,13 +275,8 @@ fn validate(args: ConfigArgs) -> Result<()> {
 
     for app in registry.iter() {
         let path = app.settings_path(&config.config_dir);
-        match app.load_settings(&path) {
-            Ok(values) => println!(
-                "app {}: {} setting(s) from {}",
-                app.id(),
-                values.iter().count(),
-                path.display()
-            ),
+        match app.validate_settings(&path) {
+            Ok(()) => println!("app {}: settings valid ({})", app.id(), path.display()),
             Err(error) => {
                 println!("error: app {} settings: {error:#}", app.id());
                 failed = true;

@@ -24,9 +24,9 @@ pub const APP_NAME: &str = "EPG Janitor";
 /// The action ids, as used in schedules and URLs.
 pub const ACTION_VALIDATE: &str = "validate";
 pub const ACTION_AUTOMATCH_PREVIEW: &str = "automatch_preview";
-pub const ACTION_AUTOMATCH_APPLY: &str = "automatch";
+pub const ACTION_AUTOMATCH_APPLY: &str = "automatch_apply";
 pub const ACTION_HEAL_PREVIEW: &str = "heal_preview";
-pub const ACTION_HEAL_APPLY: &str = "heal";
+pub const ACTION_HEAL_APPLY: &str = "heal_apply";
 pub const ACTION_STATUS: &str = "status";
 
 /// The sub-app itself.
@@ -36,11 +36,6 @@ pub struct JanitorApp;
 impl JanitorApp {
     pub fn new() -> Self {
         Self
-    }
-
-    /// The settings file this app reads, given the host config directory.
-    pub fn settings_path(config_dir: &Path) -> std::path::PathBuf {
-        config_dir.join("janitor.toml")
     }
 }
 
@@ -101,7 +96,9 @@ impl SubApp for JanitorApp {
                 ACTION_HEAL_APPLY,
                 "Scan & Heal (Apply Changes)",
                 "Replace assignments that carry no programme data with a working one.",
-                ActionKind::Destructive,
+                // Orange, not red: heal writes data but never removes an assignment it has
+                // not proven empty, which is the plugin's own distinction.
+                ActionKind::Write,
             )
             .with_confirm(
                 "This replaces broken EPG assignments with working ones. An assignment that \
@@ -118,6 +115,16 @@ impl SubApp for JanitorApp {
     fn load_settings(&self, path: &Path) -> Result<SettingsValues> {
         let settings = settings::load(path)?;
         Ok(settings::to_values(&settings))
+    }
+
+    fn validate_settings(&self, path: &Path) -> Result<()> {
+        let settings = settings::load(path)?;
+        let errors = settings::validate(&settings);
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            bail!("{}", errors.join("; "))
+        }
     }
 
     fn save_settings(&self, path: &Path, values: &SettingsValues) -> Result<()> {
@@ -170,7 +177,7 @@ impl JanitorApp {
     }
 
     fn validate(&self, context: &JobContext) -> Result<JobOutcome> {
-        let path = Self::settings_path(&context.config().config_dir);
+        let path = self.settings_path(&context.config().config_dir);
         let settings = settings::load(&path)?;
         let config_report = context.config().validate();
         let settings_errors = settings::validate(&settings);
@@ -221,6 +228,27 @@ mod tests {
     }
 
     #[test]
+    fn action_kinds_match_the_plugin_colours() {
+        let actions = app().actions();
+        let kind = |id: &str| {
+            actions
+                .iter()
+                .find(|action| action.id == id)
+                .map(|action| action.kind)
+                .expect("action exists")
+        };
+        // Blue reads.
+        assert_eq!(kind(ACTION_VALIDATE), ActionKind::Read);
+        assert_eq!(kind(ACTION_STATUS), ActionKind::Read);
+        assert_eq!(kind(ACTION_AUTOMATCH_PREVIEW), ActionKind::Read);
+        assert_eq!(kind(ACTION_HEAL_PREVIEW), ActionKind::Read);
+        // Auto-match can move an assignment that already works: red.
+        assert_eq!(kind(ACTION_AUTOMATCH_APPLY), ActionKind::Destructive);
+        // Heal only replaces assignments it proved empty, and removes none: orange.
+        assert_eq!(kind(ACTION_HEAL_APPLY), ActionKind::Write);
+    }
+
+    #[test]
     fn apply_actions_are_destructive_and_confirm() {
         let actions = app().actions();
         let apply = actions
@@ -242,7 +270,7 @@ mod tests {
     #[test]
     fn settings_round_trip_through_the_app() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = JanitorApp::settings_path(dir.path());
+        let path = app().settings_path(dir.path());
 
         let mut values = app().load_settings(&path).expect("load defaults");
         values.insert("check_hours", FieldValue::Number(6.0));
@@ -259,7 +287,7 @@ mod tests {
     #[test]
     fn save_rejects_an_unknown_field() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = JanitorApp::settings_path(dir.path());
+        let path = app().settings_path(dir.path());
         let mut values = SettingsValues::new();
         values.insert("not_a_setting", FieldValue::Text("x".into()));
         let error = app().save_settings(&path, &values).expect_err("rejects");
@@ -267,9 +295,38 @@ mod tests {
     }
 
     #[test]
+    fn save_rejects_a_fractional_integer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = app().settings_path(dir.path());
+        let mut values = SettingsValues::new();
+        values.insert("check_hours", FieldValue::Number(6.7));
+        let error = app().save_settings(&path, &values).expect_err("rejects");
+        assert!(format!("{error}").contains("whole number"), "{error}");
+    }
+
+    #[test]
+    fn save_rejects_a_negative_integer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = app().settings_path(dir.path());
+        let mut values = SettingsValues::new();
+        values.insert("csv_retention_days", FieldValue::Number(-1.0));
+        let error = app().save_settings(&path, &values).expect_err("rejects");
+        assert!(format!("{error}").contains("between"), "{error}");
+    }
+
+    #[test]
+    fn validate_settings_catches_a_hand_edited_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = app().settings_path(dir.path());
+        std::fs::write(&path, "selected_groups = \"A\"\nignore_groups = \"B\"\n").expect("seed");
+        let error = app().validate_settings(&path).expect_err("rejects");
+        assert!(format!("{error}").contains("cannot both be set"));
+    }
+
+    #[test]
     fn save_rejects_a_conflicting_combination() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = JanitorApp::settings_path(dir.path());
+        let path = app().settings_path(dir.path());
         let mut values = SettingsValues::new();
         values.insert("selected_groups", FieldValue::Text("A".into()));
         values.insert("ignore_groups", FieldValue::Text("B".into()));

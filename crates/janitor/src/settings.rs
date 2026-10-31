@@ -8,7 +8,6 @@
 use anyhow::{Context, Result};
 use crosstalk_core::subapp::{FieldKind, FieldSpec, FieldValue, SettingsSchema, SettingsValues};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::path::Path;
 
 /// How the AI verifier behaves.
@@ -238,7 +237,7 @@ pub fn schema() -> SettingsSchema {
             "The heuristics decide first. The model is asked only about results that land in \
              the uncertain band below, or about candidates for a channel the heuristics could \
              not match at all. A high-confidence heuristic match never reaches the model. \
-             The CLOCK holds the endpoint and key: see [ai.providers] in crosstalk.toml.",
+             The HOST holds the endpoint and key: see [ai.providers] in crosstalk.toml.",
         ),
         FieldSpec::new(
             "ai.enabled",
@@ -274,8 +273,8 @@ pub fn schema() -> SettingsSchema {
             FieldValue::Number(80.0),
         )
         .with_help(
-            "A heuristic score at or above this, and below the high end, is uncertain enough \
-             to ask the model about.",
+            "A heuristic score in this band, both ends inclusive, is uncertain enough to ask \
+             the model about.",
         ),
         FieldSpec::new(
             "ai.verify_band_high",
@@ -284,7 +283,10 @@ pub fn schema() -> SettingsSchema {
             FieldKind::Number,
             FieldValue::Number(94.0),
         )
-        .with_help("Scores above this are accepted without asking the model."),
+        .with_help(
+            "Scores above this are not offered to the model. They still have to clear the \
+             Auto-Match Confidence Threshold to be applied.",
+        ),
         FieldSpec::new(
             "ai.rescue",
             SECTION_AI,
@@ -293,8 +295,8 @@ pub fn schema() -> SettingsSchema {
             FieldValue::Boolean(true),
         )
         .with_help(
-            "Offer the model a shortlist when the heuristics found nothing above the rescue \
-             floor.",
+            "Offer the model a shortlist when no heuristic result reached the band, but some \
+             candidate scored at or above the rescue floor.",
         ),
         FieldSpec::new(
             "ai.rescue_floor",
@@ -461,7 +463,7 @@ pub fn apply_values(settings: &mut JanitorSettings, values: &SettingsValues) -> 
         settings.heal_fallback_sources = text.to_string();
     }
     if let Some(number) = values.number("check_hours") {
-        settings.check_hours = number.max(0.0) as u32;
+        settings.check_hours = whole_number("check_hours", number, 0, 8_760)?;
     }
     if let Some(number) = values.number("automatch_confidence_threshold") {
         settings.automatch_confidence_threshold = clamp_u8(number)?;
@@ -470,7 +472,7 @@ pub fn apply_values(settings: &mut JanitorSettings, values: &SettingsValues) -> 
         settings.heal_confidence_threshold = clamp_u8(number)?;
     }
     if let Some(number) = values.number("csv_retention_days") {
-        settings.csv_retention_days = number.max(0.0) as u32;
+        settings.csv_retention_days = whole_number("csv_retention_days", number, 0, 3_650)?;
     }
     if let Some(value) = values.bool("allow_epg_without_programs") {
         settings.allow_epg_without_programs = value;
@@ -497,7 +499,7 @@ pub fn apply_values(settings: &mut JanitorSettings, values: &SettingsValues) -> 
         settings.ai.rescue_floor = clamp_u8(number)?;
     }
     if let Some(number) = values.number("ai.shortlist") {
-        settings.ai.shortlist = number.max(1.0) as usize;
+        settings.ai.shortlist = whole_number("ai.shortlist", number, 1, 255)? as usize;
     }
     if let Some(number) = values.number("ai.accept_threshold") {
         settings.ai.accept_threshold = clamp_unit(number)?;
@@ -509,6 +511,20 @@ pub fn apply_values(settings: &mut JanitorSettings, values: &SettingsValues) -> 
         settings.ai.min_confidence = clamp_unit(number)?;
     }
     Ok(())
+}
+
+/// A number that must already be a whole number in range.
+///
+/// Truncating silently is how a typed `6.7` becomes `6` and a typed `-1` becomes `0`; both
+/// look like a saved setting and neither is what was asked for.
+fn whole_number(field: &str, value: f64, min: u32, max: u32) -> Result<u32> {
+    if !value.is_finite() || value.fract() != 0.0 {
+        anyhow::bail!("{field} must be a whole number, got {value}");
+    }
+    if value < f64::from(min) || value > f64::from(max) {
+        anyhow::bail!("{field} must be between {min} and {max}, got {value}");
+    }
+    Ok(value as u32)
 }
 
 fn clamp_u8(value: f64) -> Result<u8> {
@@ -564,14 +580,26 @@ pub fn validate(settings: &JanitorSettings) -> Vec<String> {
     if settings.automatch_confidence_threshold == 0 {
         errors.push("automatch_confidence_threshold must be at least 1".to_string());
     }
+    if settings.ai.rescue_floor > settings.ai.verify_band_low {
+        errors.push(format!(
+            "ai.rescue_floor ({}) is above ai.verify_band_low ({}), so a rescued channel \
+             would be one the band already covers",
+            settings.ai.rescue_floor, settings.ai.verify_band_low
+        ));
+    }
+    if settings.ai.shortlist == 0 {
+        errors.push("ai.shortlist must be at least 1".to_string());
+    }
+    if settings.heal_confidence_threshold == 0 {
+        errors.push("heal_confidence_threshold must be at least 1".to_string());
+    }
+    if settings.ai.enabled && settings.ai.provider.trim().is_empty() {
+        errors.push("ai.enabled is on but ai.provider is empty".to_string());
+    }
+    if settings.ai.enabled && settings.ai.model.trim().is_empty() {
+        errors.push("ai.enabled is on but ai.model is empty".to_string());
+    }
     errors
-}
-
-/// The custom aliases table, for merging into the matcher.
-pub fn custom_aliases(_settings: &JanitorSettings) -> BTreeMap<String, Vec<String>> {
-    // Aliases are a host-level matching option (they are in crosstalk.toml), so this app
-    // has none of its own. Present so a caller never has to special-case it.
-    BTreeMap::new()
 }
 
 #[cfg(test)]

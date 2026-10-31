@@ -119,9 +119,14 @@ impl JobContext {
         }
     }
 
-    /// A context that discards progress, for tests.
-    pub fn for_tests(config: CrosstalkConfig) -> Self {
+    /// A context that discards progress: the one-shot CLI path, and tests.
+    pub fn headless(config: CrosstalkConfig) -> Self {
         Self::new(Arc::new(config), Arc::new(NullSink))
+    }
+
+    /// Alias kept so library tests read naturally.
+    pub fn for_tests(config: CrosstalkConfig) -> Self {
+        Self::headless(config)
     }
 
     pub fn config(&self) -> &CrosstalkConfig {
@@ -155,7 +160,11 @@ impl JobContext {
             action: action.to_string(),
             total,
             interval,
-            last: std::time::Instant::now() - interval,
+            // `checked_sub` rather than plain subtraction: a very large interval would
+            // otherwise panic on the first report.
+            last: std::time::Instant::now()
+                .checked_sub(interval)
+                .unwrap_or_else(std::time::Instant::now),
             current: 0,
         }
     }

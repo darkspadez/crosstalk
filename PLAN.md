@@ -304,7 +304,7 @@ New repository, so everything is new. The critical paths:
       on the same inputs. Exit criterion: identical scores and methods on the full table.
 
 ### Phase 2: crosstalk-core
-- [ ] Config loading + write-back, `SubApp` trait + registry, `SettingsSchema`.
+- [x] Config loading + write-back, `SubApp` trait + registry, `SettingsSchema`.
 - [ ] Dispatcharr client (auth, channels, groups, profiles, sources, epgdata pagination,
       program search memo, batch-set-epg) with a mock server test (`wiremock`).
 - [ ] SQLite store + migrations; job runner with progress channel; scheduler.
