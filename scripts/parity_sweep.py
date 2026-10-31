@@ -269,7 +269,17 @@ def sweep_match(kind: str, names: list[str], matcher, args) -> int:
     answers = run_rust(cases, args.binary)
 
     mismatches = []
+    last_pool = None
     for case, answer in zip(cases, answers):
+        # The plugin warms the matcher's cache with `precompute_normalizations(names)` and
+        # passes NO tags there, while the query is normalised with the tag set. Reproduce
+        # that asymmetry, or the comparison would use a candidate normalisation the plugin
+        # never uses.
+        pool_key = tuple(case["candidates"])
+        if pool_key != last_pool:
+            matcher.precompute_normalizations(case["candidates"])
+            last_pool = pool_key
+
         if kind == "match":
             expected = [
                 [name, score, mtype]
