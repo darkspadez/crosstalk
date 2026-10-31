@@ -33,3 +33,37 @@ jobs:
 
       - name: Build release binary
         run: cargo build --locked --release -p crosstalk
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the image
+        run: docker build -t crosstalk:ci .
+      - name: The daemon starts and answers its health check
+        run: |
+          docker run -d --name crosstalk-ci -p 8730:8730 \
+            -e CROSSTALK_TOKEN=ci-token \
+            -e CROSSTALK_DISPATCHARR_API_KEY=unused \
+            -e CROSSTALK_SERVER__BIND=0.0.0.0 \
+            crosstalk:ci
+          for _ in $(seq 1 30); do
+            if curl -fsS http://localhost:8730/health >/dev/null; then break; fi
+            sleep 1
+          done
+          curl -fsS http://localhost:8730/health
+          # And it refuses an anonymous API call.
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8730/api/v1/apps)" = "401"
+          docker rm -f crosstalk-ci
+
+  parity:
+    runs-on: ubuntu-latest
+    needs: check
+    # The oracle needs the Python plugin as the reference; skip it where the checkout is absent.
+    if: ${{ hashFiles('reference/Dispatcharr-EPG-Janitor-Plugin/tools/match_sim.py') != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Compare against the Python tool
+        run: ./scripts/sim_parity.sh --quick

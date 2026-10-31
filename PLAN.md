@@ -321,11 +321,11 @@ New repository, so everything is new. The critical paths:
 - [x] `crosstalk run janitor ...` one-shot path and `validate`.
 
 ### Phase 4: web UI and daemon
-- [ ] axum app, auth middleware, login page, dashboard.
-- [ ] Janitor action page with colour semantics and confirm dialogs.
-- [ ] Run page: SSE progress, results table, AI panel, CSV download.
-- [ ] Settings pages generated from schemas, TOML write-back with validation.
-- [ ] Scheduler UI (enable per action, cron string, next run).
+- [x] axum app, auth middleware, login page, dashboard.
+- [x] Janitor action page with colour semantics and confirm dialogs.
+- [x] Run page: SSE progress, results table, AI panel, CSV download.
+- [x] Settings pages generated from schemas, TOML write-back with validation.
+- [x] Scheduler UI (enable per action, cron string, next run).
 
 ### Phase 5: packaging
 - [ ] Multi-stage Dockerfile (musl static), compose example beside Dispatcharr,

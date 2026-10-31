@@ -1,0 +1,6 @@
+target
+reference
+.git
+.remember
+docs
+*.db

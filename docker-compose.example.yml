@@ -1,0 +1,29 @@
+# crosstalk next to Dispatcharr.
+#
+#   1. copy this file to docker-compose.yml
+#   2. copy config/*.example.toml into ./config/ and rename them
+#   3. set a token and a Dispatcharr API key, then: docker compose up -d
+#
+# The daemon binds 0.0.0.0 inside the container, which is only safe because a token is set.
+services:
+  crosstalk:
+    build: .
+    image: crosstalk:latest
+    container_name: crosstalk
+    restart: unless-stopped
+    ports:
+      - "8730:8730"
+    volumes:
+      - ./config:/config
+    environment:
+      # The token the web UI and the API require. Generate one with: openssl rand -hex 24
+      CROSSTALK_TOKEN: "change-me"
+      # Dispatcharr's API key, from its own UI. Preferred over a username and password
+      # because it does not expire.
+      CROSSTALK_DISPATCHARR_API_KEY: "change-me-too"
+      # TypeSafe, for AI verification. Leave unset to match purely heuristically.
+      # TYPESAFE_API_KEY: ""
+    # Dispatcharr on the same compose network:
+    #   [dispatcharr] base_url = "http://dispatcharr:9191"
+    # depends_on:
+    #   - dispatcharr
