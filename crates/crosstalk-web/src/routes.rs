@@ -3,7 +3,6 @@
 use crate::auth::{self, COOKIE};
 use crate::state::{self, AppState, UiApp, UiField, UiRow, UiSettings};
 use askama::Template;
-use askama_axum::IntoResponse as _;
 use axum::extract::{Form, Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
@@ -53,19 +52,7 @@ pub fn router(state: AppState) -> Router {
 #[derive(Template)]
 #[template(path = "login.html")]
 struct LoginTemplate {
-    version: &'static str,
     error: Option<String>,
-}
-
-impl LoginTemplate {
-    fn render_with(error: Option<String>) -> String {
-        LoginTemplate {
-            version: crosstalk_core::HOST_VERSION,
-            error,
-        }
-        .render()
-        .unwrap_or_else(|_| "the login page could not be rendered".to_string())
-    }
 }
 
 #[derive(Template)]
@@ -135,10 +122,7 @@ async fn health() -> &'static str {
 }
 
 async fn login_page() -> LoginTemplate {
-    LoginTemplate {
-        version: crosstalk_core::HOST_VERSION,
-        error: None,
-    }
+    LoginTemplate { error: None }
 }
 
 #[derive(serde::Deserialize)]
@@ -154,7 +138,6 @@ async fn login(State(state): State<AppState>, Form(form): Form<LoginForm>) -> Re
 
     if !crate::auth::tokens_match(expected, form.token.trim()) {
         return LoginTemplate {
-            version: crosstalk_core::HOST_VERSION,
             error: Some("That token does not match the configured one.".to_string()),
         }
         .into_response();
