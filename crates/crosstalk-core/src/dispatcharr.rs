@@ -393,19 +393,20 @@ impl DispatcharrClient {
                         continue;
                     }
 
-                    if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
-                    {
-                        if attempt < MAX_ATTEMPTS {
-                            let retry_after = response
-                                .headers()
-                                .get(reqwest::header::RETRY_AFTER)
-                                .and_then(|value| value.to_str().ok())
-                                .and_then(|value| value.parse::<u64>().ok())
-                                .map(Duration::from_secs)
-                                .unwrap_or_else(|| RETRY_BASE * 2u32.pow(attempt - 1));
-                            tokio::time::sleep(retry_after).await;
-                            continue;
-                        }
+                    let retryable = status.is_server_error()
+                        || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+                    if retryable && attempt < MAX_ATTEMPTS {
+                        // `Retry-After` when the server states one, otherwise exponential
+                        // backoff from the attempt number.
+                        let retry_after = response
+                            .headers()
+                            .get(reqwest::header::RETRY_AFTER)
+                            .and_then(|value| value.to_str().ok())
+                            .and_then(|value| value.parse::<u64>().ok())
+                            .map(Duration::from_secs)
+                            .unwrap_or_else(|| RETRY_BASE * 2u32.pow(attempt - 1));
+                        tokio::time::sleep(retry_after).await;
+                        continue;
                     }
 
                     if status == reqwest::StatusCode::UNAUTHORIZED
