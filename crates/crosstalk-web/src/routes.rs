@@ -11,13 +11,10 @@ use axum::{Json, Router};
 use crosstalk_core::store::{RunRecord, RunStatus};
 use crosstalk_core::subapp::Registry;
 use std::collections::HashMap;
-use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
 /// Build the router.
 pub fn router(state: AppState) -> Router {
-    let static_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("static");
-
     Router::new()
         .route("/health", get(health))
         .route("/login", get(login_page).post(login))
@@ -38,7 +35,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/runs", get(api_runs))
         .route("/api/v1/runs/:id", get(api_run))
         .route("/api/v1/runs/:id/rows", get(api_run_rows))
-        .nest_service("/static", ServeDir::new(static_dir))
+        // Embedded rather than read from disk: the runtime image has no source tree, and an
+        // install behind no internet still needs its stylesheet and htmx.
+        .route("/static/app.css", get(stylesheet))
+        .route("/static/htmx.min.js", get(htmx))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require,
@@ -87,9 +87,10 @@ struct RunsTemplate {
 struct RunTemplate {
     version: &'static str,
     run: RunRecord,
-    // The embedded status panel needs the same values as its standalone route.
+    // The embedded panels need the same values as their standalone routes.
     active: Option<crosstalk_core::runner::ActiveRun>,
     counts: Vec<(String, i64)>,
+    rows: Vec<UiRow>,
 }
 
 #[derive(Template)]
@@ -119,6 +120,22 @@ struct SettingsTemplate {
 
 async fn health() -> &'static str {
     "ok\n"
+}
+
+async fn stylesheet() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        include_str!("../static/app.css"),
+    )
+        .into_response()
+}
+
+async fn htmx() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../static/htmx.min.js"),
+    )
+        .into_response()
 }
 
 async fn login_page() -> LoginTemplate {
@@ -254,6 +271,7 @@ async fn run_page(State(state): State<AppState>, Path(id): Path<i64>) -> Respons
                 .running()
                 .into_iter()
                 .find(|entry| entry.run_id == id),
+            rows: state::rows(&state.store, id),
             run,
         }
         .into_response(),
@@ -323,8 +341,11 @@ async fn cancel_run(State(state): State<AppState>, Path(id): Path<i64>) -> Respo
     Redirect::to(&format!("/runs/{id}")).into_response()
 }
 
-async fn settings_page(State(state): State<AppState>) -> Response {
-    let saved = false;
+async fn settings_page(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>,
+) -> Response {
+    let saved = query.get("saved").is_some_and(|value| value == "1");
     SettingsTemplate {
         version: crosstalk_core::HOST_VERSION,
         saved,
@@ -447,7 +468,7 @@ async fn save_host_settings(
             .into_response();
     }
 
-    Redirect::to("/settings").into_response()
+    Redirect::to("/settings?saved=1").into_response()
 }
 
 async fn save_app_settings(
@@ -501,7 +522,7 @@ async fn save_app_settings(
         tracing::warn!("could not record the settings change: {error:#}");
     }
 
-    Redirect::to("/settings").into_response()
+    Redirect::to("/settings?saved=1").into_response()
 }
 
 // --- JSON API ----------------------------------------------------------------------

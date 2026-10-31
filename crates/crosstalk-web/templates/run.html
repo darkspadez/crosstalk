@@ -10,8 +10,8 @@
 
 <section class="card">
   <h2>Results</h2>
-  <div id="rows" hx-get="/runs/{{ run.id }}/rows" hx-trigger="load, every 5s" hx-swap="innerHTML">
-    <p class="muted">Loading…</p>
+  <div id="rows" hx-get="/runs/{{ run.id }}/rows" hx-trigger="every 5s" hx-swap="innerHTML">
+    {% include "_rows.html" %}
   </div>
 </section>
 {% endblock %}

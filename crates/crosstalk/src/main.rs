@@ -119,6 +119,7 @@ struct SimulateArgs {
 }
 
 fn main() -> Result<()> {
+    install_logging();
     let cli = Cli::parse();
 
     match cli.command {
@@ -179,9 +180,10 @@ fn serve(args: ServeArgs) -> Result<()> {
         let registry = registry::builtin();
         let runner = JobRunner::new(registry.clone(), Arc::clone(&config), store.clone());
 
-        let (_runner, scheduler) =
-            crosstalk_core::scheduler::build(registry.clone(), Arc::clone(&config), store.clone())
-                .await?;
+        // ONE runner: the scheduler arms jobs on the same instance the UI talks to, or a
+        // scheduled run would be invisible to the UI and could race a UI run on the same app.
+        let scheduler =
+            crosstalk_core::scheduler::Scheduler::start(runner.clone(), &config).await?;
 
         let state = crosstalk_web::AppState::new(registry, Arc::clone(&config), runner, store);
         let app = crosstalk_web::router(state);
@@ -213,6 +215,21 @@ fn serve(args: ServeArgs) -> Result<()> {
         scheduler.shutdown().await;
         Ok(())
     })
+}
+
+/// Install the log subscriber.
+///
+/// `RUST_LOG` sets the level (`info` by default, which is what an operator needs to see: the
+/// port, the schedules, and anything a run went wrong on).
+fn install_logging() {
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_env("RUST_LOG").unwrap_or_else(|_| {
+        EnvFilter::new("info,crosstalk_core=info,crosstalk_web=info,janitor=info")
+    });
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .try_init();
 }
 
 /// Wait for Ctrl-C or SIGTERM, so a container stop is a clean shutdown.

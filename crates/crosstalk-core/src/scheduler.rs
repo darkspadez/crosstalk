@@ -13,7 +13,6 @@ use crate::config::CrosstalkConfig;
 use crate::runner::JobRunner;
 use anyhow::{bail, Context, Result};
 use croner::Cron;
-use std::sync::Arc;
 use tokio_cron_scheduler::{Job, JobScheduler};
 
 /// One configured schedule, as the UI lists it.
@@ -194,21 +193,11 @@ impl Scheduler {
     }
 }
 
-/// Build a runner and scheduler pair, for the daemon and for tests.
-pub async fn build(
-    registry: crate::subapp::Registry,
-    config: Arc<CrosstalkConfig>,
-    store: crate::store::Store,
-) -> Result<(JobRunner, Scheduler)> {
-    let runner = JobRunner::new(registry, Arc::clone(&config), store);
-    let scheduler = Scheduler::start(runner.clone(), &config).await?;
-    Ok((runner, scheduler))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     fn config_with(schedules: &[(&str, &str)]) -> CrosstalkConfig {
         let mut config = CrosstalkConfig::default();

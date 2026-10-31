@@ -274,7 +274,9 @@ pub fn prune_exports(directory: &Path, retention_days: u32, protect: Option<&str
 
 /// The report path for a run: a timestamped file inside the exports directory.
 pub fn report_path(exports_dir: &Path, stem: &str) -> PathBuf {
-    let stamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+    // Milliseconds as well as seconds: two runs started from the UI in the same second
+    // must not overwrite each other's report.
+    let stamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f");
     exports_dir.join(format!("{EXPORT_PREFIX}{stem}_{stamp}.csv"))
 }
 

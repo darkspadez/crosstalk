@@ -220,7 +220,7 @@ impl JanitorApp {
     ) -> Result<JobOutcome> {
         match action {
             ACTION_VALIDATE => self.validate(context),
-            ACTION_STATUS => Ok(JobOutcome::new("No run has been recorded yet.")),
+            ACTION_STATUS => Ok(self.status(context)),
             ACTION_AUTOMATCH_PREVIEW => self.auto_match(context, true).await,
             ACTION_AUTOMATCH_APPLY => self.auto_match(context, dry_run).await,
             ACTION_HEAL_PREVIEW => self.heal(context, true).await,
@@ -317,6 +317,37 @@ impl JanitorApp {
             dry_run,
             settings.heal_confidence_threshold,
         ))
+    }
+
+    /// What the last runs did, from the store rather than from a live session.
+    fn status(&self, context: &JobContext) -> JobOutcome {
+        let Some(store) = context.store() else {
+            return JobOutcome::new("No run history is available in this context.");
+        };
+        let runs = store.recent_runs_for(APP_ID, 1).unwrap_or_default();
+        let Some(run) = runs.into_iter().next() else {
+            return JobOutcome::new("No run has been recorded yet.");
+        };
+
+        let mut outcome = JobOutcome::new(format!(
+            "Last run: {} {} ({}) started {}",
+            run.action,
+            run.status,
+            if run.dry_run { "preview" } else { "apply" },
+            run.started_at
+        ));
+        if let Some(summary) = run.summary {
+            outcome = JobOutcome::new(format!("{} — {summary}", outcome.summary));
+        }
+        for (key, value) in store
+            .rows(run.id)
+            .map(|rows| rows.len())
+            .map(|count| ("rows", count as i64))
+            .into_iter()
+        {
+            outcome = outcome.with_count(key, value);
+        }
+        outcome
     }
 
     fn validate(&self, context: &JobContext) -> Result<JobOutcome> {

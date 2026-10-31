@@ -146,6 +146,11 @@ impl JobContext {
         self.run_id
     }
 
+    /// The run store, for an action that reports on history (the status action).
+    pub fn store(&self) -> Option<&Store> {
+        self.store.as_ref()
+    }
+
     /// Append rows to the run record. A no-op outside a recorded run.
     pub fn record_rows(&self, rows: &[RunRow]) -> anyhow::Result<()> {
         match (&self.store, self.run_id) {

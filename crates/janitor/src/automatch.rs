@@ -248,12 +248,13 @@ pub async fn run(
                 &settings.ai,
             )
             .await;
+            // Recorded whether or not it answered: a failed request is part of the story.
+            row.ai_decision = Some(outcome.decision.clone());
+            context
+                .record_ai_decision(&outcome.to_store(rows.len() as i64, &settings.ai.provider))?;
             if outcome.answered {
-                row.ai_decision = Some(outcome.decision.clone());
                 let decision_index = outcome.accepted;
                 ai_outcome = Some((outcome, decision_index));
-            } else {
-                row.ai_decision = Some(outcome.decision.clone());
             }
         }
 
@@ -276,7 +277,14 @@ pub async fn run(
                     if has == HasPrograms::Yes {
                         chosen = Some((candidate, entry, has));
                     } else {
+                        // The model said yes and the guide is empty: say that, rather than
+                        // reusing the "below threshold" wording the score would suggest.
                         best_rejected = Some(candidate.score);
+                        row.reason = format!(
+                            "The AI accepted {} (score {}%) but it carries no programme data \
+                             in the checked window",
+                            entry.name, candidate.score
+                        );
                     }
                 }
             }

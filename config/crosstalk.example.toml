@@ -83,7 +83,7 @@ exports_dir = "exports"
 data_dir = "data"
 
 # Schedules, as `<app>.<action>` with a cron expression. Five fields (minute hour day month
-# weekday) is what most people write; the scheduler accepts up to seven.
+# weekday) is what most people write, and six (with seconds) is accepted. They fire in UTC.
 # [schedules]
 # "janitor.automatch_apply" = "0 4 * * *"
 # "janitor.heal_apply" = "0 6 * * *"

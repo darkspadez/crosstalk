@@ -355,18 +355,48 @@ impl JobRunner {
                 runner.store.clone(),
                 Arc::clone(&cancel_flag),
             );
+            // Open the Dispatcharr session once per run, here rather than inside each sub-app, so
+            // every action shares one client, one concurrency cap and one token.
+            let needs_dispatcharr = app
+                .actions()
+                .iter()
+                .find(|entry| entry.id == started_action)
+                .map(|entry| entry.needs_dispatcharr)
+                .unwrap_or(true);
+            let context = if needs_dispatcharr {
+                match context.connect() {
+                    Ok(context) => context,
+                    Err(error) => {
+                        slot.finish(
+                            RunStatus::Failed,
+                            Some(&format!("{error:#}")),
+                            &serde_json::json!({}),
+                            None,
+                        );
+                        let mut event = ProgressEvent::new(&started_action, 0, 0, "failed");
+                        event.done = true;
+                        event.summary = Some(format!("{error:#}"));
+                        sink.publish(&event);
+                        return;
+                    }
+                }
+            } else {
+                context
+            };
 
             let outcome = app.run(&started_action, &context, dry_run).await;
             let cancelled = cancel_flag.load(Ordering::SeqCst);
 
             let (status, summary, counts, report) = match (&outcome, cancelled) {
-                (_, true) => (
+                // Cancelled only counts when the action actually stopped: if it returned Ok the
+                // work is done, and recording it as cancelled would hide a write that happened.
+                (Err(_), true) => (
                     RunStatus::Cancelled,
                     Some("cancelled".to_string()),
                     serde_json::json!({}),
                     None,
                 ),
-                (Ok(outcome), false) => (
+                (Ok(outcome), _) => (
                     RunStatus::Succeeded,
                     Some(outcome.summary.clone()),
                     serde_json::to_value(&outcome.counts).unwrap_or_default(),
@@ -435,12 +465,35 @@ impl JobRunner {
             self.store.clone(),
             Arc::clone(&cancel_flag),
         );
+        let needs_dispatcharr = app
+            .actions()
+            .iter()
+            .find(|entry| entry.id == action_id)
+            .map(|entry| entry.needs_dispatcharr)
+            .unwrap_or(true);
+        let context = if needs_dispatcharr {
+            match context.connect() {
+                Ok(context) => context,
+                Err(error) => {
+                    slot.finish(
+                        RunStatus::Failed,
+                        Some(&format!("{error:#}")),
+                        &serde_json::json!({}),
+                        None,
+                    );
+                    return Err(error);
+                }
+            }
+        } else {
+            context
+        };
 
         let outcome = app.run(action_id, &context, dry_run).await;
         let cancelled = cancel_flag.load(Ordering::SeqCst);
 
         match &outcome {
-            _ if cancelled => slot.finish(
+            // Same rule as `start`: only an action that actually stopped is cancelled.
+            Err(_) if cancelled => slot.finish(
                 RunStatus::Cancelled,
                 Some("cancelled"),
                 &serde_json::json!({}),
@@ -542,9 +595,11 @@ mod tests {
         }
 
         fn actions(&self) -> Vec<ActionSpec> {
+            // Offline: these tests exercise the runner's bookkeeping, not the client.
             vec![
-                ActionSpec::new("run", "Run", "runs", ActionKind::Read),
-                ActionSpec::new("apply", "Apply", "writes", ActionKind::Write),
+                ActionSpec::new("run", "Run", "runs", ActionKind::Read).offline(),
+                ActionSpec::new("apply", "Apply", "writes", ActionKind::Write).offline(),
+                ActionSpec::new("online", "Online", "needs a session", ActionKind::Read),
             ]
         }
 
@@ -757,6 +812,24 @@ mod tests {
         assert_eq!(record.status, RunStatus::Cancelled);
         let error = runner.start("test", "run", true).expect_err("refused");
         assert!(format!("{error}").contains("shutting down"));
+    }
+
+    #[tokio::test]
+    async fn an_action_that_needs_a_session_fails_cleanly_without_credentials() {
+        let store = Store::in_memory().expect("store");
+        let runner = runner(TestApp::new(Duration::from_millis(1)), store.clone());
+        // The default config has no credentials, so the runner cannot open a session.
+        let started = runner.start("test", "online", true).expect("started");
+        wait_until_idle(&runner).await;
+
+        let record = store.run(started.run_id).expect("run").expect("present");
+        assert_eq!(record.status, RunStatus::Failed);
+        assert!(record
+            .summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("credentials"));
+        assert!(!runner.is_busy("test"), "the app is free again");
     }
 
     #[tokio::test]

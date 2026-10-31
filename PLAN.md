@@ -328,7 +328,7 @@ New repository, so everything is new. The critical paths:
 - [x] Scheduler UI (enable per action, cron string, next run).
 
 ### Phase 5: packaging
-- [ ] Multi-stage Dockerfile (musl static), compose example beside Dispatcharr,
+- [x] Multi-stage Dockerfile (musl static), compose example beside Dispatcharr,
       `/config` volume layout, README with first-run walkthrough.
 
 ## Verification

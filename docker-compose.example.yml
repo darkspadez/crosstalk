@@ -2,12 +2,21 @@
 #
 #   1. copy this file to docker-compose.yml
 #   2. copy config/*.example.toml into ./config/ and rename them
-#   3. set a token and a Dispatcharr API key, then: docker compose up -d
+#   3. generate a token (openssl rand -hex 24), set it below, and set your Dispatcharr API key
+#   4. docker compose up -d --build
 #
-# The daemon binds 0.0.0.0 inside the container, which is only safe because a token is set.
+# The container listens on 0.0.0.0 (set below), so a token is mandatory: the daemon refuses to
+# start on a non-loopback address without one.
 services:
   crosstalk:
-    build: .
+    build:
+      context: .
+      args:
+        # Make the container user match whoever owns ./config, so the daemon can write its
+        # database, CSV exports and settings changes. On Linux this matters; on Docker Desktop
+        # the bind mount is remapped for you.
+        PUID: "${PUID:-1000}"
+        PGID: "${PGID:-1000}"
     image: crosstalk:latest
     container_name: crosstalk
     restart: unless-stopped
@@ -16,14 +25,20 @@ services:
     volumes:
       - ./config:/config
     environment:
-      # The token the web UI and the API require. Generate one with: openssl rand -hex 24
-      CROSSTALK_TOKEN: "change-me"
-      # Dispatcharr's API key, from its own UI. Preferred over a username and password
-      # because it does not expire.
-      CROSSTALK_DISPATCHARR_API_KEY: "change-me-too"
-      # TypeSafe, for AI verification. Leave unset to match purely heuristically.
+      # Bind inside the container. Without this the daemon listens on the container's loopback
+      # and the published port cannot reach it.
+      CROSSTALK_SERVER__BIND: "0.0.0.0"
+      CROSSTALK_SERVER__TOKEN: "${CROSSTALK_TOKEN:?set CROSSTALK_TOKEN to a long random string}"
+      # Dispatcharr's API key, from its own UI. Preferred over a username and password because
+      # it does not expire.
+      CROSSTALK_DISPATCHARR_API_KEY: "${DISPATCHARR_API_KEY:?set DISPATCHARR_API_KEY}"
+      # [dispatcharr] base_url also comes from the config file; override it here instead if you
+      # prefer to keep everything in the environment:
+      # CROSSTALK_DISPATCHARR__BASE_URL: "http://dispatcharr:9191"
+      # TypeSafe, for AI verification. Leave it unset to match purely heuristically.
       # TYPESAFE_API_KEY: ""
-    # Dispatcharr on the same compose network:
-    #   [dispatcharr] base_url = "http://dispatcharr:9191"
+      RUST_LOG: "info"
+    # On the same compose network as Dispatcharr, so [dispatcharr] base_url can be
+    # "http://dispatcharr:9191".
     # depends_on:
     #   - dispatcharr
