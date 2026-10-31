@@ -23,8 +23,6 @@ __pycache__/
 config/exports/
 /data/local/
 
-# Reference copy of the Python plugin (its own repository, kept out of this one)
-/reference/
 
 # Editor / OS noise
 .DS_Store

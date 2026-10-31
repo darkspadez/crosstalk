@@ -207,9 +207,36 @@ On top of that: a shared high-confidence callsign floors the score at 95, a disa
 rejects the candidate outright, numbered siblings and `+1` time-shifts never cross-match, and
 East/West/Pacific feeds are kept apart.
 
-The port is faithful to the Python matcher, and that is checked rather than asserted: the
-`crosstalk simulate` command produces **byte-identical** reports to the plugin's own offline
-tool, and `scripts/parity_sweep.py` compares the primitives over hundreds of thousands of cases.
+The matching core is a faithful port of the Python matcher, and that is checked rather
+than asserted — but only for the core. The split contract is:
+
+- **Strict parity**: the matching primitives (normalisation, callsign/location/network
+extraction) and the full `match_all_streams` pipeline are byte-identical ports.
+`crosstalk simulate` produces **byte-identical** reports to the plugin's own offline tool
+across four configurations (default flags, `--no-ignore-quality`, `--custom-aliases`,
+`--countries US`, with duplicate candidate names in the corpus), and
+`scripts/parity_sweep.py` compares the primitives over hundreds of thousands of cases.
+Both gates run in CI against the plugin pinned as a submodule in `reference/`.
+- **Rust-native actions**: `automatch` and `heal` reuse the parity-checked pipeline but
+make their own product decisions. They are not ports, and row-for-row equality with the
+plugin is not claimed for them.
+
+Deliberate divergences from the plugin (actions only, never the pipeline):
+
+- **EPG-override channels are skipped**: a channel whose guide was set by hand is left
+alone by automatch; the plugin re-matches it. Skipping is safer, and the CSV reason says so.
+- **AI promotion within the verify band**: with the AI gate on, an AI-accepted candidate can
+be assigned while its heuristic score (60–94) sits below `automatch_confidence_threshold`
+(default 95). The threshold still gates every heuristic assignment; AI may promote inside
+the band but never veto a heuristic win, and heal never consults AI at all.
+- **Heal preview statuses are plugin-style**: a working replacement below the threshold is
+reported as `SKIPPED_LOW_CONFIDENCE` / `REPLACEMENT_PREVIEW` with its real score, but
+never applied.
+- **Sourceless candidates are skipped**: entries with no EPG source are not considered as
+replacements; the plugin validates by EPG id and can accept one.
+- **Automatch reporting walks only validated candidates**: when nothing validates, the row
+reports the top-ranked candidate and says no programme data was found, where the plugin
+reports the first programme-carrying candidate regardless of threshold.
 
 ## Development
 
@@ -219,10 +246,13 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
 ./scripts/sim_parity.sh --quick # the oracle: Rust vs the Python tool, byte for byte
-python3 scripts/parity_sweep.py --kinds normalize,callsign,location,network,match,score
+python3 scripts/parity_sweep.py --kinds normalize,callsign,location,network --limit 300
+python3 scripts/parity_sweep.py --kinds match,score --limit 300 --pool 60
 ```
 
-The Python plugin lives in `reference/` (git-ignored) as the source of truth for parity.
+The Python plugin lives in `reference/` as a pinned git submodule: the parity gates compare
+against that exact commit. See [How matching works](#how-matching-works) for what is
+strict-parity and what is deliberately Rust-native.
 
 ### Layout
 

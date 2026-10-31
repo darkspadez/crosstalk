@@ -21,6 +21,10 @@ import os
 import subprocess
 import sys
 
+# The sweep imports the plugin in-process; don't leave __pycache__ behind in the
+# reference checkout on every run.
+sys.dont_write_bytecode = True
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PLUGIN_INNER = os.path.join(REPO, "reference", "Dispatcharr-EPG-Janitor-Plugin", "EPG-Janitor")
 DATA = os.path.join(REPO, "data")
@@ -154,7 +158,7 @@ def main() -> int:
     parser.add_argument(
         "--kinds",
         default="normalize",
-        help="comma-separated primitives: normalize, callsign, location, network, match",
+        help="comma-separated primitives: normalize, callsign, location, network, match, score",
     )
     parser.add_argument(
         "--binary",

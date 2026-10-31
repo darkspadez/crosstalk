@@ -1,0 +1,3 @@
+[submodule "reference/Dispatcharr-EPG-Janitor-Plugin"]
+	path = reference/Dispatcharr-EPG-Janitor-Plugin
+	url = https://github.com/PiratesIRC/Dispatcharr-EPG-Janitor-Plugin

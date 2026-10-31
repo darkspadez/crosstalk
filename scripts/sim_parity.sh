@@ -5,6 +5,11 @@
 # simulators over the same inputs, and compares the report files byte for byte. Any
 # difference is a port bug, so this is the gate before the janitor sub-app is wired up.
 #
+# Several configurations are compared, not just the defaults: the default flags, a
+# --no-ignore-quality run, a --custom-aliases run, and a --countries US run. The stream
+# corpus also carries duplicate candidate names (the same name in two groups), which both
+# tools de-duplicate by name before matching.
+#
 # Usage:
 #   scripts/sim_parity.sh [--quick] [--keep]
 #
@@ -13,6 +18,10 @@
 #
 # Requires python3 and the reference checkout at reference/Dispatcharr-EPG-Janitor-Plugin.
 set -euo pipefail
+
+# The sweep imports the plugin in-process, which would otherwise leave __pycache__
+# directories behind in the reference checkout on every run.
+export PYTHONDONTWRITEBYTECODE=1
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PLUGIN="$REPO/reference/Dispatcharr-EPG-Janitor-Plugin"
@@ -93,44 +102,72 @@ for name in random.sample(names, min(300, len(names))):
     streams.extend([name[:cut] + name[cut + 1:], name + " +1", name.upper()])
 
 streams = list(dict.fromkeys(streams))
+
+# Duplicate candidate names: the same stream name in two groups. Both tools
+# de-duplicate by query name before matching, so these rows exercise the dedupe
+# path rather than the matcher, and must still compare identical.
+dupes = streams[:150] if quick else streams[:400]
 with open(os.path.join(work, "streams.m3u"), "w", encoding="utf-8") as fh:
     fh.write("#EXTM3U\n")
     for index, name in enumerate(streams):
         group = ["News", "Sports", "Movies"][index % 3]
         fh.write(f'#EXTINF:-1 tvg-id="" tvg-name="{name}" group-title="{group}",{name}\n')
         fh.write(f"http://example.invalid/{index}\n")
+    for index, name in enumerate(dupes):
+        fh.write(f'#EXTINF:-1 tvg-id="dupe-{index}" tvg-name="{name}" group-title="Dupes",{name}\n')
+        fh.write(f"http://example.invalid/dupe-{index}\n")
 
-print(f"    {len(names)} channels, {len(streams)} streams")
+# A small custom-aliases file: one replaced entry, one disabled entry, one new key.
+# Both tools merge these over the built-in table, replacing per key.
+with open(os.path.join(work, "custom_aliases.json"), "w", encoding="utf-8") as fh:
+    json.dump({
+        "ESPN": ["ESPN Deportes Custom"],
+        "CNN": [],
+        "ZZZ New Channel": ["ZZZNC"],
+    }, fh)
+
+print(f"    {len(names)} channels, {len(streams)} streams (+{len(dupes)} duplicate-name rows)")
 PY
 
-echo "==> python match_sim"
-python3 "$PLUGIN/tools/match_sim.py" \
-  --channels "$WORK/channels.csv" \
-  --streams "$WORK/streams.m3u" \
-  --threshold 80 \
-  --out "$WORK/py-out" >/dev/null
+# Compare one configuration: extra args are passed to both tools verbatim, so the
+# flag spellings must agree (they do: --threshold/--no-ignore-*/--custom-aliases/
+# --countries exist on both sides with the same meaning).
+compare_case() {
+  local label="$1"; shift
+  echo "==> case: $label ${*:-<defaults>}"
+  python3 "$PLUGIN/tools/match_sim.py" \
+    --channels "$WORK/channels.csv" \
+    --streams "$WORK/streams.m3u" \
+    --threshold 80 \
+    --out "$WORK/py-$label" "$@" >/dev/null
 
-echo "==> crosstalk simulate"
-"$REPO/target/release/crosstalk" simulate \
-  --channels "$WORK/channels.csv" \
-  --streams "$WORK/streams.m3u" \
-  --threshold 80 \
-  --out "$WORK/rs-out" >/dev/null
+  "$REPO/target/release/crosstalk" simulate \
+    --channels "$WORK/channels.csv" \
+    --streams "$WORK/streams.m3u" \
+    --threshold 80 \
+    --out "$WORK/rs-$label" "$@" >/dev/null
 
-PY_DIR="$(ls -d "$WORK"/py-out/*/ | head -1)"
-RS_DIR="$(ls -d "$WORK"/rs-out/*/ | head -1)"
+  local py_dir rs_dir
+  py_dir="$(ls -d "$WORK"/py-"$label"/*/ | head -1)"
+  rs_dir="$(ls -d "$WORK"/rs-"$label"/*/ | head -1)"
+
+  for file in per_stream_matches.csv unmatched.csv low_confidence.csv top_n.csv summary.txt; do
+    printf '    [%s] %-26s ' "$label" "$file"
+    if cmp -s "$py_dir/$file" "$rs_dir/$file"; then
+      echo "identical"
+    else
+      echo "DIFFERS"
+      diff "$py_dir/$file" "$rs_dir/$file" | head -20 || true
+      status=1
+    fi
+  done
+}
 
 status=0
-for file in per_stream_matches.csv unmatched.csv low_confidence.csv top_n.csv summary.txt; do
-  printf '    %-26s ' "$file"
-  if cmp -s "$PY_DIR/$file" "$RS_DIR/$file"; then
-    echo "identical"
-  else
-    echo "DIFFERS"
-    diff "$PY_DIR/$file" "$RS_DIR/$file" | head -20 || true
-    status=1
-  fi
-done
+compare_case default
+compare_case no-ignore-quality --no-ignore-quality
+compare_case custom-aliases --custom-aliases "$WORK/custom_aliases.json"
+compare_case countries-US --countries US
 
 if [ "$status" -eq 0 ]; then
   echo "==> parity OK"
