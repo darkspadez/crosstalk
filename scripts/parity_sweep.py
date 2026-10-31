@@ -137,9 +137,12 @@ def main() -> int:
     parser.add_argument("--tags", action="store_true", help="also sweep ignored tags")
     parser.add_argument("--show", type=int, default=25, help="mismatches to print")
     parser.add_argument(
+        "--pool", type=int, default=8, help="candidate pool size per match case"
+    )
+    parser.add_argument(
         "--kinds",
         default="normalize",
-        help="comma-separated primitives: normalize, callsign, location, network",
+        help="comma-separated primitives: normalize, callsign, location, network, match",
     )
     parser.add_argument(
         "--binary",
@@ -170,6 +173,8 @@ def sweep(kind: str, names: list[str], args: argparse.Namespace) -> int:
     matcher = load_python_matcher()
     if kind == "normalize":
         return sweep_normalize(names, matcher, args)
+    if kind in ("match", "score"):
+        return sweep_match(kind, names, matcher, args)
     if kind in ("callsign", "location", "network"):
         return sweep_per_name(kind, names, matcher, args)
     print(f"unknown kind {kind!r}", file=sys.stderr)
@@ -217,6 +222,132 @@ def sweep_per_name(kind: str, names: list[str], matcher, args) -> int:
     if len(mismatches) > args.show:
         print(f"  ... and {len(mismatches) - args.show} more")
     return 1 if mismatches else 0
+
+
+def sweep_match(kind: str, names: list[str], matcher, args) -> int:
+    """Compare `match_all_streams` end to end, below-threshold matches included."""
+    from aliases import CHANNEL_ALIASES  # noqa: PLC0415  (plugin module path is set up)
+
+    # Deterministic candidate pools: a stride through the corpus so every query sees a
+    # realistic mix of sibling names, aliases and unrelated channels.
+    pool_size = args.pool
+    pool = [names[(i * 97) % len(names)] for i in range(min(pool_size, len(names)))]
+    queries = names[: args.limit] if args.limit else names
+    tag_sets = [set(), {"quality", "regional", "geographic", "misc"}]
+
+    cases = []
+    for tags in tag_sets:
+        for query in queries:
+            cases.append(
+                {
+                    "kind": kind,
+                    "query": query,
+                    "candidates": pool,
+                    "tags": sorted(tags),
+                }
+            )
+    print(f"[{kind}] {len(queries)} queries x {len(pool)} candidates x {len(tag_sets)} tag sets "
+          f"= {len(cases)} cases", file=sys.stderr)
+
+    answers = run_rust(cases, args.binary)
+
+    mismatches = []
+    for case, answer in zip(cases, answers):
+        if kind == "match":
+            expected = [
+                [name, score, mtype]
+                for name, score, mtype in matcher.match_all_streams(
+                    case["query"],
+                    case["candidates"],
+                    CHANNEL_ALIASES,
+                    user_ignored_tags=set(case["tags"]),
+                    min_score=0,
+                )
+            ]
+            got = answer.get("matches")
+        else:
+            expected = python_score(
+                case["query"], case["candidates"], matcher, CHANNEL_ALIASES, case["tags"]
+            )
+            got = answer.get("scored")
+        if got != expected:
+            mismatches.append((case["query"], case["tags"], expected, got))
+
+    print(f"[{kind}] {len(mismatches)} mismatches out of {len(cases)} cases")
+    for query, tags, expected, got in mismatches[: args.show]:
+        print(f"  query={query!r} tags={tags}\n    python={expected}\n    rust  ={got}")
+    if len(mismatches) > args.show:
+        print(f"  ... and {len(mismatches) - args.show} more")
+    return 1 if mismatches else 0
+
+
+def python_score(channel_name, epg_names, matcher, alias_map, tags) -> list:
+    """Transcription of the scoring half of `Plugin._find_best_epg_match` (plugin.py).
+
+    The database check for programme data is deliberately absent: it needs Django, and the
+    Rust port leaves it to the caller. Everything else here is the plugin's code path.
+    """
+    callsign = matcher.extract_callsign(channel_name)
+    location = python_location(channel_name)
+    network = python_network(channel_name)
+
+    fuzzy = {}
+    ranked = matcher.match_all_streams(
+        channel_name,
+        epg_names,
+        alias_map,
+        channel_number=None,
+        user_ignored_tags=set(tags),
+        min_score=85,
+    )
+    for name, score, mtype in ranked:
+        fuzzy[name] = (score, "Alias" if mtype == "alias" else "Fuzzy")
+
+    results = []
+    for epg_name in epg_names:
+        score_struct = 0
+        components = []
+
+        epg_callsign = matcher.extract_callsign(epg_name)
+        epg_location = python_location(epg_name)
+
+        if callsign:
+            if epg_callsign and epg_callsign.upper() == callsign.upper():
+                score_struct += 50
+                components.append("Callsign")
+
+        if location["state"]:
+            if epg_location["state"] and epg_location["state"] == location["state"]:
+                score_struct += 30
+                components.append("State")
+                if location["city"] and epg_location["city"]:
+                    if (
+                        location["city"].upper() in epg_location["city"].upper()
+                        or epg_location["city"].upper() in location["city"].upper()
+                    ):
+                        score_struct += 20
+                        components.append("City")
+
+        if network and score_struct > 0 and network in epg_name.upper():
+            score_struct += 10
+            components.append("Network")
+
+        score_fuzzy = 0
+        components_fuzzy = []
+        if epg_name in fuzzy:
+            score_fuzzy, fuzzy_type = fuzzy[epg_name]
+            components_fuzzy.append(fuzzy_type)
+
+        if score_fuzzy > score_struct:
+            score, used = score_fuzzy, components_fuzzy
+        else:
+            score, used = score_struct, components
+
+        if score > 0:
+            results.append([epg_name, min(score, 100), " + ".join(used)])
+
+    results.sort(key=lambda entry: entry[1], reverse=True)
+    return results
 
 
 def python_network(name: str):

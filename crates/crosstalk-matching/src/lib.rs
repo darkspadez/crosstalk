@@ -19,3 +19,7 @@ pub use normalize::{NormalizeFlags, Normalizer};
 
 /// The fuzzy-matching floor used by Janitor (`FUZZY_MATCH_THRESHOLD` in `plugin.py`).
 pub const FUZZY_MATCH_THRESHOLD: u8 = 85;
+
+pub use pipeline::{
+    CandidateIndex, MatchMethod, MatchOptions, MatchResult, Matcher, Ranked, Scored,
+};
