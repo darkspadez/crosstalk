@@ -179,6 +179,19 @@ The UI binds to `127.0.0.1` by default. To expose it, set `server.bind` and a `s
 the daemon refuses to start on a non-loopback address without a token. A browser signs in at
 `/login` and gets an `HttpOnly` cookie; a script sends `Authorization: Bearer <token>`.
 
+Bots and scripts talk to the same routes the forms do, with two differences from a browser:
+
+- Scripts send `Authorization: Bearer <token>` on every request and are CSRF-exempt: a
+  cross-site page cannot forge that header, so a request carrying it is by definition not
+  a forged browser form.
+- Browsers send the `crosstalk_token` cookie plus the `csrf_token` hidden field (or the
+  `x-csrf-token` header); without the synchroniser token a POST is rejected with 403.
+- With no token configured, only loopback `Host` values reach the daemon at all: a
+  DNS-rebinding page's hostname may resolve to 127.0.0.1, but its foreign `Host` header
+  is rejected before anything trusts it. With a token configured the Host check is skipped
+  (reverse proxies use foreign Host values by design) and the bearer token is the
+  protection; a POST whose `Origin` disagrees with `Host` is still rejected as a forgery.
+
 ## How matching works
 
 For each channel and candidate guide entry, two independent scores are computed and the better

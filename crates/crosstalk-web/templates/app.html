@@ -15,6 +15,7 @@
   <p>
     <a class="button" href="/runs/{{ active.run_id }}">Watch</a>
     <form method="post" action="/runs/{{ active.run_id }}/cancel" class="inline">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <button type="submit" class="ghost">Cancel</button>
     </form>
   </p>
@@ -36,7 +37,9 @@
           {% else %}
           <form method="post" action="/apps/{{ app.id }}/actions/{{ action.id }}"
                 {% if let Some(confirm) = action.confirm %}onsubmit="return confirm('{{ confirm }}')"{% endif %}>
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <input type="hidden" name="dry_run" value="{% if action.kind_touches_channels %}false{% else %}true{% endif %}">
+            <input type="hidden" name="confirm" value="true">
             <button type="submit">Run</button>
           </form>
           {% endif %}

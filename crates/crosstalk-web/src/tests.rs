@@ -129,15 +129,55 @@ async fn get_with_cookie(state: &AppState, uri: &str, token: &str) -> (StatusCod
 }
 
 async fn post_form(state: &AppState, uri: &str, body: &str) -> StatusCode {
+    post_form_with_csrf(state, uri, body, true).await
+}
+
+/// POST a form with extra headers (Host, Origin, Authorization), always with the CSRF
+/// header unless the caller opts out via `with_csrf = false`.
+async fn post_raw(
+    state: &AppState,
+    uri: &str,
+    body: &str,
+    headers: &[(&str, &str)],
+    with_csrf: bool,
+) -> (StatusCode, axum::http::HeaderMap) {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/x-www-form-urlencoded");
+    if with_csrf {
+        builder = builder.header(crate::csrf::CSRF_HEADER, state.csrf_token());
+    }
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
     let response = router(state.clone())
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(uri)
-                .header("content-type", "application/x-www-form-urlencoded")
-                .body(Body::from(body.to_string()))
-                .expect("request"),
-        )
+        .oneshot(builder.body(Body::from(body.to_string())).expect("request"))
+        .await
+        .expect("response");
+    let status = response.status();
+    let headers = response.headers().clone();
+    (status, headers)
+}
+
+/// POST a form, with or without this daemon's CSRF token. Scripts send the token via the
+/// `x-csrf-token` header; browsers send the hidden form field instead, which the
+/// middleware reads from the body the same way.
+async fn post_form_with_csrf(
+    state: &AppState,
+    uri: &str,
+    body: &str,
+    with_csrf: bool,
+) -> StatusCode {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/x-www-form-urlencoded");
+    if with_csrf {
+        builder = builder.header(crate::csrf::CSRF_HEADER, state.csrf_token());
+    }
+    let response = router(state.clone())
+        .oneshot(builder.body(Body::from(body.to_string())).expect("request"))
         .await
         .expect("response");
     response.status()
@@ -396,4 +436,272 @@ async fn cancelling_from_the_ui_is_accepted() {
     let status = post_form(&state, "/runs/9999/cancel", "").await;
     // Cancelling a run that is not running is harmless; the page it returns to is the run page.
     assert_eq!(status, StatusCode::SEE_OTHER);
+}
+
+#[tokio::test]
+async fn a_post_without_the_csrf_token_is_rejected() {
+    let (state, _store, _dir) = state(None);
+    // No header, no form field: the forged cross-site POST shape.
+    assert_eq!(
+        post_form_with_csrf(&state, "/apps/echo/actions/peek", "dry_run=true", false).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        post_form_with_csrf(&state, "/settings/host", "", false).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        post_form_with_csrf(&state, "/runs/9999/cancel", "", false).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        post_form_with_csrf(&state, "/logout", "", false).await,
+        StatusCode::FORBIDDEN
+    );
+    // A wrong token is the same as none.
+    let status = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/apps/echo/actions/peek")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header(crate::csrf::CSRF_HEADER, "wrong")
+                .body(Body::from("dry_run=true".to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("response")
+        .status();
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn the_form_field_carries_the_same_token_as_the_header() {
+    // Browsers send the hidden field, not the header: prove that path works too.
+    let (state, store, _dir) = state(None);
+    let body = format!("dry_run=true&csrf_token={}", state.csrf_token());
+    let status = post_form_with_csrf(&state, "/apps/echo/actions/peek", &body, false).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    for _ in 0..100 {
+        if store.run_count().expect("count") > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(store.run_count().expect("count"), 1);
+}
+
+#[tokio::test]
+async fn a_channel_changing_action_needs_a_server_side_confirmation() {
+    let (state, store, _dir) = state(None);
+    // `poke` is a Write action: CSRF alone is not enough without confirm=true.
+    let status = post_form(&state, "/apps/echo/actions/poke", "dry_run=false").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(store.run_count().expect("count"), 0, "nothing started");
+
+    // A read action never needs it.
+    let status = post_form(&state, "/apps/echo/actions/peek", "dry_run=true").await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    // Let the preview run finish so its busy lock is released before the apply below.
+    for _ in 0..200 {
+        if !state.runner.is_busy("echo") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(!state.runner.is_busy("echo"));
+
+    // With the confirmation the run starts.
+    let status = post_form(&state, "/apps/echo/actions/poke", "confirm=true").await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+}
+
+#[tokio::test]
+async fn every_post_form_embeds_the_csrf_token() {
+    let (state, _store, _dir) = state(None);
+    let (status, body) = get(&state, "/apps/echo").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains(r#"name="csrf_token""#), "{body}");
+    assert!(body.contains(r#"name="confirm""#), "{body}");
+
+    let (status, body) = get(&state, "/settings").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains(r#"name="csrf_token""#), "{body}");
+
+    let (status, body) = get(&state, "/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains(r#"name="csrf_token""#), "logout form: {body}");
+}
+
+#[tokio::test]
+async fn get_responses_do_not_set_a_csrf_cookie() {
+    // The token lives server-side; the hidden field and the header are the channels, so
+    // there is no cookie to persist. Validation never read one back.
+    let (state, _store, _dir) = state(None);
+    let response = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let cookies: Vec<String> = response
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|value| value.to_str().ok().map(str::to_string))
+        .collect();
+    assert!(
+        cookies
+            .iter()
+            .all(|cookie| !cookie.starts_with("crosstalk_csrf=")),
+        "{cookies:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_rebinding_host_is_rejected_without_a_token() {
+    // No token configured: only loopback Host values may reach the daemon. A
+    // DNS-rebinding page's hostname resolves to 127.0.0.1 but arrives as a foreign
+    // Host, which is exactly what this rejects.
+    let (state, _store, _dir) = state(None);
+    let (status, _) = post_raw(
+        &state,
+        "/apps/echo/actions/peek",
+        "dry_run=true",
+        &[("host", "evil.example")],
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // A rebinding read is rejected too, not just POSTs: the page wants the csrf_token.
+    let response = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .header("host", "evil.example")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn loopback_hosts_reach_a_tokenless_daemon() {
+    let (state, _store, _dir) = state(None);
+    for host in [
+        "localhost",
+        "localhost:8730",
+        "127.0.0.1",
+        "127.0.0.2:8730",
+        "[::1]",
+    ] {
+        let (status, _) = post_raw(
+            &state,
+            "/apps/echo/actions/peek",
+            "dry_run=true",
+            &[("host", host)],
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER, "host {host}");
+        // Let each preview run finish so its busy lock is released before the next POST.
+        for _ in 0..200 {
+            if !state.runner.is_busy("echo") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_configured_token_skips_the_host_check_but_not_auth() {
+    // Behind a reverse proxy the Host is foreign by design; the bearer token is the
+    // protection there, so the Host check steps aside and auth decides.
+    let (state, _store, _dir) = state(Some("s3cret"));
+    let (status, _) = post_raw(
+        &state,
+        "/apps/echo/actions/peek",
+        "dry_run=true",
+        &[
+            ("host", "proxy.internal"),
+            ("authorization", "Bearer s3cret"),
+        ],
+        false,
+    )
+    .await;
+    // Bearer is CSRF-exempt, so no csrf token is needed; auth passes on the token.
+    assert_eq!(status, StatusCode::SEE_OTHER);
+}
+
+#[tokio::test]
+async fn an_origin_that_disagrees_with_host_is_a_forgery() {
+    let (state, _store, _dir) = state(None);
+    let (status, _) = post_raw(
+        &state,
+        "/apps/echo/actions/peek",
+        "dry_run=true",
+        &[("host", "localhost"), ("origin", "http://evil.example")],
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // A matching Origin is the browser's own page and passes.
+    let (status, _) = post_raw(
+        &state,
+        "/apps/echo/actions/peek",
+        "dry_run=true",
+        &[("host", "localhost"), ("origin", "http://localhost")],
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+}
+
+#[tokio::test]
+async fn a_script_bearer_is_csrf_exempt_and_a_wrong_one_is_not() {
+    let (state, _store, _dir) = state(Some("s3cret"));
+    // Valid Bearer, no CSRF token at all: scripts do not have the synchroniser token.
+    let (status, _) = post_raw(
+        &state,
+        "/apps/echo/actions/peek",
+        "dry_run=true",
+        &[("authorization", "Bearer s3cret")],
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    for _ in 0..200 {
+        if !state.runner.is_busy("echo") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    // A wrong Bearer buys nothing: without a CSRF token the POST still fails closed.
+    let (status, _) = post_raw(
+        &state,
+        "/apps/echo/actions/peek",
+        "dry_run=true",
+        &[("authorization", "Bearer wrong")],
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn the_login_endpoint_is_exempt_from_csrf() {
+    // Login carries the auth token itself; with no token configured it redirects home.
+    let (state, _store, _dir) = state(None);
+    let status = post_form_with_csrf(&state, "/login", "token=anything", false).await;
+    assert_ne!(status, StatusCode::FORBIDDEN);
 }

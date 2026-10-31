@@ -16,6 +16,7 @@
       <a href="/settings">Settings</a>
     </nav>
     <form method="post" action="/logout" class="logout">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <button type="submit" class="ghost">Sign out</button>
     </form>
   </header>

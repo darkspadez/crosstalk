@@ -43,7 +43,7 @@ where
 
 /// Where the daemon listens, and how it authenticates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
     /// Interface to bind. Localhost by default, so an unconfigured daemon is not exposed.
     pub bind: String,
@@ -83,7 +83,7 @@ impl ServerConfig {
 
 /// How to reach Dispatcharr.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DispatcharrConfig {
     /// Base URL, without the `/api` suffix: `http://dispatcharr:9191`.
     #[serde(deserialize_with = "string_or_scalar")]
@@ -150,7 +150,7 @@ impl DispatcharrConfig {
 /// One AI provider endpoint. No model names here: a sub-app names the model, the host owns
 /// the connection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AiProviderConfig {
     /// `typesafe` (native System One) or `openai_compat`.
     pub kind: String,
@@ -188,7 +188,7 @@ impl AiProviderConfig {
 
 /// Every configured AI provider, keyed by the name a sub-app refers to.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AiConfig {
     pub providers: BTreeMap<String, AiProviderConfig>,
 }
@@ -204,7 +204,7 @@ impl AiConfig {
 /// These are in the host file, not a sub-app file, because a sub-app that normalised
 /// names differently would match a different candidate for the same channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct MatchingConfig {
     /// Strip `[HD]`, `[4K]`, `(Backup)` and friends before comparing.
     pub ignore_quality_tags: bool,
@@ -277,7 +277,7 @@ impl MatchingConfig {
 
 /// Filesystem and thread-pool settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct JobsConfig {
     /// Worker threads for the matching stage. 0 means "one per core".
     pub worker_threads: usize,
@@ -312,7 +312,7 @@ impl JobsConfig {
 
 /// The host configuration file.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct CrosstalkConfig {
     pub server: ServerConfig,
     pub dispatcharr: DispatcharrConfig,
@@ -386,18 +386,38 @@ impl CrosstalkConfig {
     /// having to bind-mount a file to change one value.
     fn apply_env_overrides(&mut self, env_prefix: &str) -> Result<()> {
         let before = toml::to_string(self).unwrap_or_default();
-        use figment::providers::{Env, Serialized};
+        use figment::providers::Env;
         use figment::Figment;
 
-        let overrides: Figment = Figment::from(Serialized::defaults(&*self))
-            .merge(Env::prefixed(env_prefix).split("__"));
-        let merged: Self = match overrides.extract() {
-            Ok(merged) => merged,
-            Err(error) => {
-                // A malformed override should not silently do nothing.
-                return Err(anyhow::anyhow!("invalid environment override: {error}"));
-            }
-        };
+        // Read the environment as a TOML overlay, then keep only the subtrees that name a
+        // real top-level section. The same prefix namespace also carries secrets consumed
+        // through `*_env` indirection (`CROSSTALK_TOKEN`, `CROSSTALK_DISPATCHARR_API_KEY`),
+        // which are not config paths: with unknown fields now rejected, letting them reach
+        // the merge would fail every load in a container deployment. Unknown keys under a
+        // real section still fail loudly when the overlay is deserialised below.
+        let overlay: toml::Table = Figment::from(Env::prefixed(env_prefix).split("__"))
+            .extract()
+            .map_err(|error| anyhow::anyhow!("invalid environment override: {error}"))?;
+        const SECTIONS: [&str; 6] = [
+            "server",
+            "dispatcharr",
+            "ai",
+            "matching",
+            "jobs",
+            "schedules",
+        ];
+        let overlay: toml::Table = overlay
+            .into_iter()
+            .filter(|(key, _)| SECTIONS.contains(&key.as_str()))
+            .collect();
+
+        let mut base: toml::Table =
+            toml::from_str(&before).context("serialising the configuration for overrides")?;
+        merge_toml_overlay(&mut base, overlay);
+        let merged: Self = base.try_into().map_err(|error| {
+            // A malformed override should not silently do nothing.
+            anyhow::anyhow!("invalid environment override: {error}")
+        })?;
         let dir = std::mem::take(&mut self.config_dir);
         let overrides = self.env_overrides;
         *self = merged;
@@ -682,15 +702,91 @@ pub fn save_with_comments<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     merge_document(&mut document, table);
 
     // Write through a temporary file in the same directory, so an interrupted write cannot
-    // leave a half-written configuration behind.
+    // leave a half-written configuration behind. The temporary file is created 0600: these
+    // files can inline the UI token and the Dispatcharr admin key, so the pre-rename
+    // contents must never be group- or world-readable. The name carries the process id
+    // plus a per-save counter: pid alone is shared by every thread of this process, so
+    // two concurrent saves from the same daemon would otherwise truncate each other.
+    // Creation uses `create_new`: with a pid+counter name a collision means something is
+    // genuinely wrong (a stale temp, a recycled pid), and silently truncating it would
+    // destroy evidence. On collision the save retries once with the next counter value.
+    static SAVE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let directory = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(directory)
         .with_context(|| format!("creating {}", directory.display()))?;
-    let temporary = path.with_extension("toml.tmp");
-    std::fs::write(&temporary, document.to_string())
+    let temp_name = |counter: u64| {
+        directory.join(format!(
+            ".{}.tmp.{}.{}",
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "config".to_string()),
+            std::process::id(),
+            counter,
+        ))
+    };
+    let mut temporary = temp_name(SAVE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    // `create_new` fails when the name already exists rather than truncating it: with a
+    // pid+counter name a collision means something is genuinely wrong, and silently
+    // reusing the file would destroy evidence. Retry once with the next counter value.
+    let mut file = match open_temp(&temporary) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            temporary = temp_name(SAVE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+            open_temp(&temporary).with_context(|| format!("writing {}", temporary.display()))?
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("writing {}", temporary.display()));
+        }
+    };
+    // Every failure from here on removes the temp file: these files can inline the UI
+    // token and the Dispatcharr key, so a half-written temp must never be left behind.
+    let text = document.to_string();
+    if let Err(error) = write_temp(&mut file, &temporary, &text) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    drop(file);
+    if let Err(error) = std::fs::rename(&temporary, path)
+        .with_context(|| format!("renaming {} to {}", temporary.display(), path.display()))
+    {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    // Best effort: fsync the directory so the rename itself survives a crash.
+    if let Ok(dir) = std::fs::File::open(directory) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
+/// Create the save's temporary file, failing when the name is already taken.
+fn open_temp(temporary: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(temporary)?;
+    // `mode` only applies at creation, and `create_new` always creates, so the file is
+    // 0600 from birth; the explicit chmod below is belt and braces for platforms where
+    // the option is ignored.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
+}
+
+/// Write the serialised document and fsync it, so a crash cannot lose a reported save.
+fn write_temp(file: &mut std::fs::File, temporary: &Path, text: &str) -> Result<()> {
+    use std::io::Write;
+    file.write_all(text.as_bytes())
         .with_context(|| format!("writing {}", temporary.display()))?;
-    std::fs::rename(&temporary, path)
-        .with_context(|| format!("renaming {} to {}", temporary.display(), path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("syncing {}", temporary.display()))?;
     Ok(())
 }
 
@@ -699,9 +795,12 @@ pub fn save_with_comments<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 /// Keys are matched by path, so a comment above `[server] port = 8730` survives a change
 /// to the port.
 fn merge_document(target: &mut toml_edit::DocumentMut, source: toml_edit::DocumentMut) {
-    // `prune = false` at the root: a top-level key this struct does not know about (a
-    // section from a newer version, or an operator's own note) is preserved. Nested tables
-    // are pruned, because those are the ones the form can actually edit.
+    // `prune = false` at the root: unknown top-level keys are rejected at load
+    // (`deny_unknown_fields`), so by the time a save merges, a key the structs do not
+    // know about could only have appeared in the file between load and save. Deleting
+    // it here would destroy something the operator just wrote, so the root keeps what
+    // it does not recognise. Nested tables are pruned, because those are the ones the
+    // form can actually edit.
     merge_table(target.as_table_mut(), source.as_table(), false);
 }
 
@@ -735,6 +834,26 @@ fn merge_table(target: &mut toml_edit::Table, source: &toml_edit::Table, prune: 
             }
             (None, _) => {
                 target.insert(key, source_item.clone());
+            }
+        }
+    }
+}
+
+/// Deep-merge an environment overlay into a TOML table, for [`CrosstalkConfig`].
+///
+/// Tables merge key by key so `CROSSTALK_SERVER__PORT` changes one value; anything else
+/// (including arrays) replaces, which is how figment's own merge treats them.
+fn merge_toml_overlay(base: &mut toml::Table, overlay: toml::Table) {
+    for (key, value) in overlay {
+        match (base.get_mut(&key), value) {
+            (Some(toml::Value::Table(existing)), toml::Value::Table(patch)) => {
+                merge_toml_overlay(existing, patch);
+            }
+            (Some(existing), patch) => {
+                *existing = patch;
+            }
+            (None, patch) => {
+                base.insert(key, patch);
             }
         }
     }
@@ -1043,19 +1162,42 @@ base_url = "https://api.typesafe.ai/v1"
     }
 
     #[test]
-    fn saving_preserves_unknown_top_level_keys() {
+    fn unknown_top_level_keys_are_rejected_loudly() {
+        // Strict configs fail on typos instead of silently falling back to defaults: an
+        // unknown section is an error that names the key, not a value that is kept.
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("crosstalk.toml");
         write(
             dir.path(),
             "crosstalk.toml",
             "# operator note\n[future_section]\nthing = 1\n",
         );
-        let config = CrosstalkConfig::load_file(dir.path()).expect("load");
-        config.save(&path).expect("save");
-        let text = std::fs::read_to_string(&path).expect("read");
-        assert!(text.contains("# operator note"), "{text}");
-        assert!(text.contains("[future_section]"), "{text}");
+        let error = CrosstalkConfig::load_file(dir.path()).expect_err("rejects unknown keys");
+        assert!(
+            format!("{error:#}").contains("future_section"),
+            "the error names the key: {error:#}"
+        );
+    }
+
+    #[test]
+    fn unknown_nested_keys_are_rejected_loudly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "crosstalk.toml", "[server]\nportt = 9999\n");
+        let error = CrosstalkConfig::load(dir.path()).expect_err("rejects the typo");
+        assert!(
+            format!("{error:#}").contains("portt"),
+            "the error names the key: {error:#}"
+        );
+
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            "[matching]\ncheck_hourss = 99\n",
+        );
+        let error = CrosstalkConfig::load(dir.path()).expect_err("rejects the typo");
+        assert!(
+            format!("{error:#}").contains("check_hourss"),
+            "the error names the key: {error:#}"
+        );
     }
 
     #[test]
@@ -1201,6 +1343,52 @@ base_url = "https://api.typesafe.ai/v1"
         CrosstalkConfig::default().save(&path).expect("save");
         let text = std::fs::read_to_string(&path).expect("read");
         assert!(text.contains("[server]"), "{text}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_files_are_owner_only() {
+        // These files can inline the UI token and the Dispatcharr admin key.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("crosstalk.toml");
+        CrosstalkConfig::default().save(&path).expect("save");
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "saved with mode {:o}", mode & 0o777);
+        // No temporary file is left behind in the directory.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("list")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
+    fn concurrent_saves_to_the_same_path_all_succeed() {
+        // Two settings POSTs can land at once; pid-only temp names would be shared by
+        // every thread of the daemon and the saves would truncate/rename over each other.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("crosstalk.toml");
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || CrosstalkConfig::default().save(&path))
+            })
+            .collect();
+        for handle in handles {
+            handle
+                .join()
+                .expect("save thread")
+                .expect("every concurrent save succeeds");
+        }
+        CrosstalkConfig::load_file(dir.path()).expect("the surviving file parses");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("list")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
     #[test]

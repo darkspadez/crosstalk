@@ -43,6 +43,16 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             auth::require,
         ))
+        // Outside auth, so a forged cross-site POST fails closed even with no token set.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::csrf::check,
+        ))
+        // Outside CSRF, so a DNS-rebinding Host is rejected before anything trusts it.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::host::check,
+        ))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -59,6 +69,7 @@ struct LoginTemplate {
 #[template(path = "dashboard.html")]
 struct DashboardTemplate {
     version: &'static str,
+    csrf_token: String,
     apps: Vec<UiApp>,
     schedules: Vec<crosstalk_core::scheduler::ScheduleInfo>,
     runs: Vec<RunRecord>,
@@ -69,6 +80,7 @@ struct DashboardTemplate {
 #[template(path = "app.html")]
 struct AppTemplate {
     version: &'static str,
+    csrf_token: String,
     app: UiApp,
     actions: Vec<crate::state::UiAction>,
     running: Option<crosstalk_core::runner::ActiveRun>,
@@ -79,6 +91,7 @@ struct AppTemplate {
 #[template(path = "runs.html")]
 struct RunsTemplate {
     version: &'static str,
+    csrf_token: String,
     runs: Vec<RunRecord>,
 }
 
@@ -86,6 +99,7 @@ struct RunsTemplate {
 #[template(path = "run.html")]
 struct RunTemplate {
     version: &'static str,
+    csrf_token: String,
     run: RunRecord,
     // The embedded panels need the same values as their standalone routes.
     active: Option<crosstalk_core::runner::ActiveRun>,
@@ -96,6 +110,7 @@ struct RunTemplate {
 #[derive(Template)]
 #[template(path = "_run_status.html")]
 struct RunStatusTemplate {
+    csrf_token: String,
     run: RunRecord,
     active: Option<crosstalk_core::runner::ActiveRun>,
     counts: Vec<(String, i64)>,
@@ -111,6 +126,7 @@ struct RowsTemplate {
 #[template(path = "settings.html")]
 struct SettingsTemplate {
     version: &'static str,
+    csrf_token: String,
     saved: bool,
     host_fields: Vec<UiField>,
     apps: Vec<UiSettings>,
@@ -187,6 +203,7 @@ async fn dashboard(State(state): State<AppState>) -> Response {
     let warnings = state.config.validate().warnings;
     DashboardTemplate {
         version: crosstalk_core::HOST_VERSION,
+        csrf_token: state.csrf_token().to_string(),
         apps: state::apps(&state.registry, &state.store),
         schedules: state::schedules(&state.config),
         runs,
@@ -202,6 +219,7 @@ async fn app_page(State(state): State<AppState>, Path(app_id): Path<String>) -> 
 
     AppTemplate {
         version: crosstalk_core::HOST_VERSION,
+        csrf_token: state.csrf_token().to_string(),
         app: UiApp {
             id: app.id().to_string(),
             name: app.name().to_string(),
@@ -223,6 +241,10 @@ async fn app_page(State(state): State<AppState>, Path(app_id): Path<String>) -> 
 struct StartForm {
     #[serde(default)]
     dry_run: Option<String>,
+    /// Server-side confirmation for channel-changing actions, mirroring the CLI's `--yes`.
+    /// The UI's confirm dialog submits it; a forged POST without it is rejected.
+    #[serde(default)]
+    confirm: Option<String>,
 }
 
 async fn start_action(
@@ -233,6 +255,16 @@ async fn start_action(
     let Some((_app, action)) = state.registry.find_action(&app_id, &action_id) else {
         return (StatusCode::NOT_FOUND, "no such action\n").into_response();
     };
+
+    // Write/Destructive actions need a server-side confirmation, not just the browser's
+    // confirm() dialog: without it, any page the operator visits could trigger an apply.
+    if action.kind.requires_confirmation() && form.confirm.as_deref() != Some("true") {
+        return (
+            StatusCode::BAD_REQUEST,
+            "this action changes data: resubmit the form with confirm=true\n",
+        )
+            .into_response();
+    }
 
     // The form says whether the button was a preview; the action's kind is the authority, so a
     // preview action stays a preview even if the form is tampered with.
@@ -252,6 +284,7 @@ async fn start_action(
 async fn runs_page(State(state): State<AppState>) -> Response {
     RunsTemplate {
         version: crosstalk_core::HOST_VERSION,
+        csrf_token: state.csrf_token().to_string(),
         runs: state.store.recent_runs(100).unwrap_or_default(),
     }
     .into_response()
@@ -265,6 +298,7 @@ async fn run_page(State(state): State<AppState>, Path(id): Path<i64>) -> Respons
     match load_run(&state, id).await {
         Some(run) => RunTemplate {
             version: crosstalk_core::HOST_VERSION,
+            csrf_token: state.csrf_token().to_string(),
             counts: state::counts(&run),
             active: state
                 .runner
@@ -289,6 +323,7 @@ async fn run_status(State(state): State<AppState>, Path(id): Path<i64>) -> Respo
         .into_iter()
         .find(|entry| entry.run_id == id);
     RunStatusTemplate {
+        csrf_token: state.csrf_token().to_string(),
         counts: state::counts(&run),
         run,
         active,
@@ -348,6 +383,7 @@ async fn settings_page(
     let saved = query.get("saved").is_some_and(|value| value == "1");
     SettingsTemplate {
         version: crosstalk_core::HOST_VERSION,
+        csrf_token: state.csrf_token().to_string(),
         saved,
         host_fields: state::fields(
             &crosstalk_core::config::matching_schema(),
@@ -485,6 +521,7 @@ async fn save_app_settings(
         Err(errors) => {
             return SettingsTemplate {
                 version: crosstalk_core::HOST_VERSION,
+                csrf_token: state.csrf_token().to_string(),
                 saved: false,
                 host_fields: state::fields(
                     &crosstalk_core::config::matching_schema(),
@@ -500,6 +537,7 @@ async fn save_app_settings(
     if let Err(error) = app.save_settings(&path, &values) {
         return SettingsTemplate {
             version: crosstalk_core::HOST_VERSION,
+            csrf_token: state.csrf_token().to_string(),
             saved: false,
             host_fields: state::fields(
                 &crosstalk_core::config::matching_schema(),

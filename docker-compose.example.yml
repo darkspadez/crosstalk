@@ -20,6 +20,9 @@ services:
     image: crosstalk:latest
     container_name: crosstalk
     restart: unless-stopped
+    # Longer than the daemon's 30s run drain: Docker's default 10s kill would SIGKILL an
+    # apply mid-`batch_set_epg` instead of letting it finish or cancel cleanly.
+    stop_grace_period: 40s
     ports:
       - "8730:8730"
     volumes:

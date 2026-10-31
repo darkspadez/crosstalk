@@ -9,6 +9,8 @@
 //! sent as a cookie by the login page or as an `Authorization: Bearer` header by a script.
 
 pub mod auth;
+pub mod csrf;
+pub mod host;
 pub mod routes;
 pub mod state;
 

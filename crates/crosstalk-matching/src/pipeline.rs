@@ -905,7 +905,10 @@ impl Matcher {
                 }
             }
 
-            let (fuzzy_score, fuzzy_components) = match fuzzy.get(&candidate) {
+            // The fuzzy map is keyed by representative (the plugin keys its results by
+            // NAME), so every entry sharing a name inherits that name's fuzzy score.
+            let (fuzzy_score, fuzzy_components) = match fuzzy.get(&index.representative(candidate))
+            {
                 Some((score, method)) => (*score, vec![method.component()]),
                 None => (0, Vec::new()),
             };
@@ -1165,6 +1168,33 @@ mod tests {
         let index = index_for(&m, &["ESPN", "ESPN Alt"]);
         let ranked = m.match_all_streams_all("ESPN", &index, &[]);
         assert_eq!(index.name(ranked[0].index), "ESPN");
+    }
+
+    #[test]
+    fn duplicate_names_share_the_fuzzy_score() {
+        // Two guide entries with the same name (the same channel in two sources): the
+        // plugin keys fuzzy scores by name, so both entries inherit it.
+        let m = matcher();
+        let index = index_for(&m, &["ESPN", "ESPN"]);
+        let scored = m.score_candidates("ESPN HD", &index, &[], None);
+        assert_eq!(scored.len(), 2, "{scored:?}");
+        assert_eq!(scored[0].score, scored[1].score);
+        assert_eq!(scored[0].score, 100);
+        assert!(
+            scored.iter().all(|entry| entry.components == vec!["Fuzzy"]),
+            "both carry the fuzzy component: {scored:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_names_still_produce_one_match_entry() {
+        // `match_all_streams` collapses by name: one entry per name, the first index.
+        // This documents that the H6 fix changes scoring, not the match-set shape.
+        let m = matcher();
+        let index = index_for(&m, &["ESPN", "ESPN"]);
+        let ranked = m.match_all_streams("ESPN HD", &index, &[]);
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].index, 0);
     }
 
     #[test]

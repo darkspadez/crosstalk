@@ -185,7 +185,8 @@ fn serve(args: ServeArgs) -> Result<()> {
         let scheduler =
             crosstalk_core::scheduler::Scheduler::start(runner.clone(), &config).await?;
 
-        let state = crosstalk_web::AppState::new(registry, Arc::clone(&config), runner, store);
+        let state =
+            crosstalk_web::AppState::new(registry, Arc::clone(&config), runner.clone(), store);
         let app = crosstalk_web::router(state);
 
         let address = format!("{}:{}", config.server.bind, config.server.port);
@@ -212,9 +213,34 @@ fn serve(args: ServeArgs) -> Result<()> {
             .await
             .context("serving the daemon")?;
 
+        // Stop the runs before the scheduler: cancelling first means no run dies
+        // mid-`batch_set_epg` with the runtime torn down underneath it, and the drain
+        // wait gives in-flight applies a chance to finish or cancel cleanly.
+        runner.shutdown();
+        wait_for_drain(&runner, std::time::Duration::from_secs(30)).await;
+
         scheduler.shutdown().await;
         Ok(())
     })
+}
+
+/// Wait until no runs are in flight, or `timeout` elapses (logged, then shutdown proceeds).
+///
+/// The serve path calls this after [`JobRunner::shutdown`]: shutdown sets every cancel flag,
+/// and this gives the runs a bounded window to observe it before the scheduler stops and the
+/// runtime is torn down.
+async fn wait_for_drain(runner: &JobRunner, timeout: std::time::Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    while !runner.running().is_empty() {
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(
+                "shutting down with {} run(s) still active after {timeout:?}",
+                runner.running().len()
+            );
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 /// Install the log subscriber.
@@ -389,4 +415,37 @@ fn validate(args: ConfigArgs) -> Result<()> {
     }
     println!("ok");
     Ok(())
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+
+    fn idle_runner() -> JobRunner {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = Arc::new(CrosstalkConfig::load(dir.path()).expect("config"));
+        let store = Store::in_memory().expect("store");
+        JobRunner::new(registry::builtin(), config, store)
+    }
+
+    #[tokio::test]
+    async fn drain_returns_immediately_when_nothing_runs() {
+        let runner = idle_runner();
+        assert!(runner.running().is_empty());
+        // Would hang until the timeout if the loop condition were inverted.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            wait_for_drain(&runner, std::time::Duration::from_secs(30)),
+        )
+        .await
+        .expect("an idle runner drains at once");
+    }
+
+    #[tokio::test]
+    async fn shutdown_then_drain_refuses_new_runs() {
+        let runner = idle_runner();
+        runner.shutdown();
+        wait_for_drain(&runner, std::time::Duration::from_secs(5)).await;
+        assert!(runner.start("janitor", "automatch_preview", true).is_err());
+    }
 }

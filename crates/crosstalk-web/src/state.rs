@@ -21,6 +21,8 @@ pub struct AppState {
     pub runner: JobRunner,
     pub store: Store,
     token: Option<String>,
+    /// Random secret generated at startup; every POST form carries it back.
+    csrf_token: String,
 }
 
 impl std::fmt::Debug for AppState {
@@ -49,12 +51,18 @@ impl AppState {
             runner,
             store,
             token,
+            csrf_token: crate::csrf::generate_token(),
         }
     }
 
     /// The token a request must present, if any.
     pub fn token(&self) -> Option<&str> {
         self.token.as_deref()
+    }
+
+    /// The CSRF secret POSTs must carry back, via form field or header.
+    pub fn csrf_token(&self) -> &str {
+        &self.csrf_token
     }
 }
 

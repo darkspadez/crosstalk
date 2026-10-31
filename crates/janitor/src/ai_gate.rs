@@ -92,7 +92,16 @@ impl GateOutcome {
 ///
 /// Returns the slice of `scored` worth sending, and why. Empty when the heuristics are
 /// confident enough that a request would be wasted.
-pub fn shortlist(scored: &[Scored], settings: &AiSettings) -> Option<(GateReason, Vec<usize>)> {
+///
+/// The shortlist holds one position per candidate NAME: guide listings routinely carry the
+/// same name under several entries (regional duplicates), and offering the model the same
+/// name twice spends tokens without adding information. The first position in score order
+/// wins each name, so the kept entry is the highest-scored one.
+pub fn shortlist(
+    scored: &[Scored],
+    entries: &[EpgEntry],
+    settings: &AiSettings,
+) -> Option<(GateReason, Vec<usize>)> {
     if !settings.enabled || scored.is_empty() {
         return None;
     }
@@ -100,7 +109,10 @@ pub fn shortlist(scored: &[Scored], settings: &AiSettings) -> Option<(GateReason
     let best = scored[0].score;
     let in_band = best >= settings.verify_band_low && best <= settings.verify_band_high;
     if in_band {
-        return Some((GateReason::Verify, take(scored, settings.shortlist)));
+        return Some((
+            GateReason::Verify,
+            take_unique(scored, entries, settings.shortlist),
+        ));
     }
 
     if settings.rescue && best < settings.verify_band_low {
@@ -108,23 +120,41 @@ pub fn shortlist(scored: &[Scored], settings: &AiSettings) -> Option<(GateReason
             .iter()
             .enumerate()
             .filter(|(_, candidate)| candidate.score >= settings.rescue_floor)
-            .take(settings.shortlist)
             .map(|(position, _)| position)
             .collect();
-        if !eligible.is_empty() {
-            return Some((GateReason::Rescue, eligible));
+        let offered = dedupe_names(scored, entries, &eligible, settings.shortlist);
+        if !offered.is_empty() {
+            return Some((GateReason::Rescue, offered));
         }
     }
 
     None
 }
 
-fn take(scored: &[Scored], limit: usize) -> Vec<usize> {
-    scored
+/// Up to `limit` positions from the head of `scored`, in order, keeping the first
+/// position seen for each candidate name.
+fn take_unique(scored: &[Scored], entries: &[EpgEntry], limit: usize) -> Vec<usize> {
+    let all: Vec<usize> = (0..scored.len().min(limit.max(1))).collect();
+    dedupe_names(scored, entries, &all, limit)
+}
+
+fn dedupe_names(
+    scored: &[Scored],
+    entries: &[EpgEntry],
+    candidates: &[usize],
+    limit: usize,
+) -> Vec<usize> {
+    let mut seen = std::collections::HashSet::new();
+    candidates
         .iter()
+        .copied()
+        .filter(|position| {
+            scored
+                .get(*position)
+                .and_then(|candidate| entries.get(candidate.index))
+                .is_some_and(|entry| seen.insert(entry.name.clone()))
+        })
         .take(limit.max(1))
-        .enumerate()
-        .map(|(position, _)| position)
         .collect()
 }
 
@@ -165,12 +195,19 @@ pub fn build_request(
         .filter_map(|position| {
             let candidate = scored.get(*position)?;
             let entry = entries.get(candidate.index)?;
-            Some(serde_json::json!({
+            let mut payload = serde_json::json!({
                 "id": format!("candidate_{}", candidate.index),
                 "name": entry.name,
                 "score": candidate.score,
                 "method": candidate.method_label(),
-            }))
+                "tvg_id": entry.tvg_id,
+            });
+            // The source id is what the model needs to tell two same-name entries apart;
+            // the source NAME is not plumbed this far, so the id is what is offered.
+            if let Some(source) = entry.epg_source {
+                payload["epg_source"] = serde_json::json!(source);
+            }
+            Some(payload)
         })
         .collect();
 
@@ -451,19 +488,29 @@ mod tests {
         }
     }
 
+    fn named_entries(names: &[&str]) -> Vec<EpgEntry> {
+        names
+            .iter()
+            .enumerate()
+            .map(|(position, name)| entry(position as i64, name))
+            .collect()
+    }
+
     #[test]
     fn a_confident_match_never_reaches_the_model() {
+        let entries = named_entries(&["A", "B"]);
         let ranked = vec![scored(100, 0), scored(70, 1)];
-        assert_eq!(shortlist(&ranked, &settings()), None);
+        assert_eq!(shortlist(&ranked, &entries, &settings()), None);
 
         let ranked = vec![scored(95, 0)];
-        assert_eq!(shortlist(&ranked, &settings()), None);
+        assert_eq!(shortlist(&ranked, &entries, &settings()), None);
     }
 
     #[test]
     fn a_score_inside_the_band_asks_for_verification() {
+        let entries = named_entries(&["A", "B", "C", "D"]);
         let ranked = vec![scored(90, 0), scored(85, 1), scored(70, 2), scored(65, 3)];
-        let (reason, offered) = shortlist(&ranked, &settings()).expect("asks");
+        let (reason, offered) = shortlist(&ranked, &entries, &settings()).expect("asks");
         assert_eq!(reason, GateReason::Verify);
         // Bounded by the shortlist size.
         assert_eq!(offered, vec![0, 1, 2]);
@@ -471,8 +518,9 @@ mod tests {
 
     #[test]
     fn a_low_score_with_nothing_in_the_band_asks_for_rescue() {
+        let entries = named_entries(&["A", "B", "C"]);
         let ranked = vec![scored(70, 0), scored(65, 1), scored(40, 2)];
-        let (reason, offered) = shortlist(&ranked, &settings()).expect("asks");
+        let (reason, offered) = shortlist(&ranked, &entries, &settings()).expect("asks");
         assert_eq!(reason, GateReason::Rescue);
         assert_eq!(
             offered,
@@ -483,28 +531,55 @@ mod tests {
 
     #[test]
     fn nothing_above_the_rescue_floor_is_not_sent() {
+        let entries = named_entries(&["A", "B"]);
         let ranked = vec![scored(40, 0), scored(20, 1)];
-        assert_eq!(shortlist(&ranked, &settings()), None);
+        assert_eq!(shortlist(&ranked, &entries, &settings()), None);
     }
 
     #[test]
     fn rescue_can_be_turned_off() {
+        let entries = named_entries(&["A"]);
         let ranked = vec![scored(70, 0)];
         let settings = AiSettings {
             rescue: false,
             ..settings()
         };
-        assert_eq!(shortlist(&ranked, &settings), None);
+        assert_eq!(shortlist(&ranked, &entries, &settings), None);
     }
 
     #[test]
     fn disabled_ai_sends_nothing() {
+        let entries = named_entries(&["A"]);
         let ranked = vec![scored(90, 0)];
         let settings = AiSettings {
             enabled: false,
             ..settings()
         };
-        assert_eq!(shortlist(&ranked, &settings), None);
+        assert_eq!(shortlist(&ranked, &entries, &settings), None);
+    }
+
+    #[test]
+    fn duplicate_names_are_offered_once_with_the_best_score_first() {
+        // Two guide entries share a name; the shortlist must not spend two slots on it.
+        let entries = vec![
+            entry(10, "ESPN"),
+            entry(11, "ESPN"),
+            entry(12, "ESPN 2"),
+            entry(13, "ESPN 2"),
+        ];
+        let ranked = vec![scored(90, 0), scored(89, 1), scored(88, 2), scored(87, 3)];
+        let (reason, offered) = shortlist(&ranked, &entries, &settings()).expect("asks");
+        assert_eq!(reason, GateReason::Verify);
+        assert_eq!(offered, vec![0, 2], "one position per name, best first");
+    }
+
+    #[test]
+    fn rescue_dedupes_names_too() {
+        let entries = vec![entry(10, "ESPN"), entry(11, "ESPN"), entry(12, "Other")];
+        let ranked = vec![scored(70, 0), scored(69, 1), scored(65, 2)];
+        let (reason, offered) = shortlist(&ranked, &entries, &settings()).expect("asks");
+        assert_eq!(reason, GateReason::Rescue);
+        assert_eq!(offered, vec![0, 2]);
     }
 
     #[test]
@@ -521,6 +596,11 @@ mod tests {
         );
         assert_eq!(request.state["channel"]["callsign"], "KGO");
         assert_eq!(request.state["candidates"][0]["name"], "ABC San Francisco");
+        assert_eq!(
+            request.state["candidates"][0]["tvg_id"], "tvg10",
+            "the model needs the tvg_id to tell same-name entries apart"
+        );
+        assert_eq!(request.state["candidates"][0]["epg_source"], 4);
         // A noul and a choice per candidate, plus the companion question.
         assert!(request.questions.contains_key("same_0"));
         assert!(request.questions.contains_key("same_1"));

@@ -4,3 +4,14 @@ reference
 .remember
 docs
 *.db
+# Operator config may inline the UI token and the Dispatcharr key: never send it in the
+# build context. The commented examples are still needed by the Dockerfile's config copy.
+config/*.toml
+!config/*.example.toml
+# Save temp files are `.{name}.tmp.{pid}.{counter}` inside the config dir; exports are
+# dated reports. Neither belongs in the build context.
+config/.*.tmp.*
+config/*.toml.tmp.*
+config/exports/
+.env
+docker-compose.yml

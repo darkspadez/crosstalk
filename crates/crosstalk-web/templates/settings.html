@@ -7,6 +7,7 @@
 <section class="card">
   <h2>Host</h2>
   <form method="post" action="/settings/host">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     {% for field in host_fields %}
       {% if field.is_section %}
       <h3>{{ field.label }}</h3>
@@ -34,6 +35,7 @@
   <h2>{{ app.name }}</h2>
   {% if let Some(error) = app.error %}<p class="error">{{ error }}</p>{% endif %}
   <form method="post" action="/settings/{{ app.id }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     {% for field in app.fields %}
       {% if field.is_section %}
       <h3>{{ field.label }}</h3>

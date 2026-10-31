@@ -233,7 +233,7 @@ pub async fn run(
         let gate = if already_confident {
             None
         } else {
-            ai_gate::shortlist(&ranked, &settings.ai)
+            ai_gate::shortlist(&ranked, &scoped_entries.entries, &settings.ai)
         };
 
         let mut ai_outcome = None;
@@ -258,11 +258,26 @@ pub async fn run(
             }
         }
 
-        // An accepted AI candidate replaces the heuristic search order: the model's pick is
-        // the one to validate, and if it has no programmes the channel is left alone.
+        // An accepted AI candidate replaces the heuristic search order: the model's pick
+        // names a channel, and every same-name entry is validated in ranked order, because
+        // guide listings routinely carry the picked name under several entries and only
+        // the ones with programme data are usable. The first live duplicate wins, even
+        // when the exact picked entry is empty.
         if let Some((_outcome, Some(position))) = ai_outcome.clone() {
-            if let Some(candidate) = ranked.get(position) {
-                if let Some(entry) = scoped_entries.entries.get(candidate.index) {
+            let picked_name = ranked.get(position).and_then(|candidate| {
+                scoped_entries
+                    .entries
+                    .get(candidate.index)
+                    .map(|entry| entry.name.clone())
+            });
+            if let Some(picked_name) = picked_name {
+                for candidate in &ranked {
+                    let Some(entry) = scoped_entries.entries.get(candidate.index) else {
+                        continue;
+                    };
+                    if entry.name != picked_name {
+                        continue;
+                    }
                     let has = if allow_without_programs {
                         HasPrograms::Yes
                     } else {
@@ -276,16 +291,20 @@ pub async fn run(
                     };
                     if has == HasPrograms::Yes {
                         chosen = Some((candidate, entry, has));
-                    } else {
-                        // The model said yes and the guide is empty: say that, rather than
-                        // reusing the "below threshold" wording the score would suggest.
-                        best_rejected = Some(candidate.score);
-                        row.reason = format!(
-                            "The AI accepted {} (score {}%) but it carries no programme data \
-                             in the checked window",
-                            entry.name, candidate.score
-                        );
+                        break;
                     }
+                }
+                if chosen.is_none() {
+                    // The model said yes and every same-name guide is empty: say that,
+                    // rather than reusing the "below threshold" wording the score would
+                    // suggest.
+                    let score = ranked.get(position).map(|candidate| candidate.score);
+                    best_rejected = score;
+                    row.reason = format!(
+                        "The AI accepted {picked_name} (score {}%) but it carries no programme data \
+                         in the checked window",
+                        score.unwrap_or(0),
+                    );
                 }
             }
             if let Some(outcome) = ai_outcome.as_ref() {
@@ -353,13 +372,18 @@ pub async fn run(
             }
         }
 
-        row.reason = reason_for(
-            &row,
-            threshold,
-            best_rejected,
-            allow_without_programs,
-            ranked.first().map(|entry| entry.score),
-        );
+        // A skipped channel and an AI-accepted-but-empty channel already carry their
+        // explanation; generating the generic wording over them would lose which case
+        // this was.
+        if row.reason.is_empty() {
+            row.reason = reason_for(
+                &row,
+                threshold,
+                best_rejected,
+                allow_without_programs,
+                ranked.first().map(|entry| entry.score),
+            );
+        }
         rows.push(row);
 
         if rows.len() % 200 == 0 {
@@ -1078,6 +1102,145 @@ mod tests {
             espn.ai_decision.is_some(),
             "the decision is recorded even when it is no"
         );
+    }
+
+    #[tokio::test]
+    async fn an_ai_accept_falls_through_to_a_live_same_name_duplicate() {
+        // Two guide entries share one name; the picked (first-ranked) entry is empty but
+        // the duplicate carries programmes. The channel must match the duplicate, not be
+        // left alone because the exact picked entry is empty.
+        let server = MockServer::start().await;
+        let channel_name = "ABC WABC - IL Springfield";
+        let entry_name = "XYZ WABC - IL Shelbyville";
+        Mock::given(method("GET"))
+            .and(path("/api/channels/channels/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": 1, "name": channel_name, "channel_number": 101, "channel_group_id": 10}
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/channels/groups/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!([{"id": 10, "name": "Sports"}])),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/channels/profiles/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/epg/sources/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": 4, "name": "Schedules Direct", "is_active": true, "priority": 5}
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/epg/epgdata/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": 7, "name": entry_name, "tvg_id": "espn-empty.us", "epg_source": 4},
+                {"id": 8, "name": entry_name, "tvg_id": "espn-live.us", "epg_source": 4}
+            ])))
+            .mount(&server)
+            .await;
+        // Only the duplicate carries programmes; the picked entry is empty.
+        Mock::given(method("GET"))
+            .and(path("/api/epg/programs/search/"))
+            .and(query_param("tvg_id", "espn-live.us"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "count": 1,
+                "results": [{"id": 42}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/epg/programs/search/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "count": 0,
+                "results": []
+            })))
+            .mount(&server)
+            .await;
+
+        let world = World {
+            channels: vec![Channel {
+                id: 1,
+                name: channel_name.to_string(),
+                channel_number: Some(serde_json::json!(101)),
+                channel_group_id: Some(10),
+                ..Channel::default()
+            }],
+            groups: vec![ChannelGroup {
+                id: 10,
+                name: "Sports".to_string(),
+            }],
+            sources: vec![EpgSource {
+                id: 4,
+                name: "Schedules Direct".to_string(),
+                is_active: true,
+                priority: 5,
+            }],
+            entries: vec![
+                EpgEntry {
+                    id: 7,
+                    name: entry_name.to_string(),
+                    tvg_id: "espn-empty.us".to_string(),
+                    epg_source: Some(4),
+                },
+                EpgEntry {
+                    id: 8,
+                    name: entry_name.to_string(),
+                    tvg_id: "espn-live.us".to_string(),
+                    epg_source: Some(4),
+                },
+            ],
+            ..World::default()
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = crosstalk_core::CrosstalkConfig::load(dir.path()).expect("config");
+        config.dispatcharr.base_url = server.uri();
+        config.dispatcharr.api_key = "test-key".to_string();
+        let exports = dir.path().join("exports");
+        config.jobs.exports_dir = exports.display().to_string();
+        let client = DispatcharrClient::new(&config.dispatcharr).expect("client");
+        let context = JobContext::new(
+            std::sync::Arc::new(config),
+            std::sync::Arc::new(VecSink::new()),
+        )
+        .with_dispatcharr(client);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (service, settings) = ai_settings(0.95, Arc::clone(&calls));
+        let (channels, entries) = scoped(&world);
+
+        let result = run(
+            &context,
+            &settings,
+            Some(&service),
+            &world,
+            &channels,
+            &entries,
+            true,
+        )
+        .await
+        .expect("preview");
+        assert!(calls.load(Ordering::SeqCst) >= 1, "the model was asked");
+        let row = result
+            .rows
+            .iter()
+            .find(|row| row.channel_name == channel_name)
+            .expect("row");
+        assert_eq!(
+            row.epg_data_id,
+            Some(8),
+            "the live duplicate wins over the empty picked entry"
+        );
+        assert!(row.method.contains("+ AI"), "{}", row.method);
     }
 
     #[tokio::test]

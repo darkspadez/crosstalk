@@ -2,6 +2,13 @@
 /target
 **/*.rs.bk
 
+# Live secrets and local compose overrides: the docs tell users to create these
+.env
+docker-compose.yml
+
+# Python bytecode
+__pycache__/
+
 # Local config with credentials
 /config/crosstalk.toml
 /config/janitor.toml
@@ -13,6 +20,7 @@
 *.db-shm
 *.db-wal
 /exports/
+config/exports/
 /data/local/
 
 # Reference copy of the Python plugin (its own repository, kept out of this one)

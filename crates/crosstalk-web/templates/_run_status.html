@@ -14,6 +14,7 @@
 {% endif %}
 {% if run.status.is_running() %}
 <form method="post" action="/runs/{{ run.id }}/cancel" class="inline">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
   <button type="submit" class="ghost">Cancel this run</button>
 </form>
 {% endif %}

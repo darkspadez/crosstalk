@@ -12,7 +12,7 @@ use std::path::Path;
 
 /// How the AI verifier behaves.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AiSettings {
     /// Ask the model about borderline or unmatched channels.
     pub enabled: bool,
@@ -57,11 +57,11 @@ impl Default for AiSettings {
 
 /// Everything `janitor.toml` holds.
 ///
-/// The `Default` impl is written out rather than derived, because `#[serde(default)]` takes
-/// missing fields from it: a derived one would silently give every threshold 0, which is a
-/// valid-looking configuration that rejects nothing.
+/// The `Default` impl is written out rather than derived: `#[serde(default)]` fills
+/// missing fields from it, so a derived one would silently default every threshold to 0,
+/// which is a valid-looking configuration that rejects nothing.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct JanitorSettings {
     /// Profile names to scope to, comma-separated. The first one is used by actions that
     /// need exactly one.
@@ -725,6 +725,25 @@ mod tests {
 
         let loaded = load(&path).expect("load");
         assert_eq!(loaded.check_hours, 6);
+    }
+
+    #[test]
+    fn unknown_keys_are_rejected_loudly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("janitor.toml");
+        std::fs::write(&path, "check_hourss = 99\n").expect("seed");
+        let error = load(&path).expect_err("rejects the typo");
+        assert!(
+            format!("{error:#}").contains("check_hourss"),
+            "the error names the key: {error:#}"
+        );
+
+        std::fs::write(&path, "[ai]\nenabeld = true\n").expect("seed");
+        let error = load(&path).expect_err("rejects the typo");
+        assert!(
+            format!("{error:#}").contains("enabeld"),
+            "the error names the key: {error:#}"
+        );
     }
 
     #[test]

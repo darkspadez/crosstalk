@@ -211,17 +211,21 @@ pub async fn run(
         };
 
         // Exclude the entry already assigned: proposing the same broken guide is not a fix.
+        // Walk every ranked candidate and remember the first one that carries programme
+        // data, regardless of score (mirroring the plugin's `_find_best_epg_match`): the
+        // threshold decides Healed vs SkippedLowConfidence below, never whether the
+        // replacement is recorded at all.
         let candidates = matcher.score_candidates(&channel.name, &index, &tag_refs, None);
         let mut chosen = None;
         for candidate in &candidates {
+            if context.is_cancelled() {
+                anyhow::bail!("cancelled by the operator");
+            }
             let Some(entry) = scoped_entries.entries.get(candidate.index) else {
                 continue;
             };
             if entry.id == original_id {
                 continue;
-            }
-            if candidate.score < threshold {
-                break;
             }
             if allow_without_programs {
                 chosen = Some((candidate, entry));
@@ -247,11 +251,16 @@ pub async fn run(
             row.new_epg_source = Some(source_name(entry.epg_source));
             row.confidence = candidate.score;
             row.method = candidate.method_label();
+            // A preview records every replacement it found, whatever the score, exactly
+            // as the plugin does: the threshold only decides what an APPLY writes.
+            // Only an apply splits Healed (>= threshold) from SkippedLowConfidence.
             row.status = if dry_run {
                 HealStatus::ReplacementPreview
             } else if candidate.score >= threshold {
                 HealStatus::Healed
             } else {
+                // Recorded with its real score, but never applied: only Healed rows are
+                // written in step 3 below.
                 HealStatus::SkippedLowConfidence
             };
         }
@@ -431,6 +440,11 @@ pub fn outcome(result: &HealOutcome, dry_run: bool, threshold: u8) -> JobOutcome
         .iter()
         .filter(|row| row.status == HealStatus::Healed)
         .count();
+    let low_confidence = result
+        .rows
+        .iter()
+        .filter(|row| row.status == HealStatus::SkippedLowConfidence)
+        .count();
 
     let mut summary = format!(
         "Scan & Heal {}: scanned {}, {} broken, {} replacement(s) found",
@@ -439,6 +453,9 @@ pub fn outcome(result: &HealOutcome, dry_run: bool, threshold: u8) -> JobOutcome
         result.broken,
         result.replacements
     );
+    if low_confidence > 0 {
+        summary.push_str(&format!(", {low_confidence} below threshold"));
+    }
     if dry_run {
         let would_apply = result
             .rows
@@ -457,6 +474,7 @@ pub fn outcome(result: &HealOutcome, dry_run: bool, threshold: u8) -> JobOutcome
         .with_count("scanned", result.scanned as i64)
         .with_count("broken", result.broken as i64)
         .with_count("replacements", result.replacements as i64)
+        .with_count("low_confidence", low_confidence as i64)
         .with_count("healed", high_confidence as i64)
         .with_count("applied", result.applied as i64);
     if let Some(report) = result.report.clone() {
@@ -478,12 +496,31 @@ mod tests {
         old_has_programs: bool,
         new_has_programs: bool,
     ) -> (MockServer, World, JobContext) {
+        fixture_with_names(
+            "ESPN HD",
+            "ESPN (broken)",
+            "ESPN",
+            old_has_programs,
+            new_has_programs,
+        )
+        .await
+    }
+
+    /// [`fixture`] with caller-chosen names, so a test can arrange a replacement that
+    /// scores below the threshold (a structural-only signal, not a name match).
+    async fn fixture_with_names(
+        channel_name: &str,
+        old_name: &str,
+        new_name: &str,
+        old_has_programs: bool,
+        new_has_programs: bool,
+    ) -> (MockServer, World, JobContext) {
         let server = MockServer::start().await;
 
         Mock::given(method("GET"))
             .and(path("/api/channels/channels/"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {"id": 1, "name": "ESPN HD", "channel_number": 101, "channel_group_id": 10, "epg_data_id": 7}
+                {"id": 1, "name": channel_name, "channel_number": 101, "channel_group_id": 10, "epg_data_id": 7}
             ])))
             .mount(&server)
             .await;
@@ -510,8 +547,8 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/epg/epgdata/"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {"id": 7, "name": "ESPN (broken)", "tvg_id": "old.us", "epg_source": 4},
-                {"id": 8, "name": "ESPN", "tvg_id": "new.us", "epg_source": 4}
+                {"id": 7, "name": old_name, "tvg_id": "old.us", "epg_source": 4},
+                {"id": 8, "name": new_name, "tvg_id": "new.us", "epg_source": 4}
             ])))
             .mount(&server)
             .await;
@@ -548,7 +585,7 @@ mod tests {
         let world = World {
             channels: vec![Channel {
                 id: 1,
-                name: "ESPN HD".to_string(),
+                name: channel_name.to_string(),
                 channel_number: Some(serde_json::json!(101)),
                 channel_group_id: Some(10),
                 epg_data_id: Some(7),
@@ -567,13 +604,13 @@ mod tests {
             entries: vec![
                 EpgEntry {
                     id: 7,
-                    name: "ESPN (broken)".to_string(),
+                    name: old_name.to_string(),
                     tvg_id: "old.us".to_string(),
                     epg_source: Some(4),
                 },
                 EpgEntry {
                     id: 8,
-                    name: "ESPN".to_string(),
+                    name: new_name.to_string(),
                     tvg_id: "new.us".to_string(),
                     epg_source: Some(4),
                 },
@@ -661,6 +698,55 @@ mod tests {
             "an unprovable replacement is not written"
         );
         assert_eq!(result.rows[0].reason, "No working replacement EPG found");
+    }
+
+    #[tokio::test]
+    async fn a_sub_threshold_replacement_is_recorded_but_never_applied() {
+        // "KOMO News" against "KOMO 4 News Seattle" scores a structural-only 50: a
+        // working replacement that clears nothing near the default 95 threshold.
+        let (_server, world, context) = fixture_with_names(
+            "KOMO News",
+            "KOMO (broken)",
+            "KOMO 4 News Seattle",
+            false,
+            true,
+        )
+        .await;
+        let settings = JanitorSettings::default();
+        let (channels, entries) = scoped(&world);
+        assert!(settings.heal_confidence_threshold > 50);
+
+        let result = run(&context, &settings, &world, &channels, &entries, false)
+            .await
+            .expect("apply");
+        assert_eq!(result.broken, 1);
+        let row = &result.rows[0];
+        assert_eq!(row.status, HealStatus::SkippedLowConfidence);
+        assert_eq!(row.new_epg_id, Some(8), "the replacement is recorded");
+        assert_eq!(row.new_epg_name.as_deref(), Some("KOMO 4 News Seattle"));
+        assert!(
+            row.confidence < settings.heal_confidence_threshold && row.confidence > 0,
+            "the real sub-threshold score is kept, got {}",
+            row.confidence
+        );
+        assert_eq!(
+            result.applied, 0,
+            "a low-confidence replacement is not written"
+        );
+        assert_eq!(result.replacements, 1, "it still counts as found");
+        assert!(row.reason.contains("below threshold"), "{}", row.reason);
+
+        // A preview records the replacement too, whatever the score: only an apply
+        // splits Healed from SkippedLowConfidence.
+        let preview = run(&context, &settings, &world, &channels, &entries, true)
+            .await
+            .expect("preview");
+        assert_eq!(preview.rows[0].status, HealStatus::ReplacementPreview);
+        assert_eq!(preview.rows[0].new_epg_id, Some(8));
+        assert_eq!(preview.applied, 0);
+        let recorded = outcome(&preview, true, settings.heal_confidence_threshold);
+        assert_eq!(recorded.counts.get("replacements"), Some(&1));
+        assert_eq!(recorded.counts.get("applied"), Some(&0));
     }
 
     fn row(status: HealStatus, confidence: u8) -> HealRow {
