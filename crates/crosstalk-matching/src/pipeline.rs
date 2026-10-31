@@ -398,7 +398,7 @@ impl Matcher {
             }
         }
 
-        matches.sort_by(|a, b| b.score.cmp(&a.score));
+        matches.sort_by_key(|entry| std::cmp::Reverse(entry.score));
         matches
     }
 
@@ -825,7 +825,7 @@ impl Matcher {
         }
 
         // Stable, so equal scores keep the candidate order, as Python's `list.sort` does.
-        scored.sort_by(|a, b| b.score.cmp(&a.score));
+        scored.sort_by_key(|entry| std::cmp::Reverse(entry.score));
         scored
     }
 }
