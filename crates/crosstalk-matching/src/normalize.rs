@@ -22,58 +22,16 @@
 //!   * Hyphens become spaces before the provider-prefix table runs, which is why the
 //!     table's own `-` alternatives are effectively dead for the hyphen form.
 
+use crate::pyre::{
+    py_split_whitespace, py_trim, py_trim_start, python_escape, pythonize,
+    widen_case_insensitive_i, PY_BOUNDARY, PY_SPACE,
+};
 use fancy_regex::Regex as FancyRegex;
 use regex::Regex;
 use std::sync::OnceLock;
 use unicode_general_category::{get_general_category, GeneralCategory};
 use unicode_names2::name as unicode_name;
 use unicode_normalization::UnicodeNormalization;
-
-/// Python's `\b`, rebuilt for the Rust engine.
-///
-/// A word character for Python's `\w` is `[\p{L}\p{Nd}\p{Nl}\p{No}_]`. The Rust
-/// engine's `\w` is a *different* set — it adds combining marks, connector punctuation,
-/// join controls and Alphabetic symbols, and omits `No`. That matters here because NFKD
-/// turns every accented letter into a letter plus a combining mark, so the two engines
-/// disagree about where a word boundary sits in `Télé-Québec`.
-const PY_BOUNDARY: &str = concat!(
-    r"(?:(?<=[\p{L}\p{Nd}\p{Nl}\p{No}_])(?![\p{L}\p{Nd}\p{Nl}\p{No}_])",
-    r"|(?<![\p{L}\p{Nd}\p{Nl}\p{No}_])(?=[\p{L}\p{Nd}\p{Nl}\p{No}_]))",
-);
-
-/// Python's `\s`, which also matches the four C0 separators `\x1c`-`\x1f` that Rust's
-/// Unicode `White_Space` property excludes.
-const PY_SPACE: &str = r"[\s\x{1c}-\x{1f}]";
-
-/// Rewrite a Python pattern so the Rust engine gives it Python's meaning:
-/// `\b` becomes [`PY_BOUNDARY`] and `\s` becomes [`PY_SPACE`].
-///
-/// Every rewritten pattern must be compiled with the fancy engine, because the boundary
-/// form uses lookarounds.
-fn pythonize(pattern: &str) -> String {
-    pattern.replace(r"\b", PY_BOUNDARY).replace(r"\s", PY_SPACE)
-}
-
-/// Python's `str.isspace()` includes the C0 separators that `char::is_whitespace` does
-/// not, and `str.split()` / `str.strip()` use exactly that definition.
-fn py_is_space(c: char) -> bool {
-    c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
-}
-
-/// Python's `str.split()` with no arguments.
-fn py_split_whitespace(s: &str) -> impl Iterator<Item = &str> {
-    s.split(py_is_space).filter(|token| !token.is_empty())
-}
-
-/// Python's `str.strip()`.
-fn py_trim(s: &str) -> &str {
-    s.trim_matches(py_is_space)
-}
-
-/// Python's `str.lstrip()`.
-fn py_trim_start(s: &str) -> &str {
-    s.trim_start_matches(py_is_space)
-}
 
 /// One of the two regex engines. Patterns with lookaround must go through
 /// `fancy_regex`; everything else uses `regex` for its speed.
@@ -102,10 +60,7 @@ impl Pat {
     /// widened explicitly. Only two literal `I`s remain in the tables (`IT` and `IN` in
     /// the country-prefix alternation), and those are written out in the pattern itself.
     fn py_ci(pattern: &str) -> Self {
-        let widened = pythonize(pattern)
-            .replace("[A-Z]", "[A-Z\u{131}\u{130}]")
-            .replace("[Ii]", "[Ii\u{131}\u{130}]")
-            .replace("[pi]", "[pi\u{131}\u{130}]");
+        let widened = widen_case_insensitive_i(&pythonize(pattern));
         Pat::fancy(&format!("(?i){widened}"))
     }
 
@@ -576,18 +531,6 @@ impl Normalizer {
             Err(_) => name.to_string(),
         }
     }
-}
-
-/// Python's `re.escape`, which escapes whitespace as well as the regex metacharacters.
-fn python_escape(literal: &str) -> String {
-    let mut out = String::with_capacity(literal.len());
-    for c in literal.chars() {
-        if c.is_ascii_punctuation() || c.is_whitespace() {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
 }
 
 /// Python's `\w` character class, used by the `^\w+$` bare-word test.

@@ -127,6 +127,11 @@ def main() -> int:
     parser.add_argument("--tags", action="store_true", help="also sweep ignored tags")
     parser.add_argument("--show", type=int, default=25, help="mismatches to print")
     parser.add_argument(
+        "--kinds",
+        default="normalize",
+        help="comma-separated primitives: normalize, callsign, location, network",
+    )
+    parser.add_argument(
         "--binary",
         default=os.path.join(REPO, "target", "debug", "examples", "normalize_io"),
         help="path to the normalize_io example binary",
@@ -142,7 +147,98 @@ def main() -> int:
         )
 
     names = corpus(args.limit)
+    kinds = [kind.strip() for kind in args.kinds.split(",") if kind.strip()]
+
+    status = 0
+    for kind in kinds:
+        status |= sweep(kind, names, args)
+    return status
+
+
+def sweep(kind: str, names: list[str], args: argparse.Namespace) -> int:
+    """Run one primitive across the corpus and report mismatches."""
     matcher = load_python_matcher()
+    if kind == "normalize":
+        return sweep_normalize(names, matcher, args)
+    if kind in ("callsign", "location", "network"):
+        return sweep_per_name(kind, names, matcher, args)
+    print(f"unknown kind {kind!r}", file=sys.stderr)
+    return 2
+
+
+def run_rust(cases: list[dict], binary: str) -> list[dict]:
+    requests = "\n".join(json.dumps(case) for case in cases)
+    completed = subprocess.run(
+        [binary], input=requests, capture_output=True, text=True, check=True
+    )
+    answers = [json.loads(line) for line in completed.stdout.splitlines() if line.strip()]
+    if len(answers) != len(cases):
+        raise SystemExit(f"Rust produced {len(answers)} answers for {len(cases)} cases")
+    return answers
+
+
+def sweep_per_name(kind: str, names: list[str], matcher, args) -> int:
+    cases = [{"kind": kind, "name": name} for name in names]
+    answers = run_rust(cases, args.binary)
+
+    mismatches = []
+    for name, answer in zip(names, answers):
+        if kind == "callsign":
+            expected = matcher.extract_callsign(name)
+            got = answer.get("callsign")
+        elif kind == "network":
+            expected = python_network(name)
+            got = answer.get("network")
+        else:
+            expected = python_location(name)
+            got = {"state": answer.get("state"), "city": answer.get("city")}
+        if got != expected:
+            mismatches.append((name, expected, got, None))
+
+    print(f"[{kind}] {len(mismatches)} mismatches out of {len(cases)} cases")
+    for name, expected, got, _ in mismatches[: args.show]:
+        print(f"  name={name!r}\n    python={expected!r}\n    rust  ={got!r}")
+    if len(mismatches) > args.show:
+        print(f"  ... and {len(mismatches) - args.show} more")
+    return 1 if mismatches else 0
+
+
+def python_network(name: str):
+    """The network keyword probe from `Plugin._find_best_epg_match`."""
+    import re
+
+    match = re.search(r"\b(ABC|NBC|CBS|FOX|PBS|CW|ION|MNT|IND)\b", name, re.IGNORECASE)
+    return match.group(1).upper() if match else None
+
+
+def python_location(name: str) -> dict:
+    """`Plugin._extract_location`, which lives in plugin.py and needs no Django."""
+    import re
+
+    if not name:
+        return {"state": None, "city": None}
+    match = re.search(r"-\s*([A-Z]{2})\s+([A-Za-z\s]+?)(?:\s*\(|$)", name)
+    if match:
+        return {"state": match.group(1), "city": match.group(2).strip()}
+    match = re.search(r"(?:\([A-Z]{4}\)\s*)?([A-Z]{2})\s+([A-Za-z\s]+)", name)
+    if match:
+        city = re.sub(r"\s*\(.*$", "", match.group(2)).strip()
+        if city and len(city) > 2:
+            return {"state": match.group(1), "city": city}
+    match = re.search(r"\b([A-Z]{2})\b", name)
+    if match:
+        states = {
+            "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "HI", "ID", "IL",
+            "IN", "IA", "KS", "KY", "LA", "ME", "MD", "MA", "MI", "MN", "MS", "MO", "MT",
+            "NE", "NV", "NH", "NJ", "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI",
+            "SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY", "DC",
+        }
+        if match.group(1) in states:
+            return {"state": match.group(1), "city": None}
+    return {"state": None, "city": None}
+
+
+def sweep_normalize(names: list[str], matcher, args) -> int:
     flag_combos = list(itertools.product([True, False], repeat=4))
     tag_sets = TAG_SETS if args.tags else [[]]
 
@@ -151,11 +247,11 @@ def main() -> int:
         for tags in tag_sets:
             for name in names:
                 cases.append((name, (quality, regional, geographic, misc), tags))
-    print(f"{len(names)} names x {len(flag_combos)} flag combos x {len(tag_sets)} tag sets "
-          f"= {len(cases)} cases", file=sys.stderr)
+    print(f"[normalize] {len(names)} names x {len(flag_combos)} flag combos x "
+          f"{len(tag_sets)} tag sets = {len(cases)} cases", file=sys.stderr)
 
-    requests = "\n".join(
-        json.dumps(
+    answers = run_rust(
+        [
             {
                 "name": name,
                 "ignore_quality": flags[0],
@@ -164,16 +260,10 @@ def main() -> int:
                 "ignore_misc": flags[3],
                 "tags": tags,
             }
-        )
-        for name, flags, tags in cases
+            for name, flags, tags in cases
+        ],
+        args.binary,
     )
-    completed = subprocess.run(
-        [args.binary], input=requests, capture_output=True, text=True, check=True
-    )
-    answers = [json.loads(line) for line in completed.stdout.splitlines() if line.strip()]
-    if len(answers) != len(cases):
-        print(f"Rust produced {len(answers)} answers for {len(cases)} cases", file=sys.stderr)
-        return 2
 
     mismatches = []
     for (name, (quality, regional, geographic, misc), tags), answer in zip(cases, answers):

@@ -12,6 +12,4 @@ fancy-regex.workspace = true
 unicode-normalization.workspace = true
 unicode-general-category.workspace = true
 unicode_names2.workspace = true
-
-[dev-dependencies]
 serde_json.workspace = true

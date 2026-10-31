@@ -8,8 +8,10 @@
 
 pub mod alias;
 pub mod callsign;
+pub mod data;
 pub mod normalize;
 pub mod pipeline;
+pub mod pyre;
 pub mod similarity;
 pub mod tokens;
 

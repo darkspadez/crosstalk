@@ -5,6 +5,7 @@
 //! it locks the Python matcher's output. Any divergence here is a port bug, not a
 //! design choice.
 
+use crosstalk_matching::callsign::{extract_callsign, normalize_callsign, KnownCallsigns};
 use crosstalk_matching::normalize::{NormalizeFlags, Normalizer};
 use crosstalk_matching::similarity::calculate_similarity;
 use crosstalk_matching::tokens::{has_token_overlap, process_string_for_matching};
@@ -156,4 +157,51 @@ fn normalize_name_matches_baseline() {
         }
     }
     assert_eq!(checked, 112, "56 names across two flag combinations");
+}
+
+#[test]
+fn extract_callsign_matches_baseline() {
+    let data = baseline();
+    let cases = data["extract_callsign"].as_object().expect("object");
+    // The baseline was generated with the shipped FCC allowlist and no channel
+    // databases loaded, which is exactly what `KnownCallsigns::shipped()` provides.
+    let known = KnownCallsigns::shipped().expect("shipped FCC allowlist");
+
+    let mut checked = 0;
+    for (input, expected) in cases {
+        let got = extract_callsign(input, known);
+        match expected {
+            serde_json::Value::Null => {
+                assert_eq!(got, None, "extract_callsign({input:?}) should be null")
+            }
+            serde_json::Value::String(text) => assert_eq!(
+                got.as_deref(),
+                Some(text.as_str()),
+                "extract_callsign({input:?})"
+            ),
+            other => panic!("unexpected baseline value {other:?} for {input:?}"),
+        }
+        checked += 1;
+    }
+    assert_eq!(checked, 56, "the baseline holds exactly 56 callsign cases");
+}
+
+#[test]
+fn normalize_callsign_matches_baseline() {
+    let data = baseline();
+    let cases = data["normalize_callsign"].as_object().expect("object");
+
+    let mut checked = 0;
+    for (input, expected) in cases {
+        // The baseline feeds each corpus NAME through `normalize_callsign`, so a name
+        // that is not a callsign comes back unchanged; null never appears here.
+        let expected = expected.as_str().expect("string");
+        assert_eq!(
+            normalize_callsign(input),
+            expected,
+            "normalize_callsign({input:?})"
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 56, "the baseline holds exactly 56 callsign cases");
 }
