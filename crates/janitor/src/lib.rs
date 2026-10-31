@@ -8,6 +8,7 @@
 //! freshness watchdog are deliberately out of scope for this version, as is the anonymous
 //! usage counter.
 
+pub mod scope;
 pub mod settings;
 
 use anyhow::{bail, Result};
