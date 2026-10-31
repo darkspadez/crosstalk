@@ -9,6 +9,7 @@ pub mod config;
 pub mod dispatcharr;
 pub mod jobs;
 pub mod runner;
+pub mod scheduler;
 pub mod store;
 pub mod subapp;
 
@@ -18,6 +19,7 @@ pub use dispatcharr::{
 };
 pub use jobs::{JobContext, ProgressEvent, ProgressSink};
 pub use runner::{ActiveRun, JobRunner, StartedRun};
+pub use scheduler::{ScheduleInfo, Scheduler};
 pub use store::{AiDecision, RunRecord, RunRow, RunStatus, Store};
 pub use subapp::{
     ActionKind, ActionSpec, FieldKind, FieldSpec, FieldValue, JobOutcome, Registry, SettingsSchema,
