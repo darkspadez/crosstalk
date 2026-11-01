@@ -96,6 +96,11 @@ impl MatchRow {
     }
 }
 
+/// Channels per concurrent batch in stage 2. The batch bounds how many validations are
+/// in flight at once on top of the semaphore caps, and a cancel is honoured between
+/// batches rather than only after the whole scope.
+const BATCH_CHANNELS: usize = 256;
+
 /// What an auto-match run produced.
 #[derive(Debug, Clone, Default)]
 pub struct AutoMatchOutcome {
@@ -151,12 +156,18 @@ pub async fn run(
         "scoring channels",
     ));
 
-    // Stage 1: scoring, in parallel.
+    // Stage 1: scoring, in parallel. Progress comes from the atomic counter every 500
+    // channels (P7): at 20k channels the stage runs ~10 s, which is long enough to go
+    // silent otherwise. `progress` is `&self` over a `Send + Sync` sink, so rayon
+    // workers can publish directly; rayon preserves order on collect, so `scored` stays
+    // in channel order.
     let scored: Vec<(usize, Vec<Scored>)> = {
         let matcher = Arc::clone(&matcher);
         let index = Arc::clone(&index);
         let channels = scoped_channels.channels.clone();
         let tags = crate::tag_list(config.matching.normalize_flags());
+        let progress = context.clone();
+        let total_channels = channels.len();
 
         tokio::task::spawn_blocking(move || {
             use rayon::prelude::*;
@@ -167,7 +178,15 @@ pub async fn run(
                 .map(|(position, channel)| {
                     let ranked =
                         matcher.score_candidates(&channel.name, &index, &tags_refs(&tags), None);
-                    counter.fetch_add(1, Ordering::Relaxed);
+                    let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if done % 500 == 0 || done == total_channels {
+                        progress.progress(&ProgressEvent::new(
+                            "janitor.automatch",
+                            done as u64,
+                            total_channels as u64,
+                            "scoring channels",
+                        ));
+                    }
                     (position, ranked)
                 })
                 .collect();
@@ -194,9 +213,131 @@ pub async fn run(
         .map(|(id, source)| (*id, source.name.clone()))
         .collect();
 
+    // Stage 2 prep (serial, CPU): which channels need the model. The gate decision is
+    // pure scoring, so it stays serial; the requests that follow fan out.
+    let mut gates: Vec<Option<(ai_gate::GateReason, Vec<usize>)>> =
+        Vec::with_capacity(scored.len());
+    let mut skipped: Vec<bool> = Vec::with_capacity(scored.len());
+    for (position, ranked) in &scored {
+        let channel = &scoped_channels.channels[*position];
+        if channel.has_epg_override() {
+            skipped.push(true);
+            gates.push(None);
+            continue;
+        }
+        skipped.push(false);
+        // A high-confidence heuristic match is the fast path: validate it and move on.
+        // Only a channel the heuristics are unsure about reaches the model.
+        // A heuristic result that already clears the threshold is a confident match and
+        // is never re-checked by the model.
+        let already_confident = ranked.first().is_some_and(|entry| entry.score >= threshold);
+        gates.push(if already_confident {
+            None
+        } else {
+            ai_gate::shortlist(ranked, &scoped_entries.entries, &settings.ai)
+        });
+    }
+
+    // The AI gate fans out (P2), bounded by the provider's own cap; the programme
+    // validation walk fans out per channel (P1), bounded by the Dispatcharr concurrency
+    // (the client's semaphore caps it again from inside). Each channel's walk stays
+    // serial, which preserves the ranked-order winner semantics exactly, and both phases
+    // resolve in channel order. Work runs in batches so a cancel is honoured between
+    // them rather than only after the whole scope.
+    let ai_bound = context
+        .config()
+        .ai
+        .providers
+        .get(&settings.ai.provider)
+        .map(|provider| provider.max_concurrency.max(1))
+        .unwrap_or(8);
+    let validation_bound = config.dispatcharr.concurrency.max(1);
+    // Copyable borrows for the `async move` futures below: `&window` inline would capture
+    // `window` itself by value and move it on the first batch.
+    let window_ref = &window;
+    let mut ai_outcomes: Vec<Option<ai_gate::GateOutcome>> =
+        (0..scored.len()).map(|_| None).collect();
+    let mut walks: Vec<Option<WalkResult>> = (0..scored.len()).map(|_| None).collect();
+
+    for batch_start in (0..scored.len()).step_by(BATCH_CHANNELS) {
+        if context.is_cancelled() {
+            anyhow::bail!("cancelled by the operator");
+        }
+        let batch_end = (batch_start + BATCH_CHANNELS).min(scored.len());
+
+        // Phase B: ask the model for every gated channel in the batch, concurrently.
+        // Results are stored by channel order and applied below in that order.
+        {
+            use futures::{stream, StreamExt};
+            let asked: Vec<(usize, ai_gate::GateOutcome)> =
+                stream::iter((batch_start..batch_end).filter_map(|ordinal| {
+                    if skipped[ordinal] {
+                        return None;
+                    }
+                    let (position, ranked) = &scored[ordinal];
+                    let (reason, offered) = gates[ordinal].clone()?;
+                    let channel = &scoped_channels.channels[*position];
+                    Some(async move {
+                        let outcome = ai_gate::ask(
+                            ai,
+                            channel,
+                            &scoped_entries.entries,
+                            ranked,
+                            &offered,
+                            reason,
+                            &settings.ai,
+                        )
+                        .await;
+                        (ordinal, outcome)
+                    })
+                }))
+                .buffer_unordered(ai_bound)
+                .collect()
+                .await;
+            for (ordinal, outcome) in asked {
+                ai_outcomes[ordinal] = Some(outcome);
+            }
+        }
+
+        // Phase C: validate every channel's walk concurrently; each walk is serial.
+        {
+            use futures::{stream, StreamExt};
+            let resolved: Vec<(usize, WalkResult)> =
+                stream::iter((batch_start..batch_end).filter_map(|ordinal| {
+                    if skipped[ordinal] {
+                        return None;
+                    }
+                    let (_, ranked) = &scored[ordinal];
+                    let accepted = ai_outcomes[ordinal]
+                        .as_ref()
+                        .filter(|outcome| outcome.answered)
+                        .and_then(|outcome| outcome.accepted);
+                    Some(async move {
+                        let walked = walk_for_channel(
+                            client,
+                            window_ref,
+                            ranked,
+                            &scoped_entries.entries,
+                            accepted,
+                            threshold,
+                            allow_without_programs,
+                        )
+                        .await;
+                        (ordinal, walked)
+                    })
+                }))
+                .buffer_unordered(validation_bound)
+                .collect()
+                .await;
+            for (ordinal, walked) in resolved {
+                walks[ordinal] = Some(walked);
+            }
+        }
+    }
+
     let mut rows = Vec::with_capacity(scoped_channels.channels.len());
-    for (position, ranked) in scored {
-        let channel = &scoped_channels.channels[position];
+    for (ordinal, (position, ranked)) in scored.iter().enumerate() {
+        let channel = &scoped_channels.channels[*position];
         let mut row = MatchRow {
             channel_id: channel.id,
             channel_name: channel.name.clone(),
@@ -213,7 +354,7 @@ pub async fn run(
 
         // An EPG override pins the guide somewhere the column cannot show, so writing the
         // column would change nothing the operator can see. Report it instead.
-        if channel.has_epg_override() {
+        if skipped[ordinal] {
             row.reason = "Channel has an EPG override in Dispatcharr; skipped so the override \
                           is not silently bypassed"
                 .to_string();
@@ -222,138 +363,50 @@ pub async fn run(
             continue;
         }
 
-        let mut chosen: Option<(&Scored, &EpgEntry, HasPrograms)> = None;
-        let mut best_rejected: Option<u8> = None;
-
-        // A high-confidence heuristic match is the fast path: validate it and move on. Only a
-        // channel the heuristics are unsure about reaches the model.
-        // A heuristic result that already clears the threshold is a confident match and is
-        // never re-checked by the model.
-        let already_confident = ranked.first().is_some_and(|entry| entry.score >= threshold);
-        let gate = if already_confident {
-            None
-        } else {
-            ai_gate::shortlist(&ranked, &scoped_entries.entries, &settings.ai)
-        };
-
-        let mut ai_outcome = None;
-        if let Some((reason, offered)) = gate {
-            let outcome = ai_gate::ask(
-                ai,
-                channel,
-                &scoped_entries.entries,
-                &ranked,
-                &offered,
-                reason,
-                &settings.ai,
-            )
-            .await;
+        let answered_outcome = ai_outcomes[ordinal]
+            .as_ref()
+            .filter(|outcome| outcome.answered);
+        if let Some(outcome) = ai_outcomes[ordinal].as_ref() {
             // Recorded whether or not it answered: a failed request is part of the story.
             row.ai_decision = Some(outcome.decision.clone());
             context
                 .record_ai_decision(&outcome.to_store(rows.len() as i64, &settings.ai.provider))?;
-            if outcome.answered {
-                let decision_index = outcome.accepted;
-                ai_outcome = Some((outcome, decision_index));
-            }
         }
 
-        // An accepted AI candidate replaces the heuristic search order: the model's pick
-        // names a channel, and every same-name entry is validated in ranked order, because
-        // guide listings routinely carry the picked name under several entries and only
-        // the ones with programme data are usable. The first live duplicate wins, even
-        // when the exact picked entry is empty.
-        if let Some((_outcome, Some(position))) = ai_outcome.clone() {
-            let picked_name = ranked.get(position).and_then(|candidate| {
-                scoped_entries
-                    .entries
-                    .get(candidate.index)
-                    .map(|entry| entry.name.clone())
-            });
-            if let Some(picked_name) = picked_name {
-                for candidate in &ranked {
-                    let Some(entry) = scoped_entries.entries.get(candidate.index) else {
-                        continue;
-                    };
-                    if entry.name != picked_name {
-                        continue;
-                    }
-                    let has = if allow_without_programs {
-                        HasPrograms::Yes
-                    } else {
-                        match entry.epg_source {
-                            Some(source) => client
-                                .has_programs(&entry.tvg_id, source, &window)
-                                .await
-                                .unwrap_or(HasPrograms::No),
-                            None => HasPrograms::No,
-                        }
-                    };
-                    if has == HasPrograms::Yes {
-                        chosen = Some((candidate, entry, has));
-                        break;
-                    }
-                }
-                if chosen.is_none() {
-                    // The model said yes and every same-name guide is empty: say that,
-                    // rather than reusing the "below threshold" wording the score would
-                    // suggest.
-                    let score = ranked.get(position).map(|candidate| candidate.score);
-                    best_rejected = score;
-                    row.reason = format!(
-                        "The AI accepted {picked_name} (score {}%) but it carries no programme data \
-                         in the checked window",
-                        score.unwrap_or(0),
-                    );
+        // The concurrent walk resolved the winner in ranked order; this only maps it
+        // back onto the row. See `walk_for_channel` for the search order.
+        let walked = walks[ordinal]
+            .as_ref()
+            .expect("every non-skipped channel was validated");
+        let mut chosen: Option<(&Scored, &EpgEntry)> = None;
+        let mut best_rejected = walked.best_rejected;
+        if let Some(rank_position) = walked.chosen {
+            if let Some(candidate) = ranked.get(rank_position) {
+                if let Some(entry) = scoped_entries.entries.get(candidate.index) {
+                    chosen = Some((candidate, entry));
                 }
             }
-            if let Some(outcome) = ai_outcome.as_ref() {
-                context.record_ai_decision(
-                    &outcome.0.to_store(rows.len() as i64, &settings.ai.provider),
-                )?;
-            }
-        } else {
-            for candidate in &ranked {
-                let Some(entry) = scoped_entries.entries.get(candidate.index) else {
-                    continue;
-                };
-                if candidate.score >= threshold {
-                    if allow_without_programs {
-                        chosen = Some((candidate, entry, HasPrograms::Yes));
-                        break;
-                    }
-                    let Some(source) = entry.epg_source else {
-                        continue;
-                    };
-                    let has = client
-                        .has_programs(&entry.tvg_id, source, &window)
-                        .await
-                        .unwrap_or(HasPrograms::No);
-                    match has {
-                        HasPrograms::Yes => {
-                            chosen = Some((candidate, entry, has));
-                            break;
-                        }
-                        HasPrograms::No => {
-                            best_rejected = Some(candidate.score);
-                        }
-                    }
-                }
-            }
-            if let Some(outcome) = ai_outcome.as_ref() {
-                context.record_ai_decision(
-                    &outcome.0.to_store(rows.len() as i64, &settings.ai.provider),
-                )?;
-            }
+        }
+        if let Some((picked_name, score)) = walked.ai_empty.as_ref() {
+            // The model said yes and every same-name guide is empty: say that, rather
+            // than reusing the "below threshold" wording the score would suggest.
+            best_rejected = Some(*score);
+            row.reason = format!(
+                "The AI accepted {picked_name} (score {}%) but it carries no programme data \
+                 in the checked window",
+                score,
+            );
+        }
+        if let Some(outcome) = answered_outcome {
+            context
+                .record_ai_decision(&outcome.to_store(rows.len() as i64, &settings.ai.provider))?;
         }
 
         match chosen {
-            Some((candidate, entry, _)) => {
+            Some((candidate, entry)) => {
                 row.score = candidate.score;
                 row.method = candidate.method_label();
-                if ai_outcome.as_ref().is_some_and(|(outcome, accepted)| {
-                    accepted.is_some() && outcome.accepted.is_some()
-                }) {
+                if answered_outcome.is_some_and(|outcome| outcome.accepted.is_some()) {
                     row.method = format!("{} + AI", row.method);
                 }
                 row.epg_data_id = Some(entry.id);
@@ -455,6 +508,120 @@ pub async fn run(
 
 fn tags_refs(tags: &[String]) -> Vec<&str> {
     tags.iter().map(String::as_str).collect()
+}
+
+/// What one channel's validation walk found, in owned form so the concurrent phase can
+/// hand it to the ordered row assembly.
+struct WalkResult {
+    /// Position in the channel's ranked list that won, if any.
+    chosen: Option<usize>,
+    /// Score of the last candidate rejected for lack of programmes, if any.
+    best_rejected: Option<u8>,
+    /// The model's pick and its score, when it accepted a name whose every same-name
+    /// guide entry is empty.
+    ai_empty: Option<(String, u8)>,
+}
+
+/// One channel's validation walk: the first ranked candidate that clears the threshold
+/// AND carries programme data wins. An accepted AI pick replaces the heuristic order:
+/// every same-name entry is validated in ranked order and the first live duplicate
+/// wins, even when the exact picked entry is empty.
+///
+/// Serial per channel and dependency-free across channels, so the caller runs one of
+/// these per channel concurrently and resolves the winners in channel order.
+async fn walk_for_channel(
+    client: &crosstalk_core::dispatcharr::DispatcharrClient,
+    window: &ProgramWindow,
+    ranked: &[Scored],
+    entries: &[EpgEntry],
+    accepted: Option<usize>,
+    threshold: u8,
+    allow_without_programs: bool,
+) -> WalkResult {
+    if let Some(position) = accepted {
+        let picked_name = ranked
+            .get(position)
+            .and_then(|candidate| entries.get(candidate.index).map(|entry| entry.name.clone()));
+        if let Some(picked_name) = picked_name {
+            for (rank_position, candidate) in ranked.iter().enumerate() {
+                let Some(entry) = entries.get(candidate.index) else {
+                    continue;
+                };
+                if entry.name != picked_name {
+                    continue;
+                }
+                let has = if allow_without_programs {
+                    HasPrograms::Yes
+                } else {
+                    match entry.epg_source {
+                        Some(source) => client
+                            .has_programs(&entry.tvg_id, source, window)
+                            .await
+                            .unwrap_or(HasPrograms::No),
+                        None => HasPrograms::No,
+                    }
+                };
+                if has == HasPrograms::Yes {
+                    return WalkResult {
+                        chosen: Some(rank_position),
+                        best_rejected: None,
+                        ai_empty: None,
+                    };
+                }
+            }
+            let score = ranked.get(position).map(|candidate| candidate.score);
+            return WalkResult {
+                chosen: None,
+                best_rejected: score,
+                ai_empty: score.map(|score| (picked_name, score)),
+            };
+        }
+        return WalkResult {
+            chosen: None,
+            best_rejected: None,
+            ai_empty: None,
+        };
+    }
+
+    let mut best_rejected = None;
+    for (rank_position, candidate) in ranked.iter().enumerate() {
+        let Some(entry) = entries.get(candidate.index) else {
+            continue;
+        };
+        if candidate.score >= threshold {
+            if allow_without_programs {
+                return WalkResult {
+                    chosen: Some(rank_position),
+                    best_rejected,
+                    ai_empty: None,
+                };
+            }
+            let Some(source) = entry.epg_source else {
+                continue;
+            };
+            let has = client
+                .has_programs(&entry.tvg_id, source, window)
+                .await
+                .unwrap_or(HasPrograms::No);
+            match has {
+                HasPrograms::Yes => {
+                    return WalkResult {
+                        chosen: Some(rank_position),
+                        best_rejected,
+                        ai_empty: None,
+                    };
+                }
+                HasPrograms::No => {
+                    best_rejected = Some(candidate.score);
+                }
+            }
+        }
+    }
+    WalkResult {
+        chosen: None,
+        best_rejected,
+        ai_empty: None,
+    }
 }
 
 /// The reason text, in the plugin's wording.
@@ -828,6 +995,37 @@ mod tests {
             crate::scope::scope_channels(world, &settings).expect("channels"),
             crate::scope::scope_entries(world, ""),
         )
+    }
+
+    #[tokio::test]
+    async fn scoring_reports_progress_from_the_rayon_stage() {
+        // P7: the scoring stage publishes as its atomic counter advances, so the UI is
+        // not silent on big scopes. Even a two-channel run emits the completion event.
+        let (_server, world, base_context) = fixture("espn.us").await;
+        let sink = Arc::new(VecSink::new());
+        let context = JobContext::new(base_context.config_arc(), sink.clone()).with_dispatcharr(
+            base_context
+                .dispatcharr()
+                .expect("fixture wires a client")
+                .clone(),
+        );
+        let settings = JanitorSettings::default();
+        let (channels, entries) = scoped(&world);
+
+        run(&context, &settings, None, &world, &channels, &entries, true)
+            .await
+            .expect("preview");
+
+        let scoring: Vec<_> = sink
+            .events()
+            .into_iter()
+            .filter(|event| {
+                event.action == "janitor.automatch" && event.phase == "scoring channels"
+            })
+            .collect();
+        assert!(!scoring.is_empty(), "the scoring stage reported progress");
+        let last = scoring.last().expect("at least one scoring event");
+        assert_eq!((last.current, last.total), (2, 2));
     }
 
     #[tokio::test]

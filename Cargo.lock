@@ -523,6 +523,7 @@ dependencies = [
  "csv",
  "fancy-regex",
  "janitor",
+ "rayon",
  "serde_json",
  "tempfile",
  "tokio",
@@ -564,6 +565,7 @@ name = "crosstalk-matching"
 version = "0.1.0"
 dependencies = [
  "fancy-regex",
+ "rayon",
  "regex",
  "serde_json",
  "unicode-general-category",
@@ -1239,6 +1241,7 @@ dependencies = [
  "crosstalk-core",
  "crosstalk-matching",
  "csv",
+ "futures",
  "rayon",
  "serde",
  "serde_json",

@@ -172,15 +172,27 @@ pub fn simulate(
 ) -> PerStream {
     let index = CandidateIndex::build(stream_names, matcher.normalizer(), matcher.known());
 
-    // Per stream, the channels that matched it, in channel-iteration order. Order is not
-    // incidental: ties keep insertion order, which is how the Python tool's stable sort
+    // Score every channel in parallel (P4): matching is pure, so each channel's ranked
+    // list is independent. The merge below stays serial in channel-iteration order, which
+    // is what keeps the output byte-identical to the sequential run (and to the Python
+    // tool): ties keep insertion order, which is how the Python tool's stable sort
     // resolves them, so a HashMap here would shuffle tied rows between runs.
+    // `par_iter` preserves order on collect, so `per_channel[i]` is channel `i`'s list.
+    let per_channel: Vec<Vec<crosstalk_matching::pipeline::Ranked>> = {
+        use rayon::prelude::*;
+        channel_names
+            .par_iter()
+            .map(|channel| matcher.match_all_streams_all(channel, &index, user_ignored_tags))
+            .collect()
+    };
+
+    // Per stream, the channels that matched it, in channel-iteration order.
     let mut accumulated: Vec<Vec<(String, u8, String)>> = vec![Vec::new(); stream_names.len()];
     // stream position -> channel -> position in that stream's row list
     let mut lookup: Vec<HashMap<&str, usize>> = vec![HashMap::new(); stream_names.len()];
 
-    for channel in channel_names {
-        for entry in matcher.match_all_streams_all(channel, &index, user_ignored_tags) {
+    for (channel, entries) in channel_names.iter().zip(per_channel.iter()) {
+        for entry in entries {
             if entry.index >= accumulated.len() {
                 continue;
             }

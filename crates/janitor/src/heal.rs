@@ -17,7 +17,7 @@ use crosstalk_core::dispatcharr::{EpgEntry, HasPrograms, ProgramWindow, World};
 use crosstalk_core::jobs::{JobContext, ProgressEvent};
 use crosstalk_core::store::RunRow;
 use crosstalk_core::subapp::JobOutcome;
-use crosstalk_matching::pipeline::{CandidateIndex, MatchOptions, Matcher};
+use crosstalk_matching::pipeline::{CandidateIndex, MatchOptions, Matcher, Scored};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -139,6 +139,8 @@ pub async fn run(
     };
 
     // Step 1: which in-scope channels are assigned but carry no programmes?
+    // The checks fan out (P1), bounded by the Dispatcharr concurrency; assignments that
+    // need no request resolve without one. Broken channels collect in channel order.
     context.progress(&ProgressEvent::new(
         "janitor.heal",
         0,
@@ -146,23 +148,75 @@ pub async fn run(
         "checking existing assignments",
     ));
 
-    let mut broken = Vec::new();
+    enum Detection {
+        Unassigned,
+        Decided(HasPrograms),
+        Check(String, i64),
+    }
+    let mut plans: Vec<Detection> = Vec::with_capacity(scoped_channels.channels.len());
     for channel in &scoped_channels.channels {
         let Some(current) = channel.current_epg_id() else {
+            plans.push(Detection::Unassigned);
             continue;
         };
-        let has = match entry_by_id.get(&current) {
+        match entry_by_id.get(&current) {
             Some(entry) => match entry.epg_source {
-                Some(source) if !allow_without_programs => client
-                    .has_programs(&entry.tvg_id, source, &window)
-                    .await
-                    .unwrap_or(HasPrograms::No),
+                Some(source) if !allow_without_programs => {
+                    plans.push(Detection::Check(entry.tvg_id.clone(), source))
+                }
                 // Without a source there is nothing to ask about; treat it as empty, which is
                 // what the plugin's own query would find.
-                Some(_) => HasPrograms::Yes,
-                None => HasPrograms::No,
+                Some(_) => plans.push(Detection::Decided(HasPrograms::Yes)),
+                None => plans.push(Detection::Decided(HasPrograms::No)),
             },
-            None => HasPrograms::No,
+            None => plans.push(Detection::Decided(HasPrograms::No)),
+        }
+    }
+
+    let validation_bound = context.config().dispatcharr.concurrency.max(1);
+    let window_ref = &window;
+    let mut detected: Vec<Option<HasPrograms>> = (0..plans.len()).map(|_| None).collect();
+    {
+        use futures::{stream, StreamExt};
+        let resolved: Vec<(usize, HasPrograms)> =
+            stream::iter((0..plans.len()).filter_map(|ordinal| {
+                // Owned up front: the future must not borrow the plan, and the
+                // closure argument is an owned index so no borrowed-iterator
+                // lifetime leaks into the future's type.
+                let (tvg_id, source) = match &plans[ordinal] {
+                    Detection::Check(tvg_id, source) => (tvg_id.clone(), *source),
+                    _ => return None,
+                };
+                Some(async move {
+                    let has = client
+                        .has_programs(&tvg_id, source, window_ref)
+                        .await
+                        .unwrap_or(HasPrograms::No);
+                    (ordinal, has)
+                })
+            }))
+            .buffer_unordered(validation_bound)
+            .collect()
+            .await;
+        for (ordinal, has) in resolved {
+            detected[ordinal] = Some(has);
+        }
+    }
+    if context.is_cancelled() {
+        anyhow::bail!("cancelled by the operator");
+    }
+
+    let mut broken = Vec::new();
+    for (ordinal, (channel, plan)) in scoped_channels
+        .channels
+        .iter()
+        .zip(plans.iter())
+        .enumerate()
+    {
+        let has = match plan {
+            Detection::Unassigned => continue,
+            Detection::Decided(has) => *has,
+            Detection::Check(..) => detected[ordinal].expect("every checked channel was resolved"),
         };
         if has == HasPrograms::No {
             broken.push(channel.clone());
@@ -183,9 +237,89 @@ pub async fn run(
         .iter()
         .map(|entry| entry.name.clone())
         .collect();
-    let index = CandidateIndex::build(&names, matcher.normalizer(), matcher.known());
+    let index = Arc::new(CandidateIndex::build(
+        &names,
+        matcher.normalizer(),
+        matcher.known(),
+    ));
     let tags = crate::tag_list(context.config().matching.normalize_flags());
-    let tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
+
+    // Step 2a: score every broken channel off the async runtime (P3), the same
+    // spawn_blocking + rayon shape automatch uses, so a big heal never stalls a Tokio
+    // worker. `par_iter` preserves order on collect: `scored_all[i]` is broken[i].
+    let scored_all: Vec<Vec<Scored>> = {
+        let matcher = Arc::clone(&matcher);
+        let index = Arc::clone(&index);
+        let broken_names: Vec<String> = broken.iter().map(|channel| channel.name.clone()).collect();
+        tokio::task::spawn_blocking(move || {
+            use rayon::prelude::*;
+            let tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
+            broken_names
+                .par_iter()
+                .map(|name| matcher.score_candidates(name, &index, &tag_refs, None))
+                .collect()
+        })
+        .await
+        .context("the scoring stage panicked")?
+    };
+
+    // Step 2b: walk each broken channel's ranked list serially, concurrently across
+    // channels (P1). Picks resolve by channel order below.
+    // Shared borrows for the `async move` futures: capturing the vecs themselves would
+    // move them on the first poll.
+    let broken_ref = &broken;
+    let scored_ref = &scored_all;
+    let entries_ref = &scoped_entries.entries;
+    let mut picks: Vec<Option<usize>> = (0..broken.len()).map(|_| None).collect();
+    {
+        use futures::{stream, StreamExt};
+        let resolved: Vec<(usize, Option<usize>)> =
+            stream::iter((0..broken_ref.len()).map(|ordinal| async move {
+                let channel = &broken_ref[ordinal];
+                let original_id = channel.current_epg_id().unwrap_or(0);
+                let candidates = &scored_ref[ordinal];
+                // Exclude the entry already assigned: proposing the same broken guide is
+                // not a fix. Walk every ranked candidate and remember the first one that
+                // carries programme data, regardless of score (mirroring the plugin's
+                // `_find_best_epg_match`): the threshold decides Healed vs
+                // SkippedLowConfidence below, never whether the replacement is recorded.
+                let mut picked = None;
+                for (rank_position, candidate) in candidates.iter().enumerate() {
+                    let Some(entry) = entries_ref.get(candidate.index) else {
+                        continue;
+                    };
+                    if entry.id == original_id {
+                        continue;
+                    }
+                    if allow_without_programs {
+                        picked = Some(rank_position);
+                        break;
+                    }
+                    let Some(source) = entry.epg_source else {
+                        continue;
+                    };
+                    if client
+                        .has_programs(&entry.tvg_id, source, window_ref)
+                        .await
+                        .unwrap_or(HasPrograms::No)
+                        == HasPrograms::Yes
+                    {
+                        picked = Some(rank_position);
+                        break;
+                    }
+                }
+                (ordinal, picked)
+            }))
+            .buffer_unordered(validation_bound)
+            .collect()
+            .await;
+        for (ordinal, picked) in resolved {
+            picks[ordinal] = picked;
+        }
+    }
+    if context.is_cancelled() {
+        anyhow::bail!("cancelled by the operator");
+    }
 
     let mut rows = Vec::with_capacity(broken.len());
     for (position, channel) in broken.iter().enumerate() {
@@ -210,38 +344,15 @@ pub async fn run(
             reason: String::new(),
         };
 
-        // Exclude the entry already assigned: proposing the same broken guide is not a fix.
-        // Walk every ranked candidate and remember the first one that carries programme
-        // data, regardless of score (mirroring the plugin's `_find_best_epg_match`): the
-        // threshold decides Healed vs SkippedLowConfidence below, never whether the
-        // replacement is recorded at all.
-        let candidates = matcher.score_candidates(&channel.name, &index, &tag_refs, None);
+        // The concurrent walk above already chose the first ranked candidate carrying
+        // programme data (same order as the old inline walk); this only maps it back.
+        let candidates = &scored_all[position];
         let mut chosen = None;
-        for candidate in &candidates {
-            if context.is_cancelled() {
-                anyhow::bail!("cancelled by the operator");
-            }
-            let Some(entry) = scoped_entries.entries.get(candidate.index) else {
-                continue;
-            };
-            if entry.id == original_id {
-                continue;
-            }
-            if allow_without_programs {
-                chosen = Some((candidate, entry));
-                break;
-            }
-            let Some(source) = entry.epg_source else {
-                continue;
-            };
-            if client
-                .has_programs(&entry.tvg_id, source, &window)
-                .await
-                .unwrap_or(HasPrograms::No)
-                == HasPrograms::Yes
-            {
-                chosen = Some((candidate, entry));
-                break;
+        if let Some(rank_position) = picks[position] {
+            if let Some(candidate) = candidates.get(rank_position) {
+                if let Some(entry) = scoped_entries.entries.get(candidate.index) {
+                    chosen = Some((candidate, entry));
+                }
             }
         }
 

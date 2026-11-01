@@ -23,7 +23,7 @@ use crate::callsign::{
 };
 use crate::normalize::{NormalizeFlags, Normalizer};
 use crate::pyre::{py_split_whitespace, pythonize};
-use crate::similarity::{calculate_similarity_cutoff, length_scaled_threshold};
+use crate::similarity::{calculate_similarity_chars, length_scaled_threshold};
 use crate::tokens::{has_token_overlap, is_digit, process_string_for_matching, trailing_number};
 use std::sync::{Arc, OnceLock};
 
@@ -199,6 +199,11 @@ pub struct CandidateIndex {
     normalized_lower: Vec<Option<String>>,
     normalized_nospace: Vec<Option<String>>,
     processed: Vec<Option<String>>,
+    /// Scalar values of `normalized_lower`, pre-collected so the hot loop skips the
+    /// per-pair `Vec<char>` allocation (P5). Same strings, so identical scores.
+    normalized_lower_chars: Vec<Option<Vec<char>>>,
+    /// Scalar values of `processed`, for the token-sort fuzzy stage.
+    processed_chars: Vec<Option<Vec<char>>>,
     callsign: Vec<Option<String>>,
     callsign_high_confidence: Vec<bool>,
     location: Vec<Location>,
@@ -259,6 +264,8 @@ impl CandidateIndex {
             normalized_lower: Vec::with_capacity(names.len()),
             normalized_nospace: Vec::with_capacity(names.len()),
             processed: Vec::with_capacity(names.len()),
+            normalized_lower_chars: Vec::with_capacity(names.len()),
+            processed_chars: Vec::with_capacity(names.len()),
             callsign: Vec::with_capacity(names.len()),
             callsign_high_confidence: Vec::with_capacity(names.len()),
             location: Vec::with_capacity(names.len()),
@@ -274,15 +281,22 @@ impl CandidateIndex {
             let chars = normalized.chars().count();
             if chars >= 2 {
                 let lowercased = lower(&normalized);
+                let processed = process_string_for_matching(&normalized);
+                index
+                    .normalized_lower_chars
+                    .push(Some(lowercased.chars().collect()));
+                index
+                    .processed_chars
+                    .push(Some(processed.chars().collect()));
                 index.normalized_lower.push(Some(lowercased.clone()));
                 index.normalized_nospace.push(Some(nospace(&lowercased)));
-                index
-                    .processed
-                    .push(Some(process_string_for_matching(&normalized)));
+                index.processed.push(Some(processed));
             } else {
                 index.normalized_lower.push(None);
                 index.normalized_nospace.push(None);
                 index.processed.push(None);
+                index.normalized_lower_chars.push(None);
+                index.processed_chars.push(None);
             }
 
             let (callsign, high) = extract_callsign_with_confidence(name, known);
@@ -348,6 +362,16 @@ impl CandidateIndex {
 
     fn processed(&self, index: usize) -> Option<&str> {
         self.processed[index].as_deref()
+    }
+
+    /// Pre-collected scalar values of the lowercased candidate, for the hot loop.
+    fn normalized_chars(&self, index: usize) -> Option<&[char]> {
+        self.normalized_lower_chars[index].as_deref()
+    }
+
+    /// Pre-collected scalar values of the token-sorted candidate, for the fuzzy stage.
+    fn processed_char_list(&self, index: usize) -> Option<&[char]> {
+        self.processed_chars[index].as_deref()
     }
 
     /// The candidate that represents this name in the results, which is the first one
@@ -444,6 +468,9 @@ impl Matcher {
 
         let mut lookup = std::collections::HashMap::new();
         let mut spaced: Vec<String> = Vec::new();
+        // Scalar values collected once per alias, so the per-candidate loop below does no
+        // string collection at all (P5): the candidate side is precomputed in the index.
+        let mut spaced_chars: Vec<Vec<char>> = Vec::new();
         for alias in aliases {
             let normalized = self.normalizer.normalize_name(alias, user_ignored_tags);
             if normalized.is_empty() {
@@ -451,6 +478,7 @@ impl Matcher {
             }
             let lowered = lower(&normalized);
             lookup.insert(lowered.clone(), ());
+            spaced_chars.push(lowered.chars().collect());
             spaced.push(lowered.clone());
             let no_space = nospace(&lowered);
             if no_space != lowered {
@@ -468,6 +496,9 @@ impl Matcher {
             let Some((candidate_lower, candidate_nospace)) = index.normalized(candidate) else {
                 continue;
             };
+            let Some(candidate_chars) = index.normalized_chars(candidate) else {
+                continue;
+            };
 
             if lookup.contains_key(candidate_lower) || lookup.contains_key(candidate_nospace) {
                 matches.push(Ranked {
@@ -481,11 +512,12 @@ impl Matcher {
             let mut best_ratio = 0.0;
             let mut best_len = 0;
             let mut best_alias = String::new();
-            for alias in &spaced {
-                let ratio = calculate_similarity_cutoff(alias, candidate_lower, threshold_ratio);
+            for (alias, alias_chars) in spaced.iter().zip(spaced_chars.iter()) {
+                let ratio =
+                    calculate_similarity_chars(alias_chars, candidate_chars, threshold_ratio);
                 if ratio > best_ratio {
                     best_ratio = ratio;
-                    best_len = alias.chars().count().min(candidate_lower.chars().count());
+                    best_len = alias_chars.len().min(candidate_chars.len());
                     best_alias = alias.clone();
                 }
             }
@@ -583,6 +615,10 @@ impl Matcher {
                 .collect();
             let query_is_shift = is_time_shift(query);
             let processed_query = process_string_for_matching(&normalized_query);
+            // Collected once per query so the per-candidate similarity calls below take
+            // slices (P5); identical values to what the string entry point would collect.
+            let query_lower_chars: Vec<char> = query_lower.chars().collect();
+            let processed_query_chars: Vec<char> = processed_query.chars().collect();
 
             for candidate in 0..index.len() {
                 let representative = index.representative(candidate);
@@ -626,12 +662,14 @@ impl Matcher {
                 let mut score: u8 = 0;
                 let mut method: Option<MatchMethod> = None;
 
+                let candidate_chars = index.normalized_chars(candidate);
                 // Stage 1: exact after normalisation.
                 if query_nospace == candidate_nospace {
                     score = 100;
                     method = Some(MatchMethod::Exact);
-                } else {
-                    let ratio = calculate_similarity_cutoff(&query_lower, candidate_lower, 0.97);
+                } else if let Some(candidate_chars) = candidate_chars {
+                    let ratio =
+                        calculate_similarity_chars(&query_lower_chars, candidate_chars, 0.97);
                     if ratio >= 0.97 {
                         score = (ratio * 100.0) as u8;
                         method = Some(MatchMethod::Exact);
@@ -643,22 +681,20 @@ impl Matcher {
                     && (candidate_lower.contains(&query_lower)
                         || query_lower.contains(candidate_lower))
                 {
-                    let shorter = query_lower
-                        .chars()
-                        .count()
-                        .min(candidate_lower.chars().count());
-                    let longer = query_lower
-                        .chars()
-                        .count()
-                        .max(candidate_lower.chars().count());
+                    let candidate_len = candidate_chars.map(<[char]>::len).unwrap_or(0);
+                    let shorter = query_lower_chars.len().min(candidate_len);
+                    let longer = query_lower_chars.len().max(candidate_len);
                     let length_ratio = shorter as f64 / longer as f64;
                     if length_ratio >= 0.75 {
                         let threshold_ratio = f64::from(self.options.match_threshold) / 100.0;
-                        let ratio = calculate_similarity_cutoff(
-                            &query_lower,
-                            candidate_lower,
-                            threshold_ratio,
-                        );
+                        let ratio = match candidate_chars {
+                            Some(candidate_chars) => calculate_similarity_chars(
+                                &query_lower_chars,
+                                candidate_chars,
+                                threshold_ratio,
+                            ),
+                            None => 0.0,
+                        };
                         let sub_score = (ratio * 100.0) as u8;
                         let sub_threshold =
                             length_scaled_threshold(self.options.match_threshold, shorter);
@@ -675,16 +711,17 @@ impl Matcher {
                 if method.is_none() {
                     if let Some(processed_candidate) = index.processed(candidate) {
                         let threshold_ratio = f64::from(self.options.match_threshold) / 100.0;
-                        let ratio = calculate_similarity_cutoff(
-                            &processed_query,
-                            processed_candidate,
+                        let candidate_processed_chars =
+                            index.processed_char_list(candidate).unwrap_or(&[]);
+                        let ratio = calculate_similarity_chars(
+                            &processed_query_chars,
+                            candidate_processed_chars,
                             threshold_ratio,
                         );
                         let fuzzy_score = (ratio * 100.0) as u8;
-                        let shorter = processed_query
-                            .chars()
-                            .count()
-                            .min(processed_candidate.chars().count());
+                        let shorter = processed_query_chars
+                            .len()
+                            .min(candidate_processed_chars.len());
                         let fuzzy_threshold =
                             length_scaled_threshold(self.options.match_threshold, shorter);
                         if fuzzy_score >= fuzzy_threshold
@@ -786,7 +823,9 @@ impl Matcher {
         }
 
         // Deterministic tie-break: on equal score, prefer the candidate sharing more
-        // ORIGINAL-name tokens with the query.
+        // ORIGINAL-name tokens with the query. The query set is built once, not once per
+        // candidate (P5): the old helper rebuilt it on every call.
+        let query_tokens = ascii_tokens(&original_lower);
         let mut results: Vec<(Ranked, usize)> = all_matches
             .iter()
             .filter(|(_, score, _)| *score >= min_score)
@@ -797,7 +836,7 @@ impl Matcher {
                         score: *score,
                         method: method.clone(),
                     },
-                    ascii_token_overlap(&original_lower, index.name(*candidate)),
+                    token_overlap_count(&query_tokens, index.name(*candidate)),
                 )
             })
             .collect();
@@ -822,10 +861,16 @@ impl Matcher {
         static CACHE: OnceLock<std::sync::Mutex<std::collections::HashMap<String, regex::Regex>>> =
             OnceLock::new();
         let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-        let mut guard = cache.lock().expect("boost cache");
-        let re = guard
-            .entry(text.clone())
-            .or_insert_with(|| regex::Regex::new(&pattern).expect("static regex"));
+        // Clone the compiled pattern under the lock, then match without holding it (P5):
+        // `Regex::clone` is a cheap `Arc` bump, while `is_match` under the lock
+        // serialised every rayon worker in the hot loop.
+        let re = {
+            let mut guard = cache.lock().expect("boost cache");
+            guard
+                .entry(text.clone())
+                .or_insert_with(|| regex::Regex::new(&pattern).expect("static regex"))
+                .clone()
+        };
         if re.is_match(candidate) {
             5
         } else {
@@ -966,9 +1011,11 @@ fn ascii_tokens(name_lower: &str) -> std::collections::HashSet<String> {
 
 /// How many distinct ASCII tokens the candidate shares with the query. Python's
 /// deterministic tie-break compares exactly these sets.
-fn ascii_token_overlap(query_lower: &str, candidate: &str) -> usize {
+///
+/// The query set is built once per query by the caller and passed in, so the
+/// per-candidate path only tokenises the candidate (P5).
+fn token_overlap_count(query_tokens: &std::collections::HashSet<String>, candidate: &str) -> usize {
     let candidate_lower = lower(candidate);
-    let query_tokens = ascii_tokens(query_lower);
     ascii_tokens(&candidate_lower)
         .iter()
         .filter(|token| query_tokens.contains(*token))
@@ -976,16 +1023,26 @@ fn ascii_token_overlap(query_lower: &str, candidate: &str) -> usize {
 }
 
 /// `(e)` / `(w)` / `(p)` region abbreviations in an already-lowercased name.
+///
+/// The three patterns are fixed, so they are precompiled statics (P5): the old
+/// mutex-guarded cache serialised every rayon worker on the hot loop.
+fn abbrev_re(letter: &str) -> &'static fancy_regex::Regex {
+    static EAST: OnceLock<fancy_regex::Regex> = OnceLock::new();
+    static WEST: OnceLock<fancy_regex::Regex> = OnceLock::new();
+    static PACIFIC: OnceLock<fancy_regex::Regex> = OnceLock::new();
+    match letter {
+        "e" => EAST.get_or_init(|| abbrev_pattern("e")),
+        "w" => WEST.get_or_init(|| abbrev_pattern("w")),
+        _ => PACIFIC.get_or_init(|| abbrev_pattern("p")),
+    }
+}
+
+fn abbrev_pattern(letter: &str) -> fancy_regex::Regex {
+    fancy_regex::Regex::new(&pythonize(&format!(r"\(\s*{letter}\s*\)"))).expect("static regex")
+}
+
 fn contains_abbrev(name: &str, letter: &str) -> bool {
-    static CACHE: OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, fancy_regex::Regex>>,
-    > = OnceLock::new();
-    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    let mut guard = cache.lock().expect("abbrev cache");
-    let re = guard.entry(letter.to_string()).or_insert_with(|| {
-        fancy_regex::Regex::new(&pythonize(&format!(r"\(\s*{letter}\s*\)"))).expect("static regex")
-    });
-    re.is_match(name).unwrap_or(false)
+    abbrev_re(letter).is_match(name).unwrap_or(false)
 }
 
 #[cfg(test)]
