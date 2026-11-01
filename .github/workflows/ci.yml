@@ -59,6 +59,7 @@ jobs:
   parity:
     runs-on: ubuntu-latest
     needs: check
+    timeout-minutes: 20
     # The Python plugin is a pinned submodule, so the reference is always present.
     steps:
       - uses: actions/checkout@v4

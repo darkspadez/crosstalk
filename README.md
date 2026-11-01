@@ -213,10 +213,16 @@ than asserted — but only for the core. The split contract is:
 - **Strict parity**: the matching primitives (normalisation, callsign/location/network
 extraction) and the full `match_all_streams` pipeline are byte-identical ports.
 `crosstalk simulate` produces **byte-identical** reports to the plugin's own offline tool
-across four configurations (default flags, `--no-ignore-quality`, `--custom-aliases`,
-`--countries US`, with duplicate candidate names in the corpus), and
-`scripts/parity_sweep.py` compares the primitives over hundreds of thousands of cases.
-Both gates run in CI against the plugin pinned as a submodule in `reference/`.
+across four configurations: default flags and `--custom-aliases` (which change matching
+output), `--no-ignore-quality` (which catches Rust wrongly applying the flag), and
+`--countries US` (which proves flag acceptance and call-sign DB merge parity). Duplicate
+stream names in the sim corpus exercise parser dedupe — they are removed before matching,
+so duplicate *candidates* reach the matcher in the automatch/heal unit tests for the H6
+duplicate-name fix, not via sim. `scripts/parity_sweep.py` compares the primitives over
+hundreds of thousands of cases in a full local run (no `--limit`); the bounded CI sweeps
+cover ~4,800 normalize, ~900 per-name (callsign/location/network), and ~1,200
+match/score cases. Both gates run in CI against the plugin pinned as a submodule in
+`reference/`.
 - **Rust-native actions**: `automatch` and `heal` reuse the parity-checked pipeline but
 make their own product decisions. They are not ports, and row-for-row equality with the
 plugin is not claimed for them.

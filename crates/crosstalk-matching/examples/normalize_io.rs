@@ -65,7 +65,12 @@ fn main() {
         let request: serde_json::Value = match serde_json::from_str(&line) {
             Ok(request) => request,
             Err(err) => {
-                let _ = writeln!(out, "{{\"error\":\"{err}\"}}");
+                let response = serde_json::json!({"error": err.to_string()});
+                let _ = writeln!(
+                    out,
+                    "{}",
+                    serde_json::to_string(&response).unwrap_or_default()
+                );
                 continue;
             }
         };

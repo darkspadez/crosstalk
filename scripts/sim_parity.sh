@@ -37,6 +37,9 @@ done
 
 if [ ! -f "$PLUGIN/tools/match_sim.py" ]; then
   echo "reference plugin not found at $PLUGIN" >&2
+  if [ ! -e "$PLUGIN" ] || [ -z "$(ls -A "$PLUGIN" 2>/dev/null)" ]; then
+    echo 'reference/ is empty; run `git submodule update --init` to check it out' >&2
+  fi
   exit 2
 fi
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -132,6 +133,13 @@ def load_python_matcher():
     sys.path.insert(0, PLUGIN_INNER)
     import fuzzy_matcher  # noqa: PLC0415
 
+    # fuzzy_matcher.py sets this logger to DEBUG at import, which floods the sweep's
+    # stderr with per-comparison chatter; keep it at WARNING so mismatch output stays
+    # readable.
+    logging.getLogger("plugins.epg_janitor.fuzzy_matcher").setLevel(logging.WARNING)
+    logging.getLogger("plugins.epg_janitor").setLevel(logging.WARNING)
+    logging.getLogger("matching_core").setLevel(logging.WARNING)
+
     # The plugin constructs its matcher with FUZZY_MATCH_THRESHOLD (85); the class default
     # of 80 would change every thresholded decision the sweep compares.
     return fuzzy_matcher.FuzzyMatcher(match_threshold=85)
@@ -167,13 +175,23 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    if not os.path.exists(args.binary):
-        print(f"building {args.binary} ...", file=sys.stderr)
-        subprocess.run(
-            ["cargo", "build", "-q", "-p", "crosstalk-matching", "--example", "normalize_io"],
-            cwd=REPO,
-            check=True,
+    logging.basicConfig(level=logging.WARNING)
+
+    if not os.path.isdir(PLUGIN_INNER):
+        print(
+            f"reference plugin not found at {PLUGIN_INNER}; "
+            "run `git submodule update --init` to check it out",
+            file=sys.stderr,
         )
+        return 2
+
+    # Always rebuild: a stale local binary would otherwise be silently compared.
+    print(f"building {args.binary} ...", file=sys.stderr)
+    subprocess.run(
+        ["cargo", "build", "-q", "-p", "crosstalk-matching", "--example", "normalize_io"],
+        cwd=REPO,
+        check=True,
+    )
 
     names = corpus(args.limit)
     kinds = [kind.strip() for kind in args.kinds.split(",") if kind.strip()]

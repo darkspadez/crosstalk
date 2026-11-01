@@ -96,9 +96,10 @@ operator visits** (H1).
     never committed). The sweep "passes" on this machine only because a stale binary from the
     build session still sits in `target/debug/examples/` — provenance unverifiable.
   - `.github/workflows/ci.yml:58-72`: the parity job is gated on
-    `hashFiles('reference/.../match_sim.py') != ''`, but `reference/` is git-ignored, so the
-    condition is **always false in CI** and the job always skips. `parity_sweep.py` isn't in CI
-    at all.
+    `hashFiles('reference/.../match_sim.py') != ''`, but at audit time `reference/` was
+git-ignored, so the condition was **always false in CI** and the job always skipped (fixed
+in Phase 2: `reference/` is now a pinned submodule and the job runs unconditionally).
+`parity_sweep.py` isn't in CI at all.
   - `scripts/sim_parity.sh` tests exactly one configuration: `--threshold 80` (plugin default
     is 85), default flags, deduped names, no custom aliases/countries, no duplicate candidate
     names, no programme validation.
@@ -106,8 +107,9 @@ operator visits** (H1).
   currently untrue in any reproducible sense. The primitives *are* verified (golden fixture in
   `cargo test`); the claim as written covers far more than that.
 - **Fix:** Commit the `normalize_io` example (or a `xtask`-style bin), vendor a small fixture
-  corpus into the repo so the gate doesn't depend on the git-ignored `reference/`, and run it
-  unconditionally in CI.
+  corpus into the repo so the gate doesn't depend on the (then git-ignored) `reference/`,
+and run it unconditionally in CI. [Phase 2: done via the plugin submodule + committed
+`normalize_io` + unconditional CI parity job.]
 
 ### H4. The one write call (`batch_set_epg`) is the least reliable call in the system
 - **Where:** `crates/crosstalk-core/src/dispatcharr.rs:639+`; callers
@@ -345,8 +347,7 @@ corrections (Docker steps, parity-claim scoping, SSE→polling, override-skip di
 ### Revised roadmap (supersedes Section 7 ordering where they conflict)
 
 1. **Safety weekend pass** — H2 heal walk, H6 duplicate names, H1 CSRF+confirm, H5 shutdown drain, H7 strict config, M3 `0600` config saves, M7 ignore files. Nothing unattended before this lands.
-2. **Parity made real** — submodule the plugin (Q12), commit `normalize_io`, extend the gate to automatch/heal-shaped walks + duplicate names + non-default flags; rewrite README parity claims to the Q2 split contract.
-3. **Write-path reliability** — H4 POST retry/refresh/chunking; M1 prune at 15 days (Q16); L6 `busy_timeout`.
+2. **Parity made real** — submodule the plugin (Q12), commit `normalize_io`, extend the gate to duplicate names + non-default flags; rewrite README parity claims to the Q2 split contract. (Automatch/heal-shaped parity walks were dropped per the Q2 split contract: actions are Rust-native, so matching-core walks are covered by the match/score sweep kinds plus janitor unit/E2E tests instead.)3. **Write-path reliability** — H4 POST retry/refresh/chunking; M1 prune at 15 days (Q16); L6 `busy_timeout`.
 4. **Hot reload** — config swap + schedule re-arm on save (Q8); M2 resolved by construction.
 5. **Performance for 20k+ interactive** (Q6) — char-vector precompute, query-set hoisting, concurrent programme validation, heal in `spawn_blocking`/rayon, scoring-stage progress.
 6. **AI hardening** (Q4/Q9/Q13) — fallthrough walk, single decision record, run allowlist in requests, concurrent AI calls; live-verify the decision-model + local backends once the provider is named.
