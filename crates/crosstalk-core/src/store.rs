@@ -162,6 +162,7 @@ impl Store {
                 r#"
                 PRAGMA journal_mode = WAL;
                 PRAGMA foreign_keys = ON;
+                PRAGMA busy_timeout = 5000;
 
                 CREATE TABLE IF NOT EXISTS runs (
                     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -486,6 +487,30 @@ impl Store {
                 .map_err(Into::into)
         })
     }
+
+    /// Backdate a run's `started_at`, for tests that seed old history.
+    #[cfg(test)]
+    pub(crate) fn set_started_at_for_test(&self, run_id: i64, started_at: &str) -> Result<()> {
+        self.with_connection(|connection| {
+            connection
+                .execute(
+                    "UPDATE runs SET started_at = ?1 WHERE id = ?2",
+                    params![started_at, run_id],
+                )
+                .map(|_| ())
+                .map_err(Into::into)
+        })
+    }
+
+    /// The `busy_timeout` in effect on this connection, for tests.
+    #[cfg(test)]
+    pub(crate) fn busy_timeout_for_test(&self) -> Result<i64> {
+        self.with_connection(|connection| {
+            connection
+                .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+                .map_err(Into::into)
+        })
+    }
 }
 
 fn map_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
@@ -713,6 +738,14 @@ mod tests {
             })
             .expect("age");
         assert_eq!(store.prune(7, 0).expect("prune"), 0);
+    }
+
+    #[test]
+    fn the_connection_waits_on_a_locked_database() {
+        // A second process (or an operator's sqlite3) holding a lock must not fail
+        // instantly with SQLITE_BUSY; the 5 s timeout gives it time to clear.
+        let store = Store::in_memory().expect("store");
+        assert_eq!(store.busy_timeout_for_test().expect("pragma"), 5000);
     }
 
     #[test]

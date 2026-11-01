@@ -285,6 +285,15 @@ pub struct JobsConfig {
     pub exports_dir: String,
     /// Where the SQLite database lives.
     pub data_dir: String,
+    /// Days of run history to keep. 0 keeps everything. Pruned after each run, keeping
+    /// at least the newest 10 runs per app so recent history survives even on a busy
+    /// install.
+    #[serde(default = "default_run_history_days")]
+    pub run_history_days: u32,
+}
+
+fn default_run_history_days() -> u32 {
+    15
 }
 
 impl Default for JobsConfig {
@@ -293,6 +302,7 @@ impl Default for JobsConfig {
             worker_threads: 0,
             exports_dir: "exports".to_string(),
             data_dir: "data".to_string(),
+            run_history_days: default_run_history_days(),
         }
     }
 }
@@ -1292,6 +1302,24 @@ base_url = "https://api.typesafe.ai/v1"
             );
             assert!(matches, "{} has a mismatched default", field.id);
         }
+    }
+
+    #[test]
+    fn run_history_is_kept_for_15_days_by_default() {
+        assert_eq!(JobsConfig::default().run_history_days, 15);
+        // An old file without the key still loads, and inherits the 15-day default.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "crosstalk.toml", "[jobs]\nworker_threads = 2\n");
+        let config = CrosstalkConfig::load(dir.path()).expect("load");
+        assert_eq!(config.jobs.run_history_days, 15);
+        // Explicit zero keeps everything.
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            "[jobs]\nrun_history_days = 0\n",
+        );
+        let config = CrosstalkConfig::load(dir.path()).expect("load");
+        assert_eq!(config.jobs.run_history_days, 0);
     }
 
     #[test]

@@ -30,6 +30,9 @@ use std::time::Duration;
 const MAX_ATTEMPTS: u32 = 3;
 /// Base backoff; doubled per attempt.
 const RETRY_BASE: Duration = Duration::from_millis(250);
+/// Associations per `batch-set-epg` request. One request for a whole install would sit
+/// under a single timeout; chunks keep each write small enough to retry on its own.
+const BATCH_SET_EPG_CHUNK_SIZE: usize = 500;
 
 /// One channel, as the matcher needs it.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -636,6 +639,12 @@ impl DispatcharrClient {
     /// step the plugin had to trigger by hand through a Django signal. `channels_updated` can
     /// legitimately be smaller than the number of associations: a channel already on that
     /// entry is skipped upstream, and that is not an error.
+    ///
+    /// Associations are sent in chunks of at most [`BATCH_SET_EPG_CHUNK_SIZE`]. Each chunk
+    /// gets the same retry/refresh treatment as the GET path (retry 5xx/429 honouring
+    /// `Retry-After` with exponential backoff, one JWT refresh on 401), and the returned
+    /// counts are summed. A chunk failure names the chunk and how many associations were
+    /// already confirmed, so the caller can report partial progress.
     pub async fn batch_set_epg(&self, associations: &[(i64, i64)]) -> Result<usize> {
         if associations.is_empty() {
             // Upstream rejects an empty list with 400; a run with nothing to write is a
@@ -643,6 +652,28 @@ impl DispatcharrClient {
             return Ok(0);
         }
 
+        let total_chunks = associations.len().div_ceil(BATCH_SET_EPG_CHUNK_SIZE);
+        let mut confirmed: usize = 0;
+        let mut updated: usize = 0;
+        for (index, chunk) in associations.chunks(BATCH_SET_EPG_CHUNK_SIZE).enumerate() {
+            let chunk_no = index + 1;
+            match self.post_epg_chunk(chunk).await {
+                Ok(count) => {
+                    confirmed += chunk.len();
+                    updated += count;
+                }
+                Err(error) => {
+                    anyhow::bail!(
+                        "chunk {chunk_no}/{total_chunks} failed after {confirmed} associations were confirmed: {error:#}"
+                    );
+                }
+            }
+        }
+        Ok(updated)
+    }
+
+    /// POST one chunk of associations, with retry/refresh mirroring [`Self::get_json`].
+    async fn post_epg_chunk(&self, chunk: &[(i64, i64)]) -> Result<usize> {
         #[derive(Serialize)]
         struct Association {
             channel_id: i64,
@@ -657,7 +688,7 @@ impl DispatcharrClient {
         }
 
         let body = serde_json::json!({
-            "associations": associations
+            "associations": chunk
                 .iter()
                 .map(|(channel_id, epg_data_id)| Association {
                     channel_id: *channel_id,
@@ -667,31 +698,79 @@ impl DispatcharrClient {
         });
 
         let url = format!("{}/channels/channels/batch-set-epg/", self.base);
-        let authorization = self.authorization().await?;
-        let mut request = self.http.post(&url).json(&body);
-        if let Some(value) = authorization.as_deref() {
-            request = request.header(reqwest::header::AUTHORIZATION, value);
-        }
-        let response = request
-            .send()
-            .await
-            .with_context(|| format!("POST {url}"))?;
+        let mut refreshed = false;
+        let mut attempt = 0u32;
 
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        if !status.is_success() {
-            bail!("POST {url} failed with {status}: {}", truncate(&text, 300));
+        loop {
+            attempt += 1;
+            let authorization = self.authorization().await?;
+            let mut request = self.http.post(&url).json(&body);
+            if let Some(value) = authorization.as_deref() {
+                request = request.header(reqwest::header::AUTHORIZATION, value);
+            }
+            let outcome = request.send().await;
+            match outcome {
+                Ok(response) => {
+                    let status = response.status();
+
+                    if status == reqwest::StatusCode::UNAUTHORIZED && !refreshed {
+                        refreshed = true;
+                        if !self.credentials.uses_api_key() {
+                            self.refresh_token().await?;
+                        }
+                        continue;
+                    }
+
+                    let retryable = status.is_server_error()
+                        || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+                    if retryable && attempt < MAX_ATTEMPTS {
+                        let retry_after = response
+                            .headers()
+                            .get(reqwest::header::RETRY_AFTER)
+                            .and_then(|value| value.to_str().ok())
+                            .and_then(|value| value.parse::<u64>().ok())
+                            .map(Duration::from_secs)
+                            .unwrap_or_else(|| RETRY_BASE * 2u32.pow(attempt - 1));
+                        tokio::time::sleep(retry_after).await;
+                        continue;
+                    }
+
+                    if status == reqwest::StatusCode::UNAUTHORIZED
+                        || status == reqwest::StatusCode::FORBIDDEN
+                    {
+                        let body = response.text().await.unwrap_or_default();
+                        anyhow::bail!(
+                            "Dispatcharr rejected the credentials for POST {url} ({status}). Check \
+                             dispatcharr.api_key, or the username and password, and that the \
+                             account is an administrator. Response: {}",
+                            truncate(&body, 300)
+                        );
+                    }
+                    if !status.is_success() {
+                        let body = response.text().await.unwrap_or_default();
+                        anyhow::bail!("POST {url} failed with {status}: {}", truncate(&body, 300));
+                    }
+                    let text = response.text().await.unwrap_or_default();
+                    let parsed: Response = serde_json::from_str(&text).with_context(|| {
+                        format!(
+                            "POST {url} returned an unexpected body: {}",
+                            truncate(&text, 200)
+                        )
+                    })?;
+                    if !parsed.success {
+                        anyhow::bail!("POST {url} reported failure: {}", truncate(&text, 300));
+                    }
+                    return Ok(parsed.channels_updated.max(0) as usize);
+                }
+                Err(error) => {
+                    if attempt < MAX_ATTEMPTS && (error.is_connect() || error.is_timeout()) {
+                        tokio::time::sleep(RETRY_BASE * 2u32.pow(attempt - 1)).await;
+                        continue;
+                    }
+                    return Err(error).with_context(|| format!("POST {url}"));
+                }
+            }
         }
-        let parsed: Response = serde_json::from_str(&text).with_context(|| {
-            format!(
-                "POST {url} returned an unexpected body: {}",
-                truncate(&text, 200)
-            )
-        })?;
-        if !parsed.success {
-            bail!("POST {url} reported failure: {}", truncate(&text, 300));
-        }
-        Ok(parsed.channels_updated.max(0) as usize)
     }
 
     /// Fetch every source of truth a run needs, once, in parallel.
@@ -1197,7 +1276,140 @@ mod tests {
 
         let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
         let error = client.batch_set_epg(&[(1, 10)]).await.expect_err("failure");
-        assert!(format!("{error}").contains("reported failure"));
+        let message = format!("{error:#}");
+        assert!(message.contains("reported failure"), "{message}");
+        assert!(message.contains("chunk 1/1"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn batch_set_epg_chunks_large_writes_and_sums_counts() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/channels/channels/batch-set-epg/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "channels_updated": 7
+            })))
+            .expect(3)
+            .mount(&server)
+            .await;
+
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        let associations: Vec<(i64, i64)> = (1..=1200).map(|id| (id, id + 10_000)).collect();
+        assert_eq!(client.batch_set_epg(&associations).await.expect("ok"), 21);
+
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), 3);
+        let mut sizes = requests
+            .iter()
+            .map(|request| {
+                let body: serde_json::Value =
+                    serde_json::from_slice(&request.body).expect("json body");
+                body["associations"].as_array().expect("array").len()
+            })
+            .collect::<Vec<_>>();
+        sizes.sort_unstable();
+        assert_eq!(sizes, vec![200, 500, 500]);
+    }
+
+    #[tokio::test]
+    async fn batch_set_epg_retries_a_transient_server_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/channels/channels/batch-set-epg/"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/channels/channels/batch-set-epg/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "channels_updated": 2
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        assert_eq!(
+            client.batch_set_epg(&[(1, 10), (2, 11)]).await.expect("ok"),
+            2
+        );
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn batch_set_epg_refreshes_a_lapsed_jwt_and_retries() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/accounts/token/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access": "stale",
+                "refresh": "refresh-token"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/accounts/token/refresh/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"access": "fresh"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/channels/channels/batch-set-epg/"))
+            .and(header("Authorization", "Bearer stale"))
+            .respond_with(ResponseTemplate::new(401))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/channels/channels/batch-set-epg/"))
+            .and(header("Authorization", "Bearer fresh"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "channels_updated": 1
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DispatcharrClient::new(&password_config(&server.uri())).expect("client");
+        assert_eq!(client.batch_set_epg(&[(1, 10)]).await.expect("ok"), 1);
+    }
+
+    #[tokio::test]
+    async fn batch_set_epg_failure_names_the_chunk_and_confirmed_progress() {
+        let server = MockServer::start().await;
+        // The first chunk succeeds; every later attempt fails, so the error must say
+        // which chunk failed and how many associations were already confirmed.
+        Mock::given(method("POST"))
+            .and(path("/api/channels/channels/batch-set-epg/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "channels_updated": 500
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/channels/channels/batch-set-epg/"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        let associations: Vec<(i64, i64)> = (1..=600).map(|id| (id, id + 1)).collect();
+        let error = client
+            .batch_set_epg(&associations)
+            .await
+            .expect_err("fails");
+        let message = format!("{error:#}");
+        assert!(message.contains("chunk 2/2"), "{message}");
+        assert!(
+            message.contains("500 associations were confirmed"),
+            "{message}"
+        );
     }
 
     #[tokio::test]

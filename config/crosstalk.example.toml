@@ -81,6 +81,9 @@ worker_threads = 0
 # Relative paths resolve against this file's directory.
 exports_dir = "exports"
 data_dir = "data"
+# Days of run history kept in the SQLite store. Pruned after each run finishes,
+# keeping at least the 10 newest runs per app. 0 keeps everything.
+run_history_days = 15
 
 # Schedules, as `<app>.<action>` with a cron expression. Five fields (minute hour day month
 # weekday) is what most people write, and six (with seconds) is accepted. They fire in UTC.

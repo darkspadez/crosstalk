@@ -373,6 +373,7 @@ impl JobRunner {
                             &serde_json::json!({}),
                             None,
                         );
+                        runner.prune_history();
                         let mut event = ProgressEvent::new(&started_action, 0, 0, "failed");
                         event.done = true;
                         event.summary = Some(format!("{error:#}"));
@@ -414,6 +415,7 @@ impl JobRunner {
             };
 
             slot.finish(status, summary.as_deref(), &counts, report.as_deref());
+            runner.prune_history();
 
             let mut event = ProgressEvent::new(&started_action, 0, 0, status.as_str());
             event.done = true;
@@ -481,6 +483,7 @@ impl JobRunner {
                         &serde_json::json!({}),
                         None,
                     );
+                    self.prune_history();
                     return Err(error);
                 }
             }
@@ -516,7 +519,29 @@ impl JobRunner {
                 None,
             ),
         }
+        self.prune_history();
         outcome
+    }
+
+    /// Delete run history older than the configured retention.
+    ///
+    /// Runs after every finished run. A failure here must never fail the run itself, so it
+    /// is logged and dropped. The just-finished run is the newest of its app and `prune`
+    /// skips running rows, so it can never delete the run that just ended.
+    fn prune_history(&self) {
+        let days = self.config.jobs.run_history_days;
+        if days == 0 {
+            return;
+        }
+        match self.store.prune(days, 10) {
+            Ok(0) => {}
+            Ok(removed) => {
+                tracing::info!(removed, days, "pruned old run history");
+            }
+            Err(error) => {
+                tracing::warn!("could not prune old run history: {error:#}");
+            }
+        }
     }
 
     /// The dry-run flag a schedule should use for this action.
@@ -900,5 +925,75 @@ mod tests {
         assert_eq!(active.percent(), Some(40));
         active.current = 20;
         assert_eq!(active.percent(), Some(100));
+    }
+
+    fn seed_finished_run(store: &Store, app: &str, days_ago: i64) -> i64 {
+        let run_id = store.start_run(app, "run", true).expect("start");
+        store
+            .finish_run(
+                run_id,
+                RunStatus::Succeeded,
+                Some("seeded"),
+                &serde_json::json!({}),
+                None,
+            )
+            .expect("finish");
+        // `started_at` has one-second resolution; ids break the tie, so backdating every
+        // seed to the same old timestamp still leaves their order deterministic.
+        let started = (chrono::Utc::now() - chrono::Duration::days(days_ago))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        store
+            .set_started_at_for_test(run_id, &started)
+            .expect("age");
+        run_id
+    }
+
+    #[tokio::test]
+    async fn a_finished_run_prunes_history_beyond_retention_and_minimum() {
+        let store = Store::in_memory().expect("store");
+        // Twelve old runs plus the one the test is about to run: 13 total, so pruning to
+        // the 10-newest leaves 10 and the just-finished run must be among them.
+        for _ in 0..12 {
+            seed_finished_run(&store, "test", 30);
+        }
+        let runner = runner(TestApp::new(Duration::from_millis(1)), store.clone());
+        assert_eq!(runner.config.jobs.run_history_days, 15);
+        let outcome = runner
+            .run_to_completion("test", "run", true)
+            .await
+            .expect("ok");
+        assert_eq!(outcome.summary, "finished");
+        let runs = store.recent_runs_for("test", 100).expect("runs");
+        assert_eq!(runs.len(), 10, "keeps the 10 newest");
+        assert!(
+            runs.iter()
+                .any(|run| run.summary.as_deref() == Some("finished")),
+            "the run that just finished is never pruned"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_retention_disables_pruning() {
+        let store = Store::in_memory().expect("store");
+        for _ in 0..3 {
+            seed_finished_run(&store, "test", 30);
+        }
+        let config = CrosstalkConfig {
+            jobs: crate::config::JobsConfig {
+                run_history_days: 0,
+                ..crate::config::JobsConfig::default()
+            },
+            ..CrosstalkConfig::default()
+        };
+        let runner = JobRunner::new(
+            Registry::new(vec![Arc::new(TestApp::new(Duration::from_millis(1)))]),
+            Arc::new(config),
+            store.clone(),
+        );
+        runner
+            .run_to_completion("test", "run", true)
+            .await
+            .expect("ok");
+        assert_eq!(store.run_count().expect("count"), 4);
     }
 }
