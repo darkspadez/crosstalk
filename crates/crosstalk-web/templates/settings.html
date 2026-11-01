@@ -3,6 +3,7 @@
 {% block content %}
 <h1>Settings</h1>
 {% if saved %}<p class="ok">Saved.</p>{% endif %}
+{% if let Some(notice) = host_notice %}<p class="notice">{{ notice }}</p>{% endif %}
 
 <section class="card">
   <h2>Host</h2>

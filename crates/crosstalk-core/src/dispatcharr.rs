@@ -30,11 +30,26 @@ use std::time::Duration;
 const MAX_ATTEMPTS: u32 = 3;
 /// Base backoff; doubled per attempt.
 const RETRY_BASE: Duration = Duration::from_millis(250);
+/// Upper bound on a single retry wait. A server-sent `Retry-After` of minutes or hours
+/// would otherwise stall a run for that long; the cap keeps a retry a delay, not a hang.
+/// The request is still retried, just sooner than the server asked.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
 /// Associations per `batch-set-epg` request. One request for a whole install would sit
 /// under a single timeout; chunks keep each write small enough to retry on its own.
 const BATCH_SET_EPG_CHUNK_SIZE: usize = 500;
 
-/// One channel, as the matcher needs it.
+/// How long to wait before the next attempt: the server's `Retry-After` when it states
+/// one, otherwise exponential backoff from the attempt number. Either way capped at
+/// [`MAX_RETRY_AFTER`], so a wayward header cannot stall a run.
+fn retry_delay(headers: &reqwest::header::HeaderMap, attempt: u32) -> Duration {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| RETRY_BASE * 2u32.pow(attempt.saturating_sub(1)))
+        .min(MAX_RETRY_AFTER)
+}
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Channel {
     pub id: i64,
@@ -399,16 +414,7 @@ impl DispatcharrClient {
                     let retryable = status.is_server_error()
                         || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
                     if retryable && attempt < MAX_ATTEMPTS {
-                        // `Retry-After` when the server states one, otherwise exponential
-                        // backoff from the attempt number.
-                        let retry_after = response
-                            .headers()
-                            .get(reqwest::header::RETRY_AFTER)
-                            .and_then(|value| value.to_str().ok())
-                            .and_then(|value| value.parse::<u64>().ok())
-                            .map(Duration::from_secs)
-                            .unwrap_or_else(|| RETRY_BASE * 2u32.pow(attempt - 1));
-                        tokio::time::sleep(retry_after).await;
+                        tokio::time::sleep(retry_delay(response.headers(), attempt)).await;
                         continue;
                     }
 
@@ -640,6 +646,13 @@ impl DispatcharrClient {
     /// legitimately be smaller than the number of associations: a channel already on that
     /// entry is skipped upstream, and that is not an error.
     ///
+    /// A retry after a timeout can re-apply a chunk the server already committed (the
+    /// response was lost, not the write). The endpoint is idempotent per
+    /// (channel, entry) pair — re-applying an assignment changes nothing — so a retried
+    /// chunk is safe; note only that `channels_updated` counts channels the confirmed write
+    /// actually changed, and may under-report when a retry re-applied an already-committed
+    /// chunk.
+    ///
     /// Associations are sent in chunks of at most [`BATCH_SET_EPG_CHUNK_SIZE`]. Each chunk
     /// gets the same retry/refresh treatment as the GET path (retry 5xx/429 honouring
     /// `Retry-After` with exponential backoff, one JWT refresh on 401), and the returned
@@ -724,14 +737,7 @@ impl DispatcharrClient {
                     let retryable = status.is_server_error()
                         || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
                     if retryable && attempt < MAX_ATTEMPTS {
-                        let retry_after = response
-                            .headers()
-                            .get(reqwest::header::RETRY_AFTER)
-                            .and_then(|value| value.to_str().ok())
-                            .and_then(|value| value.parse::<u64>().ok())
-                            .map(Duration::from_secs)
-                            .unwrap_or_else(|| RETRY_BASE * 2u32.pow(attempt - 1));
-                        tokio::time::sleep(retry_after).await;
+                        tokio::time::sleep(retry_delay(response.headers(), attempt)).await;
                         continue;
                     }
 

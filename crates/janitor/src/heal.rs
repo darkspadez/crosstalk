@@ -289,7 +289,14 @@ pub async fn run(
 
     let replacements = rows.iter().filter(|row| row.new_epg_id.is_some()).count();
 
-    // Step 3: write the replacements that clear the threshold.
+    // Step 3: write the report BEFORE applying, so it reflects the plan. On an apply
+    // failure the CSV still exists on disk recording what was attempted and confirmed,
+    // and the error below names it (mirroring automatch, which also reports before it
+    // writes). The run record itself cannot link it: the runner drops the report path on
+    // a failed run.
+    let report = write_report(context, settings, scanned, &rows, dry_run)?;
+
+    // Step 4: write the replacements that clear the threshold.
     let mut applied = 0;
     if !dry_run {
         let associations: Vec<(i64, i64)> = rows
@@ -298,14 +305,18 @@ pub async fn run(
             .filter_map(|row| row.new_epg_id.map(|epg| (row.channel_id, epg)))
             .collect();
         if !associations.is_empty() {
-            applied = client
-                .batch_set_epg(&associations)
-                .await
-                .context("applying the EPG replacements")?;
+            let plan = report
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "(no report)".to_string());
+            applied = client.batch_set_epg(&associations).await.with_context(|| {
+                format!("applying the EPG replacements; the plan was recorded in {plan}")
+            })?;
         }
     }
 
-    let report = write_report(context, settings, scanned, &rows, dry_run)?;
+    // Tidy up only after a successful run: deleting older reports before an apply that then
+    // fails would throw away the history while producing nothing to replace it.
     if let Some(path) = report.as_deref() {
         let name = path
             .file_name()
@@ -502,18 +513,23 @@ mod tests {
             "ESPN",
             old_has_programs,
             new_has_programs,
+            true,
         )
         .await
     }
 
     /// [`fixture`] with caller-chosen names, so a test can arrange a replacement that
     /// scores below the threshold (a structural-only signal, not a name match).
+    /// `apply_ok` decides whether the batch-set-epg endpoint answers success: a failing
+    /// endpoint proves the report is written before the apply, so the plan survives the
+    /// failure on disk.
     async fn fixture_with_names(
         channel_name: &str,
         old_name: &str,
         new_name: &str,
         old_has_programs: bool,
         new_has_programs: bool,
+        apply_ok: bool,
     ) -> (MockServer, World, JobContext) {
         let server = MockServer::start().await;
 
@@ -574,11 +590,18 @@ mod tests {
             .await;
         Mock::given(method("POST"))
             .and(path("/api/channels/channels/batch-set-epg/"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "success": true,
-                "channels_updated": 1,
-                "programs_refreshed": 1
-            })))
+            .respond_with(if apply_ok {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "success": true,
+                    "channels_updated": 1,
+                    "programs_refreshed": 1
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "success": false,
+                    "channels_updated": 0
+                }))
+            })
             .mount(&server)
             .await;
 
@@ -671,6 +694,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_apply_still_leaves_the_report_on_disk() {
+        // The report is written before the apply, so a batch failure still leaves the plan
+        // on disk and names it in the error (the runner drops the report path on failure).
+        let (_server, world, context) =
+            fixture_with_names("ESPN HD", "ESPN (broken)", "ESPN", false, true, false).await;
+        let settings = JanitorSettings::default();
+        let (channels, entries) = scoped(&world);
+        let error = run(&context, &settings, &world, &channels, &entries, false)
+            .await
+            .expect_err("the apply fails");
+        let message = format!("{error:#}");
+        assert!(message.contains("recorded in"), "{message}");
+
+        let reports: Vec<_> = std::fs::read_dir(context.exports_dir())
+            .expect("exports dir")
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains("heal_applied"))
+            })
+            .collect();
+        assert_eq!(reports.len(), 1, "the plan survives the failure");
+        let text = std::fs::read_to_string(&reports[0]).expect("read report");
+        assert!(text.contains("ESPN HD"), "{text}");
+        assert!(
+            message.contains(&reports[0].display().to_string()),
+            "the error names the report: {message}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_working_assignment_is_never_touched() {
         let (_server, world, context) = fixture(true, true).await;
         let settings = JanitorSettings::default();
@@ -709,6 +764,7 @@ mod tests {
             "KOMO (broken)",
             "KOMO 4 News Seattle",
             false,
+            true,
             true,
         )
         .await;

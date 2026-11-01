@@ -744,3 +744,69 @@ async fn saving_host_settings_applies_without_a_restart() {
         "the box reflects the save: {input}"
     );
 }
+
+/// POST a form with extra headers and return the status and body, for asserting on pages
+/// rendered with an error rather than a redirect.
+async fn post_page(
+    state: &AppState,
+    uri: &str,
+    body: &str,
+    headers: &[(&str, &str)],
+) -> (StatusCode, String) {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header(crate::csrf::CSRF_HEADER, state.csrf_token());
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let response = router(state.clone())
+        .oneshot(builder.body(Body::from(body.to_string())).expect("request"))
+        .await
+        .expect("response");
+    let status = response.status();
+    let text = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .expect("body");
+    (status, String::from_utf8_lossy(&text).to_string())
+}
+
+#[tokio::test]
+async fn saving_host_settings_refuses_a_swap_that_would_drop_auth() {
+    // The live config binds a non-loopback address with a token; the file on disk binds the
+    // same address with no token (the secret lived in the environment and is gone). Saving
+    // must still write the file, but must not swap the unauthenticated config in.
+    let (state, _store, dir) = state(Some("s3cret"));
+    std::fs::write(
+        dir.path().join("crosstalk.toml"),
+        "[server]\nbind = \"0.0.0.0\"\n",
+    )
+    .expect("seed");
+
+    let (status, body) = post_page(
+        &state,
+        "/settings/host",
+        "matching.enabled_databases=US",
+        &[("cookie", "crosstalk_token=s3cret")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(body.contains("NOT applied"), "{body}");
+    assert!(body.contains("unauthenticated"), "{body}");
+    assert!(body.contains("refuse to start"), "{body}");
+
+    // The file save itself happened: the submitted databases are on disk.
+    let text = std::fs::read_to_string(dir.path().join("crosstalk.toml")).expect("read");
+    assert!(text.contains("US"), "{text}");
+
+    // But the live config is untouched: the old snapshot, token included, is retained.
+    assert_eq!(
+        state.snapshot().server.resolved_token().as_deref(),
+        Some("s3cret")
+    );
+    assert!(
+        state.snapshot().matching.ignore_quality_tags,
+        "the unticked box must not have been applied"
+    );
+}

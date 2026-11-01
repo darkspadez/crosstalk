@@ -125,7 +125,7 @@ impl Scheduler {
         let inner = JobScheduler::new()
             .await
             .context("creating the job scheduler")?;
-        let jobs = arm_jobs(&inner, &runner, config).await?;
+        let jobs = arm_jobs(&inner, &runner, config).await;
         inner.start().await.context("starting the scheduler")?;
         Ok(Self {
             inner,
@@ -145,6 +145,10 @@ impl Scheduler {
     /// Called after a settings save swapped the shared config: the next firing of each
     /// schedule uses the new expression, and schedules removed from the file stop firing.
     /// Runs already in flight are untouched; only their future firings change.
+    ///
+    /// Arming is per-entry: one bad entry never stops the others, and every successfully
+    /// armed job is tracked, including partial successes, so a later re-arm can remove
+    /// exactly what is armed.
     pub async fn rearm(&mut self, runner: &JobRunner, config: &CrosstalkConfig) -> Result<()> {
         let armed: Vec<uuid::Uuid> = self
             .jobs
@@ -156,7 +160,7 @@ impl Scheduler {
                 tracing::warn!("removing a replaced schedule: {error:#}");
             }
         }
-        let jobs = arm_jobs(&self.inner, runner, config).await?;
+        let jobs = arm_jobs(&self.inner, runner, config).await;
         *self
             .jobs
             .lock()
@@ -186,12 +190,14 @@ impl Scheduler {
 ///
 /// Shared by [`Scheduler::start`] and [`Scheduler::rearm`] so both agree on what "armed"
 /// means: entries naming an unknown app or action, or carrying a bad expression, are skipped
-/// with a warning and reported by `crosstalk validate`.
+/// with a warning and reported by `crosstalk validate`. A job that fails to build or to add
+/// is skipped the same way rather than aborting the rest: the ids already armed are returned
+/// so the caller still tracks every partial success, and a later re-arm can remove them.
 async fn arm_jobs(
     inner: &JobScheduler,
     runner: &JobRunner,
     config: &CrosstalkConfig,
-) -> Result<Vec<uuid::Uuid>> {
+) -> Vec<uuid::Uuid> {
     let mut armed = Vec::new();
     for (key, expression) in &config.schedules {
         let Ok((app, action)) = split_key(key) else {
@@ -221,7 +227,7 @@ async fn arm_jobs(
         let app = app.to_string();
         let action = action.to_string();
         let dry_run = runner.scheduled_dry_run(&app, &action);
-        let job = Job::new_async(normalized.as_str(), move |_uuid, _lock| {
+        let job = match Job::new_async(normalized.as_str(), move |_uuid, _lock| {
             let runner = job_runner.clone();
             let app = app.clone();
             let action = action.clone();
@@ -240,16 +246,22 @@ async fn arm_jobs(
                     }
                 }
             })
-        })
-        .with_context(|| format!("parsing the cron expression for {key:?}"))?;
+        }) {
+            Ok(job) => job,
+            Err(error) => {
+                tracing::warn!("schedule {key:?}: {error:#}; ignoring it");
+                continue;
+            }
+        };
 
-        let id = inner
-            .add(job)
-            .await
-            .with_context(|| format!("arming the schedule {key:?}"))?;
-        armed.push(id);
+        match inner.add(job).await {
+            Ok(id) => armed.push(id),
+            Err(error) => {
+                tracing::warn!("schedule {key:?}: could not be armed: {error:#}; ignoring it");
+            }
+        }
     }
-    Ok(armed)
+    armed
 }
 
 #[cfg(test)]
@@ -430,6 +442,89 @@ mod tests {
         assert_eq!(scheduler.jobs_count(), 1);
 
         // Clearing the schedules disarms everything.
+        scheduler
+            .rearm(&runner, &CrosstalkConfig::default())
+            .await
+            .expect("disarms");
+        assert_eq!(scheduler.jobs_count(), 0);
+        scheduler.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn rearm_tracks_partial_successes_past_bad_entries() {
+        use crate::jobs::JobContext;
+        use crate::subapp::JobOutcome;
+        use crate::subapp::{ActionKind, ActionSpec};
+
+        struct TwoActionApp;
+        impl crate::subapp::SubApp for TwoActionApp {
+            fn id(&self) -> &'static str {
+                "janitor"
+            }
+            fn name(&self) -> &'static str {
+                "Janitor"
+            }
+            fn description(&self) -> &'static str {
+                "test"
+            }
+            fn actions(&self) -> Vec<ActionSpec> {
+                vec![
+                    ActionSpec::new("automatch", "Automatch", "runs", ActionKind::Read).offline(),
+                    ActionSpec::new("heal", "Heal", "runs", ActionKind::Read).offline(),
+                ]
+            }
+            fn schema(&self) -> &crate::subapp::SettingsSchema {
+                static SCHEMA: std::sync::OnceLock<crate::subapp::SettingsSchema> =
+                    std::sync::OnceLock::new();
+                SCHEMA.get_or_init(crate::subapp::SettingsSchema::default)
+            }
+            fn load_settings(
+                &self,
+                _path: &std::path::Path,
+            ) -> anyhow::Result<crate::subapp::SettingsValues> {
+                Ok(crate::subapp::SettingsValues::new())
+            }
+            fn save_settings(
+                &self,
+                _path: &std::path::Path,
+                _values: &crate::subapp::SettingsValues,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn run<'a>(
+                &'a self,
+                _action: &'a str,
+                _context: &'a JobContext,
+                _dry_run: bool,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = anyhow::Result<JobOutcome>> + Send + 'a>,
+            > {
+                Box::pin(async move { Ok(JobOutcome::new("finished")) })
+            }
+        }
+
+        let store = crate::store::Store::in_memory().expect("store");
+        let runner = JobRunner::new(
+            crate::subapp::Registry::new(vec![Arc::new(TwoActionApp)]),
+            crate::config::SharedConfig::new(CrosstalkConfig::default()),
+            store,
+        );
+        let mut scheduler = Scheduler::start(runner.clone(), &CrosstalkConfig::default())
+            .await
+            .expect("arms");
+
+        // BTreeMap order puts the bad entries on both sides of the good one: an unknown
+        // action first, a bad expression on a known action last. The good entry must still
+        // arm, and its id must be tracked.
+        let partial = config_with(&[
+            ("janitor.aardvark", "0 4 * * *"),
+            ("janitor.automatch", "0 4 * * *"),
+            ("janitor.heal", "not a cron"),
+        ]);
+        scheduler.rearm(&runner, &partial).await.expect("re-arms");
+        assert_eq!(scheduler.jobs_count(), 1);
+
+        // A later re-arm removes exactly what was tracked: nothing is left armed.
         scheduler
             .rearm(&runner, &CrosstalkConfig::default())
             .await

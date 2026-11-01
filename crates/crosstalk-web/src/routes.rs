@@ -129,6 +129,7 @@ struct SettingsTemplate {
     csrf_token: String,
     saved: bool,
     host_error: Option<String>,
+    host_notice: Option<String>,
     host_fields: Vec<UiField>,
     apps: Vec<UiSettings>,
 }
@@ -383,12 +384,19 @@ async fn settings_page(
     axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>,
 ) -> Response {
     let saved = query.get("saved").is_some_and(|value| value == "1");
+    let env_overrides = query.get("env_overrides").is_some_and(|value| value == "1");
     let snapshot = state.snapshot();
     SettingsTemplate {
         version: crosstalk_core::HOST_VERSION,
         csrf_token: state.csrf_token().to_string(),
         saved,
         host_error: None,
+        host_notice: env_overrides.then(|| {
+            "Some values come from environment variables and override this form: the page \
+             shows the effective values, and saving here will not change them until the \
+             environment override is removed."
+                .to_string()
+        }),
         host_fields: state::fields(
             &crosstalk_core::config::matching_schema(),
             &host_values(&snapshot),
@@ -455,6 +463,7 @@ fn settings_with_host_error(state: &AppState, error: String) -> Response {
         csrf_token: state.csrf_token().to_string(),
         saved: false,
         host_error: Some(error),
+        host_notice: None,
         host_fields: state::fields(
             &crosstalk_core::config::matching_schema(),
             &host_values(&snapshot),
@@ -549,22 +558,65 @@ async fn save_host_settings(
                 .into_response();
         }
     };
-    state.config.replace(fresh);
-    if let Some(scheduler) = &state.scheduler {
-        let snapshot = state.snapshot();
-        if let Err(error) = scheduler.lock().await.rearm(&state.runner, &snapshot).await {
-            tracing::error!("host settings applied but the schedules would not re-arm: {error:#}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                settings_with_host_error(
-                    &state,
-                    format!("Settings applied, but the schedules would not re-arm: {error:#}"),
+    // Refuse a swap that would leave the daemon unauthenticated: a non-loopback listener
+    // with no token is a configuration the daemon refuses to start with, so it must not be
+    // swapped in at runtime either. The file IS saved at this point, so say so: a restart
+    // would refuse to start until a token is restored.
+    if crate::auth::requires_token(&fresh.server.bind, fresh.server.resolved_token().as_deref()) {
+        tracing::warn!(
+            bind = fresh.server.bind.as_str(),
+            "host settings saved but NOT applied: the reloaded config has a non-loopback bind with no token"
+        );
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            settings_with_host_error(
+                &state,
+                format!(
+                    "Saved to {path}, but NOT applied: the reloaded configuration binds \
+                     {bind} with no token, which would leave the daemon unauthenticated. A \
+                     restart with this file would refuse to start. Restore a token \
+                     (server.token or server.token_env) and save again.",
+                    path = path.display(),
+                    bind = fresh.server.bind,
                 ),
-            )
-                .into_response();
+            ),
+        )
+            .into_response();
+    }
+
+    // The file holds exactly what the form submitted, so any difference between it and the
+    // effective config is an environment override the form cannot change. Name it on the
+    // page rather than showing values the operator cannot edit into effect.
+    let overridden = env_override_fields(&config.matching, &fresh.matching);
+    if !overridden.is_empty() {
+        tracing::warn!(
+            fields = overridden.join(", ").as_str(),
+            "host settings saved, but environment variables override the saved values"
+        );
+    }
+
+    let previous_schedules = state.snapshot().schedules;
+    state.config.replace(fresh);
+    let snapshot = state.snapshot();
+    // The re-arm only matters when the expressions changed: re-adding identical jobs would
+    // churn every schedule's next firing for no reason.
+    if previous_schedules != snapshot.schedules {
+        if let Some(scheduler) = &state.scheduler {
+            if let Err(error) = scheduler.lock().await.rearm(&state.runner, &snapshot).await {
+                tracing::error!(
+                    "host settings applied but the schedules would not re-arm: {error:#}"
+                );
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    settings_with_host_error(
+                        &state,
+                        format!("Settings applied, but the schedules would not re-arm: {error:#}"),
+                    ),
+                )
+                    .into_response();
+            }
         }
     }
-    let snapshot = state.snapshot();
     tracing::info!(
         ignore_quality = snapshot.matching.ignore_quality_tags,
         databases = ?snapshot.matching.databases(),
@@ -572,7 +624,42 @@ async fn save_host_settings(
         "host settings saved and applied without a restart"
     );
 
-    Redirect::to("/settings?saved=1").into_response()
+    if overridden.is_empty() {
+        Redirect::to("/settings?saved=1").into_response()
+    } else {
+        Redirect::to("/settings?saved=1&env_overrides=1").into_response()
+    }
+}
+
+/// The host-matching fields where the effective config differs from the file.
+///
+/// After a save the file holds exactly what the form submitted, so a difference here means
+/// an environment variable is overriding the UI for that field: the page shows the effective
+/// value, and saving the form cannot change it until the override is removed.
+fn env_override_fields(
+    file: &crosstalk_core::config::MatchingConfig,
+    effective: &crosstalk_core::config::MatchingConfig,
+) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    if file.ignore_quality_tags != effective.ignore_quality_tags {
+        fields.push("matching.ignore_quality_tags");
+    }
+    if file.ignore_regional_tags != effective.ignore_regional_tags {
+        fields.push("matching.ignore_regional_tags");
+    }
+    if file.ignore_geographic_tags != effective.ignore_geographic_tags {
+        fields.push("matching.ignore_geographic_tags");
+    }
+    if file.ignore_misc_tags != effective.ignore_misc_tags {
+        fields.push("matching.ignore_misc_tags");
+    }
+    if file.databases() != effective.databases() {
+        fields.push("matching.enabled_databases");
+    }
+    if file.custom_aliases != effective.custom_aliases {
+        fields.push("matching.custom_aliases");
+    }
+    fields
 }
 
 async fn save_app_settings(
@@ -593,6 +680,7 @@ async fn save_app_settings(
                 csrf_token: state.csrf_token().to_string(),
                 saved: false,
                 host_error: None,
+                host_notice: None,
                 host_fields: state::fields(
                     &crosstalk_core::config::matching_schema(),
                     &host_values(&snapshot),
@@ -611,6 +699,7 @@ async fn save_app_settings(
             csrf_token: state.csrf_token().to_string(),
             saved: false,
             host_error: None,
+            host_notice: None,
             host_fields: state::fields(
                 &crosstalk_core::config::matching_schema(),
                 &host_values(&snapshot),
@@ -706,4 +795,63 @@ pub fn describe_registry(registry: &Registry) -> String {
         .map(|app| format!("{} ({})", app.name(), app.id()))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::env_override_fields;
+    use crosstalk_core::config::MatchingConfig;
+
+    #[test]
+    fn identical_matching_configs_have_no_overrides() {
+        let file = MatchingConfig::default();
+        let effective = MatchingConfig::default();
+        assert!(env_override_fields(&file, &effective).is_empty());
+    }
+
+    #[test]
+    fn every_matching_field_the_form_edits_is_compared() {
+        let file = MatchingConfig::default();
+        let mut effective = MatchingConfig {
+            ignore_quality_tags: !file.ignore_quality_tags,
+            ignore_regional_tags: !file.ignore_regional_tags,
+            ignore_geographic_tags: !file.ignore_geographic_tags,
+            ignore_misc_tags: !file.ignore_misc_tags,
+            enabled_databases: vec!["UK".to_string()],
+            ..MatchingConfig::default()
+        };
+        effective
+            .custom_aliases
+            .insert("ESPN".to_string(), vec!["ESPN US".to_string()]);
+
+        let fields = env_override_fields(&file, &effective);
+        assert!(
+            fields.contains(&"matching.ignore_quality_tags"),
+            "{fields:?}"
+        );
+        assert!(
+            fields.contains(&"matching.ignore_regional_tags"),
+            "{fields:?}"
+        );
+        assert!(
+            fields.contains(&"matching.ignore_geographic_tags"),
+            "{fields:?}"
+        );
+        assert!(fields.contains(&"matching.ignore_misc_tags"), "{fields:?}");
+        assert!(fields.contains(&"matching.enabled_databases"), "{fields:?}");
+        assert!(fields.contains(&"matching.custom_aliases"), "{fields:?}");
+    }
+
+    #[test]
+    fn only_the_differing_fields_are_named() {
+        let file = MatchingConfig::default();
+        let effective = MatchingConfig {
+            ignore_quality_tags: !file.ignore_quality_tags,
+            ..MatchingConfig::default()
+        };
+        assert_eq!(
+            env_override_fields(&file, &effective),
+            vec!["matching.ignore_quality_tags"]
+        );
+    }
 }
