@@ -67,6 +67,7 @@ async-trait = "0.1"
 thiserror = "2"
 chrono = { version = "0.4", features = ["serde"] }
 tokio-cron-scheduler = "0.13"
+uuid = "1"
 croner = { version = "2", features = ["serde"] }
 dashmap = "6"
 csv = "1"

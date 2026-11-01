@@ -555,6 +555,7 @@ dependencies = [
  "toml",
  "toml_edit",
  "tracing",
+ "uuid",
  "wiremock",
 ]
 

@@ -201,7 +201,7 @@ pub async fn check(
     // configured, and only on an exact constant-time match.
     if let Some(expected) = state.token() {
         if let Some(presented) = bearer_token(&request) {
-            if crate::auth::tokens_match(expected, presented) {
+            if crate::auth::tokens_match(&expected, presented) {
                 return next.run(request).await;
             }
         }

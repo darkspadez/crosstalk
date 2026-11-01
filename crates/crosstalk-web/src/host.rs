@@ -55,8 +55,10 @@ pub async fn check(
     }
 
     // A configured token means bearer auth is the protection (see the module docs): only
-    // the tokenless loopback listener needs the Host allowlist.
-    if state.token().is_some() {
+    // the tokenless loopback listener needs the Host allowlist. Both are read from the
+    // current snapshot, so a token rotation or bind change saved in the UI applies here too.
+    let snapshot = state.snapshot();
+    if snapshot.server.resolved_token().is_some() {
         return next.run(request).await;
     }
 
@@ -66,7 +68,7 @@ pub async fn check(
         .and_then(|value| value.to_str().ok())
     {
         let host = host_part(host);
-        if !host.is_empty() && !is_allowed(&host, &state.config.server.bind) {
+        if !host.is_empty() && !is_allowed(&host, &snapshot.server.bind) {
             return (
                 StatusCode::FORBIDDEN,
                 "the request host is not this daemon: possible DNS rebinding\n",

@@ -101,8 +101,12 @@ fn next_run(expression: &str) -> Option<String> {
 }
 
 /// The armed scheduler.
+///
+/// The armed job ids are tracked so [`Scheduler::rearm`] can remove exactly what `start`
+/// armed and arm the new config: saving host settings re-arms without a daemon restart.
 pub struct Scheduler {
     inner: JobScheduler,
+    jobs: std::sync::Mutex<Vec<uuid::Uuid>>,
 }
 
 impl std::fmt::Debug for Scheduler {
@@ -121,76 +125,131 @@ impl Scheduler {
         let inner = JobScheduler::new()
             .await
             .context("creating the job scheduler")?;
-
-        for (key, expression) in &config.schedules {
-            let Ok((app, action)) = split_key(key) else {
-                tracing::warn!("schedule {key:?} is not <app>.<action>; ignoring it");
-                continue;
-            };
-            if runner.registry().find_action(app, action).is_none() {
-                tracing::warn!("schedule {key:?} names an unknown action; ignoring it");
-                continue;
-            }
-
-            let normalized = match normalize_cron(expression) {
-                Ok(normalized) => normalized,
-                Err(error) => {
-                    tracing::warn!("schedule {key:?}: {error:#}; ignoring it");
-                    continue;
-                }
-            };
-            if let Err(error) = parse_schedule(expression) {
-                // Skipping rather than failing: a typo in one schedule must not stop the
-                // daemon or the other schedules. `crosstalk validate` reports it as an error.
-                tracing::warn!("schedule {key:?}: {error:#}; ignoring it");
-                continue;
-            }
-
-            let job_runner = runner.clone();
-            let app = app.to_string();
-            let action = action.to_string();
-            let dry_run = runner.scheduled_dry_run(&app, &action);
-            let job = Job::new_async(normalized.as_str(), move |_uuid, _lock| {
-                let runner = job_runner.clone();
-                let app = app.clone();
-                let action = action.clone();
-                Box::pin(async move {
-                    // The flag comes from the action's own kind, so a schedule naming a
-                    // preview stays a preview instead of writing because a schedule said so.
-                    match runner.start(&app, &action, dry_run) {
-                        Ok(started) => tracing::info!(
-                            app,
-                            action,
-                            run_id = started.run_id,
-                            "scheduled run started"
-                        ),
-                        Err(error) => {
-                            tracing::warn!(app, action, "scheduled run not started: {error:#}")
-                        }
-                    }
-                })
-            })
-            .with_context(|| format!("parsing the cron expression for {key:?}"))?;
-
-            inner
-                .add(job)
-                .await
-                .with_context(|| format!("arming the schedule {key:?}"))?;
-        }
-
+        let jobs = arm_jobs(&inner, &runner, config).await?;
         inner.start().await.context("starting the scheduler")?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            jobs: std::sync::Mutex::new(jobs),
+        })
+    }
+
+    /// How many jobs are currently armed. Exposed for tests: there is no public job listing
+    /// on the scheduler itself, so the count is what proves a re-arm replaced rather than
+    /// duplicated.
+    pub fn jobs_count(&self) -> usize {
+        self.jobs.lock().map(|jobs| jobs.len()).unwrap_or(0)
+    }
+
+    /// Drop every armed job and arm the new config in its place.
+    ///
+    /// Called after a settings save swapped the shared config: the next firing of each
+    /// schedule uses the new expression, and schedules removed from the file stop firing.
+    /// Runs already in flight are untouched; only their future firings change.
+    pub async fn rearm(&mut self, runner: &JobRunner, config: &CrosstalkConfig) -> Result<()> {
+        let armed: Vec<uuid::Uuid> = self
+            .jobs
+            .lock()
+            .map(|mut jobs| std::mem::take(&mut *jobs))
+            .unwrap_or_default();
+        for id in armed {
+            if let Err(error) = self.inner.remove(&id).await {
+                tracing::warn!("removing a replaced schedule: {error:#}");
+            }
+        }
+        let jobs = arm_jobs(&self.inner, runner, config).await?;
+        *self
+            .jobs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = jobs;
+        tracing::info!(
+            count = self.jobs_count(),
+            "schedules re-armed from the saved configuration"
+        );
+        Ok(())
     }
 
     /// Stop every armed job.
     ///
     /// Schedules fire in UTC; that is the scheduler's behaviour and is worth knowing when an
     /// expression is written for local time.
-    pub async fn shutdown(mut self) {
+    ///
+    /// Takes `&mut self` so a scheduler shared behind a mutex (the daemon's serve path
+    /// shares one between the web UI's re-arm and shutdown) can stop without being moved out.
+    pub async fn shutdown(&mut self) {
         if let Err(error) = self.inner.shutdown().await {
             tracing::warn!("shutting the scheduler down: {error:#}");
         }
     }
+}
+
+/// Arm every schedule in `config` on `inner`, returning the armed job ids.
+///
+/// Shared by [`Scheduler::start`] and [`Scheduler::rearm`] so both agree on what "armed"
+/// means: entries naming an unknown app or action, or carrying a bad expression, are skipped
+/// with a warning and reported by `crosstalk validate`.
+async fn arm_jobs(
+    inner: &JobScheduler,
+    runner: &JobRunner,
+    config: &CrosstalkConfig,
+) -> Result<Vec<uuid::Uuid>> {
+    let mut armed = Vec::new();
+    for (key, expression) in &config.schedules {
+        let Ok((app, action)) = split_key(key) else {
+            tracing::warn!("schedule {key:?} is not <app>.<action>; ignoring it");
+            continue;
+        };
+        if runner.registry().find_action(app, action).is_none() {
+            tracing::warn!("schedule {key:?} names an unknown action; ignoring it");
+            continue;
+        }
+
+        let normalized = match normalize_cron(expression) {
+            Ok(normalized) => normalized,
+            Err(error) => {
+                tracing::warn!("schedule {key:?}: {error:#}; ignoring it");
+                continue;
+            }
+        };
+        if let Err(error) = parse_schedule(expression) {
+            // Skipping rather than failing: a typo in one schedule must not stop the
+            // daemon or the other schedules. `crosstalk validate` reports it as an error.
+            tracing::warn!("schedule {key:?}: {error:#}; ignoring it");
+            continue;
+        }
+
+        let job_runner = runner.clone();
+        let app = app.to_string();
+        let action = action.to_string();
+        let dry_run = runner.scheduled_dry_run(&app, &action);
+        let job = Job::new_async(normalized.as_str(), move |_uuid, _lock| {
+            let runner = job_runner.clone();
+            let app = app.clone();
+            let action = action.clone();
+            Box::pin(async move {
+                // The flag comes from the action's own kind, so a schedule naming a
+                // preview stays a preview instead of writing because a schedule said so.
+                match runner.start(&app, &action, dry_run) {
+                    Ok(started) => tracing::info!(
+                        app,
+                        action,
+                        run_id = started.run_id,
+                        "scheduled run started"
+                    ),
+                    Err(error) => {
+                        tracing::warn!(app, action, "scheduled run not started: {error:#}")
+                    }
+                }
+            })
+        })
+        .with_context(|| format!("parsing the cron expression for {key:?}"))?;
+
+        let id = inner
+            .add(job)
+            .await
+            .with_context(|| format!("arming the schedule {key:?}"))?;
+        armed.push(id);
+    }
+    Ok(armed)
 }
 
 #[cfg(test)]
@@ -286,11 +345,96 @@ mod tests {
         let store = crate::store::Store::in_memory().expect("store");
         let runner = JobRunner::new(
             crate::subapp::Registry::new(vec![]),
-            Arc::new(config.clone()),
+            crate::config::SharedConfig::new(config.clone()),
             store,
         );
         // Nothing here names a real action, so arming succeeds with no jobs.
-        let scheduler = Scheduler::start(runner, &config).await.expect("arms");
+        let mut scheduler = Scheduler::start(runner, &config).await.expect("arms");
+        assert_eq!(scheduler.jobs_count(), 0);
+        scheduler.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn rearm_replaces_armed_jobs_without_duplicating() {
+        use crate::jobs::JobContext;
+        use crate::subapp::JobOutcome;
+        use crate::subapp::{ActionKind, ActionSpec};
+
+        struct PreviewApp;
+        impl crate::subapp::SubApp for PreviewApp {
+            fn id(&self) -> &'static str {
+                "janitor"
+            }
+            fn name(&self) -> &'static str {
+                "Janitor"
+            }
+            fn description(&self) -> &'static str {
+                "test"
+            }
+            fn actions(&self) -> Vec<ActionSpec> {
+                vec![ActionSpec::new("automatch", "Automatch", "runs", ActionKind::Read).offline()]
+            }
+            fn schema(&self) -> &crate::subapp::SettingsSchema {
+                static SCHEMA: std::sync::OnceLock<crate::subapp::SettingsSchema> =
+                    std::sync::OnceLock::new();
+                SCHEMA.get_or_init(crate::subapp::SettingsSchema::default)
+            }
+            fn load_settings(
+                &self,
+                _path: &std::path::Path,
+            ) -> anyhow::Result<crate::subapp::SettingsValues> {
+                Ok(crate::subapp::SettingsValues::new())
+            }
+            fn save_settings(
+                &self,
+                _path: &std::path::Path,
+                _values: &crate::subapp::SettingsValues,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn run<'a>(
+                &'a self,
+                _action: &'a str,
+                _context: &'a JobContext,
+                _dry_run: bool,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = anyhow::Result<JobOutcome>> + Send + 'a>,
+            > {
+                Box::pin(async move { Ok(JobOutcome::new("finished")) })
+            }
+        }
+
+        let store = crate::store::Store::in_memory().expect("store");
+        let runner = JobRunner::new(
+            crate::subapp::Registry::new(vec![Arc::new(PreviewApp)]),
+            crate::config::SharedConfig::new(CrosstalkConfig::default()),
+            store,
+        );
+        // Start with no schedules: nothing armed.
+        let mut scheduler = Scheduler::start(runner.clone(), &CrosstalkConfig::default())
+            .await
+            .expect("arms");
+        assert_eq!(scheduler.jobs_count(), 0);
+
+        // Re-arm with one schedule: it arms.
+        let with_one = config_with(&[("janitor.automatch", "0 4 * * *")]);
+        scheduler.rearm(&runner, &with_one).await.expect("re-arms");
+        assert_eq!(scheduler.jobs_count(), 1);
+        assert_eq!(describe(&with_one).len(), 1);
+
+        // Re-arming with the same config replaces rather than duplicates.
+        scheduler
+            .rearm(&runner, &with_one)
+            .await
+            .expect("re-arms again");
+        assert_eq!(scheduler.jobs_count(), 1);
+
+        // Clearing the schedules disarms everything.
+        scheduler
+            .rearm(&runner, &CrosstalkConfig::default())
+            .await
+            .expect("disarms");
+        assert_eq!(scheduler.jobs_count(), 0);
         scheduler.shutdown().await;
     }
 }

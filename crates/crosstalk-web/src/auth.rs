@@ -97,7 +97,7 @@ pub async fn require(
     }
 
     match presented_token(&request) {
-        Some(presented) if tokens_match(expected, &presented) => next.run(request).await,
+        Some(presented) if tokens_match(&expected, &presented) => next.run(request).await,
         _ => {
             let wants_html = request
                 .headers()

@@ -84,12 +84,15 @@ fn state(token: Option<&str>) -> (AppState, Store, tempfile::TempDir) {
 
     let store = Store::in_memory().expect("store");
     let registry = Registry::new(vec![Arc::new(EchoApp)]);
+    // ONE shared config for the runner and the UI, like the daemon: a save the UI applies
+    // is the value the runner's next run snapshots.
+    let shared = crosstalk_core::config::SharedConfig::new(config);
     let runner = JobRunner::new(
         Registry::new(vec![Arc::new(EchoApp)]),
-        Arc::new(config.clone()),
+        shared.clone(),
         store.clone(),
     );
-    let state = AppState::new(registry, Arc::new(config), runner, store.clone());
+    let state = AppState::new(registry, shared, runner, store.clone());
     (state, store, dir)
 }
 
@@ -704,4 +707,40 @@ async fn the_login_endpoint_is_exempt_from_csrf() {
     let (state, _store, _dir) = state(None);
     let status = post_form_with_csrf(&state, "/login", "token=anything", false).await;
     assert_ne!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn saving_host_settings_applies_without_a_restart() {
+    let (state, _store, dir) = state(None);
+    std::fs::write(dir.path().join("crosstalk.toml"), "").expect("seed");
+    assert!(state.snapshot().matching.ignore_quality_tags);
+
+    // Untick the quality-tags box (an absent checkbox means false) and save.
+    let status = post_form(&state, "/settings/host", "matching.enabled_databases=US").await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    // The file holds the new value and the live config matches it: no restart needed.
+    let text = std::fs::read_to_string(dir.path().join("crosstalk.toml")).expect("read");
+    assert!(text.contains("ignore_quality_tags = false"), "{text}");
+    assert!(!state.snapshot().matching.ignore_quality_tags);
+    assert_eq!(
+        state.snapshot().matching.databases(),
+        vec!["US".to_string()]
+    );
+
+    // The settings page renders the saved value from the live config: the quality-tags
+    // checkbox is now unticked (no `checked` on its input).
+    let (status, body) = get(&state, "/settings").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Ignore Quality Tags"), "{body}");
+    let input = body
+        .lines()
+        .find(|line| line.contains("name=\"matching.ignore_quality_tags\""))
+        .unwrap_or("")
+        .to_string();
+    assert!(!input.is_empty(), "the host form renders the field: {body}");
+    assert!(
+        !input.contains("checked"),
+        "the box reflects the save: {input}"
+    );
 }

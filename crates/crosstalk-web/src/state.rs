@@ -4,9 +4,9 @@
 //! know about `SettingsSchema`, `RunRow` or `ActionKind`, and the same view models are what the
 //! tests assert on.
 
-use crosstalk_core::config::CrosstalkConfig;
+use crosstalk_core::config::{CrosstalkConfig, SharedConfig};
 use crosstalk_core::runner::JobRunner;
-use crosstalk_core::scheduler::ScheduleInfo;
+use crosstalk_core::scheduler::{ScheduleInfo, Scheduler};
 use crosstalk_core::store::{RunRecord, RunRow, Store};
 use crosstalk_core::subapp::{
     ActionKind, FieldKind, FieldValue, Registry, SettingsSchema, SettingsValues,
@@ -17,10 +17,14 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct AppState {
     pub registry: Arc<Registry>,
-    pub config: Arc<CrosstalkConfig>,
+    /// The daemon's live config. Handlers snapshot it per request, so a settings save
+    /// takes effect without a restart; runs snapshot it at start and keep their own copy.
+    pub config: SharedConfig,
     pub runner: JobRunner,
     pub store: Store,
-    token: Option<String>,
+    /// The armed scheduler, shared with the serve path. Present in the daemon so a host
+    /// settings save can re-arm schedules; absent in tests and one-shot contexts.
+    pub scheduler: Option<Arc<tokio::sync::Mutex<Scheduler>>>,
     /// Random secret generated at startup; every POST form carries it back.
     csrf_token: String,
 }
@@ -32,32 +36,38 @@ impl std::fmt::Debug for AppState {
                 "apps",
                 &self.registry.iter().map(|app| app.id()).collect::<Vec<_>>(),
             )
-            .field("auth", &self.token.is_some())
+            .field("auth", &self.token().is_some())
             .finish_non_exhaustive()
     }
 }
 
 impl AppState {
-    pub fn new(
-        registry: Registry,
-        config: Arc<CrosstalkConfig>,
-        runner: JobRunner,
-        store: Store,
-    ) -> Self {
-        let token = config.server.resolved_token();
+    pub fn new(registry: Registry, config: SharedConfig, runner: JobRunner, store: Store) -> Self {
         Self {
             registry: Arc::new(registry),
             config,
             runner,
             store,
-            token,
+            scheduler: None,
             csrf_token: crate::csrf::generate_token(),
         }
     }
 
-    /// The token a request must present, if any.
-    pub fn token(&self) -> Option<&str> {
-        self.token.as_deref()
+    /// Attach the armed scheduler so host settings saves can re-arm schedules.
+    pub fn with_scheduler(mut self, scheduler: Arc<tokio::sync::Mutex<Scheduler>>) -> Self {
+        self.scheduler = Some(scheduler);
+        self
+    }
+
+    /// A point-in-time copy of the live config, for rendering and validating.
+    pub fn snapshot(&self) -> CrosstalkConfig {
+        self.config.snapshot()
+    }
+
+    /// The token a request must present, if any, read from the CURRENT config: a token
+    /// rotation saved in the UI takes effect on the next request, without a restart.
+    pub fn token(&self) -> Option<String> {
+        self.config.read().server.resolved_token()
     }
 
     /// The CSRF secret POSTs must carry back, via form field or header.

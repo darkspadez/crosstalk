@@ -93,6 +93,8 @@ configuration that had environment overrides applied, so a token cannot leak int
 accident.
 
 The web UI writes settings back through `toml_edit`, preserving your comments and ordering.
+Host settings saved in the UI hot-reload: the next run uses them and schedules re-arm, with
+no daemon restart (a run already in progress finishes with the settings it started with).
 
 ## Actions
 

@@ -11,7 +11,7 @@ mod simulate;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
-use crosstalk_core::config::CrosstalkConfig;
+use crosstalk_core::config::{CrosstalkConfig, SharedConfig};
 use crosstalk_core::jobs::JobContext;
 use crosstalk_core::runner::JobRunner;
 use crosstalk_core::store::Store;
@@ -164,32 +164,38 @@ fn main() -> Result<()> {
 fn serve(args: ServeArgs) -> Result<()> {
     let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
     runtime.block_on(async move {
-        let config = Arc::new(CrosstalkConfig::load(&args.config)?);
+        // The live config: the runner, the scheduler and the web UI share it, and a host
+        // settings save swaps it without a restart. Runs snapshot it at start, so a save
+        // mid-run reaches the next run, never the running one.
+        let config = SharedConfig::new(CrosstalkConfig::load(&args.config)?);
+        let snapshot = config.snapshot();
 
         // Refuse to expose an unauthenticated listener: an apply action can rewrite a guide.
-        let token = config.server.resolved_token();
-        if crosstalk_web::auth::requires_token(&config.server.bind, token.as_deref()) {
+        let token = snapshot.server.resolved_token();
+        if crosstalk_web::auth::requires_token(&snapshot.server.bind, token.as_deref()) {
             anyhow::bail!(
                 "server.bind is {} with no token: set server.token or server.token_env before \
                  exposing the daemon. Anyone who can reach the port could run apply actions.",
-                config.server.bind
+                snapshot.server.bind
             );
         }
 
-        let store = Store::open(config.data_dir().join("crosstalk.db"))?;
+        let store = Store::open(snapshot.data_dir().join("crosstalk.db"))?;
         let registry = registry::builtin();
-        let runner = JobRunner::new(registry.clone(), Arc::clone(&config), store.clone());
+        let runner = JobRunner::new(registry.clone(), config.clone(), store.clone());
 
         // ONE runner: the scheduler arms jobs on the same instance the UI talks to, or a
         // scheduled run would be invisible to the UI and could race a UI run on the same app.
-        let scheduler =
-            crosstalk_core::scheduler::Scheduler::start(runner.clone(), &config).await?;
+        // Behind a mutex shared with the web UI, so a settings save can re-arm schedules.
+        let scheduler = Arc::new(tokio::sync::Mutex::new(
+            crosstalk_core::scheduler::Scheduler::start(runner.clone(), &snapshot).await?,
+        ));
 
-        let state =
-            crosstalk_web::AppState::new(registry, Arc::clone(&config), runner.clone(), store);
+        let state = crosstalk_web::AppState::new(registry, config, runner.clone(), store)
+            .with_scheduler(Arc::clone(&scheduler));
         let app = crosstalk_web::router(state);
 
-        let address = format!("{}:{}", config.server.bind, config.server.port);
+        let address = format!("{}:{}", snapshot.server.bind, snapshot.server.port);
         let listener = tokio::net::TcpListener::bind(&address)
             .await
             .with_context(|| format!("binding {address}"))?;
@@ -201,7 +207,7 @@ fn serve(args: ServeArgs) -> Result<()> {
         if token.is_none() {
             println!("no token configured: only a loopback listener may run without one");
         }
-        for entry in crosstalk_core::scheduler::describe(&config) {
+        for entry in crosstalk_core::scheduler::describe(&snapshot) {
             match &entry.next_run {
                 Some(next) => println!("schedule {} next runs at {next}", entry.key),
                 None => println!("schedule {} is not valid and will not run", entry.key),
@@ -219,7 +225,7 @@ fn serve(args: ServeArgs) -> Result<()> {
         runner.shutdown();
         wait_for_drain(&runner, std::time::Duration::from_secs(30)).await;
 
-        scheduler.shutdown().await;
+        scheduler.lock().await.shutdown().await;
         Ok(())
     })
 }
@@ -423,7 +429,7 @@ mod shutdown_tests {
 
     fn idle_runner() -> JobRunner {
         let dir = tempfile::tempdir().expect("tempdir");
-        let config = Arc::new(CrosstalkConfig::load(dir.path()).expect("config"));
+        let config = SharedConfig::new(CrosstalkConfig::load(dir.path()).expect("config"));
         let store = Store::in_memory().expect("store");
         JobRunner::new(registry::builtin(), config, store)
     }

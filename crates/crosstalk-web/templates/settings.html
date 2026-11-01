@@ -6,6 +6,8 @@
 
 <section class="card">
   <h2>Host</h2>
+  <p class="muted">Host settings apply immediately when saved: the next run uses them, schedules re-arm, and no restart is needed. A run already in progress finishes with the settings it started with.</p>
+  {% if let Some(error) = host_error %}<p class="error">{{ error }}</p>{% endif %}
   <form method="post" action="/settings/host">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     {% for field in host_fields %}

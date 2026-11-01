@@ -27,6 +27,7 @@ chrono.workspace = true
 tracing.workspace = true
 tokio-cron-scheduler.workspace = true
 croner.workspace = true
+uuid.workspace = true
 globset.workspace = true
 
 [dev-dependencies]

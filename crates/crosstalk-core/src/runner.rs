@@ -14,7 +14,7 @@
 //!   * a panic in an action frees the app and records the failure, so one bad run cannot lock
 //!     the daemon out of ever running that app again.
 
-use crate::config::CrosstalkConfig;
+use crate::config::{CrosstalkConfig, SharedConfig};
 use crate::jobs::{JobContext, ProgressEvent, ProgressSink};
 use crate::store::{RunStatus, Store};
 use crate::subapp::{ActionKind, Registry};
@@ -162,7 +162,7 @@ impl Drop for RunSlot {
 #[derive(Clone)]
 pub struct JobRunner {
     registry: Arc<Registry>,
-    config: Arc<CrosstalkConfig>,
+    config: SharedConfig,
     store: Store,
     sender: broadcast::Sender<ProgressEvent>,
     active: Arc<Mutex<HashMap<i64, ActiveRun>>>,
@@ -183,7 +183,9 @@ impl std::fmt::Debug for JobRunner {
 }
 
 impl JobRunner {
-    pub fn new(registry: Registry, config: Arc<CrosstalkConfig>, store: Store) -> Self {
+    /// The runner shares the daemon's live config: every run snapshots it at start, so a
+    /// save mid-run changes the next run, never the one already in flight.
+    pub fn new(registry: Registry, config: SharedConfig, store: Store) -> Self {
         let (sender, _) = broadcast::channel(1024);
         Self {
             registry: Arc::new(registry),
@@ -195,6 +197,11 @@ impl JobRunner {
             finish: Arc::new(Mutex::new(HashMap::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// A point-in-time copy of the live config, for callers that need a value now.
+    pub fn config_snapshot(&self) -> CrosstalkConfig {
+        self.config.snapshot()
     }
 
     pub fn store(&self) -> &Store {
@@ -350,7 +357,10 @@ impl JobRunner {
                 active: Arc::clone(&runner.active),
                 run_id,
             });
-            let context = JobContext::new(Arc::clone(&runner.config), sink.clone()).for_run(
+            // Snapshot at run start: a settings save while this run is in flight changes
+            // the next run, never this one's context.
+            let snapshot = Arc::new(runner.config.snapshot());
+            let context = JobContext::new(snapshot, sink.clone()).for_run(
                 run_id,
                 runner.store.clone(),
                 Arc::clone(&cancel_flag),
@@ -462,7 +472,9 @@ impl JobRunner {
             active: Arc::clone(&self.active),
             run_id,
         });
-        let context = JobContext::new(Arc::clone(&self.config), sink).for_run(
+        // Same snapshot rule as `start`: the run keeps the config it started with.
+        let snapshot = Arc::new(self.config.snapshot());
+        let context = JobContext::new(snapshot, sink).for_run(
             run_id,
             self.store.clone(),
             Arc::clone(&cancel_flag),
@@ -529,7 +541,7 @@ impl JobRunner {
     /// is logged and dropped. The just-finished run is the newest of its app and `prune`
     /// skips running rows, so it can never delete the run that just ended.
     fn prune_history(&self) {
-        let days = self.config.jobs.run_history_days;
+        let days = self.config.snapshot().jobs.run_history_days;
         if days == 0 {
             return;
         }
@@ -675,7 +687,7 @@ mod tests {
     fn runner(app: TestApp, store: Store) -> JobRunner {
         JobRunner::new(
             Registry::new(vec![Arc::new(app)]),
-            Arc::new(CrosstalkConfig::default()),
+            SharedConfig::new(CrosstalkConfig::default()),
             store,
         )
     }
@@ -957,7 +969,7 @@ mod tests {
             seed_finished_run(&store, "test", 30);
         }
         let runner = runner(TestApp::new(Duration::from_millis(1)), store.clone());
-        assert_eq!(runner.config.jobs.run_history_days, 15);
+        assert_eq!(runner.config_snapshot().jobs.run_history_days, 15);
         let outcome = runner
             .run_to_completion("test", "run", true)
             .await
@@ -987,7 +999,7 @@ mod tests {
         };
         let runner = JobRunner::new(
             Registry::new(vec![Arc::new(TestApp::new(Duration::from_millis(1)))]),
-            Arc::new(config),
+            SharedConfig::new(config),
             store.clone(),
         );
         runner
@@ -995,5 +1007,130 @@ mod tests {
             .await
             .expect("ok");
         assert_eq!(store.run_count().expect("count"), 4);
+    }
+
+    /// An app that records the config value its run started with.
+    struct SnapshotApp {
+        seen: Arc<std::sync::Mutex<Vec<u16>>>,
+        delay: Duration,
+    }
+
+    impl SubApp for SnapshotApp {
+        fn id(&self) -> &'static str {
+            "test"
+        }
+
+        fn name(&self) -> &'static str {
+            "Test"
+        }
+
+        fn description(&self) -> &'static str {
+            "test app"
+        }
+
+        fn actions(&self) -> Vec<ActionSpec> {
+            vec![ActionSpec::new("run", "Run", "runs", ActionKind::Read).offline()]
+        }
+
+        fn schema(&self) -> &SettingsSchema {
+            static SCHEMA: std::sync::OnceLock<SettingsSchema> = std::sync::OnceLock::new();
+            SCHEMA.get_or_init(SettingsSchema::default)
+        }
+
+        fn load_settings(&self, _path: &Path) -> Result<SettingsValues> {
+            Ok(SettingsValues::new())
+        }
+
+        fn save_settings(&self, _path: &Path, _values: &SettingsValues) -> Result<()> {
+            Ok(())
+        }
+
+        fn run<'a>(
+            &'a self,
+            _action: &'a str,
+            context: &'a JobContext,
+            _dry_run: bool,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<JobOutcome>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                // Record first, then work: a save that lands while this run is in flight
+                // must not change what this run already observed.
+                self.seen
+                    .lock()
+                    .expect("seen lock")
+                    .push(context.config().server.port);
+                tokio::time::sleep(self.delay).await;
+                // Re-read at the end: the snapshot is a clone, so it still says the old value.
+                self.seen
+                    .lock()
+                    .expect("seen lock")
+                    .push(context.config().server.port);
+                Ok(JobOutcome::new("finished"))
+            })
+        }
+    }
+
+    fn snapshot_runner(seen: Arc<std::sync::Mutex<Vec<u16>>>, delay: Duration) -> JobRunner {
+        let mut config = CrosstalkConfig::default();
+        config.server.port = 1111;
+        JobRunner::new(
+            Registry::new(vec![Arc::new(SnapshotApp { seen, delay })]),
+            SharedConfig::new(config),
+            Store::in_memory().expect("store"),
+        )
+    }
+
+    #[test]
+    fn shared_config_replace_swaps_the_snapshot() {
+        let shared = SharedConfig::new(CrosstalkConfig::default());
+        assert!(shared.snapshot().matching.ignore_quality_tags);
+        let mut next = CrosstalkConfig::default();
+        next.matching.ignore_quality_tags = false;
+        next.server.port = 9999;
+        shared.replace(next);
+        let snapshot = shared.snapshot();
+        assert!(!snapshot.matching.ignore_quality_tags);
+        assert_eq!(snapshot.server.port, 9999);
+        // The earlier snapshot is a clone, unaffected by the replace.
+        assert_eq!(shared.read().server.port, 9999);
+    }
+
+    #[tokio::test]
+    async fn a_replace_between_runs_reaches_the_next_run() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runner = snapshot_runner(Arc::clone(&seen), Duration::from_millis(1));
+        runner
+            .run_to_completion("test", "run", true)
+            .await
+            .expect("first run");
+        let mut next = runner.config_snapshot();
+        next.server.port = 2222;
+        runner.config.replace(next);
+        runner
+            .run_to_completion("test", "run", true)
+            .await
+            .expect("second run");
+        // Each run records its port twice (start and end); the first run saw 1111, the
+        // second sees 2222.
+        assert_eq!(
+            *seen.lock().expect("seen lock"),
+            vec![1111, 1111, 2222, 2222]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replace_mid_run_does_not_mutate_the_running_job() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runner = snapshot_runner(Arc::clone(&seen), Duration::from_millis(100));
+        runner.start("test", "run", true).expect("started");
+        // Give the run a moment to record its starting port, then save new settings.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut next = runner.config_snapshot();
+        next.server.port = 2222;
+        runner.config.replace(next);
+        wait_until_idle(&runner).await;
+        // Both observations come from the run's own snapshot: the mid-run replace changed
+        // the shared value, not the running job's context.
+        assert_eq!(*seen.lock().expect("seen lock"), vec![1111, 1111]);
     }
 }

@@ -578,6 +578,60 @@ impl CrosstalkConfig {
     }
 }
 
+/// The daemon's live configuration: one value shared by the runner, the scheduler and
+/// the web UI, swapped wholesale when the operator saves host settings.
+///
+/// A run snapshots the config when it starts ([`SharedConfig::snapshot`]) and builds its
+/// [`crate::jobs::JobContext`] from that copy, so saving settings mid-run changes the
+/// NEXT run, never the one already in flight. Schedules re-arm from the same swap.
+#[derive(Debug, Clone)]
+pub struct SharedConfig {
+    inner: std::sync::Arc<std::sync::RwLock<CrosstalkConfig>>,
+}
+
+impl SharedConfig {
+    pub fn new(config: CrosstalkConfig) -> Self {
+        Self {
+            inner: std::sync::Arc::new(std::sync::RwLock::new(config)),
+        }
+    }
+
+    /// A point-in-time copy. Runs take one at start; request handlers take one per request.
+    pub fn snapshot(&self) -> CrosstalkConfig {
+        self.read().clone()
+    }
+
+    /// Read the live value. Recovers from a poisoned lock rather than panicking: a poisoned
+    /// config would take the whole daemon down on the next request, long after whatever
+    /// panicked while holding it.
+    pub fn read(&self) -> std::sync::RwLockReadGuard<'_, CrosstalkConfig> {
+        self.inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Swap in a freshly loaded config, for example after the settings page saved the file.
+    pub fn replace(&self, config: CrosstalkConfig) {
+        let mut guard = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = config;
+    }
+
+    /// Where the configuration was loaded from. Needed to reload after a save without
+    /// snapshotting the whole value.
+    pub fn config_dir(&self) -> std::path::PathBuf {
+        self.read().config_dir.clone()
+    }
+}
+
+impl From<CrosstalkConfig> for SharedConfig {
+    fn from(config: CrosstalkConfig) -> Self {
+        Self::new(config)
+    }
+}
+
 /// The host's own settings form: the shared matching options.
 ///
 /// These live in the host file, so they need a schema of their own; without one the UI has

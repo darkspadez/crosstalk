@@ -128,6 +128,7 @@ struct SettingsTemplate {
     version: &'static str,
     csrf_token: String,
     saved: bool,
+    host_error: Option<String>,
     host_fields: Vec<UiField>,
     apps: Vec<UiSettings>,
 }
@@ -169,7 +170,7 @@ async fn login(State(state): State<AppState>, Form(form): Form<LoginForm>) -> Re
         return Redirect::to("/").into_response();
     };
 
-    if !crate::auth::tokens_match(expected, form.token.trim()) {
+    if !crate::auth::tokens_match(&expected, form.token.trim()) {
         return LoginTemplate {
             error: Some("That token does not match the configured one.".to_string()),
         }
@@ -200,12 +201,13 @@ async fn logout() -> Response {
 
 async fn dashboard(State(state): State<AppState>) -> Response {
     let runs = state.store.recent_runs(20).unwrap_or_default();
-    let warnings = state.config.validate().warnings;
+    let snapshot = state.snapshot();
+    let warnings = snapshot.validate().warnings;
     DashboardTemplate {
         version: crosstalk_core::HOST_VERSION,
         csrf_token: state.csrf_token().to_string(),
         apps: state::apps(&state.registry, &state.store),
-        schedules: state::schedules(&state.config),
+        schedules: state::schedules(&snapshot),
         runs,
         warnings,
     }
@@ -381,13 +383,15 @@ async fn settings_page(
     axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>,
 ) -> Response {
     let saved = query.get("saved").is_some_and(|value| value == "1");
+    let snapshot = state.snapshot();
     SettingsTemplate {
         version: crosstalk_core::HOST_VERSION,
         csrf_token: state.csrf_token().to_string(),
         saved,
+        host_error: None,
         host_fields: state::fields(
             &crosstalk_core::config::matching_schema(),
-            &host_values(&state.config),
+            &host_values(&snapshot),
         ),
         apps: app_forms(&state, None),
     }
@@ -426,11 +430,12 @@ fn host_values(config: &crosstalk_core::CrosstalkConfig) -> crosstalk_core::Sett
 }
 
 fn app_forms(state: &AppState, error: Option<String>) -> Vec<UiSettings> {
+    let config_dir = state.config.config_dir();
     state
         .registry
         .iter()
         .map(|app| {
-            let path = app.settings_path(&state.config.config_dir);
+            let path = app.settings_path(&config_dir);
             let values = app.load_settings(&path).unwrap_or_default();
             UiSettings {
                 id: app.id().to_string(),
@@ -442,13 +447,31 @@ fn app_forms(state: &AppState, error: Option<String>) -> Vec<UiSettings> {
         .collect()
 }
 
+/// Render the settings page with a host-level error, keeping the just-submitted values.
+fn settings_with_host_error(state: &AppState, error: String) -> Response {
+    let snapshot = state.snapshot();
+    SettingsTemplate {
+        version: crosstalk_core::HOST_VERSION,
+        csrf_token: state.csrf_token().to_string(),
+        saved: false,
+        host_error: Some(error),
+        host_fields: state::fields(
+            &crosstalk_core::config::matching_schema(),
+            &host_values(&snapshot),
+        ),
+        apps: app_forms(state, None),
+    }
+    .into_response()
+}
+
 async fn save_host_settings(
     State(state): State<AppState>,
     Form(form): Form<HashMap<String, String>>,
 ) -> Response {
+    let config_dir = state.config.config_dir();
     // Saved into the FILE-only configuration, never the effective one: writing the effective
     // config would copy an environment-supplied secret into the file.
-    let mut config = match crosstalk_core::CrosstalkConfig::load_file(&state.config.config_dir) {
+    let mut config = match crosstalk_core::CrosstalkConfig::load_file(&config_dir) {
         Ok(config) => config,
         Err(error) => {
             return (
@@ -495,7 +518,7 @@ async fn save_host_settings(
         }
     }
 
-    let path = state.config.config_dir.join("crosstalk.toml");
+    let path = config_dir.join("crosstalk.toml");
     if let Err(error) = config.save(&path) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -503,6 +526,51 @@ async fn save_host_settings(
         )
             .into_response();
     }
+
+    // Hot reload: swap the daemon's live config so the NEXT run uses the saved values, and
+    // re-arm the schedules from them. A run already in flight keeps the snapshot it started
+    // with. When the reload or the re-arm fails, the file IS saved but the daemon still runs
+    // the old values, so say so on the page instead of claiming success.
+    let fresh = match crosstalk_core::CrosstalkConfig::load(&config_dir) {
+        Ok(fresh) => fresh,
+        Err(error) => {
+            tracing::error!("host settings saved but the config would not reload: {error:#}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                settings_with_host_error(
+                    &state,
+                    format!(
+                        "Saved to {path}, but the daemon could not reload it and still runs the \
+                         old values: {error:#}",
+                        path = path.display()
+                    ),
+                ),
+            )
+                .into_response();
+        }
+    };
+    state.config.replace(fresh);
+    if let Some(scheduler) = &state.scheduler {
+        let snapshot = state.snapshot();
+        if let Err(error) = scheduler.lock().await.rearm(&state.runner, &snapshot).await {
+            tracing::error!("host settings applied but the schedules would not re-arm: {error:#}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                settings_with_host_error(
+                    &state,
+                    format!("Settings applied, but the schedules would not re-arm: {error:#}"),
+                ),
+            )
+                .into_response();
+        }
+    }
+    let snapshot = state.snapshot();
+    tracing::info!(
+        ignore_quality = snapshot.matching.ignore_quality_tags,
+        databases = ?snapshot.matching.databases(),
+        schedules = snapshot.schedules.len(),
+        "host settings saved and applied without a restart"
+    );
 
     Redirect::to("/settings?saved=1").into_response()
 }
@@ -519,29 +587,33 @@ async fn save_app_settings(
     let values = match state::values_from_form(app.schema(), &form) {
         Ok(values) => values,
         Err(errors) => {
+            let snapshot = state.snapshot();
             return SettingsTemplate {
                 version: crosstalk_core::HOST_VERSION,
                 csrf_token: state.csrf_token().to_string(),
                 saved: false,
+                host_error: None,
                 host_fields: state::fields(
                     &crosstalk_core::config::matching_schema(),
-                    &host_values(&state.config),
+                    &host_values(&snapshot),
                 ),
                 apps: app_forms(&state, Some(errors.join("; "))),
             }
-            .into_response()
+            .into_response();
         }
     };
 
-    let path = app.settings_path(&state.config.config_dir);
+    let path = app.settings_path(&state.config.config_dir());
     if let Err(error) = app.save_settings(&path, &values) {
+        let snapshot = state.snapshot();
         return SettingsTemplate {
             version: crosstalk_core::HOST_VERSION,
             csrf_token: state.csrf_token().to_string(),
             saved: false,
+            host_error: None,
             host_fields: state::fields(
                 &crosstalk_core::config::matching_schema(),
-                &host_values(&state.config),
+                &host_values(&snapshot),
             ),
             apps: app_forms(&state, Some(format!("{error:#}"))),
         }
