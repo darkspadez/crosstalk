@@ -8,9 +8,10 @@
 //!   * **rescue** — no candidate reached the band, but some candidate scored above the rescue
 //!     floor. The heuristics found nothing; the model may still see the match.
 //!
-//! A high-confidence match NEVER reaches the model. That is the whole design: the heuristics
-//! are cheap and already right on the easy cases, and spending latency and tokens to re-check
-//! them would make the tool slower without making it more accurate.
+//! A heuristic result at or above the automatch confidence threshold NEVER reaches the
+//! model: the model may promote inside the band, but it never re-checks or vetoes a
+//! heuristic win. Spending latency and tokens to re-check results the heuristics are
+//! already sure about would make the tool slower without making it more accurate.
 //!
 //! One request carries the whole shortlist. TypeSafe answers every question against one state
 //! in parallel, so asking about five candidates costs about as much as asking about one.
@@ -18,7 +19,7 @@
 use crosstalk_core::ai::{AiService, Answer, DecisionRequest, Question};
 use crosstalk_core::dispatcharr::{Channel, EpgEntry};
 use crosstalk_core::store::AiDecision;
-use crosstalk_matching::callsign::{extract_location, network_keyword};
+use crosstalk_matching::callsign::{extract_location, network_keyword, KnownCallsigns};
 use crosstalk_matching::pipeline::Scored;
 use std::collections::BTreeMap;
 
@@ -159,17 +160,19 @@ fn dedupe_names(
 }
 
 /// Build the request: the channel, the shortlist, and the questions.
+///
+/// The callsign is extracted with the run's allowlist, the same one the matcher scores
+/// with — never an empty default, which would hide denylisted-but-real callsigns (like
+/// `KING`) from the model while the matcher itself sees them.
 pub fn build_request(
     channel: &Channel,
     entries: &[EpgEntry],
     scored: &[Scored],
     offered: &[usize],
+    known: &KnownCallsigns,
     settings: &AiSettings,
 ) -> DecisionRequest {
-    let callsign = crosstalk_matching::callsign::extract_callsign(
-        &channel.name,
-        &crosstalk_matching::callsign::KnownCallsigns::default(),
-    );
+    let callsign = crosstalk_matching::callsign::extract_callsign(&channel.name, known);
     let location = extract_location(&channel.name);
     let network = network_keyword(&channel.name);
 
@@ -376,6 +379,7 @@ pub fn combine(
 ///
 /// A failed request is reported as `answered: false` and never fails the run: an install whose
 /// AI endpoint is down should still match the channels the heuristics are sure about.
+#[allow(clippy::too_many_arguments)]
 pub async fn ask(
     service: Option<&AiService>,
     channel: &Channel,
@@ -383,6 +387,7 @@ pub async fn ask(
     scored: &[Scored],
     offered: &[usize],
     reason: GateReason,
+    known: &KnownCallsigns,
     settings: &AiSettings,
 ) -> GateOutcome {
     let mut outcome = GateOutcome {
@@ -405,7 +410,7 @@ pub async fn ask(
     let Some(service) = service else {
         return outcome;
     };
-    let request = build_request(channel, entries, scored, offered, settings);
+    let request = build_request(channel, entries, scored, offered, known, settings);
     outcome.request = serde_json::to_value(&request).unwrap_or_default();
 
     match service.decide(&request).await {
@@ -586,7 +591,14 @@ mod tests {
     fn the_request_carries_the_channel_and_the_shortlist() {
         let entries = vec![entry(10, "ABC San Francisco"), entry(11, "ABC 7")];
         let ranked = vec![scored(90, 0), scored(88, 1)];
-        let request = build_request(&channel(), &entries, &ranked, &[0, 1], &settings());
+        let request = build_request(
+            &channel(),
+            &entries,
+            &ranked,
+            &[0, 1],
+            &KnownCallsigns::default(),
+            &settings(),
+        );
 
         assert_eq!(request.provider, "typesafe");
         assert_eq!(request.model, "jev-latest");
@@ -658,7 +670,14 @@ mod tests {
     fn a_confident_agreeing_answer_is_accepted() {
         let entries = vec![entry(10, "ABC San Francisco")];
         let ranked = vec![scored(90, 0)];
-        let request = build_request(&channel(), &entries, &ranked, &[0], &settings());
+        let request = build_request(
+            &channel(),
+            &entries,
+            &ranked,
+            &[0],
+            &KnownCallsigns::default(),
+            &settings(),
+        );
         let response = response("candidate_0", Some(0.93), 0.9);
 
         let mut result = outcome();
@@ -682,7 +701,14 @@ mod tests {
     fn a_rejected_probability_is_not_accepted() {
         let entries = vec![entry(10, "ABC San Francisco")];
         let ranked = vec![scored(90, 0)];
-        let request = build_request(&channel(), &entries, &ranked, &[0], &settings());
+        let request = build_request(
+            &channel(),
+            &entries,
+            &ranked,
+            &[0],
+            &KnownCallsigns::default(),
+            &settings(),
+        );
         let response = response("candidate_0", Some(0.2), 0.9);
 
         let mut result = outcome();
@@ -702,7 +728,14 @@ mod tests {
     fn an_undecided_answer_leaves_the_channel_unmatched() {
         let entries = vec![entry(10, "ABC San Francisco")];
         let ranked = vec![scored(90, 0)];
-        let request = build_request(&channel(), &entries, &ranked, &[0], &settings());
+        let request = build_request(
+            &channel(),
+            &entries,
+            &ranked,
+            &[0],
+            &KnownCallsigns::default(),
+            &settings(),
+        );
         // Probability says yes, but the choice confidence does not clear the floor.
         let response = response("candidate_0", Some(0.9), 0.2);
 
@@ -724,7 +757,14 @@ mod tests {
     fn a_pick_outside_the_shortlist_is_ignored() {
         let entries = vec![entry(10, "ABC San Francisco")];
         let ranked = vec![scored(90, 0)];
-        let request = build_request(&channel(), &entries, &ranked, &[0], &settings());
+        let request = build_request(
+            &channel(),
+            &entries,
+            &ranked,
+            &[0],
+            &KnownCallsigns::default(),
+            &settings(),
+        );
         let response = response("candidate_99", Some(0.99), 0.99);
 
         let mut result = outcome();
@@ -749,7 +789,14 @@ mod tests {
     fn picking_none_accepts_nothing() {
         let entries = vec![entry(10, "ABC San Francisco")];
         let ranked = vec![scored(90, 0)];
-        let request = build_request(&channel(), &entries, &ranked, &[0], &settings());
+        let request = build_request(
+            &channel(),
+            &entries,
+            &ranked,
+            &[0],
+            &KnownCallsigns::default(),
+            &settings(),
+        );
         let response = response("none", Some(0.9), 0.9);
 
         let mut result = outcome();
@@ -789,12 +836,56 @@ mod tests {
             &ranked,
             &[0],
             GateReason::Verify,
+            &KnownCallsigns::default(),
             &settings(),
         )
         .await;
         assert!(!is_answered(&result));
         assert!(result.decision.contains("no AI provider"));
         assert_eq!(result.accepted, None);
+    }
+
+    #[test]
+    fn the_request_uses_the_run_allowlist_for_the_callsign() {
+        // `KING` is denylisted as an ordinary English word, so an empty allowlist hides
+        // it — exactly the bug this guards: the request must see what the matcher sees.
+        let entries = vec![entry(10, "KING 5 News")];
+        let ranked = vec![scored(90, 0)];
+        let king_channel = Channel {
+            id: 1,
+            name: "Evening News (KING)".to_string(),
+            ..Channel::default()
+        };
+
+        let empty = KnownCallsigns::default();
+        let denied = build_request(&king_channel, &entries, &ranked, &[0], &empty, &settings());
+        assert_eq!(
+            denied.state["channel"].get("callsign"),
+            None,
+            "an empty allowlist hides the denylisted callsign"
+        );
+
+        let mut allowlist = KnownCallsigns::default();
+        allowlist.insert("KING");
+        let request = build_request(
+            &king_channel,
+            &entries,
+            &ranked,
+            &[0],
+            &allowlist,
+            &settings(),
+        );
+        assert_eq!(
+            request.state["channel"]["callsign"], "KING",
+            "a denylisted-but-real callsign vouched for by the allowlist is told to the model"
+        );
+        assert_eq!(
+            request.state["channel"]["callsign"],
+            crosstalk_matching::callsign::extract_callsign(&king_channel.name, &allowlist)
+                .map(serde_json::Value::from)
+                .unwrap_or(serde_json::Value::Null),
+            "the request callsign matches the matcher's own extraction"
+        );
     }
 
     #[test]

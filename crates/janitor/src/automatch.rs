@@ -12,6 +12,16 @@
 //!
 //! Both stages stay faithful to the plugin's order: the highest-scoring candidate that both
 //! clears the threshold and has programmes is the one that wins.
+//!
+//! AI contract (owner Q4): the model may PROMOTE a candidate inside the verify band or above
+//! the rescue floor, and never re-checks or vetoes a heuristic result at or above
+//! `automatch_confidence_threshold` — a confident match never reaches the model at all.
+//! An AI-accepted pick replaces the heuristic order for same-name guide entries only: every
+//! same-name copy is tried in ranked order, and when none carries programme data the
+//! channel is left unmatched with a reason saying so. There is deliberately no fallback
+//! to other sub-threshold heuristic candidates — the model only runs when no heuristic
+//! candidate cleared the threshold, so falling back would contradict the threshold itself.
+//! Heal never consults the model.
 
 use crate::ai_gate;
 use crate::scope::{ScopedChannels, ScopedEntries};
@@ -94,6 +104,20 @@ impl MatchRow {
             ai_decision: self.ai_decision.clone(),
         }
     }
+}
+
+/// The concurrent bound for the AI fan-out: the configured provider's own cap.
+///
+/// The single source of truth is `[ai.providers.<name>].max_concurrency` in the host
+/// config, which both backends also enforce on their own HTTP semaphores. An unknown
+/// provider name falls back to the default cap (8); validation enforces a minimum of 1.
+pub(crate) fn ai_fanout_bound(config: &crosstalk_core::CrosstalkConfig, provider: &str) -> usize {
+    config
+        .ai
+        .providers
+        .get(provider)
+        .map(|provider| provider.max_concurrency.max(1))
+        .unwrap_or(8)
 }
 
 /// Channels per concurrent batch in stage 2. The batch bounds how many validations are
@@ -251,13 +275,7 @@ pub async fn run(
     // serial, which preserves the ranked-order winner semantics exactly, and both phases
     // resolve in channel order. Work runs in batches so a cancel is honoured between
     // them rather than only after the whole scope.
-    let ai_bound = context
-        .config()
-        .ai
-        .providers
-        .get(&settings.ai.provider)
-        .map(|provider| provider.max_concurrency.max(1))
-        .unwrap_or(8);
+    let ai_bound = ai_fanout_bound(context.config(), &settings.ai.provider);
     let validation_bound = config.dispatcharr.concurrency.max(1);
     // Copyable borrows for the `async move` futures below: `&window` inline would capture
     // `window` itself by value and move it on the first batch.
@@ -286,6 +304,7 @@ pub async fn run(
                     let channel = &scoped_channels.channels[*position];
                     let cancel = context.clone();
                     let model = settings.ai.model.clone();
+                    let known = matcher.known();
                     Some(async move {
                         // Checked inside the future so a cancel lands within one
                         // in-flight round instead of after the whole batch. The
@@ -319,6 +338,7 @@ pub async fn run(
                             ranked,
                             &offered,
                             reason,
+                            known,
                             &settings.ai,
                         )
                         .await;
@@ -415,7 +435,8 @@ pub async fn run(
             .as_ref()
             .filter(|outcome| outcome.answered);
         if let Some(outcome) = ai_outcomes[ordinal].as_ref() {
-            // Recorded whether or not it answered: a failed request is part of the story.
+            // Recorded exactly once per channel, whether or not it answered: a failed
+            // request is part of the story, and the ask-time record already covers both.
             row.ai_decision = Some(outcome.decision.clone());
             context
                 .record_ai_decision(&outcome.to_store(rows.len() as i64, &settings.ai.provider))?;
@@ -445,11 +466,6 @@ pub async fn run(
                 score,
             );
         }
-        if let Some(outcome) = answered_outcome {
-            context
-                .record_ai_decision(&outcome.to_store(rows.len() as i64, &settings.ai.provider))?;
-        }
-
         match chosen {
             Some((candidate, entry)) => {
                 row.score = candidate.score;
@@ -573,7 +589,11 @@ struct WalkResult {
 /// One channel's validation walk: the first ranked candidate that clears the threshold
 /// AND carries programme data wins. An accepted AI pick replaces the heuristic order:
 /// every same-name entry is validated in ranked order and the first live duplicate
-/// wins, even when the exact picked entry is empty.
+/// wins, even when the exact picked entry is empty. When every same-name copy is empty
+/// the channel is left unmatched with an `ai_empty` reason saying exactly that — there
+/// is no fallback to other heuristic candidates, which by construction all scored below
+/// the threshold (the model only runs when nothing cleared it), so falling back would
+/// contradict the threshold itself.
 ///
 /// Serial per channel and dependency-free across channels, so the caller runs one of
 /// these per channel concurrently and resolves the winners in channel order.
@@ -1373,6 +1393,208 @@ mod tests {
         assert!(
             espn.ai_decision.is_some(),
             "the decision is recorded even when it is no"
+        );
+    }
+
+    #[test]
+    fn the_ai_fanout_bound_comes_from_the_provider_config() {
+        let mut config = crosstalk_core::CrosstalkConfig::default();
+        assert_eq!(
+            ai_fanout_bound(&config, "typesafe"),
+            8,
+            "an unconfigured provider falls back to the default cap"
+        );
+
+        config.ai.providers.insert(
+            "typesafe".to_string(),
+            crosstalk_core::config::AiProviderConfig {
+                kind: "typesafe".to_string(),
+                max_concurrency: 3,
+                ..crosstalk_core::config::AiProviderConfig::default()
+            },
+        );
+        assert_eq!(
+            ai_fanout_bound(&config, "typesafe"),
+            3,
+            "the provider's own max_concurrency bounds the fan-out"
+        );
+
+        config.ai.providers.insert(
+            "zero".to_string(),
+            crosstalk_core::config::AiProviderConfig {
+                kind: "typesafe".to_string(),
+                max_concurrency: 0,
+                ..crosstalk_core::config::AiProviderConfig::default()
+            },
+        );
+        assert_eq!(
+            ai_fanout_bound(&config, "zero"),
+            1,
+            "a zero cap still allows one request rather than deadlocking"
+        );
+    }
+
+    /// A decider whose endpoint is down, so the audit-on-failure path is exercised.
+    struct FailingDecider;
+
+    #[async_trait::async_trait]
+    impl crosstalk_core::ai::Decider for FailingDecider {
+        fn provider(&self) -> &str {
+            "typesafe"
+        }
+
+        fn calibrated(&self) -> bool {
+            true
+        }
+
+        async fn decide(
+            &self,
+            _request: &crosstalk_core::ai::DecisionRequest,
+        ) -> Result<crosstalk_core::ai::DecisionResponse> {
+            anyhow::bail!("the endpoint is down")
+        }
+    }
+
+    #[tokio::test]
+    async fn each_gated_channel_records_exactly_one_ai_decision() {
+        // The Springfield channel lands in the verify band and is answered; the other
+        // channel never reaches the model. One gated channel must mean one row — the
+        // ask-time record covers answered and failed alike, with no second write in
+        // the resolve loop.
+        let (_server, world, base_context) = fixture_full(
+            "espn.us",
+            "XYZ WABC - IL Shelbyville",
+            "ABC WABC - IL Springfield",
+        )
+        .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (service, settings) = ai_settings(0.95, Arc::clone(&calls));
+        let (channels, entries) = scoped(&world);
+
+        let store = crosstalk_core::store::Store::in_memory().expect("store");
+        let run_id = store
+            .start_run("janitor", "automatch_preview", true)
+            .expect("run");
+        let context = JobContext::new(base_context.config_arc(), Arc::new(VecSink::new()))
+            .with_dispatcharr(
+                base_context
+                    .dispatcharr()
+                    .expect("fixture wires a client")
+                    .clone(),
+            )
+            .for_run(
+                run_id,
+                store.clone(),
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            );
+
+        let result = run(
+            &context,
+            &settings,
+            Some(&service),
+            &world,
+            &channels,
+            &entries,
+            true,
+        )
+        .await
+        .expect("preview");
+        assert!(calls.load(Ordering::SeqCst) >= 1, "the model was asked");
+        assert_eq!(
+            store.ai_decision_count(run_id).expect("count"),
+            1,
+            "exactly one ai_decisions row for the one gated channel"
+        );
+        assert!(
+            store.ai_decision(run_id, 0).expect("load").is_some(),
+            "the gated first row carries the decision"
+        );
+        assert!(
+            store.ai_decision(run_id, 1).expect("load").is_none(),
+            "the ungated channel records nothing"
+        );
+        let espn = result
+            .rows
+            .iter()
+            .find(|row| row.channel_name == "ABC WABC - IL Springfield")
+            .expect("row");
+        assert!(espn
+            .ai_decision
+            .as_deref()
+            .unwrap_or_default()
+            .contains("accept"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_ai_request_is_still_audited_exactly_once() {
+        let (_server, world, base_context) = fixture_full(
+            "espn.us",
+            "XYZ WABC - IL Shelbyville",
+            "ABC WABC - IL Springfield",
+        )
+        .await;
+        let service =
+            crosstalk_core::ai::AiService::with_decider("typesafe", Arc::new(FailingDecider));
+        let settings = JanitorSettings {
+            ai: crate::settings::AiSettings {
+                enabled: true,
+                provider: "typesafe".to_string(),
+                model: "stub".to_string(),
+                ..crate::settings::AiSettings::default()
+            },
+            ..JanitorSettings::default()
+        };
+        let (channels, entries) = scoped(&world);
+
+        let store = crosstalk_core::store::Store::in_memory().expect("store");
+        let run_id = store
+            .start_run("janitor", "automatch_preview", true)
+            .expect("run");
+        let context = JobContext::new(base_context.config_arc(), Arc::new(VecSink::new()))
+            .with_dispatcharr(
+                base_context
+                    .dispatcharr()
+                    .expect("fixture wires a client")
+                    .clone(),
+            )
+            .for_run(
+                run_id,
+                store.clone(),
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            );
+
+        let result = run(
+            &context,
+            &settings,
+            Some(&service),
+            &world,
+            &channels,
+            &entries,
+            true,
+        )
+        .await
+        .expect("a failed model never fails the run");
+        assert_eq!(
+            store.ai_decision_count(run_id).expect("count"),
+            1,
+            "the failed request is audited, once"
+        );
+        let espn = result
+            .rows
+            .iter()
+            .find(|row| row.channel_name == "ABC WABC - IL Springfield")
+            .expect("row");
+        assert!(
+            espn.ai_decision
+                .as_deref()
+                .unwrap_or_default()
+                .contains("request failed"),
+            "the row says the request failed: {:?}",
+            espn.ai_decision
+        );
+        assert_eq!(
+            espn.epg_data_id, None,
+            "an unanswered channel stays unmatched"
         );
     }
 

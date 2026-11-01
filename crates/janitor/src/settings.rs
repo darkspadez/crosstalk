@@ -234,10 +234,15 @@ pub fn schema() -> SettingsSchema {
         FieldSpec::section(
             SECTION_AI,
             "AI Verification",
-            "The heuristics decide first. The model is asked only about results that land in \
-             the uncertain band below, or about candidates for a channel the heuristics could \
-             not match at all. A high-confidence heuristic match never reaches the model. \
-             The HOST holds the endpoint and key: see [ai.providers] in crosstalk.toml.",
+            "The heuristics decide first and the model only promotes: it is asked about \
+             results in the uncertain band below, or about candidates for a channel the \
+             heuristics could not match at all. A heuristic result at or above the \
+             Auto-Match Confidence Threshold is never re-checked or vetoed by the model. \
+             An AI-accepted pick is still validated for programme data: when every \
+             same-name copy is empty the channel is left unmatched with a reason saying \
+             so, and there is no fallback to other candidates. Heal never consults the \
+             model. The HOST holds the endpoint and key: see [ai.providers] in \
+             crosstalk.toml.",
         ),
         FieldSpec::new(
             "ai.enabled",
@@ -284,8 +289,10 @@ pub fn schema() -> SettingsSchema {
             FieldValue::Number(94.0),
         )
         .with_help(
-            "Scores above this are not offered to the model. They still have to clear the \
-             Auto-Match Confidence Threshold to be applied.",
+            "Scores above this are not offered to the model. Scores at or above the \
+             Auto-Match Confidence Threshold are never offered either, whatever the band \
+             says: the model promotes inside the band but never re-checks or vetoes a \
+             heuristic win.",
         ),
         FieldSpec::new(
             "ai.rescue",
@@ -323,7 +330,9 @@ pub fn schema() -> SettingsSchema {
         )
         .with_help(
             "0-1. A candidate is accepted when the model's yes-probability reaches this and \
-             its choice agrees.",
+             its choice agrees. An accepted pick is still validated for programme data: \
+             when every same-name copy is empty the channel is left unmatched and the \
+             reason says so.",
         ),
         FieldSpec::new(
             "ai.reject_threshold",

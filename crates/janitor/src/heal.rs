@@ -5,6 +5,9 @@
 //! working is never moved, and a channel for which no replacement is found is left exactly as
 //! it was rather than cleared.
 //!
+//! Heal never consults the AI gate — it is heuristic-only by design (owner Q4), so every
+//! replacement above carries the matcher's own score and method, with no model in the loop.
+//!
 //! The order mirrors the plugin: find the broken channels, search replacements (excluding the
 //! one already assigned), take the first candidate that clears the threshold AND has
 //! programmes, then apply only those.

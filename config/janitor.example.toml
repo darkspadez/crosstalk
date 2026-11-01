@@ -37,9 +37,12 @@ heal_confidence_threshold = 95
 # Delete this app's CSV exports older than this many days. 0 keeps everything.
 csv_retention_days = 0
 
-# The heuristics decide first. The model is asked only about results that land in the band
-# below, or about candidates for a channel the heuristics could not match at all. A
-# high-confidence heuristic match never reaches the model.
+# The heuristics decide first and the model only promotes. It is asked about results in
+# the band below, or about candidates for a channel the heuristics could not match at
+# all. A heuristic result at or above automatch_confidence_threshold is never re-checked
+# or vetoed by the model. An AI-accepted pick is still validated for programme data:
+# when every same-name copy is empty the channel is left unmatched with a reason saying
+# so. Heal never consults the model.
 #
 # The endpoint and key are NOT here: they belong to the host. Pick a provider name from
 # [ai.providers] in crosstalk.toml.

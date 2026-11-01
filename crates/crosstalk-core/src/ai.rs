@@ -564,6 +564,20 @@ pub mod openai {
         confidences: BTreeMap<String, f64>,
     }
 
+    /// Strip markdown code fences before parsing: chat models wrap the JSON object in
+    /// ```json ... ``` even when told to reply with nothing else. Without this the
+    /// reply below would fail to parse and a working answer would be lost.
+    pub(super) fn strip_code_fences(content: &str) -> &str {
+        let trimmed = content.trim();
+        let unmarked = trimmed
+            .strip_prefix("```json")
+            .or_else(|| trimmed.strip_prefix("```"))
+            .unwrap_or(trimmed);
+        // A lone closing fence is not valid JSON either; drop it when it is the tail.
+        let unmarked = unmarked.trim();
+        unmarked.strip_suffix("```").unwrap_or(unmarked).trim()
+    }
+
     /// Build the instruction sent as the system message.
     fn system_prompt(request: &DecisionRequest) -> String {
         let mut lines = vec![
@@ -698,12 +712,13 @@ pub mod openai {
                 .first()
                 .map(|choice| choice.message.content.clone())
                 .unwrap_or_default();
-            let reply: Reply = serde_json::from_str(&content).with_context(|| {
-                format!(
-                    "the model did not answer with the expected JSON object: {}",
-                    truncate(&content, 300)
-                )
-            })?;
+            let reply: Reply =
+                serde_json::from_str(strip_code_fences(&content)).with_context(|| {
+                    format!(
+                        "the model did not answer with the expected JSON object: {}",
+                        truncate(&content, 300)
+                    )
+                })?;
 
             let mut answers = BTreeMap::new();
             for (id, question) in &request.questions {
@@ -728,7 +743,11 @@ pub mod openai {
                             continue;
                         }
                         // A chat backend gives no distribution, so it is reported as a point
-                        // mass on the chosen option.
+                        // mass on the chosen option — and the response stays marked
+                        // `calibrated: false`, because a chat model asked for a number is not
+                        // a decision model returning one. A missing confidence is neutral
+                        // (0.5), not 1.0: an absent number must not auto-pass the
+                        // `min_confidence` floor the way a reported one can.
                         let mut probabilities = BTreeMap::new();
                         for name in criteria.keys() {
                             probabilities
@@ -736,14 +755,16 @@ pub mod openai {
                         }
                         Answer::Choice {
                             choice: chosen.to_string(),
-                            confidence: confidence.unwrap_or(1.0),
+                            confidence: confidence.unwrap_or(0.5),
                             probabilities,
                         }
                     }
                     Question::Score { criteria, .. } => match value.as_f64() {
                         Some(score) => Answer::Score {
                             score: score.clamp(0.0, criteria.len().saturating_sub(1) as f64),
-                            confidence: confidence.unwrap_or(1.0),
+                            // Same neutral default as a choice: an absent confidence is not
+                            // evidence of certainty.
+                            confidence: confidence.unwrap_or(0.5),
                             probabilities: BTreeMap::new(),
                         },
                         None => continue,
@@ -953,6 +974,83 @@ mod tests {
         assert_eq!(response.choice("best"), Some(("espn", 0.66)));
         // And it says the numbers are not calibrated.
         assert!(!response.calibrated);
+    }
+
+    #[tokio::test]
+    async fn openai_compat_defaults_a_missing_confidence_to_neutral() {
+        // No "confidences" map at all: the choice must not report certainty it was
+        // never given. 0.5 is neutral — it neither auto-passes nor auto-fails a
+        // default 0.5 `min_confidence` floor on its own merits — while the point-mass
+        // probabilities stay marked `calibrated: false`.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "m",
+                "choices": [{"message": {"content": "{\"answers\": {\"same\": 0.9, \"best\": \"espn\"}}"}}],
+                "usage": {}
+            })))
+            .mount(&server)
+            .await;
+        let service = AiService::from_config(&CrosstalkConfig {
+            ai: crate::config::AiConfig {
+                providers: BTreeMap::from([(
+                    "local".to_string(),
+                    openai_provider(&format!("{}/v1", server.uri())),
+                )]),
+            },
+            ..CrosstalkConfig::default()
+        });
+        let response = service.decide(&request("local")).await.expect("answers");
+        assert_eq!(response.noul("same"), Some(0.9));
+        assert_eq!(
+            response.choice("best"),
+            Some(("espn", 0.5)),
+            "an unreported confidence is neutral, not certain"
+        );
+        assert!(!response.calibrated);
+    }
+
+    #[tokio::test]
+    async fn openai_compat_parses_a_fenced_json_reply() {
+        // Chat models wrap the object in markdown fences even when told not to.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "m",
+                "choices": [{"message": {"content": "```json\n{\"answers\": {\"same\": 0.81, \"best\": \"espn\"}, \"confidences\": {\"best\": 0.66}}\n```"}}],
+                "usage": {}
+            })))
+            .mount(&server)
+            .await;
+        let service = AiService::from_config(&CrosstalkConfig {
+            ai: crate::config::AiConfig {
+                providers: BTreeMap::from([(
+                    "local".to_string(),
+                    openai_provider(&format!("{}/v1", server.uri())),
+                )]),
+            },
+            ..CrosstalkConfig::default()
+        });
+        let response = service.decide(&request("local")).await.expect("answers");
+        assert_eq!(response.noul("same"), Some(0.81));
+        assert_eq!(response.choice("best"), Some(("espn", 0.66)));
+    }
+
+    #[test]
+    fn code_fences_are_stripped_before_parsing() {
+        assert_eq!(
+            super::openai::strip_code_fences("```json\n{\"a\": 1}\n```"),
+            "{\"a\": 1}"
+        );
+        assert_eq!(
+            super::openai::strip_code_fences("```\n{\"a\": 1}\n```"),
+            "{\"a\": 1}"
+        );
+        assert_eq!(
+            super::openai::strip_code_fences("  {\"a\": 1}  "),
+            "{\"a\": 1}",
+            "a bare object passes through untouched"
+        );
     }
 
     #[tokio::test]

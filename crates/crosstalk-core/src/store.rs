@@ -429,6 +429,19 @@ impl Store {
         })
     }
 
+    /// How many AI decisions are recorded for one run.
+    pub fn ai_decision_count(&self, run_id: i64) -> Result<u64> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM ai_decisions WHERE run_id = ?1",
+                    params![run_id],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+        })
+    }
+
     /// The AI decision recorded for one row, if any.
     pub fn ai_decision(&self, run_id: i64, ordinal: i64) -> Result<Option<AiDecision>> {
         self.with_connection(|connection| {

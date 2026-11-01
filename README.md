@@ -119,7 +119,17 @@ prose. Two things happen only:
    is plausible and could be wrong, which is where a second opinion is worth a request.
 2. **Rescue** — nothing reached the band, but a candidate cleared the rescue floor (default 60).
 
-A high-confidence match never reaches the model.
+The contract, precisely:
+
+- A heuristic result at or above `automatch_confidence_threshold` (default 95) never
+  reaches the model. The model may promote inside the band, but it never re-checks or
+  vetoes a heuristic win.
+- Promotion happens only inside the verify band or above the rescue floor — nowhere else.
+- An AI-accepted pick is still validated for programme data. When every same-name copy
+  of the pick is empty, the channel is left unmatched and the reason says so
+  (`The AI accepted … but it carries no programme data …`); there is no fallback to
+  other candidates, which by construction all scored below the threshold.
+- Heal never consults the model: it is heuristic-only by design.
 
 The default provider is [TypeSafe](https://docs.typesafe.ai), whose System One models answer
 typed questions with calibrated probabilities: one request carries the channel, a shortlist and
