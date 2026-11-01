@@ -565,14 +565,24 @@ pub mod openai {
     }
 
     /// Strip markdown code fences before parsing: chat models wrap the JSON object in
-    /// ```json ... ``` even when told to reply with nothing else. Without this the
-    /// reply below would fail to parse and a working answer would be lost.
+    /// ```json ... ``` even when told to reply with nothing else, and sometimes add
+    /// prose around it. Without this the reply below would fail to parse and a working
+    /// answer would be lost.
     pub(super) fn strip_code_fences(content: &str) -> &str {
         let trimmed = content.trim();
-        let unmarked = trimmed
-            .strip_prefix("```json")
-            .or_else(|| trimmed.strip_prefix("```"))
-            .unwrap_or(trimmed);
+        // Find the first fence anywhere, so leading prose is dropped too; the language
+        // tag (`json`, `JSON`, `jsonc`, ...) lives on the fence's own line.
+        let unmarked = match trimmed.find("```") {
+            Some(start) => {
+                let after = &trimmed[start + 3..];
+                match after.find('\n') {
+                    Some(newline) => &after[newline + 1..],
+                    // A single-line fence with no newline: strip a bare language tag.
+                    None => after.trim_start_matches(|cell: char| cell.is_ascii_alphabetic()),
+                }
+            }
+            None => trimmed,
+        };
         // A lone closing fence is not valid JSON either; drop it when it is the tail.
         let unmarked = unmarked.trim();
         unmarked.strip_suffix("```").unwrap_or(unmarked).trim()
@@ -745,9 +755,10 @@ pub mod openai {
                         // A chat backend gives no distribution, so it is reported as a point
                         // mass on the chosen option — and the response stays marked
                         // `calibrated: false`, because a chat model asked for a number is not
-                        // a decision model returning one. A missing confidence is neutral
-                        // (0.5), not 1.0: an absent number must not auto-pass the
-                        // `min_confidence` floor the way a reported one can.
+                        // a decision model returning one. A missing confidence is 0.0, not
+                        // 1.0 and not a "neutral" 0.5: an absent number must fail the
+                        // `min_confidence` floor rather than auto-pass it (0.5 would clear a
+                        // default 0.5 floor).
                         let mut probabilities = BTreeMap::new();
                         for name in criteria.keys() {
                             probabilities
@@ -755,16 +766,16 @@ pub mod openai {
                         }
                         Answer::Choice {
                             choice: chosen.to_string(),
-                            confidence: confidence.unwrap_or(0.5),
+                            confidence: confidence.unwrap_or(0.0),
                             probabilities,
                         }
                     }
                     Question::Score { criteria, .. } => match value.as_f64() {
                         Some(score) => Answer::Score {
                             score: score.clamp(0.0, criteria.len().saturating_sub(1) as f64),
-                            // Same neutral default as a choice: an absent confidence is not
+                            // Same failing default as a choice: an absent confidence is not
                             // evidence of certainty.
-                            confidence: confidence.unwrap_or(0.5),
+                            confidence: confidence.unwrap_or(0.0),
                             probabilities: BTreeMap::new(),
                         },
                         None => continue,
@@ -977,10 +988,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn openai_compat_defaults_a_missing_confidence_to_neutral() {
+    async fn openai_compat_defaults_a_missing_confidence_to_zero() {
         // No "confidences" map at all: the choice must not report certainty it was
-        // never given. 0.5 is neutral — it neither auto-passes nor auto-fails a
-        // default 0.5 `min_confidence` floor on its own merits — while the point-mass
+        // never given. 0.0 fails the `min_confidence` floor instead of auto-passing
+        // it — the old 0.5 default cleared a default 0.5 floor — while the point-mass
         // probabilities stay marked `calibrated: false`.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -1004,8 +1015,8 @@ mod tests {
         assert_eq!(response.noul("same"), Some(0.9));
         assert_eq!(
             response.choice("best"),
-            Some(("espn", 0.5)),
-            "an unreported confidence is neutral, not certain"
+            Some(("espn", 0.0)),
+            "an unreported confidence fails the floor, it is not certain"
         );
         assert!(!response.calibrated);
     }
@@ -1045,6 +1056,23 @@ mod tests {
         assert_eq!(
             super::openai::strip_code_fences("```\n{\"a\": 1}\n```"),
             "{\"a\": 1}"
+        );
+        assert_eq!(
+            super::openai::strip_code_fences("```JSON\n{\"a\": 1}\n```"),
+            "{\"a\": 1}",
+            "the language tag case does not matter"
+        );
+        assert_eq!(
+            super::openai::strip_code_fences("```jsonc\n{\"a\": 1}\n```"),
+            "{\"a\": 1}",
+            "jsonc is fenced the same way"
+        );
+        assert_eq!(
+            super::openai::strip_code_fences(
+                "Here is the object you asked for:\n```json\n{\"a\": 1}\n```"
+            ),
+            "{\"a\": 1}",
+            "prose before the fence is dropped"
         );
         assert_eq!(
             super::openai::strip_code_fences("  {\"a\": 1}  "),

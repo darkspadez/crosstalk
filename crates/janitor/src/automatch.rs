@@ -349,6 +349,14 @@ pub async fn run(
                 .collect()
                 .await;
             for (ordinal, outcome) in asked {
+                // Recorded here, at ask time, exactly once per channel whether or not it
+                // answered: a failed request is part of the story too. Recording in the row
+                // loop below would lose every earlier batch's paid calls when a cancel
+                // lands mid-run, so the audit row is written while the answer is in hand.
+                // The row index is the channel ordinal: the row loop pushes exactly one row
+                // per ordinal in order, so `ordinal` is the row this outcome will label.
+                context
+                    .record_ai_decision(&outcome.to_store(ordinal as i64, &settings.ai.provider))?;
                 ai_outcomes[ordinal] = Some(outcome);
             }
         }
@@ -435,11 +443,9 @@ pub async fn run(
             .as_ref()
             .filter(|outcome| outcome.answered);
         if let Some(outcome) = ai_outcomes[ordinal].as_ref() {
-            // Recorded exactly once per channel, whether or not it answered: a failed
-            // request is part of the story, and the ask-time record already covers both.
+            // The audit row was already written at ask time (see above), so this only
+            // carries the one-line summary onto the report row.
             row.ai_decision = Some(outcome.decision.clone());
-            context
-                .record_ai_decision(&outcome.to_store(rows.len() as i64, &settings.ai.provider))?;
         }
 
         // The concurrent walk resolved the winner in ranked order; this only maps it

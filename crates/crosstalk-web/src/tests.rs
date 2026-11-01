@@ -716,6 +716,26 @@ async fn the_login_endpoint_is_exempt_from_csrf() {
 }
 
 #[tokio::test]
+async fn bad_logins_without_connect_info_share_the_fallback_bucket() {
+    // `oneshot` requests carry no `ConnectInfo<SocketAddr>`, exactly like the daemon
+    // served without `into_make_service_with_connect_info`: every attempt falls back to
+    // the one unspecified-address bucket, so ten bad tokens lock the eleventh out.
+    // That the lockout fires proves the fallback still counts instead of letting
+    // connect-info-less requests through unlimited.
+    let (state, _store, _dir) = state(Some("secret"));
+    for attempt in 0..crate::auth::MAX_LOGIN_FAILURES {
+        let status = post_form_with_csrf(&state, "/login", "token=wrong", false).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "bad attempt {attempt} re-renders login"
+        );
+    }
+    let status = post_form_with_csrf(&state, "/login", "token=wrong", false).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
 async fn saving_host_settings_applies_without_a_restart() {
     let (state, _store, dir) = state(None);
     std::fs::write(dir.path().join("crosstalk.toml"), "").expect("seed");

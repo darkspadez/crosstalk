@@ -1,0 +1,10 @@
+# cargo-audit configuration: advisories fail the CI audit job by design.
+#
+# There are no `[advisories.ignore]` entries here on purpose: ignoring an advisory
+# should be a deliberate, dated, reviewed change, not a default. When an advisory fires,
+# either upgrade the dependency or add an ignore below with the advisory id, the reason,
+# and the date it was accepted.
+#
+# The audit job also runs on a weekly schedule (see .github/workflows/ci.yml), so a
+# newly published advisory surfaces on the scheduled run rather than reddening the next
+# unrelated pull request.

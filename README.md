@@ -271,6 +271,10 @@ replacements; the plugin validates by EPG id and can accept one.
 - **Automatch reporting walks only validated candidates**: when nothing validates, the row
 reports the top-ranked candidate and says no programme data was found, where the plugin
 reports the first programme-carrying candidate regardless of threshold.
+- **CSV formula guard**: cells starting with `=`, `+`, `-` or `@` are prefixed with a single
+quote, so crosstalk CSVs differ from the plugin's for such names. The quote is a
+spreadsheet display instruction that keeps the text inert — open the CSV in a text
+editor (rather than a spreadsheet) and the quote is visible as part of the value.
 
 ## Development
 

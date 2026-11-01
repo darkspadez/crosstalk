@@ -504,10 +504,11 @@ impl DispatcharrClient {
     /// A list endpoint that answers either a bare array or a page envelope.
     ///
     /// Like [`Self::epg_entries`]: most builds answer these listings with a bare array,
-    /// but some put them behind a `{"results": [...]}` envelope. These endpoints are
-    /// not paginated unless asked, so a single request reads the whole list either way
-    /// (an envelope's `next` page is not followed — nothing here sends a page
-    /// parameter, and following one would silently multiply the scope).
+    /// but some put them behind a `{"results": [...]}` envelope. When the envelope
+    /// carries a non-null `next`, further pages are followed with `page`/`page_size`
+    /// parameters (capped, like [`Self::epg_entries`]) instead of silently returning only
+    /// the first page. `results` is required: a JSON object without it is an error, not
+    /// an empty list.
     async fn get_list<T: DeserializeOwned>(
         &self,
         path: &str,
@@ -516,8 +517,9 @@ impl DispatcharrClient {
     ) -> Result<Vec<T>> {
         #[derive(Deserialize)]
         struct Envelope<T> {
-            #[serde(default = "Vec::new")]
             results: Vec<T>,
+            #[serde(default)]
+            next: Option<serde_json::Value>,
         }
 
         #[derive(Deserialize)]
@@ -527,16 +529,37 @@ impl DispatcharrClient {
             Paged(Envelope<T>),
         }
 
-        let payload: Payload<T> = self.get_json(path, query).await.with_context(|| {
-            format!(
-                "{}: expected a JSON array or a {{\"results\": [...]}} envelope",
-                what
-            )
-        })?;
-        Ok(match payload {
-            Payload::Bare(list) => list,
-            Payload::Paged(envelope) => envelope.results,
-        })
+        let mut items = Vec::new();
+        let mut page = 1u32;
+        loop {
+            let mut paged_query: Vec<(&str, String)> = query.to_vec();
+            paged_query.push(("page", page.to_string()));
+            paged_query.push(("page_size", "1000".to_string()));
+            let payload: Payload<T> =
+                self.get_json(path, &paged_query).await.with_context(|| {
+                    format!(
+                        "{}: expected a JSON array or a {{\"results\": [...]}} envelope",
+                        what
+                    )
+                })?;
+            match payload {
+                Payload::Bare(list) => {
+                    items.extend(list);
+                    break;
+                }
+                Payload::Paged(envelope) => {
+                    items.extend(envelope.results);
+                    if envelope.next.is_none_or(|next| next.is_null()) {
+                        break;
+                    }
+                    page += 1;
+                    if page > 1_000 {
+                        bail!("{}: the list did not terminate after 1000 pages", what);
+                    }
+                }
+            }
+        }
+        Ok(items)
     }
 
     /// Every EPG entry.
@@ -1554,6 +1577,56 @@ mod tests {
         assert_eq!(client.profile_channels(3).await.expect("ids"), vec![1]);
         let sources = client.epg_sources().await.expect("sources");
         assert_eq!(sources[0].name, "SD");
+    }
+
+    #[tokio::test]
+    async fn list_endpoints_follow_a_non_null_next_page() {
+        // An envelope with a non-null `next` means more pages: both must be returned,
+        // not just the first.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/channels/channels/"))
+            .and(query_param("page", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "next": "http://x/api/channels/channels/?page=2",
+                "results": [{"id": 1, "name": "ESPN HD"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/channels/channels/"))
+            .and(query_param("page", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "next": null,
+                "results": [{"id": 2, "name": "CNN"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        let channels = client.channels().await.expect("channels");
+        assert_eq!(channels.len(), 2);
+        assert_eq!(channels[0].name, "ESPN HD");
+        assert_eq!(channels[1].name, "CNN");
+    }
+
+    #[tokio::test]
+    async fn a_list_object_without_results_is_an_error_not_an_empty_list() {
+        // `results` is required: silently reading an empty list would drop channels.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/channels/channels/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "count": 0,
+                "next": null
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        let error = client.channels().await.expect_err("no results");
+        let message = format!("{error:#}");
+        assert!(message.contains("listing channels"), "{message}");
     }
 
     #[test]

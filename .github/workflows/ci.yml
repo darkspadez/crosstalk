@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Weekly even without code changes, so a newly published advisory surfaces on its
+    # own rather than reddening the next unrelated PR.
+    - cron: "0 6 * * 1"
 
 env:
   CARGO_TERM_COLOR: always
@@ -82,7 +86,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: taiki-e/install-action@cargo-audit
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # Fails by design when an advisory matches the tree: see audit.toml (comment-only,
+      # no ignores) at the repo root. The weekly schedule above means a new advisory
+      # fails the scheduled run first, not an unrelated PR.
       - name: Known vulnerabilities in the dependency tree
         run: cargo audit
 

@@ -331,16 +331,25 @@ pub fn combine(
     let probability = response.noul(&format!("same_{}", candidate.index));
     outcome.probability = probability;
 
-    let verdict = match probability {
-        Some(probability) => crosstalk_core::ai::Verdict {
-            probability,
-            confidence: Some(choice_confidence),
-        },
-        // A backend that answered the choice but not the noul still gives a usable signal.
-        None => crosstalk_core::ai::Verdict {
-            probability: 1.0,
-            confidence: Some(choice_confidence),
-        },
+    // A missing yes-probability for the picked candidate is not evidence: the old code
+    // defaulted it to 1.0, which auto-accepted a choice the model never backed with a
+    // number. Undecided instead, and say which answer was missing.
+    let Some(probability) = probability else {
+        outcome.decision = format!(
+            "{}: {} (undecided, missing same_{} probability, confidence {:.2})",
+            outcome.reason.as_str(),
+            entry.name,
+            candidate.index,
+            choice_confidence
+        );
+        return;
+    };
+
+    // A missing choice confidence arrives as 0.0 (see the OpenAI-compatible backend),
+    // which fails the `min_confidence` floor below instead of auto-passing it.
+    let verdict = crosstalk_core::ai::Verdict {
+        probability,
+        confidence: Some(choice_confidence),
     };
 
     let accepted = if verdict.reject(settings.reject_threshold) {
@@ -355,7 +364,7 @@ pub fn combine(
             "{}: {} {:.2} (accept{})",
             outcome.reason.as_str(),
             entry.name,
-            probability.unwrap_or(1.0),
+            probability,
             if response.calibrated {
                 ""
             } else {
@@ -367,7 +376,7 @@ pub fn combine(
             "{}: {} {:.2} (undecided, confidence {:.2})",
             outcome.reason.as_str(),
             entry.name,
-            probability.unwrap_or(0.0),
+            probability,
             choice_confidence
         );
     }
@@ -751,6 +760,102 @@ mod tests {
         );
         assert_eq!(result.accepted, None);
         assert!(result.decision.contains("undecided"), "{}", result.decision);
+    }
+
+    #[test]
+    fn a_choice_without_its_yes_probability_is_undecided_not_accepted() {
+        // An OpenAI-shaped reply with only {"best": ...} and no confidences/noul:
+        // the pick names a candidate but no number backs it, so it must not accept.
+        let entries = vec![entry(10, "ABC San Francisco")];
+        let ranked = vec![scored(90, 0)];
+        let request = build_request(
+            &channel(),
+            &entries,
+            &ranked,
+            &[0],
+            &KnownCallsigns::default(),
+            &settings(),
+        );
+        let response = response("candidate_0", None, 0.0);
+
+        let mut result = outcome();
+        combine(
+            &mut result,
+            &request,
+            &response,
+            &ranked,
+            &entries,
+            &[0],
+            &settings(),
+        );
+        assert_eq!(result.accepted, None);
+        assert!(result.decision.contains("undecided"), "{}", result.decision);
+        assert!(result.decision.contains("missing"), "{}", result.decision);
+        assert!(
+            result.decision.contains("same_0"),
+            "says which answer was missing: {}",
+            result.decision
+        );
+    }
+
+    #[test]
+    fn a_missing_confidence_fails_the_floor_even_with_a_high_probability() {
+        // The number says yes but no confidence was reported (0.0): that fails the
+        // `min_confidence` floor rather than passing it.
+        let entries = vec![entry(10, "ABC San Francisco")];
+        let ranked = vec![scored(90, 0)];
+        let request = build_request(
+            &channel(),
+            &entries,
+            &ranked,
+            &[0],
+            &KnownCallsigns::default(),
+            &settings(),
+        );
+        let response = response("candidate_0", Some(0.93), 0.0);
+
+        let mut result = outcome();
+        combine(
+            &mut result,
+            &request,
+            &response,
+            &ranked,
+            &entries,
+            &[0],
+            &settings(),
+        );
+        assert_eq!(result.accepted, None);
+        assert!(result.decision.contains("undecided"), "{}", result.decision);
+    }
+
+    #[test]
+    fn an_explicit_confidence_with_a_probability_still_accepts() {
+        // The OpenAI shape with both numbers reported behaves as before.
+        let entries = vec![entry(10, "ABC San Francisco")];
+        let ranked = vec![scored(90, 0)];
+        let request = build_request(
+            &channel(),
+            &entries,
+            &ranked,
+            &[0],
+            &KnownCallsigns::default(),
+            &settings(),
+        );
+        let mut response = response("candidate_0", Some(0.93), 0.9);
+        response.calibrated = false;
+
+        let mut result = outcome();
+        combine(
+            &mut result,
+            &request,
+            &response,
+            &ranked,
+            &entries,
+            &[0],
+            &settings(),
+        );
+        assert_eq!(result.accepted, Some(0));
+        assert!(result.decision.contains("accept"), "{}", result.decision);
     }
 
     #[test]

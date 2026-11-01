@@ -180,8 +180,10 @@ where
 /// Channel and guide names come from Dispatcharr, which an operator does not control:
 /// a name starting with `=`, `+`, `-` or `@` (or a tab/CR, which some spreadsheets
 /// also honour) would execute as a formula when the export is opened. Prefixing such
-/// a cell with a single quote keeps the text visible but inert — the quote is a
-/// display instruction, not part of the value. Ordinary cells pass through unchanged.
+/// a cell with a single quote keeps the text visible but inert. Note the quote BECOMES
+/// part of the parsed CSV value: a spreadsheet hides it as a display instruction, but
+/// any other CSV reader sees the quote as the cell's first character. Ordinary cells
+/// pass through unchanged.
 pub fn safe_cell(text: &str) -> String {
     match text.chars().next() {
         Some('=') | Some('+') | Some('-') | Some('@') | Some('\t') | Some('\r') => {
