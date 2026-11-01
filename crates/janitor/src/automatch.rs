@@ -172,6 +172,10 @@ pub async fn run(
         tokio::task::spawn_blocking(move || {
             use rayon::prelude::*;
             let counter = AtomicUsize::new(0);
+            // Published `current` must be monotonic: rayon workers finish out of order,
+            // so a later-finishing worker with a smaller `done` must not move the
+            // bar backwards. Only the largest value so far is published.
+            let max_sent = AtomicUsize::new(0);
             let results: Vec<(usize, Vec<Scored>)> = channels
                 .par_iter()
                 .enumerate()
@@ -180,12 +184,15 @@ pub async fn run(
                         matcher.score_candidates(&channel.name, &index, &tags_refs(&tags), None);
                     let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
                     if done % 500 == 0 || done == total_channels {
-                        progress.progress(&ProgressEvent::new(
-                            "janitor.automatch",
-                            done as u64,
-                            total_channels as u64,
-                            "scoring channels",
-                        ));
+                        let prev = max_sent.fetch_max(done, Ordering::Relaxed);
+                        if done > prev {
+                            progress.progress(&ProgressEvent::new(
+                                "janitor.automatch",
+                                done as u64,
+                                total_channels as u64,
+                                "scoring channels",
+                            ));
+                        }
                     }
                     (position, ranked)
                 })
@@ -277,7 +284,34 @@ pub async fn run(
                     let (position, ranked) = &scored[ordinal];
                     let (reason, offered) = gates[ordinal].clone()?;
                     let channel = &scoped_channels.channels[*position];
+                    let cancel = context.clone();
+                    let model = settings.ai.model.clone();
                     Some(async move {
+                        // Checked inside the future so a cancel lands within one
+                        // in-flight round instead of after the whole batch. The
+                        // unanswered outcome is the "no result" value; the batch
+                        // cancel check below turns it into an abort.
+                        if cancel.is_cancelled() {
+                            return (
+                                ordinal,
+                                ai_gate::GateOutcome {
+                                    accepted: None,
+                                    reason,
+                                    picked: None,
+                                    probability: None,
+                                    confidence: None,
+                                    decision: "cancelled by the operator".to_string(),
+                                    model,
+                                    calibrated: false,
+                                    latency_ms: 0,
+                                    input_tokens: 0,
+                                    output_tokens: 0,
+                                    request: serde_json::json!({}),
+                                    response: serde_json::json!({}),
+                                    answered: false,
+                                },
+                            );
+                        }
                         let outcome = ai_gate::ask(
                             ai,
                             channel,
@@ -312,9 +346,11 @@ pub async fn run(
                         .as_ref()
                         .filter(|outcome| outcome.answered)
                         .and_then(|outcome| outcome.accepted);
+                    let cancel = context.clone();
                     Some(async move {
                         let walked = walk_for_channel(
                             client,
+                            &cancel,
                             window_ref,
                             ranked,
                             &scoped_entries.entries,
@@ -332,6 +368,18 @@ pub async fn run(
             for (ordinal, walked) in resolved {
                 walks[ordinal] = Some(walked);
             }
+        }
+
+        // Progress after each batch so the network phases are not silent on big
+        // scopes, and an abort as soon as a cancel landed inside the batch.
+        context.progress(&ProgressEvent::new(
+            "janitor.automatch",
+            batch_end as u64,
+            total,
+            "validating candidates",
+        ));
+        if context.is_cancelled() {
+            anyhow::bail!("cancelled by the operator");
         }
     }
 
@@ -529,8 +577,10 @@ struct WalkResult {
 ///
 /// Serial per channel and dependency-free across channels, so the caller runs one of
 /// these per channel concurrently and resolves the winners in channel order.
+#[allow(clippy::too_many_arguments)]
 async fn walk_for_channel(
     client: &crosstalk_core::dispatcharr::DispatcharrClient,
+    context: &JobContext,
     window: &ProgramWindow,
     ranked: &[Scored],
     entries: &[EpgEntry],
@@ -538,6 +588,19 @@ async fn walk_for_channel(
     threshold: u8,
     allow_without_programs: bool,
 ) -> WalkResult {
+    // Every `has_programs` call below is preceded by a cancel check so a cancel
+    // lands within one in-flight round. The empty result is the "no result"
+    // value: the outer batch check turns it into an abort.
+    fn empty() -> WalkResult {
+        WalkResult {
+            chosen: None,
+            best_rejected: None,
+            ai_empty: None,
+        }
+    }
+    if context.is_cancelled() {
+        return empty();
+    }
     if let Some(position) = accepted {
         let picked_name = ranked
             .get(position)
@@ -554,10 +617,15 @@ async fn walk_for_channel(
                     HasPrograms::Yes
                 } else {
                     match entry.epg_source {
-                        Some(source) => client
-                            .has_programs(&entry.tvg_id, source, window)
-                            .await
-                            .unwrap_or(HasPrograms::No),
+                        Some(source) => {
+                            if context.is_cancelled() {
+                                return empty();
+                            }
+                            client
+                                .has_programs(&entry.tvg_id, source, window)
+                                .await
+                                .unwrap_or(HasPrograms::No)
+                        }
                         None => HasPrograms::No,
                     }
                 };
@@ -585,6 +653,9 @@ async fn walk_for_channel(
 
     let mut best_rejected = None;
     for (rank_position, candidate) in ranked.iter().enumerate() {
+        if context.is_cancelled() {
+            return empty();
+        }
         let Some(entry) = entries.get(candidate.index) else {
             continue;
         };
@@ -599,6 +670,9 @@ async fn walk_for_channel(
             let Some(source) = entry.epg_source else {
                 continue;
             };
+            if context.is_cancelled() {
+                return empty();
+            }
             let has = client
                 .has_programs(&entry.tvg_id, source, window)
                 .await
@@ -1601,5 +1675,19 @@ mod tests {
         assert_eq!(outcome.counts.get("applied"), Some(&1));
         assert_eq!(outcome.counts.get("candidates"), Some(&50));
         assert_eq!(outcome.report_path, Some(PathBuf::from("/exports/a.csv")));
+    }
+
+    #[tokio::test]
+    async fn a_cancel_before_validation_aborts_promptly() {
+        // The cancel flag is set before the validation batches: the batch guard
+        // (and the in-future checks) must abort instead of validating.
+        let (_server, world, context) = fixture("espn.us").await;
+        context.cancel();
+        let settings = JanitorSettings::default();
+        let (channels, entries) = scoped(&world);
+        let error = run(&context, &settings, None, &world, &channels, &entries, true)
+            .await
+            .expect_err("a cancelled run aborts");
+        assert!(format!("{error:#}").contains("cancelled"));
     }
 }

@@ -1033,7 +1033,10 @@ fn abbrev_re(letter: &str) -> &'static fancy_regex::Regex {
     match letter {
         "e" => EAST.get_or_init(|| abbrev_pattern("e")),
         "w" => WEST.get_or_init(|| abbrev_pattern("w")),
-        _ => PACIFIC.get_or_init(|| abbrev_pattern("p")),
+        _ => {
+            debug_assert_eq!(letter, "p", "abbrev_re only handles e/w/p");
+            PACIFIC.get_or_init(|| abbrev_pattern("p"))
+        }
     }
 }
 

@@ -126,14 +126,19 @@ fn main() {
     });
 
     // CandidateIndex build (§2.1: ~29k names/s at 20k).
-    let build_names: Vec<String> = names.iter().take(20000).cloned().collect();
+    let base_names: Vec<String> = names.iter().take(20000).cloned().collect();
+    let mut build_names = base_names;
     while build_names.len() < 20000 {
         // Small corpora (synthetic fallback) are cycled up to the target size.
+        if names.is_empty() {
+            break;
+        }
         let mut grown = build_names.clone();
         grown.extend(names.iter().cloned());
         if grown.len() == build_names.len() {
             break;
         }
+        build_names = grown;
     }
     let build_names: Vec<String> = build_names.into_iter().take(20000).collect();
     let known = Arc::new(KnownCallsigns::shipped().cloned().unwrap_or_default());
@@ -175,6 +180,36 @@ fn main() {
         Default::default(),
     );
     let pairs = queries.len() as u64 * candidates.len() as u64;
+    // One warmup iteration before timing the hard path, so the measured run does
+    // not include first-touch allocation and thread-pool spin-up.
+    {
+        use rayon::prelude::*;
+        let warm: Vec<usize> = queries
+            .par_iter()
+            .map(|q| matcher.score_candidates(q, &cand_index, &[], None).len())
+            .collect();
+        std::hint::black_box(warm);
+    }
+    // Serial (non-rayon) baseline for the rayon speedup report. The
+    // PERFORMANCE_AUDIT acceptance is >=6x; the number is reported, not asserted.
+    let serial_start = Instant::now();
+    let serial_scored: Vec<usize> = queries
+        .iter()
+        .map(|q| matcher.score_candidates(q, &cand_index, &[], None).len())
+        .collect();
+    std::hint::black_box(&serial_scored);
+    let serial_elapsed = serial_start.elapsed();
+    println!(
+        "    {:<42} {:>10.3} ms total ({:.2} M pairs/s over {} pairs)",
+        format!(
+            "score_candidates hard path {}q x {}c serial",
+            queries.len(),
+            candidates.len()
+        ),
+        serial_elapsed.as_secs_f64() * 1000.0,
+        pairs as f64 / serial_elapsed.as_secs_f64() / 1e6,
+        pairs
+    );
     let start = Instant::now();
     {
         use rayon::prelude::*;
@@ -195,6 +230,10 @@ fn main() {
         elapsed.as_secs_f64() * 1000.0,
         pairs as f64 / elapsed.as_secs_f64() / 1e6,
         pairs
+    );
+    let speedup = serial_elapsed.as_secs_f64() / elapsed.as_secs_f64();
+    println!(
+        "    rayon speedup vs serial: {speedup:.2}x (PERFORMANCE_AUDIT target >=6x, reported only)"
     );
     let _ = index;
 }

@@ -22,6 +22,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Channels per concurrent batch in step 2b. Bounds in-flight validation and honours
+/// a cancel between batches rather than only after the whole broken set.
+const BATCH_CHANNELS: usize = 256;
+
 /// The columns the heal report carries.
 pub const COLUMNS: [&str; 12] = [
     "channel_id",
@@ -187,7 +191,14 @@ pub async fn run(
                     Detection::Check(tvg_id, source) => (tvg_id.clone(), *source),
                     _ => return None,
                 };
+                let cancel = context.clone();
                 Some(async move {
+                    // Checked inside the future so a cancel lands within one
+                    // in-flight round instead of after the whole phase. `No` is
+                    // the "no result" value; the cancel check below aborts.
+                    if cancel.is_cancelled() {
+                        return (ordinal, HasPrograms::No);
+                    }
                     let has = client
                         .has_programs(&tvg_id, source, window_ref)
                         .await
@@ -264,61 +275,83 @@ pub async fn run(
     };
 
     // Step 2b: walk each broken channel's ranked list serially, concurrently across
-    // channels (P1). Picks resolve by channel order below.
+    // channels (P1). Picks resolve by channel order below. Work runs in batches so
+    // a cancel is honoured between them and progress is published per batch.
     // Shared borrows for the `async move` futures: capturing the vecs themselves would
     // move them on the first poll.
     let broken_ref = &broken;
     let scored_ref = &scored_all;
     let entries_ref = &scoped_entries.entries;
     let mut picks: Vec<Option<usize>> = (0..broken.len()).map(|_| None).collect();
-    {
-        use futures::{stream, StreamExt};
-        let resolved: Vec<(usize, Option<usize>)> =
-            stream::iter((0..broken_ref.len()).map(|ordinal| async move {
-                let channel = &broken_ref[ordinal];
-                let original_id = channel.current_epg_id().unwrap_or(0);
-                let candidates = &scored_ref[ordinal];
-                // Exclude the entry already assigned: proposing the same broken guide is
-                // not a fix. Walk every ranked candidate and remember the first one that
-                // carries programme data, regardless of score (mirroring the plugin's
-                // `_find_best_epg_match`): the threshold decides Healed vs
-                // SkippedLowConfidence below, never whether the replacement is recorded.
-                let mut picked = None;
-                for (rank_position, candidate) in candidates.iter().enumerate() {
-                    let Some(entry) = entries_ref.get(candidate.index) else {
-                        continue;
-                    };
-                    if entry.id == original_id {
-                        continue;
-                    }
-                    if allow_without_programs {
-                        picked = Some(rank_position);
-                        break;
-                    }
-                    let Some(source) = entry.epg_source else {
-                        continue;
-                    };
-                    if client
-                        .has_programs(&entry.tvg_id, source, window_ref)
-                        .await
-                        .unwrap_or(HasPrograms::No)
-                        == HasPrograms::Yes
-                    {
-                        picked = Some(rank_position);
-                        break;
-                    }
-                }
-                (ordinal, picked)
-            }))
-            .buffer_unordered(validation_bound)
-            .collect()
-            .await;
-        for (ordinal, picked) in resolved {
-            picks[ordinal] = picked;
+    for batch_start in (0..broken_ref.len()).step_by(BATCH_CHANNELS) {
+        if context.is_cancelled() {
+            anyhow::bail!("cancelled by the operator");
         }
-    }
-    if context.is_cancelled() {
-        anyhow::bail!("cancelled by the operator");
+        let batch_end = (batch_start + BATCH_CHANNELS).min(broken_ref.len());
+        {
+            use futures::{stream, StreamExt};
+            let resolved: Vec<(usize, Option<usize>)> =
+                stream::iter((batch_start..batch_end).map(|ordinal| {
+                    let cancel = context.clone();
+                    async move {
+                        let channel = &broken_ref[ordinal];
+                        let original_id = channel.current_epg_id().unwrap_or(0);
+                        let candidates = &scored_ref[ordinal];
+                        // Exclude the entry already assigned: proposing the same broken guide is
+                        // not a fix. Walk every ranked candidate and remember the first one that
+                        // carries programme data, regardless of score (mirroring the plugin's
+                        // `_find_best_epg_match`): the threshold decides Healed vs
+                        // SkippedLowConfidence below, never whether the replacement is recorded.
+                        let mut picked = None;
+                        for (rank_position, candidate) in candidates.iter().enumerate() {
+                            if cancel.is_cancelled() {
+                                break;
+                            }
+                            let Some(entry) = entries_ref.get(candidate.index) else {
+                                continue;
+                            };
+                            if entry.id == original_id {
+                                continue;
+                            }
+                            if allow_without_programs {
+                                picked = Some(rank_position);
+                                break;
+                            }
+                            let Some(source) = entry.epg_source else {
+                                continue;
+                            };
+                            if cancel.is_cancelled() {
+                                break;
+                            }
+                            if client
+                                .has_programs(&entry.tvg_id, source, window_ref)
+                                .await
+                                .unwrap_or(HasPrograms::No)
+                                == HasPrograms::Yes
+                            {
+                                picked = Some(rank_position);
+                                break;
+                            }
+                        }
+                        (ordinal, picked)
+                    }
+                }))
+                .buffer_unordered(validation_bound)
+                .collect()
+                .await;
+            for (ordinal, picked) in resolved {
+                picks[ordinal] = picked;
+            }
+        }
+        context.progress(&ProgressEvent::new(
+            "janitor.heal",
+            batch_end as u64,
+            broken_ref.len() as u64,
+            "searching replacements",
+        ));
+        if context.is_cancelled() {
+            anyhow::bail!("cancelled by the operator");
+        }
     }
 
     let mut rows = Vec::with_capacity(broken.len());
@@ -1018,5 +1051,19 @@ mod tests {
         let recorded = outcome(&result, true, 95);
         assert!(recorded.summary.contains("1 would be applied"));
         assert_eq!(recorded.counts.get("applied"), Some(&0));
+    }
+
+    #[tokio::test]
+    async fn a_cancel_before_validation_aborts_promptly() {
+        // The cancel flag is set before the detection/replacement network phases:
+        // the in-future checks plus the batch guards must abort the run.
+        let (_server, world, context) = fixture(false, true).await;
+        context.cancel();
+        let settings = JanitorSettings::default();
+        let (channels, entries) = scoped(&world);
+        let error = run(&context, &settings, &world, &channels, &entries, true)
+            .await
+            .expect_err("a cancelled run aborts");
+        assert!(format!("{error:#}").contains("cancelled"));
     }
 }
