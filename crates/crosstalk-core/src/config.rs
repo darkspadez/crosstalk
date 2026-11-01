@@ -485,6 +485,13 @@ impl CrosstalkConfig {
                 .errors
                 .push("dispatcharr.concurrency must be at least 1".to_string());
         }
+        if url_is_plaintext_to_remote(&self.dispatcharr.base_url) {
+            report.warnings.push(format!(
+                "dispatcharr.base_url uses plaintext http:// to a non-loopback host {}: the \
+                 API key travels in cleartext. Prefer https:// or keep Dispatcharr on this host.",
+                url_host(&self.dispatcharr.base_url)
+            ));
+        }
 
         if self.server.port == 0 {
             report.errors.push("server.port must not be 0".to_string());
@@ -533,6 +540,13 @@ impl CrosstalkConfig {
                     "ai.providers.{name} has no api_key; AI features that use it will be skipped"
                 ));
             }
+            if url_is_plaintext_to_remote(&provider.base_url) {
+                report.warnings.push(format!(
+                    "ai.providers.{name}.base_url uses plaintext http:// to a non-loopback host {}: \
+                     the API key travels in cleartext. Prefer https:// or keep the endpoint on this host.",
+                    url_host(&provider.base_url)
+                ));
+            }
         }
 
         let available = crosstalk_matching::data::available_database_codes();
@@ -576,6 +590,48 @@ impl CrosstalkConfig {
         }
         save_with_comments(path.as_ref(), self)
     }
+}
+
+/// Whether a base URL sends secrets in cleartext: `http://` to a non-loopback host.
+///
+/// Loopback stays quiet (the daemon itself defaults to `http://localhost:9191`), and so
+/// does anything that is not even an `http://` URL — the scheme check in `validate`
+/// already errors on those. Only a plaintext scheme aimed off-host warns.
+fn url_is_plaintext_to_remote(base_url: &str) -> bool {
+    let lower = base_url.trim().to_lowercase();
+    if !lower.starts_with("http://") {
+        return false;
+    }
+    !is_loopback_host(&url_host(base_url))
+}
+
+/// The host portion of a base URL, lowercased, without port or brackets.
+fn url_host(base_url: &str) -> String {
+    let lower = base_url.trim().to_lowercase();
+    let rest = lower
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(lower.as_str());
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // Drop userinfo (`user:pass@host`): the host is what the loopback check needs.
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    if let Some(bracketed) = authority.strip_prefix('[') {
+        return bracketed.split(']').next().unwrap_or("").to_string();
+    }
+    authority.split(':').next().unwrap_or("").to_string()
+}
+
+/// Whether a URL host is this machine: `localhost`, `127.0.0.0/8`, or `::1`.
+fn is_loopback_host(host: &str) -> bool {
+    if host == "localhost" || host == "::1" {
+        return true;
+    }
+    let parts: Vec<&str> = host.split('.').collect();
+    parts.len() == 4
+        && parts[0] == "127"
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// The daemon's live configuration: one value shared by the runner, the scheduler and
@@ -1088,6 +1144,105 @@ enabled_databases = ["US", "UK"]
 
         config.server.token = "t".to_string();
         assert!(config.validate().warnings.is_empty());
+    }
+
+    #[test]
+    fn validate_warns_on_plaintext_http_to_a_remote_host() {
+        let mut config = CrosstalkConfig::default();
+        config.dispatcharr.api_key = "abc".to_string();
+
+        // Loopback over http is the default and stays quiet.
+        for quiet in [
+            "http://localhost:9191",
+            "http://127.0.0.1:9191",
+            "http://127.0.0.2:9191",
+            "http://[::1]:9191",
+            "https://dispatcharr.lan:9191",
+        ] {
+            config.dispatcharr.base_url = quiet.to_string();
+            let report = config.validate();
+            assert!(
+                report.warnings.iter().all(|w| !w.contains("cleartext")),
+                "{quiet}: {:?}",
+                report.warnings
+            );
+        }
+
+        // Plaintext off-host warns, naming the host.
+        for loud in [
+            "http://dispatcharr:9191",
+            "http://192.168.1.5:9191/",
+            "http://dispatcharr.lan:9191/api",
+        ] {
+            config.dispatcharr.base_url = loud.to_string();
+            let report = config.validate();
+            assert!(
+                report.warnings.iter().any(|w| w.contains("cleartext")),
+                "{loud}: {:?}",
+                report.warnings
+            );
+        }
+        config.dispatcharr.base_url = "http://192.168.1.5:9191".to_string();
+        let report = config.validate();
+        assert!(
+            report.warnings.iter().any(|w| w.contains("192.168.1.5")),
+            "{:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn validate_warns_on_plaintext_ai_endpoints_off_host() {
+        let mut config = CrosstalkConfig::default();
+        config.dispatcharr.api_key = "abc".to_string();
+        config.ai.providers.insert(
+            "remote".to_string(),
+            AiProviderConfig {
+                kind: "openai_compat".to_string(),
+                base_url: "http://gpu-box:8000/v1".to_string(),
+                ..AiProviderConfig::default()
+            },
+        );
+        let report = config.validate();
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("ai.providers.remote")),
+            "{:?}",
+            report.warnings
+        );
+
+        // A loopback AI endpoint stays quiet.
+        config
+            .ai
+            .providers
+            .get_mut("remote")
+            .expect("provider")
+            .base_url = "http://127.0.0.1:11434/v1".to_string();
+        let report = config.validate();
+        assert!(
+            report
+                .warnings
+                .iter()
+                .all(|w| !w.contains("ai.providers.remote")),
+            "{:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn url_hosts_parse_with_ports_brackets_and_userinfo() {
+        assert_eq!(url_host("http://dispatcharr:9191"), "dispatcharr");
+        assert_eq!(url_host("http://dispatcharr:9191/api"), "dispatcharr");
+        assert_eq!(url_host("http://[::1]:9191"), "::1");
+        assert_eq!(url_host("http://user:pass@lan:9191"), "lan");
+        assert_eq!(url_host("https://AI.EXAMPLE:443/v1"), "ai.example");
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("::1"));
+        assert!(!is_loopback_host("dispatcharr"));
+        assert!(!is_loopback_host(""));
     }
 
     #[test]

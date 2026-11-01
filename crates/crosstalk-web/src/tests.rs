@@ -203,8 +203,14 @@ async fn an_app_page_shows_every_action_with_its_colour() {
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("tag action-read"), "{body}");
     assert!(body.contains("tag action-write"), "{body}");
-    // A writing action confirms before running.
-    assert!(body.contains("confirm("), "{body}");
+    // A writing action confirms before running: via a data-confirm attribute read by the
+    // self-hosted confirm.js, never an inline onsubmit handler (the CSP forbids those).
+    assert!(body.contains("data-confirm="), "{body}");
+    assert!(!body.contains("onsubmit"), "{body}");
+    assert!(
+        body.contains("This writes data. Continue?"),
+        "the confirm message survives: {body}"
+    );
 }
 
 #[tokio::test]
@@ -809,4 +815,220 @@ async fn saving_host_settings_refuses_a_swap_that_would_drop_auth() {
         state.snapshot().matching.ignore_quality_tags,
         "the unticked box must not have been applied"
     );
+}
+
+/// GET a path and return the status, headers and body, for asserting on headers.
+async fn get_full(state: &AppState, uri: &str) -> (StatusCode, axum::http::HeaderMap, String) {
+    let response = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .expect("body");
+    (status, headers, String::from_utf8_lossy(&body).to_string())
+}
+
+fn security_headers(headers: &axum::http::HeaderMap) {
+    let csp = headers
+        .get("content-security-policy")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        csp.contains("default-src 'self'"),
+        "CSP carries a strict default: {csp}"
+    );
+    assert!(
+        !csp.contains("unsafe-inline"),
+        "no inline scripts survive: {csp}"
+    );
+    assert!(
+        csp.contains("frame-ancestors 'none'"),
+        "clickjacking is denied in the policy: {csp}"
+    );
+    assert_eq!(
+        headers
+            .get("x-frame-options")
+            .and_then(|value| value.to_str().ok()),
+        Some("DENY")
+    );
+    assert_eq!(
+        headers
+            .get("x-content-type-options")
+            .and_then(|value| value.to_str().ok()),
+        Some("nosniff")
+    );
+    assert_eq!(
+        headers
+            .get("referrer-policy")
+            .and_then(|value| value.to_str().ok()),
+        Some("same-origin")
+    );
+}
+
+#[tokio::test]
+async fn every_response_carries_the_browser_security_headers() {
+    let (state, _store, _dir) = state(None);
+
+    // A normal page.
+    let (status, headers, _body) = get_full(&state, "/").await;
+    assert_eq!(status, StatusCode::OK);
+    security_headers(&headers);
+
+    // The standalone login page, which does not extend the base template.
+    let (status, headers, _body) = get_full(&state, "/login").await;
+    assert_eq!(status, StatusCode::OK);
+    security_headers(&headers);
+
+    // A rejection from an inner layer: the headers layer sits outside CSRF, so even a
+    // forged POST without the token is answered with the headers attached.
+    let (status, headers) = post_raw(
+        &state,
+        "/apps/echo/actions/peek",
+        "dry_run=true",
+        &[],
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    security_headers(&headers);
+}
+
+#[tokio::test]
+async fn the_confirm_dialog_is_a_self_hosted_script_not_an_inline_handler() {
+    let (state, _store, _dir) = state(None);
+
+    // The script is served from the daemon itself, so the CSP's script-src 'self' allows it.
+    let (status, headers, body) = get_full(&state, "/static/confirm.js").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/javascript; charset=utf-8")
+    );
+    assert!(body.contains("data-confirm"), "{body}");
+    security_headers(&headers);
+
+    // Every page loads it.
+    let (_status, _headers, body) = get_full(&state, "/").await;
+    assert!(
+        body.contains(r#"<script src="/static/confirm.js""#),
+        "the base template loads the confirm script: {body}"
+    );
+}
+
+#[tokio::test]
+async fn ten_wrong_tokens_lock_the_address_out_of_login() {
+    let (state, _store, _dir) = state(Some("s3cret"));
+
+    for attempt in 1..=10 {
+        let status = post_form_with_csrf(&state, "/login", "token=wrong", false).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "attempt {attempt} shows the error page"
+        );
+    }
+
+    // The eleventh attempt in five minutes is a 429, with a Retry-After.
+    let (status, headers) = post_raw(&state, "/login", "token=wrong", &[], false).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        headers.contains_key("retry-after"),
+        "the lockout names its wait: {headers:?}"
+    );
+
+    // Even the right token waits out the lockout.
+    let (status, _) = post_raw(&state, "/login", "token=s3cret", &[], false).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn a_correct_sign_in_clears_the_failure_count() {
+    let (state, _store, _dir) = state(Some("s3cret"));
+
+    // Nine failures, then the right token: the sign-in succeeds and the count resets.
+    for _ in 0..9 {
+        let status = post_form_with_csrf(&state, "/login", "token=wrong", false).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let status = post_form_with_csrf(&state, "/login", "token=s3cret", false).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    // Nine more failures are tolerated again: without the reset the first of these
+    // would already be the eleventh and locked out.
+    for attempt in 1..=10 {
+        let status = post_form_with_csrf(&state, "/login", "token=wrong", false).await;
+        assert_eq!(status, StatusCode::OK, "attempt {attempt} after the reset");
+    }
+    let (status, _) = post_raw(&state, "/login", "token=wrong", &[], false).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn a_csv_outside_the_exports_directory_is_not_served() {
+    let (state, store, dir) = state(None);
+    let exports = dir.path().join("exports");
+    std::fs::create_dir_all(&exports).expect("exports");
+
+    // A report inside the exports directory downloads as before.
+    let inside = exports.join("epg_janitor_test.csv");
+    std::fs::write(&inside, "channel_name\nESPN\n").expect("write");
+    let run_id = store.start_run("echo", "peek", true).expect("run");
+    store
+        .finish_run(
+            run_id,
+            crosstalk_core::store::RunStatus::Succeeded,
+            None,
+            &serde_json::json!({}),
+            Some(inside.to_str().expect("path")),
+        )
+        .expect("finish");
+    let (status, headers, body) = get_full(&state, &format!("/runs/{run_id}/csv")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("ESPN"), "{body}");
+    assert!(headers.contains_key("content-disposition"), "{headers:?}");
+
+    // A report path pointing elsewhere — even at a file that exists — is a 404, not a
+    // file read. The row is hand-planted, standing in for any future feature that
+    // lets a path into the database from somewhere less trusted.
+    let outside = dir.path().join("secret.csv");
+    std::fs::write(&outside, "classified\n").expect("write");
+    let run_id = store.start_run("echo", "peek", true).expect("run");
+    store
+        .finish_run(
+            run_id,
+            crosstalk_core::store::RunStatus::Succeeded,
+            None,
+            &serde_json::json!({}),
+            Some(outside.to_str().expect("path")),
+        )
+        .expect("finish");
+    let (status, _headers, body) = get_full(&state, &format!("/runs/{run_id}/csv")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(!body.contains("classified"), "nothing leaks: {body}");
+
+    // A `..` escape through a symlinked-looking path resolves the same way.
+    let sneaky = exports.join("..").join("secret.csv");
+    let run_id = store.start_run("echo", "peek", true).expect("run");
+    store
+        .finish_run(
+            run_id,
+            crosstalk_core::store::RunStatus::Succeeded,
+            None,
+            &serde_json::json!({}),
+            Some(sneaky.to_str().expect("path")),
+        )
+        .expect("finish");
+    let (status, _headers, body) = get_full(&state, &format!("/runs/{run_id}/csv")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(!body.contains("classified"), "nothing leaks: {body}");
 }

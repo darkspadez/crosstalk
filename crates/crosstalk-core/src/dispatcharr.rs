@@ -456,12 +456,12 @@ impl DispatcharrClient {
     /// `hidden_from_output` is set unless it is sent, and the plugin read every channel.
     pub async fn channels(&self) -> Result<Vec<Channel>> {
         let channels: Vec<Channel> = self
-            .get_json(
+            .get_list(
                 "/channels/channels/",
                 &[("visibility_filter", "all".to_string())],
+                "listing channels",
             )
-            .await
-            .context("listing channels")?;
+            .await?;
         for channel in &channels {
             self.channel_cache.insert(channel.id, channel.clone());
         }
@@ -474,15 +474,13 @@ impl DispatcharrClient {
     }
 
     pub async fn groups(&self) -> Result<Vec<ChannelGroup>> {
-        self.get_json("/channels/groups/", &[])
+        self.get_list("/channels/groups/", &[], "listing channel groups")
             .await
-            .context("listing channel groups")
     }
 
     pub async fn profiles(&self) -> Result<Vec<ChannelProfile>> {
-        self.get_json("/channels/profiles/", &[])
+        self.get_list("/channels/profiles/", &[], "listing channel profiles")
             .await
-            .context("listing channel profiles")
     }
 
     /// Channel ids enabled in a profile.
@@ -499,9 +497,46 @@ impl DispatcharrClient {
     }
 
     pub async fn epg_sources(&self) -> Result<Vec<EpgSource>> {
-        self.get_json("/epg/sources/", &[])
+        self.get_list("/epg/sources/", &[], "listing EPG sources")
             .await
-            .context("listing EPG sources")
+    }
+
+    /// A list endpoint that answers either a bare array or a page envelope.
+    ///
+    /// Like [`Self::epg_entries`]: most builds answer these listings with a bare array,
+    /// but some put them behind a `{"results": [...]}` envelope. These endpoints are
+    /// not paginated unless asked, so a single request reads the whole list either way
+    /// (an envelope's `next` page is not followed — nothing here sends a page
+    /// parameter, and following one would silently multiply the scope).
+    async fn get_list<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+        what: &str,
+    ) -> Result<Vec<T>> {
+        #[derive(Deserialize)]
+        struct Envelope<T> {
+            #[serde(default = "Vec::new")]
+            results: Vec<T>,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Payload<T> {
+            Bare(Vec<T>),
+            Paged(Envelope<T>),
+        }
+
+        let payload: Payload<T> = self.get_json(path, query).await.with_context(|| {
+            format!(
+                "{}: expected a JSON array or a {{\"results\": [...]}} envelope",
+                what
+            )
+        })?;
+        Ok(match payload {
+            Payload::Bare(list) => list,
+            Payload::Paged(envelope) => envelope.results,
+        })
     }
 
     /// Every EPG entry.
@@ -1472,6 +1507,53 @@ mod tests {
         assert_eq!(world.group_name(None), "No Group");
         assert_eq!(world.sources[0].priority, 5);
         assert_eq!(world.entries[0].tvg_id, "espn.us");
+    }
+
+    #[tokio::test]
+    async fn list_endpoints_accept_a_results_envelope() {
+        // Some builds wrap the listings in a page envelope, the way epg_entries already
+        // tolerates: channels, groups, profiles and sources must read the same shape.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/channels/channels/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "count": 1,
+                "next": null,
+                "results": [{"id": 1, "name": "ESPN HD"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/channels/groups/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": [{"id": 10, "name": "Sports"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/channels/profiles/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": [{"id": 3, "name": "Favs", "channels": [1]}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/epg/sources/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": [{"id": 4, "name": "SD"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        let channels = client.channels().await.expect("channels");
+        assert_eq!(channels.len(), 1);
+        assert_eq!(channels[0].name, "ESPN HD");
+        let groups = client.groups().await.expect("groups");
+        assert_eq!(groups[0].name, "Sports");
+        assert_eq!(client.profile_channels(3).await.expect("ids"), vec![1]);
+        let sources = client.epg_sources().await.expect("sources");
+        assert_eq!(sources[0].name, "SD");
     }
 
     #[test]

@@ -39,6 +39,7 @@ pub fn router(state: AppState) -> Router {
         // install behind no internet still needs its stylesheet and htmx.
         .route("/static/app.css", get(stylesheet))
         .route("/static/htmx.min.js", get(htmx))
+        .route("/static/confirm.js", get(confirm_script))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require,
@@ -54,6 +55,9 @@ pub fn router(state: AppState) -> Router {
             crate::host::check,
         ))
         .layer(TraceLayer::new_for_http())
+        // Outside everything, so even a rejection from an inner layer (a 403 from the
+        // Host or CSRF checks, a 401, a redirect) carries the browser security headers.
+        .layer(axum::middleware::from_fn(crate::security::headers))
         .with_state(state)
 }
 
@@ -156,6 +160,15 @@ async fn htmx() -> Response {
         .into_response()
 }
 
+/// The delegated `data-confirm` submit listener (see `static/confirm.js`).
+async fn confirm_script() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../static/confirm.js"),
+    )
+        .into_response()
+}
+
 async fn login_page() -> LoginTemplate {
     LoginTemplate { error: None }
 }
@@ -165,18 +178,49 @@ struct LoginForm {
     token: String,
 }
 
-async fn login(State(state): State<AppState>, Form(form): Form<LoginForm>) -> Response {
+async fn login(
+    State(state): State<AppState>,
+    connect: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    Form(form): Form<LoginForm>,
+) -> Response {
     let Some(expected) = state.token() else {
         // No token configured: there is nothing to sign in to.
         return Redirect::to("/").into_response();
     };
 
+    // Per-IP failure counting: ten wrong tokens in five minutes locks the address out
+    // with a 429, so the single all-powerful token cannot be guessed at line rate.
+    // Without connection info (tests, some proxies) every attempt shares one bucket,
+    // which only makes the limit stricter.
+    let ip = connect
+        .map(|info| info.0.ip())
+        .unwrap_or_else(|| std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    if !state.login_limiter().allowed(ip) {
+        let mut response = (
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many failed sign-in attempts: wait a few minutes and try again\n",
+        )
+            .into_response();
+        if let Ok(value) = header::HeaderValue::from_str(
+            &state
+                .login_limiter()
+                .retry_after_secs(ip)
+                .max(1)
+                .to_string(),
+        ) {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        return response;
+    }
+
     if !crate::auth::tokens_match(&expected, form.token.trim()) {
+        state.login_limiter().record_failure(ip);
         return LoginTemplate {
             error: Some("That token does not match the configured one.".to_string()),
         }
         .into_response();
     }
+    state.login_limiter().record_success(ip);
 
     let cookie = format!(
         "{COOKIE}={}; Path=/; HttpOnly; SameSite=Strict",
@@ -348,7 +392,29 @@ async fn run_csv(State(state): State<AppState>, Path(id): Path<i64>) -> Response
     let Some(path) = run.report_path else {
         return (StatusCode::NOT_FOUND, "this run wrote no report\n").into_response();
     };
-    match std::fs::read(&path) {
+    // Confine the download to the exports directory: the path comes from the database,
+    // and a future feature writing user-influenced paths must not turn this into a file
+    // read. Both sides are canonicalized so a `..` or a symlink cannot escape. A path
+    // that resolves to nothing is gone; one that resolves outside the exports
+    // directory does not exist as far as this endpoint is concerned.
+    let confined = match std::fs::canonicalize(&path) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            return (
+                StatusCode::GONE,
+                format!("the report is no longer on disk: {error}\n"),
+            )
+                .into_response()
+        }
+    };
+    let exports = match std::fs::canonicalize(state.snapshot().exports_dir()) {
+        Ok(directory) => directory,
+        Err(_) => return (StatusCode::NOT_FOUND, "no such report\n").into_response(),
+    };
+    if !confined.starts_with(&exports) {
+        return (StatusCode::NOT_FOUND, "no such report\n").into_response();
+    }
+    match std::fs::read(&confined) {
         Ok(bytes) => {
             let name = std::path::Path::new(&path)
                 .file_name()

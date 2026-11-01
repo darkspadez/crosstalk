@@ -565,25 +565,30 @@ fn write_report(
 
     csv_report::write_report(&path, &preamble, &COLUMNS, |writer| {
         for row in rows {
+            // Names and reasons come from Dispatcharr: defuse spreadsheet formulas.
             writer.write_record([
                 row.channel_id.to_string(),
-                row.channel_name.clone(),
+                csv_report::safe_cell(&row.channel_name),
                 row.channel_number
                     .map(|number| format!("{number}"))
                     .unwrap_or_default(),
-                row.channel_group.clone(),
-                row.original_epg_name.clone(),
-                row.original_epg_source.clone(),
-                row.new_epg_name
-                    .clone()
-                    .unwrap_or_else(|| "N/A".to_string()),
-                row.new_epg_source
-                    .clone()
-                    .unwrap_or_else(|| "N/A".to_string()),
+                csv_report::safe_cell(&row.channel_group),
+                csv_report::safe_cell(&row.original_epg_name),
+                csv_report::safe_cell(&row.original_epg_source),
+                csv_report::safe_cell(
+                    &row.new_epg_name
+                        .clone()
+                        .unwrap_or_else(|| "N/A".to_string()),
+                ),
+                csv_report::safe_cell(
+                    &row.new_epg_source
+                        .clone()
+                        .unwrap_or_else(|| "N/A".to_string()),
+                ),
                 row.confidence.to_string(),
-                row.method.clone(),
+                csv_report::safe_cell(&row.method),
                 row.status.as_str().to_string(),
-                row.reason.clone(),
+                csv_report::safe_cell(&row.reason),
             ])?;
         }
         Ok(())
@@ -870,6 +875,40 @@ mod tests {
             message.contains(&reports[0].display().to_string()),
             "the error names the report: {message}"
         );
+    }
+
+    #[tokio::test]
+    async fn hostile_names_are_defused_in_the_report() {
+        // The broken guide and its replacement come from Dispatcharr: names starting
+        // with `=`, `+` or `@` must reach the CSV quoted, never as live formulas.
+        let (_server, world, context) =
+            fixture_with_names("+ESPN HD", "=ESPN (broken)", "@ESPN", false, true, true).await;
+        let settings = JanitorSettings::default();
+        let (channels, entries) = scoped(&world);
+        let result = run(&context, &settings, &world, &channels, &entries, true)
+            .await
+            .expect("preview");
+        assert_eq!(result.broken, 1);
+        let row = &result.rows[0];
+        assert_eq!(row.original_epg_name, "=ESPN (broken)");
+
+        let report = result.report.as_ref().expect("report written");
+        let text = std::fs::read_to_string(report).expect("read report");
+        assert!(text.contains("'+ESPN HD"), "channel cell is inert: {text}");
+        assert!(
+            text.contains("'=ESPN (broken)"),
+            "original epg cell is inert: {text}"
+        );
+        if let Some(new) = row.new_epg_name.as_deref() {
+            assert!(
+                text.contains(&crosstalk_core::csv_report::safe_cell(new)),
+                "replacement cell is inert: {text}"
+            );
+            assert!(
+                !text.lines().any(|line| line.contains(&format!(",{new}"))),
+                "no raw formula cell survives: {text}"
+            );
+        }
     }
 
     #[tokio::test]

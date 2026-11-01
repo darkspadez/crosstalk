@@ -48,8 +48,24 @@ With Docker:
 
 ```bash
 cp docker-compose.example.yml docker-compose.yml
-docker compose up -d
+cp config/crosstalk.example.toml config/crosstalk.toml
+cp config/janitor.example.toml config/janitor.toml
+
+# Point config/crosstalk.toml at Dispatcharr. From inside the container
+# "localhost" is the container itself, so use a reachable address:
+#   base_url = "http://dispatcharr:9191"
+
+# Compose refuses to start without both of these: a long random UI token and
+# your Dispatcharr API key (from Dispatcharr's own UI).
+export CROSSTALK_TOKEN="$(openssl rand -hex 24)"
+export DISPATCHARR_API_KEY="..."
+
+docker compose up -d --build
+docker compose logs -f crosstalk
 ```
+
+Tagged releases (`v*`) publish versioned images plus `latest` to
+`ghcr.io/darkspadez/crosstalk`, so you can `docker pull` instead of building.
 
 The UI listens on <http://localhost:8730>.
 

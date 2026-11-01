@@ -19,8 +19,8 @@ pub mod wildcard;
 pub use ai::{AiService, Answer, Decider, DecisionRequest, DecisionResponse, Question, Verdict};
 pub use config::{ConfigReport, CrosstalkConfig, SharedConfig};
 pub use csv_report::{
-    exports_to_delete, is_our_export, preamble, prune_exports, report_path, write_report,
-    ExportFile,
+    exports_to_delete, is_our_export, preamble, prune_exports, report_path, safe_cell,
+    write_report, ExportFile,
 };
 pub use dispatcharr::{
     Channel, DispatcharrClient, EpgEntry, EpgSource, HasPrograms, ProgramWindow, World,

@@ -175,6 +175,22 @@ where
     Ok(())
 }
 
+/// Defuse a spreadsheet formula before it reaches the CSV.
+///
+/// Channel and guide names come from Dispatcharr, which an operator does not control:
+/// a name starting with `=`, `+`, `-` or `@` (or a tab/CR, which some spreadsheets
+/// also honour) would execute as a formula when the export is opened. Prefixing such
+/// a cell with a single quote keeps the text visible but inert — the quote is a
+/// display instruction, not part of the value. Ordinary cells pass through unchanged.
+pub fn safe_cell(text: &str) -> String {
+    match text.chars().next() {
+        Some('=') | Some('+') | Some('-') | Some('@') | Some('\t') | Some('\r') => {
+            format!("'{text}")
+        }
+        _ => text.to_string(),
+    }
+}
+
 /// A file in the exports directory, as the retention rule sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExportFile {
@@ -287,6 +303,16 @@ mod tests {
 
     fn at(seconds_ago: u64) -> SystemTime {
         SystemTime::now() - Duration::from_secs(seconds_ago)
+    }
+
+    #[test]
+    fn formula_cells_are_quoted_and_plain_ones_pass_through() {
+        for hostile in ["=cmd", "+1", "-2", "@mention", "\tindented", "\rreturn"] {
+            assert_eq!(safe_cell(hostile), format!("'{hostile}"), "{hostile:?}");
+        }
+        for plain in ["ESPN HD", "007", "", "(not set)", "Yes", "N/A", "'already"] {
+            assert_eq!(safe_cell(plain), plain, "{plain:?}");
+        }
     }
 
     #[test]

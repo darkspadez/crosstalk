@@ -23,6 +23,13 @@ services:
     # Longer than the daemon's 30s run drain: Docker's default 10s kill would SIGKILL an
     # apply mid-`batch_set_epg` instead of letting it finish or cancel cleanly.
     stop_grace_period: 40s
+    # Mirrors the image HEALTHCHECK (which assumes the default server.port of 8730).
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8730/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     ports:
       - "8730:8730"
     volumes:

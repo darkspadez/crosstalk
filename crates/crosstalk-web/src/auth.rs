@@ -15,6 +15,89 @@ use axum::response::{IntoResponse, Redirect, Response};
 /// The cookie the login page sets.
 pub const COOKIE: &str = "crosstalk_token";
 
+/// Failed sign-ins allowed per IP before the address is locked out.
+pub const MAX_LOGIN_FAILURES: u32 = 10;
+/// The window those failures are counted in.
+pub const LOGIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Brute-force guard for `POST /login`: per-IP failure counting.
+///
+/// Ten wrong tokens in five minutes locks the address out with a 429, because the one
+/// token guards everything and never expires. A correct sign-in clears the address's
+/// failures, so a typo streak followed by the right token does not lock anyone out.
+/// Expired failures are pruned on every check, so idle addresses do not accumulate.
+#[derive(Debug)]
+pub struct LoginLimiter {
+    failures:
+        std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, Vec<std::time::Instant>>>,
+    max_failures: u32,
+    window: std::time::Duration,
+}
+
+impl LoginLimiter {
+    pub fn new(max_failures: u32, window: std::time::Duration) -> Self {
+        Self {
+            failures: std::sync::Mutex::new(std::collections::HashMap::new()),
+            max_failures,
+            window,
+        }
+    }
+
+    /// Whether this address may attempt a sign-in now.
+    pub fn allowed(&self, ip: std::net::IpAddr) -> bool {
+        let mut failures = self.failures.lock().expect("login limiter lock");
+        let now = std::time::Instant::now();
+        let window = self.window;
+        failures.retain(|_, instants| {
+            instants.retain(|at| now.duration_since(*at) < window);
+            !instants.is_empty()
+        });
+        failures
+            .get(&ip)
+            .is_none_or(|instants| (instants.len() as u32) < self.max_failures)
+    }
+
+    /// Seconds until the oldest failure expires, for the `Retry-After` header.
+    pub fn retry_after_secs(&self, ip: std::net::IpAddr) -> u64 {
+        let failures = self.failures.lock().expect("login limiter lock");
+        let now = std::time::Instant::now();
+        failures
+            .get(&ip)
+            .and_then(|instants| instants.iter().min())
+            .map(|oldest| {
+                self.window
+                    .checked_sub(now.duration_since(*oldest))
+                    .map(|left| left.as_secs().max(1))
+                    .unwrap_or(1)
+            })
+            .unwrap_or(0)
+    }
+
+    /// Record a wrong token from this address.
+    pub fn record_failure(&self, ip: std::net::IpAddr) {
+        self.failures
+            .lock()
+            .expect("login limiter lock")
+            .entry(ip)
+            .or_default()
+            .push(std::time::Instant::now());
+    }
+
+    /// A correct sign-in clears the address's failures.
+    pub fn record_success(&self, ip: std::net::IpAddr) {
+        self.failures
+            .lock()
+            .expect("login limiter lock")
+            .remove(&ip);
+    }
+}
+
+impl Default for LoginLimiter {
+    fn default() -> Self {
+        Self::new(MAX_LOGIN_FAILURES, LOGIN_WINDOW)
+    }
+}
+
 /// Whether the daemon must require a token, given the bind address.
 ///
 /// A loopback listener with no token is fine: only processes on the host can reach it. Anything
@@ -174,5 +257,59 @@ mod tests {
         assert!(is_public("/health"));
         assert!(!is_public("/"));
         assert!(!is_public("/apps/janitor"));
+    }
+}
+
+#[cfg(test)]
+mod limiter_tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn ip() -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))
+    }
+
+    #[test]
+    fn ten_failures_lock_the_address_out() {
+        let limiter = LoginLimiter::default();
+        assert!(limiter.allowed(ip()));
+        for _ in 0..10 {
+            limiter.record_failure(ip());
+        }
+        assert!(!limiter.allowed(ip()));
+        assert!(limiter.retry_after_secs(ip()) > 0);
+    }
+
+    #[test]
+    fn a_success_clears_the_count() {
+        let limiter = LoginLimiter::default();
+        for _ in 0..9 {
+            limiter.record_failure(ip());
+        }
+        limiter.record_success(ip());
+        for _ in 0..9 {
+            assert!(limiter.allowed(ip()));
+            limiter.record_failure(ip());
+        }
+        assert!(limiter.allowed(ip()), "the count restarted at the success");
+    }
+
+    #[test]
+    fn expired_failures_stop_counting() {
+        let limiter = LoginLimiter::new(2, std::time::Duration::from_millis(50));
+        limiter.record_failure(ip());
+        limiter.record_failure(ip());
+        assert!(!limiter.allowed(ip()));
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert!(limiter.allowed(ip()));
+    }
+
+    #[test]
+    fn addresses_are_counted_separately() {
+        let limiter = LoginLimiter::new(1, LOGIN_WINDOW);
+        let other = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        limiter.record_failure(ip());
+        assert!(!limiter.allowed(ip()));
+        assert!(limiter.allowed(other));
     }
 }

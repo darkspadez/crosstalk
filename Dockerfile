@@ -35,5 +35,12 @@ WORKDIR /config
 USER crosstalk
 EXPOSE 8730
 
+# The daemon serves /health without authentication. The port here is the default
+# `server.port` (8730): an install that overrides the port must override this too
+# (docker run --health-cmd / compose `healthcheck:`), because a Dockerfile
+# HEALTHCHECK cannot read the container's environment. BusyBox wget is always present.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD wget -qO- http://127.0.0.1:8730/health || exit 1
+
 ENTRYPOINT ["/usr/local/bin/crosstalk"]
 CMD ["serve", "--config", "/config"]

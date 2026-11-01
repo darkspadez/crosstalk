@@ -24,8 +24,6 @@ janitor = { path = "crates/janitor" }
 
 # Async / runtime
 tokio = { version = "1", features = ["full"] }
-tokio-util = { version = "0.7", features = ["rt"] }
-tokio-stream = { version = "0.1", features = ["sync"] }
 futures = "0.3"
 
 # HTTP
@@ -48,7 +46,6 @@ fancy-regex = "0.14"
 unicode-normalization = "0.1"
 unicode-general-category = "1"
 unicode_names2 = "1"
-globset = "0.4"
 
 # Storage
 rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
@@ -56,7 +53,6 @@ rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
 # Web UI
 askama = { version = "0.12", features = ["with-axum"] }
 askama_axum = "0.4"
-mime_guess = "2"
 
 # Observability / CLI
 tracing = "0.1"
@@ -64,14 +60,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 async-trait = "0.1"
-thiserror = "2"
 chrono = { version = "0.4", features = ["serde"] }
 tokio-cron-scheduler = "0.13"
 uuid = "1"
 croner = { version = "2", features = ["serde"] }
 dashmap = "6"
 csv = "1"
-include_dir = "0.7"
 
 # Dev
 tempfile = "3"

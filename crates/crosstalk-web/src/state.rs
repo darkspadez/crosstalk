@@ -27,6 +27,8 @@ pub struct AppState {
     pub scheduler: Option<Arc<tokio::sync::Mutex<Scheduler>>>,
     /// Random secret generated at startup; every POST form carries it back.
     csrf_token: String,
+    /// Per-IP sign-in failure counting for POST /login.
+    login_limiter: Arc<crate::auth::LoginLimiter>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -50,6 +52,7 @@ impl AppState {
             store,
             scheduler: None,
             csrf_token: crate::csrf::generate_token(),
+            login_limiter: Arc::new(crate::auth::LoginLimiter::default()),
         }
     }
 
@@ -73,6 +76,11 @@ impl AppState {
     /// The CSRF secret POSTs must carry back, via form field or header.
     pub fn csrf_token(&self) -> &str {
         &self.csrf_token
+    }
+
+    /// The sign-in failure limiter POST /login checks.
+    pub fn login_limiter(&self) -> &crate::auth::LoginLimiter {
+        &self.login_limiter
     }
 }
 

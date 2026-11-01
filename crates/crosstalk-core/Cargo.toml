@@ -11,14 +11,12 @@ crosstalk-matching.workspace = true
 
 anyhow.workspace = true
 async-trait = { workspace = true }
-thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 toml_edit.workspace = true
 figment.workspace = true
 tokio.workspace = true
-tokio-util.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true
 dashmap.workspace = true
@@ -28,7 +26,6 @@ tracing.workspace = true
 tokio-cron-scheduler.workspace = true
 croner.workspace = true
 uuid.workspace = true
-globset.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

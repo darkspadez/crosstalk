@@ -40,12 +40,17 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build the image
         run: docker build -t crosstalk:ci .
+      # The shipped mechanism: docker-compose.example.yml maps the host's
+      # CROSSTALK_TOKEN into the container as CROSSTALK_SERVER__TOKEN (a direct
+      # figment override of server.token), with CROSSTALK_SERVER__BIND for the bind.
+      # This job mirrors that exactly, so CI exercises the compose path, not a
+      # parallel one.
       - name: The daemon starts and answers its health check
         run: |
           docker run -d --name crosstalk-ci -p 8730:8730 \
-            -e CROSSTALK_TOKEN=ci-token \
-            -e CROSSTALK_DISPATCHARR_API_KEY=unused \
             -e CROSSTALK_SERVER__BIND=0.0.0.0 \
+            -e CROSSTALK_SERVER__TOKEN=ci-token \
+            -e CROSSTALK_DISPATCHARR_API_KEY=unused \
             crosstalk:ci
           for _ in $(seq 1 30); do
             if curl -fsS http://localhost:8730/health >/dev/null; then break; fi
@@ -54,7 +59,32 @@ jobs:
           curl -fsS http://localhost:8730/health
           # And it refuses an anonymous API call.
           test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8730/api/v1/apps)" = "401"
+          # While the compose-style token authenticates a bearer call.
+          test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer ci-token' http://localhost:8730/api/v1/apps)" = "200"
           docker rm -f crosstalk-ci
+      # The token_env indirection (server.token_env, default CROSSTALK_TOKEN) must keep
+      # working too: operators who set the token in the container directly rely on it.
+      - name: The token_env indirection also authenticates
+        run: |
+          docker run -d --name crosstalk-ci-env -p 8730:8730 \
+            -e CROSSTALK_SERVER__BIND=0.0.0.0 \
+            -e CROSSTALK_TOKEN=ci-token \
+            -e CROSSTALK_DISPATCHARR_API_KEY=unused \
+            crosstalk:ci
+          for _ in $(seq 1 30); do
+            if curl -fsS http://localhost:8730/health >/dev/null; then break; fi
+            sleep 1
+          done
+          test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer ci-token' http://localhost:8730/api/v1/apps)" = "200"
+          docker rm -f crosstalk-ci-env
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@cargo-audit
+      - name: Known vulnerabilities in the dependency tree
+        run: cargo audit
 
   parity:
     runs-on: ubuntu-latest

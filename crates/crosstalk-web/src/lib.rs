@@ -12,6 +12,7 @@ pub mod auth;
 pub mod csrf;
 pub mod host;
 pub mod routes;
+pub mod security;
 pub mod state;
 
 pub use routes::router;

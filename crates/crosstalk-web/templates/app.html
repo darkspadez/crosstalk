@@ -36,7 +36,7 @@
           <span class="muted">a run is in progress</span>
           {% else %}
           <form method="post" action="/apps/{{ app.id }}/actions/{{ action.id }}"
-                {% if let Some(confirm) = action.confirm %}onsubmit="return confirm('{{ confirm }}')"{% endif %}>
+                {% if let Some(confirm) = action.confirm %}data-confirm="{{ confirm }}"{% endif %}>
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <input type="hidden" name="dry_run" value="{% if action.kind_touches_channels %}false{% else %}true{% endif %}">
             <input type="hidden" name="confirm" value="true">

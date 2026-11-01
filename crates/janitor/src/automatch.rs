@@ -817,27 +817,37 @@ fn write_report(
     );
 
     csv_report::write_report(&path, &preamble, &COLUMNS, |writer| {
+        // Names and reasons come from Dispatcharr: defuse spreadsheet formulas.
+        let safe = |text: &str| csv_report::safe_cell(text);
+        let safe_opt = |text: &Option<String>| {
+            text.as_deref()
+                .map(csv_report::safe_cell)
+                .unwrap_or_default()
+        };
         for row in rows {
             writer.write_record([
                 row.channel_id.to_string(),
-                row.channel_name.clone(),
+                safe(&row.channel_name),
                 row.channel_number
                     .map(|number| format!("{number}"))
                     .unwrap_or_default(),
-                row.channel_group.clone(),
-                row.method.clone(),
+                safe(&row.channel_group),
+                safe(&row.method),
                 row.score.to_string(),
-                row.callsign.clone().unwrap_or_else(|| "N/A".to_string()),
-                row.epg_source_name.clone().unwrap_or_default(),
+                row.callsign
+                    .as_deref()
+                    .map(csv_report::safe_cell)
+                    .unwrap_or_else(|| "N/A".to_string()),
+                safe_opt(&row.epg_source_name),
                 row.epg_data_id.map(|id| id.to_string()).unwrap_or_default(),
-                row.epg_channel_name.clone().unwrap_or_default(),
+                safe_opt(&row.epg_channel_name),
                 row.current_epg_id
                     .map(|id| id.to_string())
                     .unwrap_or_default(),
-                row.current_epg_name.clone().unwrap_or_default(),
+                safe_opt(&row.current_epg_name),
                 if row.has_program_data { "Yes" } else { "No" }.to_string(),
-                row.reason.clone(),
-                row.ai_decision.clone().unwrap_or_default(),
+                safe(&row.reason),
+                safe_opt(&row.ai_decision),
             ])?;
         }
         Ok(())
@@ -1911,5 +1921,33 @@ mod tests {
             .await
             .expect_err("a cancelled run aborts");
         assert!(format!("{error:#}").contains("cancelled"));
+    }
+    #[tokio::test]
+    async fn hostile_names_are_defused_in_the_report() {
+        // Dispatcharr-controlled names starting with `=` would execute as spreadsheet
+        // formulas when the CSV is opened. The writer prefixes such cells with a quote.
+        // `=ESPN` still normalises to ESPN, so the match itself is unaffected.
+        let (_server, world, context) = fixture_full("espn.us", "=ESPN", "=ESPN HD").await;
+        let settings = JanitorSettings::default();
+        let (channels, entries) = scoped(&world);
+        let result = run(&context, &settings, None, &world, &channels, &entries, true)
+            .await
+            .expect("preview");
+
+        let row = result
+            .rows
+            .iter()
+            .find(|row| row.channel_name == "=ESPN HD")
+            .expect("row");
+        assert_eq!(row.epg_channel_name.as_deref(), Some("=ESPN"));
+
+        let report = result.report.expect("report written");
+        let text = std::fs::read_to_string(&report).expect("read report");
+        assert!(text.contains("'=ESPN HD"), "channel cell is inert: {text}");
+        assert!(text.contains("'=ESPN"), "epg cell is inert: {text}");
+        assert!(
+            !text.lines().any(|line| line.contains(",=ESPN")),
+            "no raw formula cell survives: {text}"
+        );
     }
 }
