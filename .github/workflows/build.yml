@@ -79,7 +79,7 @@ jobs:
         run: |
           bin="target/${{ matrix.target }}/release/crosstalk"
           file "$bin"
-          file "$bin" | grep -qE 'static(-pie)? linked'
+          file "$bin" | grep -qE 'static(-pie|ally) linked'
           "$bin" --version
 
       - name: Package
