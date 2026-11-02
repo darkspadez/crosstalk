@@ -70,3 +70,8 @@ csv = "1"
 # Dev
 tempfile = "3"
 wiremock = "0.6"
+
+[profile.release]
+# Release binaries (and the Docker image) ship without symbol tables. Panics still
+# report the message and location; only backtrace frame names are lost.
+strip = true
