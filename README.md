@@ -64,8 +64,11 @@ docker compose up -d --build
 docker compose logs -f crosstalk
 ```
 
-Tagged releases (`v*`) publish versioned images plus `latest` to
-`ghcr.io/darkspadez/crosstalk`, so you can `docker pull` instead of building.
+Prebuilt images for `linux/amd64` and `linux/arm64` live at
+`ghcr.io/darkspadez/crosstalk`, so you can `docker pull` instead of building:
+versioned tags plus `latest` from tagged releases (`v*`), and `edge` from every push
+to `main`. Each release also attaches static Linux binaries (amd64/arm64) with a
+`SHA256SUMS` file on the GitHub Releases page.
 
 The UI listens on <http://localhost:8730>.
 

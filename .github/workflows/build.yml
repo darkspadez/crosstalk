@@ -1,0 +1,169 @@
+name: Build
+
+# Static Linux binaries and the multi-arch Docker image, all on Namespace runners.
+#
+#   pull request -> binaries as workflow artifacts; image built but not pushed
+#   push to main -> binaries as workflow artifacts; image pushed as :edge and :sha-<short>
+#   push v* tag  -> GitHub Release with the binaries + SHA256SUMS; image pushed with
+#                   semver tags, plus `latest` for non-prerelease versions
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  version:
+    # A tag that disagrees with the workspace version would publish a binary that
+    # reports the wrong `--version`: refuse it before anything is built.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: nscloud-ubuntu-24.04-amd64-2x4
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches the workspace version
+        run: |
+          want="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          got="${GITHUB_REF_NAME#v}"
+          if [ "$want" != "$got" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match workspace version $want"
+            exit 1
+          fi
+
+  binaries:
+    needs: [version]
+    # `version` is skipped on non-tag runs; still build then, but never after it fails.
+    if: ${{ !cancelled() && needs.version.result != 'failure' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            target: x86_64-unknown-linux-musl
+          - arch: arm64
+            target: aarch64-unknown-linux-musl
+    # Native runners for both architectures: no cross toolchain, no QEMU.
+    runs-on:
+      - nscloud-ubuntu-24.04-${{ matrix.arch }}-8x16-with-cache
+      - nscloud-cache-tag-crosstalk-${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # ring (rustls) and bundled SQLite compile C code, so the musl target needs musl-gcc.
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: namespacelabs/nscloud-cache-action@v1
+        with:
+          cache: rust
+
+      - name: Build
+        run: cargo build --locked --release --bin crosstalk --target ${{ matrix.target }}
+
+      - name: The binary is static and runs
+        run: |
+          bin="target/${{ matrix.target }}/release/crosstalk"
+          file "$bin"
+          file "$bin" | grep -qE 'static(-pie)? linked'
+          "$bin" --version
+
+      - name: Package
+        id: pkg
+        run: |
+          name="crosstalk-${GITHUB_REF_NAME//\//-}-linux-${{ matrix.arch }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/crosstalk" README.md "dist/$name/"
+          cp config/*.example.toml "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crosstalk-linux-${{ matrix.arch }}
+          path: dist/${{ steps.pkg.outputs.name }}.tar.gz
+          if-no-files-found: error
+
+  image:
+    needs: [version]
+    if: ${{ !cancelled() && needs.version.result != 'failure' }}
+    permissions:
+      contents: read
+      packages: write
+    # The build itself runs on Namespace Remote Builders, which build each platform
+    # natively; the runner only drives it, so it can stay small. No setup-buildx/QEMU.
+    runs-on: nscloud-ubuntu-24.04-amd64-2x4
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          # `latest` only from a semver tag without a prerelease suffix.
+          flavor: |
+            latest=auto
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}},enable=${{ !startsWith(github.ref, 'refs/tags/v0.') }}
+            type=edge,branch=main
+            type=sha,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build (and push outside pull requests)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [binaries, image]
+    permissions:
+      contents: write
+    runs-on: nscloud-ubuntu-24.04-amd64-2x4
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: crosstalk-linux-*
+          merge-multiple: true
+          path: dist
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum -- *.tar.gz | tee SHA256SUMS
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=""
+          case "$GITHUB_REF_NAME" in *-*) prerelease="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes $prerelease

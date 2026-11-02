@@ -15,7 +15,9 @@ env:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on:
+      - nscloud-ubuntu-24.04-amd64-8x16-with-cache
+      - nscloud-cache-tag-crosstalk-amd64
     steps:
       - uses: actions/checkout@v4
 
@@ -24,7 +26,11 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      # Cargo registry, git deps and target/ live on the runner's Namespace cache
+      # volume, so there is no upload/download round-trip as with actions/cache.
+      - uses: namespacelabs/nscloud-cache-action@v1
+        with:
+          cache: rust
 
       - name: Format
         run: cargo fmt --all -- --check
@@ -35,15 +41,15 @@ jobs:
       - name: Test
         run: cargo test --locked --workspace
 
-      - name: Build release binary
-        run: cargo build --locked --release -p crosstalk
 
   docker:
-    runs-on: ubuntu-latest
+    # Namespace runners hand the build to a Remote Builder (no setup-buildx needed);
+    # --load brings the result back into the runner's daemon for the smoke test.
+    runs-on: nscloud-ubuntu-24.04-amd64-4x8
     steps:
       - uses: actions/checkout@v4
       - name: Build the image
-        run: docker build -t crosstalk:ci .
+        run: docker buildx build --load -t crosstalk:ci .
       # The shipped mechanism: docker-compose.example.yml maps the host's
       # CROSSTALK_TOKEN into the container as CROSSTALK_SERVER__TOKEN (a direct
       # figment override of server.token), with CROSSTALK_SERVER__BIND for the bind.
@@ -83,7 +89,7 @@ jobs:
           docker rm -f crosstalk-ci-env
 
   audit:
-    runs-on: ubuntu-latest
+    runs-on: nscloud-ubuntu-24.04-amd64-2x4
     steps:
       - uses: actions/checkout@v4
       - uses: taiki-e/install-action@v2
@@ -96,7 +102,9 @@ jobs:
         run: cargo audit
 
   parity:
-    runs-on: ubuntu-latest
+    runs-on:
+      - nscloud-ubuntu-24.04-amd64-8x16-with-cache
+      - nscloud-cache-tag-crosstalk-amd64
     needs: check
     timeout-minutes: 20
     # The Python plugin is a pinned submodule, so the reference is always present.
@@ -105,7 +113,9 @@ jobs:
         with:
           submodules: true
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: namespacelabs/nscloud-cache-action@v1
+        with:
+          cache: rust
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
