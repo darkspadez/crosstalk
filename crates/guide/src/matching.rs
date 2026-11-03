@@ -235,6 +235,7 @@ pub async fn run(
     ));
 
     // Stage 2: validation, in score order, memoised by the client.
+    let ai_settings = &config.ai.verify;
     let window = ProgramWindow::ahead(settings.check_hours);
     let threshold = settings.match_confidence_threshold;
     let allow_without_programs = settings.allow_epg_without_programs;
@@ -265,7 +266,7 @@ pub async fn run(
         gates.push(if already_confident {
             None
         } else {
-            ai_gate::shortlist(ranked, &scoped_entries.entries, &settings.ai)
+            ai_gate::shortlist(ranked, &scoped_entries.entries, ai_settings)
         });
     }
 
@@ -275,7 +276,7 @@ pub async fn run(
     // serial, which preserves the ranked-order winner semantics exactly, and both phases
     // resolve in channel order. Work runs in batches so a cancel is honoured between
     // them rather than only after the whole scope.
-    let ai_bound = ai_fanout_bound(context.config(), &settings.ai.provider);
+    let ai_bound = ai_fanout_bound(context.config(), &ai_settings.provider);
     let validation_bound = config.dispatcharr.concurrency.max(1);
     // Copyable borrows for the `async move` futures below: `&window` inline would capture
     // `window` itself by value and move it on the first batch.
@@ -303,7 +304,7 @@ pub async fn run(
                     let (reason, offered) = gates[ordinal].clone()?;
                     let channel = &scoped_channels.channels[*position];
                     let cancel = context.clone();
-                    let model = settings.ai.model.clone();
+                    let model = ai_settings.model.clone();
                     let known = matcher.known();
                     Some(async move {
                         // Checked inside the future so a cancel lands within one
@@ -339,7 +340,7 @@ pub async fn run(
                             &offered,
                             reason,
                             known,
-                            &settings.ai,
+                            ai_settings,
                         )
                         .await;
                         (ordinal, outcome)
@@ -356,7 +357,7 @@ pub async fn run(
                 // The row index is the channel ordinal: the row loop pushes exactly one row
                 // per ordinal in order, so `ordinal` is the row this outcome will label.
                 context
-                    .record_ai_decision(&outcome.to_store(ordinal as i64, &settings.ai.provider))?;
+                    .record_ai_decision(&outcome.to_store(ordinal as i64, &ai_settings.provider))?;
                 ai_outcomes[ordinal] = Some(outcome);
             }
         }
@@ -562,7 +563,7 @@ pub async fn run(
             .map(|name| name.to_string_lossy().to_string());
         csv_report::prune_exports(
             &context.exports_dir(),
-            settings.csv_retention_days,
+            context.config().exports.retention_days,
             name.as_deref(),
         );
     }
@@ -1100,9 +1101,9 @@ mod tests {
     }
 
     fn scoped(world: &World) -> (ScopedChannels, ScopedEntries) {
-        let settings = GuideSettings::default();
+        let scope = crosstalk_core::config::ScopeConfig::default();
         (
-            crate::scope::scope_channels(world, &settings).expect("channels"),
+            crate::scope::scope_channels(world, &scope).expect("channels"),
             crate::scope::scope_entries(world, ""),
         )
     }
@@ -1284,31 +1285,39 @@ mod tests {
         }
     }
 
-    fn ai_settings(
-        probability: f64,
-        calls: Arc<AtomicUsize>,
-    ) -> (crosstalk_core::ai::AiService, GuideSettings) {
-        let service = crosstalk_core::ai::AiService::with_decider(
+    fn ai_settings(probability: f64, calls: Arc<AtomicUsize>) -> crosstalk_core::ai::AiService {
+        crosstalk_core::ai::AiService::with_decider(
             "typesafe",
             Arc::new(FixedDecider { probability, calls }),
-        );
-        let settings = GuideSettings {
-            ai: crate::settings::AiSettings {
-                enabled: true,
-                provider: "typesafe".to_string(),
-                model: "stub".to_string(),
-                ..crate::settings::AiSettings::default()
-            },
-            ..GuideSettings::default()
-        };
-        (service, settings)
+        )
+    }
+
+    /// The AI policy as the host file holds it: `[ai.verify]`.
+    fn ai_policy() -> crosstalk_core::config::AiVerifyConfig {
+        crosstalk_core::config::AiVerifyConfig {
+            enabled: true,
+            provider: "typesafe".to_string(),
+            model: "stub".to_string(),
+            ..crosstalk_core::config::AiVerifyConfig::default()
+        }
+    }
+
+    /// The fixture's context with the gate switched on. The policy lives in the host config
+    /// now, so a test that wants the model asked has to configure the host, not `guide.toml`.
+    fn gate_on(base: &JobContext) -> JobContext {
+        let mut config = (*base.config_arc()).clone();
+        config.ai.verify = ai_policy();
+        JobContext::new(std::sync::Arc::new(config), Arc::new(VecSink::new()))
+            .with_dispatcharr(base.dispatcharr().expect("fixture wires a client").clone())
     }
 
     #[tokio::test]
     async fn a_confident_match_never_calls_the_model() {
         let (_server, world, context) = fixture("espn.us").await;
         let calls = Arc::new(AtomicUsize::new(0));
-        let (service, settings) = ai_settings(0.99, Arc::clone(&calls));
+        let service = ai_settings(0.99, Arc::clone(&calls));
+        let context = gate_on(&context);
+        let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
 
         let result = run(
@@ -1346,7 +1355,9 @@ mod tests {
         )
         .await;
         let calls = Arc::new(AtomicUsize::new(0));
-        let (service, settings) = ai_settings(0.95, Arc::clone(&calls));
+        let service = ai_settings(0.95, Arc::clone(&calls));
+        let context = gate_on(&context);
+        let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
 
         let result = run(
@@ -1384,7 +1395,9 @@ mod tests {
         )
         .await;
         let calls = Arc::new(AtomicUsize::new(0));
-        let (service, settings) = ai_settings(0.05, Arc::clone(&calls));
+        let service = ai_settings(0.05, Arc::clone(&calls));
+        let context = gate_on(&context);
+        let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
 
         let result = run(
@@ -1482,14 +1495,17 @@ mod tests {
         )
         .await;
         let calls = Arc::new(AtomicUsize::new(0));
-        let (service, settings) = ai_settings(0.95, Arc::clone(&calls));
+        let service = ai_settings(0.95, Arc::clone(&calls));
+        let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
 
         let store = crosstalk_core::store::Store::in_memory().expect("store");
         let run_id = store
             .start_run("guide", "match_preview", true)
             .expect("run");
-        let context = JobContext::new(base_context.config_arc(), Arc::new(VecSink::new()))
+        let mut config = (*base_context.config_arc()).clone();
+        config.ai.verify = ai_policy();
+        let context = JobContext::new(std::sync::Arc::new(config), Arc::new(VecSink::new()))
             .with_dispatcharr(
                 base_context
                     .dispatcharr()
@@ -1549,22 +1565,16 @@ mod tests {
         .await;
         let service =
             crosstalk_core::ai::AiService::with_decider("typesafe", Arc::new(FailingDecider));
-        let settings = GuideSettings {
-            ai: crate::settings::AiSettings {
-                enabled: true,
-                provider: "typesafe".to_string(),
-                model: "stub".to_string(),
-                ..crate::settings::AiSettings::default()
-            },
-            ..GuideSettings::default()
-        };
+        let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
 
         let store = crosstalk_core::store::Store::in_memory().expect("store");
         let run_id = store
             .start_run("guide", "match_preview", true)
             .expect("run");
-        let context = JobContext::new(base_context.config_arc(), Arc::new(VecSink::new()))
+        let mut config = (*base_context.config_arc()).clone();
+        config.ai.verify = ai_policy();
+        let context = JobContext::new(std::sync::Arc::new(config), Arc::new(VecSink::new()))
             .with_dispatcharr(
                 base_context
                     .dispatcharr()
@@ -1723,7 +1733,9 @@ mod tests {
         .with_dispatcharr(client);
 
         let calls = Arc::new(AtomicUsize::new(0));
-        let (service, settings) = ai_settings(0.95, Arc::clone(&calls));
+        let service = ai_settings(0.95, Arc::clone(&calls));
+        let context = gate_on(&context);
+        let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
 
         let result = run(

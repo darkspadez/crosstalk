@@ -1,7 +1,9 @@
 //! Scope: which channels and which EPG entries a run may touch.
 //!
-//! Port of `Plugin._validate_and_filter_groups` and `_get_filtered_epg_data`. The rules are
-//! faithful to the plugin, including the ones that surprise people:
+//! Port of `Plugin._validate_and_filter_groups` and `_get_filtered_epg_data`. The channel
+//! half reads `[scope]` from `crosstalk.toml`, because every sub-app asks the same question;
+//! the EPG-source half reads this app's own `epg_sources_to_match`. The rules are faithful
+//! to the plugin, including the ones that surprise people:
 //!
 //!   * `Channel Groups` and `Ignore Groups` are mutually exclusive, and using both raises;
 //!   * an EPG source list is a FILTER, not a priority order — priority comes from each
@@ -13,6 +15,7 @@
 
 use crate::settings::GuideSettings;
 use anyhow::{bail, Result};
+use crosstalk_core::config::ScopeConfig;
 use crosstalk_core::dispatcharr::{
     Channel, ChannelGroup, ChannelProfile, EpgEntry, EpgSource, World,
 };
@@ -34,9 +37,9 @@ pub struct ScopedChannels {
 /// Fails with the plugin's own wording when both group settings are set, when a named profile
 /// does not exist, or when no group matches: those are configuration mistakes an operator can
 /// fix, not empty results to be explained later.
-pub fn scope_channels(world: &World, settings: &GuideSettings) -> Result<ScopedChannels> {
-    let selected = settings.selected_groups.trim();
-    let ignored = settings.ignore_groups.trim();
+pub fn scope_channels(world: &World, scope: &ScopeConfig) -> Result<ScopedChannels> {
+    let selected = scope.groups.trim();
+    let ignored = scope.ignore_groups.trim();
     if !selected.is_empty() && !ignored.is_empty() {
         bail!(
             "Cannot use both 'Channel Groups' and 'Ignore Groups' at the same time. Please use \
@@ -49,7 +52,7 @@ pub fn scope_channels(world: &World, settings: &GuideSettings) -> Result<ScopedC
     let mut profiles_used = Vec::new();
 
     // Profiles first: they are the coarsest filter and the plugin applied them in this order.
-    let want_profiles = parse_tokens(&settings.channel_profile_name);
+    let want_profiles = parse_tokens(&scope.profiles);
     if !want_profiles.is_empty() {
         let visible = profile_scope(world, &want_profiles)?;
         profiles_used = visible.found.clone();
@@ -417,8 +420,8 @@ mod tests {
         }
     }
 
-    fn defaults() -> GuideSettings {
-        GuideSettings::default()
+    fn defaults() -> ScopeConfig {
+        ScopeConfig::default()
     }
 
     #[test]
@@ -430,8 +433,8 @@ mod tests {
 
     #[test]
     fn both_group_settings_is_an_error() {
-        let settings = GuideSettings {
-            selected_groups: "Sports".to_string(),
+        let settings = ScopeConfig {
+            groups: "Sports".to_string(),
             ignore_groups: "PPV*".to_string(),
             ..defaults()
         };
@@ -441,8 +444,8 @@ mod tests {
 
     #[test]
     fn selected_groups_filter_and_describe() {
-        let settings = GuideSettings {
-            selected_groups: "Sports".to_string(),
+        let settings = ScopeConfig {
+            groups: "Sports".to_string(),
             ..defaults()
         };
         let scoped = scope_channels(&world(), &settings).expect("ok");
@@ -452,8 +455,8 @@ mod tests {
 
     #[test]
     fn selected_groups_accept_wildcards() {
-        let settings = GuideSettings {
-            selected_groups: "Spo*".to_string(),
+        let settings = ScopeConfig {
+            groups: "Spo*".to_string(),
             ..defaults()
         };
         let scoped = scope_channels(&world(), &settings).expect("ok");
@@ -462,8 +465,8 @@ mod tests {
 
     #[test]
     fn an_unknown_selected_group_is_an_error() {
-        let settings = GuideSettings {
-            selected_groups: "Nope".to_string(),
+        let settings = ScopeConfig {
+            groups: "Nope".to_string(),
             ..defaults()
         };
         let error = scope_channels(&world(), &settings).expect_err("rejects");
@@ -472,7 +475,7 @@ mod tests {
 
     #[test]
     fn ignored_groups_exclude_and_describe() {
-        let settings = GuideSettings {
+        let settings = ScopeConfig {
             ignore_groups: "PPV*".to_string(),
             ..defaults()
         };
@@ -484,7 +487,7 @@ mod tests {
 
     #[test]
     fn an_unknown_ignored_group_only_warns() {
-        let settings = GuideSettings {
+        let settings = ScopeConfig {
             ignore_groups: "Nope".to_string(),
             ..defaults()
         };
@@ -494,8 +497,8 @@ mod tests {
 
     #[test]
     fn profiles_are_matched_case_insensitively() {
-        let settings = GuideSettings {
-            channel_profile_name: "favorites".to_string(),
+        let settings = ScopeConfig {
+            profiles: "favorites".to_string(),
             ..defaults()
         };
         let scoped = scope_channels(&world(), &settings).expect("ok");
@@ -506,8 +509,8 @@ mod tests {
 
     #[test]
     fn several_profiles_union_their_channels() {
-        let settings = GuideSettings {
-            channel_profile_name: "Favorites, Empty".to_string(),
+        let settings = ScopeConfig {
+            profiles: "Favorites, Empty".to_string(),
             ..defaults()
         };
         // `Empty` contributes nothing but does not fail, because `Favorites` found channels.
@@ -518,8 +521,8 @@ mod tests {
 
     #[test]
     fn an_unknown_profile_is_an_error_naming_the_available_ones() {
-        let settings = GuideSettings {
-            channel_profile_name: "Nope".to_string(),
+        let settings = ScopeConfig {
+            profiles: "Nope".to_string(),
             ..defaults()
         };
         let error = scope_channels(&world(), &settings).expect_err("rejects");
@@ -530,8 +533,8 @@ mod tests {
 
     #[test]
     fn an_empty_profile_is_an_error() {
-        let settings = GuideSettings {
-            channel_profile_name: "Empty".to_string(),
+        let settings = ScopeConfig {
+            profiles: "Empty".to_string(),
             ..defaults()
         };
         let error = scope_channels(&world(), &settings).expect_err("rejects");
@@ -540,9 +543,9 @@ mod tests {
 
     #[test]
     fn profile_and_group_filters_combine() {
-        let settings = GuideSettings {
-            channel_profile_name: "All".to_string(),
-            selected_groups: "PPV*".to_string(),
+        let settings = ScopeConfig {
+            profiles: "All".to_string(),
+            groups: "PPV*".to_string(),
             ..defaults()
         };
         let scoped = scope_channels(&world(), &settings).expect("ok");
@@ -614,14 +617,14 @@ mod tests {
         let settings = GuideSettings {
             epg_sources_to_match: "Schedules Direct".to_string(),
             heal_fallback_sources: String::new(),
-            ..defaults()
+            ..GuideSettings::default()
         };
         assert_eq!(heal_source_filter(&settings), "Schedules Direct");
 
         let settings = GuideSettings {
             epg_sources_to_match: "Schedules Direct".to_string(),
             heal_fallback_sources: "XMLTV".to_string(),
-            ..defaults()
+            ..GuideSettings::default()
         };
         assert_eq!(heal_source_filter(&settings), "XMLTV");
     }

@@ -889,6 +889,7 @@ mod tests {
                     "typesafe".to_string(),
                     provider(&format!("{}/v1", server.uri())),
                 )]),
+                ..crate::config::AiConfig::default()
             },
             ..CrosstalkConfig::default()
         });
@@ -926,6 +927,7 @@ mod tests {
                     "typesafe".to_string(),
                     provider(&format!("{}/v1", server.uri())),
                 )]),
+                ..crate::config::AiConfig::default()
             },
             ..CrosstalkConfig::default()
         });
@@ -946,6 +948,7 @@ mod tests {
                     "typesafe".to_string(),
                     provider(&format!("{}/v1", server.uri())),
                 )]),
+                ..crate::config::AiConfig::default()
             },
             ..CrosstalkConfig::default()
         });
@@ -975,6 +978,7 @@ mod tests {
                     "local".to_string(),
                     openai_provider(&format!("{}/v1", server.uri())),
                 )]),
+                ..crate::config::AiConfig::default()
             },
             ..CrosstalkConfig::default()
         });
@@ -1008,6 +1012,7 @@ mod tests {
                     "local".to_string(),
                     openai_provider(&format!("{}/v1", server.uri())),
                 )]),
+                ..crate::config::AiConfig::default()
             },
             ..CrosstalkConfig::default()
         });
@@ -1039,6 +1044,7 @@ mod tests {
                     "local".to_string(),
                     openai_provider(&format!("{}/v1", server.uri())),
                 )]),
+                ..crate::config::AiConfig::default()
             },
             ..CrosstalkConfig::default()
         });
@@ -1098,6 +1104,7 @@ mod tests {
                     "local".to_string(),
                     openai_provider(&format!("{}/v1", server.uri())),
                 )]),
+                ..crate::config::AiConfig::default()
             },
             ..CrosstalkConfig::default()
         });
@@ -1125,6 +1132,7 @@ mod tests {
                     "local".to_string(),
                     openai_provider(&format!("{}/v1", server.uri())),
                 )]),
+                ..crate::config::AiConfig::default()
             },
             ..CrosstalkConfig::default()
         });
@@ -1233,6 +1241,7 @@ mod tests {
                         },
                     ),
                 ]),
+                ..crate::config::AiConfig::default()
             },
             ..CrosstalkConfig::default()
         };

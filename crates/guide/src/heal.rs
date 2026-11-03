@@ -470,7 +470,7 @@ pub async fn run(
             .map(|name| name.to_string_lossy().to_string());
         csv_report::prune_exports(
             &context.exports_dir(),
-            settings.csv_retention_days,
+            context.config().exports.retention_days,
             name.as_deref(),
         );
     }
@@ -808,9 +808,9 @@ mod tests {
     }
 
     fn scoped(world: &World) -> (ScopedChannels, ScopedEntries) {
-        let settings = GuideSettings::default();
+        let scope = crosstalk_core::config::ScopeConfig::default();
         (
-            crate::scope::scope_channels(world, &settings).expect("channels"),
+            crate::scope::scope_channels(world, &scope).expect("channels"),
             crate::scope::scope_entries(world, ""),
         )
     }

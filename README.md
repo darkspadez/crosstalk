@@ -91,12 +91,22 @@ one-shot run has no dialog to confirm in.
 Two files, split by who owns the option:
 
 - **`crosstalk.toml`** (host): the Dispatcharr connection, AI providers, the HTTP listener, the
-  thread pool, the directories, and the **shared name-matching options** — the normalisation
-  toggles, which country databases to load, and custom aliases. Those are shared because two
-  apps disagreeing about whether `[HD]` is stripped would give two different answers for the
-  same channel.
-- **`guide.toml`** (sub-app): scope filters, confidence thresholds, the AI gate, CSV
-  retention.
+  thread pool, the directories, the schedules, and every option the sub-apps must agree on:
+  - `[matching]` — the normalisation toggles, which country databases to load, and custom
+    aliases. Two apps disagreeing about whether `[HD]` is stripped would give two different
+    answers for the same channel.
+  - `[scope]` — `profiles`, `groups` and `ignore_groups`: which channels a run may touch.
+    "Which channels am I responsible for" is the same question for every sub-app.
+  - `[exports]` — `retention_days`, how long CSV reports are kept.
+  - `[ai.verify]` — when a borderline match is worth asking a model about, and how its answer
+    is read. The endpoints and keys stay under `[ai.providers]` in the same file.
+- **`guide.toml`** (sub-app): what is genuinely the guide's own — the EPG sources to match,
+  the check window, the auto-match and heal confidence thresholds, and the heal fallback
+  sources.
+
+The split is a clean break: `guide.toml` rejects the old `channel_profile_name`,
+`selected_groups`, `ignore_groups`, `csv_retention_days` and `[ai]` keys, and the error says
+where each one moved. Two files claiming one setting would be worse than a loud failure.
 
 Every value can be overridden by an environment variable named `CROSSTALK_<SECTION>__<KEY>`,
 with a double underscore between levels:
@@ -105,6 +115,9 @@ with a double underscore between levels:
 CROSSTALK_SERVER__PORT=9100
 CROSSTALK_DISPATCHARR__API_KEY=...
 CROSSTALK_AI__PROVIDERS__TYPESAFE__API_KEY=...
+CROSSTALK_SCOPE__PROFILES="All, Favorites"
+CROSSTALK_EXPORTS__RETENTION_DAYS=30
+CROSSTALK_AI__VERIFY__ENABLED=true
 ```
 
 Secrets should live in the environment, not the file: the daemon refuses to save a
@@ -163,11 +176,8 @@ kind = "typesafe"
 base_url = "https://api.typesafe.ai/v1"
 api_key_env = "TYPESAFE_API_KEY"
 max_concurrency = 8          # the public endpoint rate-limits around eight
-```
 
-```toml
-# guide.toml
-[ai]
+[ai.verify]                  # the policy every sub-app shares
 enabled = true
 provider = "typesafe"
 model = "jev-latest"         # pin a version to keep answers stable across releases
@@ -205,6 +215,8 @@ a preview action stays a preview.
 - Run page: live status, the full result table with the reason for every row, the AI decision
   where there was one, and the CSV download.
 - Settings: every option with the help text the form shows, written back to the TOML files.
+  The host form carries the shared options — scope, CSV retention and the AI policy — plus
+  the matching toggles; each app's form carries only what that app owns.
 
 The UI binds to `127.0.0.1` by default. To expose it, set `server.bind` and a `server.token`;
 the daemon refuses to start on a non-loopback address without a token. A browser signs in at

@@ -236,6 +236,21 @@ impl GuideApp {
         if !errors.is_empty() {
             bail!("invalid settings: {}", errors.join("; "));
         }
+        // The AI policy lived in this file until it moved to the host: an inverted band or
+        // an enabled gate with no provider is still a configuration mistake, and a run must
+        // refuse it the way it did before the move. Only the shared scope/AI errors block a
+        // run; unrelated host problems (a missing token, Dispatcharr credentials) are the
+        // caller's concern and are reported by `validate`.
+        let host_errors: Vec<String> = context
+            .config()
+            .validate()
+            .errors
+            .into_iter()
+            .filter(|error| error.contains("scope.") || error.contains("ai.verify."))
+            .collect();
+        if !host_errors.is_empty() {
+            bail!("invalid settings: {}", host_errors.join("; "));
+        }
 
         let client = context.dispatcharr()?;
         context.progress(&crosstalk_core::jobs::ProgressEvent::new(
@@ -246,7 +261,7 @@ impl GuideApp {
         ));
         let world = client.load_world().await?;
 
-        let scoped_channels = scope::scope_channels(&world, &settings)?;
+        let scoped_channels = scope::scope_channels(&world, &context.config().scope)?;
         let scoped_entries = scope::scope_entries(&world, &settings.epg_sources_to_match);
 
         if scoped_channels.channels.is_empty() {
@@ -261,15 +276,18 @@ impl GuideApp {
             );
         }
 
-        // Built once per run: one session, one concurrency cap, one audit trail.
+        // Built once per run: one session, one concurrency cap, one audit trail. The policy
+        // is the host's `[ai.verify]`, shared with every other sub-app that matches names.
+        let policy = &context.config().ai.verify;
         let ai = crosstalk_core::ai::AiService::from_config(context.config());
-        let ai = if settings.ai.enabled && ai.has(&settings.ai.provider) {
+        let ai = if policy.enabled && ai.has(&policy.provider) {
             Some(ai)
         } else {
-            if settings.ai.enabled {
+            if policy.enabled {
                 tracing::warn!(
-                    "ai.enabled is on but provider {:?} is not configured; matching without it",
-                    settings.ai.provider
+                    "ai.verify.enabled is on but provider {:?} is not configured; matching \
+                     without it",
+                    policy.provider
                 );
             }
             None
@@ -299,7 +317,7 @@ impl GuideApp {
         let client = context.dispatcharr()?;
         let world = client.load_world().await?;
 
-        let scoped_channels = scope::scope_channels(&world, &settings)?;
+        let scoped_channels = scope::scope_channels(&world, &context.config().scope)?;
         let filter = scope::heal_source_filter(&settings);
         let scoped_entries = scope::scope_entries(&world, filter);
 
@@ -365,7 +383,11 @@ impl GuideApp {
         let mut outcome = JobOutcome::new(format!(
             "Settings valid. {} channel database(s) enabled, AI verification {}.",
             context.config().matching.databases().len(),
-            if settings.ai.enabled { "on" } else { "off" }
+            if context.config().ai.verify.enabled {
+                "on"
+            } else {
+                "off"
+            }
         ));
         outcome = outcome.with_count("warnings", config_report.warnings.len() as i64);
         Ok(outcome)
@@ -448,14 +470,18 @@ mod tests {
 
         let mut values = app().load_settings(&path).expect("load defaults");
         values.insert("check_hours", FieldValue::Number(6.0));
-        values.insert("ai.enabled", FieldValue::Boolean(true));
-        values.insert("ai.model", FieldValue::Text("jev-1.14.0".to_string()));
+        values.insert(
+            "epg_sources_to_match",
+            FieldValue::Text("Schedules Direct".to_string()),
+        );
         app().save_settings(&path, &values).expect("save");
 
         let reloaded = app().load_settings(&path).expect("reload");
         assert_eq!(reloaded.number("check_hours"), Some(6.0));
-        assert_eq!(reloaded.bool("ai.enabled"), Some(true));
-        assert_eq!(reloaded.text("ai.model"), Some("jev-1.14.0"));
+        assert_eq!(
+            reloaded.text("epg_sources_to_match"),
+            Some("Schedules Direct")
+        );
     }
 
     #[test]
@@ -483,7 +509,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = app().settings_path(dir.path());
         let mut values = SettingsValues::new();
-        values.insert("csv_retention_days", FieldValue::Number(-1.0));
+        values.insert("check_hours", FieldValue::Number(-1.0));
         let error = app().save_settings(&path, &values).expect_err("rejects");
         assert!(format!("{error}").contains("between"), "{error}");
     }
@@ -492,20 +518,20 @@ mod tests {
     fn validate_settings_catches_a_hand_edited_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = app().settings_path(dir.path());
-        std::fs::write(&path, "selected_groups = \"A\"\nignore_groups = \"B\"\n").expect("seed");
+        std::fs::write(&path, "match_confidence_threshold = 0\n").expect("seed");
         let error = app().validate_settings(&path).expect_err("rejects");
-        assert!(format!("{error}").contains("cannot both be set"));
+        assert!(format!("{error}").contains("at least 1"));
     }
 
     #[test]
-    fn save_rejects_a_conflicting_combination() {
+    fn save_rejects_a_settings_file_that_still_holds_a_moved_key() {
+        // The clean break: `selected_groups` now lives under [scope] in crosstalk.toml, and
+        // the app says so rather than quietly ignoring a value the operator can see.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = app().settings_path(dir.path());
-        let mut values = SettingsValues::new();
-        values.insert("selected_groups", FieldValue::Text("A".into()));
-        values.insert("ignore_groups", FieldValue::Text("B".into()));
-        let error = app().save_settings(&path, &values).expect_err("rejects");
-        assert!(format!("{error}").contains("cannot both be set"));
+        std::fs::write(&path, "selected_groups = \"A\"\n").expect("seed");
+        let error = app().load_settings(&path).expect_err("rejects the old key");
+        assert!(format!("{error:#}").contains("crosstalk.toml"), "{error:#}");
     }
 
     #[tokio::test]
@@ -535,6 +561,25 @@ mod tests {
             .expect("ok");
         assert!(outcome.summary.contains("Settings valid"));
         assert_eq!(outcome.counts.get("warnings"), Some(&0));
+    }
+
+    #[tokio::test]
+    async fn an_apply_with_an_inverted_ai_band_is_refused_before_dispatch() {
+        // The AI policy moved to the host file, but a run must still refuse it the way it
+        // did when the band lived in guide.toml.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = CrosstalkConfig::load(dir.path()).expect("load");
+        config.ai.verify.verify_band_low = 95;
+        config.ai.verify.verify_band_high = 80;
+        let context = JobContext::for_tests(config);
+        let error = app()
+            .dispatch(ACTION_MATCH_PREVIEW, &context, true)
+            .await
+            .expect_err("inverted band");
+        assert!(
+            format!("{error}").contains("ai.verify.verify_band_low"),
+            "{error:#}"
+        );
     }
 
     #[tokio::test]

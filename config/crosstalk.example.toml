@@ -1,12 +1,15 @@
 # crosstalk host configuration.
 #
 # This file holds everything the host owns: the Dispatcharr connection, the AI providers,
-# the HTTP listener, the thread pool and the shared name-matching options. Each sub-app has
-# its own file next to this one (guide.toml, ...) for its thresholds and scope filters.
+# the HTTP listener, the thread pool, the schedule list, and every option the sub-apps must
+# agree on -- the shared name-matching options, the channel scope, the CSV retention and the
+# AI matching policy. Each sub-app has its own file next to this one (guide.toml, ...) for
+# the thresholds and filters that are genuinely its own.
 #
 # Every value can be overridden by an environment variable named CROSSTALK_<SECTION>__<KEY>
-# in upper case, for example CROSSTALK_SERVER__PORT=9100. A double underscore separates
-# levels, which is how one value is changed in a container without editing this file.
+# in upper case, for example CROSSTALK_SERVER__PORT=9100 or CROSSTALK_SCOPE__PROFILES="All".
+# A double underscore separates levels, which is how one value is changed in a container
+# without editing this file.
 #
 # Copy this file to crosstalk.toml and edit it. The daemon writes back to that file when a
 # setting is changed in the web UI, and it preserves comments when it does.
@@ -38,9 +41,10 @@ timeout_secs = 30
 # concurrent requests; Dispatcharr itself is usually fine with more.
 concurrency = 8
 
-# AI providers. A sub-app names the provider and the model in its own file; the host owns
-# the endpoint, the key and the concurrency cap, so several sub-apps share one provider
-# entry rather than each holding a copy.
+# AI providers. The endpoint, the key and the concurrency cap live here, so several
+# sub-apps share one provider entry rather than each holding a copy. Which provider and
+# model are used, and when a borderline match is worth asking about, is the [ai.verify]
+# policy below.
 #
 # [ai.providers.typesafe]
 # kind = "typesafe"            # native System One: real probabilities and confidence
@@ -55,6 +59,55 @@ concurrency = 8
 # base_url = "http://localhost:11434/v1"
 # api_key_env = "OPENAI_API_KEY"
 # max_concurrency = 4
+
+# The AI matching policy. The heuristics decide first and the model only promotes: it is
+# asked about results in the band below, or about candidates for a channel the heuristics
+# could not match at all. A heuristic result at or above a sub-app's own confidence
+# threshold is never re-checked or vetoed by the model. An AI-accepted pick is still
+# validated for programme data: when every same-name copy is empty the channel is left
+# unmatched with a reason saying so. The guide app's heal never consults the model.
+#
+# The provider name below must match an [ai.providers.<name>] entry.
+[ai.verify]
+enabled = false
+provider = "typesafe"
+# Model name as the provider spells it. TypeSafe's aliases are jev-latest and jev-preview;
+# pinning a version (jev-1.14.0) keeps answers stable when a new release ships.
+model = "jev-latest"
+# Inclusive score band treated as uncertain.
+verify_band_low = 80
+verify_band_high = 94
+# Offer the model a shortlist when the heuristics found nothing above the floor.
+rescue = true
+rescue_floor = 60
+# Candidates per request. More costs tokens; the request is one call regardless.
+shortlist = 5
+# A candidate is accepted when the model's yes-probability reaches this and its choice
+# agrees. At or below reject_threshold it is dropped outright. Between the two, the channel
+# is left unmatched and the row says "AI undecided".
+accept_threshold = 0.8
+reject_threshold = 0.3
+# Below this, the model's pick is treated as undecided.
+min_confidence = 0.5
+
+# Which channels a run may touch, shared by every sub-app: "which channels am I responsible
+# for" is the same question for all of them, and answering it twice lets two apps disagree
+# about one install. An app's own filters (the guide's EPG sources, for example) stay in
+# that app's file.
+[scope]
+# Comma-separated profile names. Empty means every profile. Actions that need exactly one
+# profile use the first name given.
+profiles = ""
+# Only process channels in these groups. Supports * and ? wildcards. Cannot be combined
+# with ignore_groups: set one or the other.
+groups = ""
+# Exclude channels in these groups, applied after `groups`.
+ignore_groups = ""
+
+# CSV reports, in the shared exports directory. Only files named <app>_*.csv are touched.
+[exports]
+# Delete this app's CSV exports older than this many days. 0 keeps everything.
+retention_days = 0
 
 [matching]
 # These four toggles live here rather than in a sub-app file, because every sub-app that

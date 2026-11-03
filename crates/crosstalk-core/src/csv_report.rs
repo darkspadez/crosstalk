@@ -63,6 +63,15 @@ pub fn preamble(
     for (label, value) in render_settings(schema, values) {
         lines.push(format!("#   {label}: {value}"));
     }
+    // The settings every app shares live in the host file, so they come from it rather
+    // than from the app's own values: a report that omitted them would say what this app
+    // was told but not what it was pointed at.
+    for (label, value) in render_settings(
+        &crate::config::shared_schema(),
+        &crate::config::shared_values(host),
+    ) {
+        lines.push(format!("#   {label}: {value}"));
+    }
     lines.push("#".to_string());
     lines
 }
@@ -84,13 +93,18 @@ fn render_settings(schema: &SettingsSchema, values: &SettingsValues) -> Vec<(Str
 }
 
 /// One setting, read the way a person reading the report needs it.
+///
+/// The rule is picked by the setting's own name, not its full path: the same option is
+/// `retention_days` under `[exports]` and `check_hours` in an app's file, and one wording
+/// per meaning is what a reader needs.
 fn render_setting(id: &str, kind: &crate::subapp::FieldKind, value: &FieldValue) -> String {
-    match (id, kind) {
+    let name = id.rsplit('.').next().unwrap_or(id);
+    match (name, kind) {
         ("match_confidence_threshold", _) | ("heal_confidence_threshold", _) => {
             format!("{} out of 100, higher is stricter", value.render())
         }
         ("check_hours", _) => format!("{} hours ahead of now", value.render()),
-        ("csv_retention_days", _) => {
+        ("retention_days", _) => {
             let days: i64 = match value {
                 FieldValue::Number(number) => *number as i64,
                 _ => 0,
@@ -101,7 +115,7 @@ fn render_setting(id: &str, kind: &crate::subapp::FieldKind, value: &FieldValue)
                 format!("{days} days, older exports of this app are deleted after each run")
             }
         }
-        ("ai.accept_threshold", _) | ("ai.reject_threshold", _) | ("ai.min_confidence", _) => {
+        ("accept_threshold", _) | ("reject_threshold", _) | ("min_confidence", _) => {
             format!("{} (0 to 1)", value.render())
         }
         (_, crate::subapp::FieldKind::JsonObject) => value.render(),
@@ -480,6 +494,42 @@ mod tests {
         assert!(joined.contains("Allow EPG Without Program Data: Yes"));
         // A multi-line value is flattened so it cannot emit a line with no `#`.
         assert!(joined.contains("Channel Groups: A B"));
+    }
+
+    #[test]
+    fn the_preamble_reports_the_settings_that_live_in_the_host_file() {
+        // Scope, retention and the AI policy moved to crosstalk.toml, but a reader of the
+        // report still needs to see what the run was told to do.
+        let mut host = CrosstalkConfig::default();
+        host.scope.profiles = "All".to_string();
+        host.scope.groups = "Sports".to_string();
+        host.exports.retention_days = 30;
+        host.ai.verify.enabled = true;
+        host.ai.verify.accept_threshold = 0.85;
+
+        let lines = preamble(
+            &host,
+            &SettingsSchema::new(vec![]),
+            &SettingsValues::new(),
+            "Auto-Match Preview Report",
+            10,
+            &[],
+        );
+        let joined = lines.join("\n");
+        assert!(joined.contains("Channel Profile Names: All"), "{joined}");
+        assert!(joined.contains("Channel Groups: Sports"), "{joined}");
+        assert!(
+            joined.contains("Delete CSV Exports Older Than (Days): 30 days"),
+            "{joined}"
+        );
+        assert!(joined.contains("Enable AI Verification: Yes"), "{joined}");
+        assert!(
+            joined.contains("AI Accept Threshold: 0.85 (0 to 1)"),
+            "{joined}"
+        );
+        for line in &lines {
+            assert!(line.starts_with('#'), "not a comment: {line:?}");
+        }
     }
 
     #[test]

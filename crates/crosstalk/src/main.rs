@@ -402,6 +402,17 @@ fn validate(args: ConfigArgs) -> Result<()> {
         config.matching.ignore_misc_tags
     );
     println!("threads: {}", config.jobs.resolved_worker_threads());
+    // The shared scope and export settings: they decide which channels a run may touch and
+    // how much history it leaves behind, so `validate` should show them without opening the
+    // file.
+    println!(
+        "scope: profiles [{}], groups [{}], ignore groups [{}]",
+        config.scope.profiles, config.scope.groups, config.scope.ignore_groups
+    );
+    println!(
+        "exports: kept {} day(s), 0 means every report",
+        config.exports.retention_days
+    );
 
     for warning in &report.warnings {
         println!("warning: {warning}");

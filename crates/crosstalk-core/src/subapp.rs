@@ -299,6 +299,11 @@ impl SettingsValues {
         self.0.get(id)
     }
 
+    /// Drop a value, so an absent form control can mean "unchanged" rather than "cleared".
+    pub fn remove(&mut self, id: &str) -> Option<FieldValue> {
+        self.0.remove(id)
+    }
+
     pub fn text(&self, id: &str) -> Option<&str> {
         match self.0.get(id) {
             Some(FieldValue::Text(text)) => Some(text),
@@ -342,6 +347,37 @@ impl SettingsValues {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+}
+
+/// A number that must already be a whole number in range.
+///
+/// Truncating silently is how a typed `6.7` becomes `6` and a typed `-1` becomes `0`; both
+/// look like a saved setting and neither is what was asked for. Shared because every
+/// settings form, the host's included, needs the same rule.
+pub fn whole_number(field: &str, value: f64, min: u32, max: u32) -> Result<u32> {
+    if !value.is_finite() || value.fract() != 0.0 {
+        anyhow::bail!("{field} must be a whole number, got {value}");
+    }
+    if value < f64::from(min) || value > f64::from(max) {
+        anyhow::bail!("{field} must be between {min} and {max}, got {value}");
+    }
+    Ok(value as u32)
+}
+
+/// A number that must sit in 0-100, rounded rather than truncated.
+pub fn clamp_u8(value: f64) -> Result<u8> {
+    if !(0.0..=100.0).contains(&value) {
+        anyhow::bail!("value {value} is outside 0-100");
+    }
+    Ok(value.round() as u8)
+}
+
+/// A number that must sit in 0-1: the AI probability thresholds.
+pub fn clamp_unit(value: f64) -> Result<f64> {
+    if !(0.0..=1.0).contains(&value) {
+        anyhow::bail!("value {value} is outside 0-1");
+    }
+    Ok(value)
 }
 
 /// How one action finished, for the run record and the toast.
@@ -565,6 +601,38 @@ mod tests {
         assert_eq!(FieldValue::Number(1.5).render(), "1.5");
         assert_eq!(FieldValue::Text("x".into()).render(), "x");
         assert_eq!(FieldValue::Json(BTreeMap::new()).render(), "(not set)");
+    }
+
+    #[test]
+    fn whole_number_refuses_fractions_and_out_of_range_values() {
+        // Truncating silently would turn a typed 6.7 into 6 and look like a saved setting.
+        assert_eq!(whole_number("hours", 6.0, 0, 8_760).expect("ok"), 6);
+        assert!(whole_number("hours", 6.7, 0, 8_760).is_err());
+        assert!(whole_number("hours", -1.0, 0, 8_760).is_err());
+        assert!(whole_number("hours", 8_761.0, 0, 8_760).is_err());
+        assert!(whole_number("hours", f64::NAN, 0, 8_760).is_err());
+        // The error names the field, because a form has several.
+        assert!(format!("{}", whole_number("hours", 6.7, 0, 8_760).unwrap_err()).contains("hours"));
+    }
+
+    #[test]
+    fn the_clamps_hold_their_ranges() {
+        assert_eq!(clamp_u8(94.4).expect("ok"), 94);
+        assert_eq!(clamp_u8(100.0).expect("ok"), 100);
+        assert!(clamp_u8(101.0).is_err());
+        assert!(clamp_u8(-1.0).is_err());
+
+        assert_eq!(clamp_unit(0.8).expect("ok"), 0.8);
+        assert!(clamp_unit(1.5).is_err());
+        assert!(clamp_unit(-0.1).is_err());
+    }
+
+    #[test]
+    fn a_value_can_be_dropped_from_a_form_snapshot() {
+        let mut values = SettingsValues::new();
+        values.insert("hours", FieldValue::Number(12.0));
+        assert!(values.remove("hours").is_some());
+        assert!(values.get("hours").is_none());
     }
 
     #[test]

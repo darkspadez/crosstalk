@@ -2,11 +2,18 @@
 //!
 //! The split follows how the options are used. Anything the HOST owns — the Dispatcharr
 //! connection, the AI providers, the HTTP listener, the thread pool, the export directory —
-//! lives in `crosstalk.toml`. Anything about matching names — the normalisation toggles,
-//! the enabled country databases, the custom aliases — also lives in `crosstalk.toml`,
-//! because every sub-app that matches channel names must agree on it; two plugins
-//! disagreeing about whether `[HD]` is stripped would produce two different answers for the
-//! same channel. A sub-app's own thresholds and scope filters live in its own file.
+//! lives in `crosstalk.toml`. Anything every sub-app must agree on also lives in
+//! `crosstalk.toml`:
+//!
+//!   * `[matching]`: the normalisation toggles, the enabled country databases, the custom
+//!     aliases. Two sub-apps disagreeing about whether `[HD]` is stripped would produce two
+//!     different answers for the same channel;
+//!   * `[scope]`: which profiles, groups and ignored groups a run may touch;
+//!   * `[exports]`: how long CSV reports are kept;
+//!   * `[ai.verify]`: when a borderline match is worth asking a model about. The endpoints
+//!     and keys stay under `[ai.providers]`; the policy is what every app shares.
+//!
+//! A sub-app's own thresholds and filters live in its own file.
 //!
 //! Secrets can be written inline or named through `*_env`, which is what a container
 //! deployment wants. Loading never logs a secret value.
@@ -186,17 +193,105 @@ impl AiProviderConfig {
     }
 }
 
-/// Every configured AI provider, keyed by the name a sub-app refers to.
+/// Every configured AI provider, keyed by the name a sub-app refers to, plus the policy each
+/// sub-app shares.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AiConfig {
     pub providers: BTreeMap<String, AiProviderConfig>,
+    /// When a borderline match is worth a request, and how to read the answer.
+    ///
+    /// Under `[ai.verify]` rather than flattened into `[ai]` so the connection details
+    /// (`[ai.providers.<name>]`) stay apart from the matching policy, and so a provider can
+    /// never be mistaken for a policy key.
+    pub verify: AiVerifyConfig,
 }
 
 impl AiConfig {
     pub fn provider(&self, name: &str) -> Option<&AiProviderConfig> {
         self.providers.get(name)
     }
+}
+
+/// When the AI verifier is asked, and how its answers are read: `[ai.verify]`.
+///
+/// This was `guide.toml`'s `[ai]` block. It moved to the host file because verifying a
+/// borderline match is the same decision for every sub-app that matches names, and because
+/// the endpoint and key it refers to were already host-owned.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct AiVerifyConfig {
+    /// Ask the model about borderline or unmatched candidates.
+    pub enabled: bool,
+    /// Which entry under `[ai.providers]` in `crosstalk.toml` to use.
+    pub provider: String,
+    /// Model name, as the provider names it: `jev-latest`, `clef`, and so on.
+    pub model: String,
+    /// Score band, inclusive, in which a heuristic result is treated as uncertain.
+    pub verify_band_low: u8,
+    pub verify_band_high: u8,
+    /// Ask the model about candidates when no heuristic result cleared the band.
+    pub rescue: bool,
+    /// Lowest heuristic score worth showing the model during a rescue.
+    pub rescue_floor: u8,
+    /// How many candidates to put in one request.
+    pub shortlist: usize,
+    /// Accept a candidate when the model's yes-probability reaches this.
+    pub accept_threshold: f64,
+    /// Drop a candidate outright at or below this.
+    pub reject_threshold: f64,
+    /// Minimum choice confidence needed to act on the model's pick.
+    pub min_confidence: f64,
+}
+
+impl Default for AiVerifyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: "typesafe".to_string(),
+            model: "jev-latest".to_string(),
+            verify_band_low: 80,
+            verify_band_high: 94,
+            rescue: true,
+            rescue_floor: 60,
+            shortlist: 5,
+            accept_threshold: 0.8,
+            reject_threshold: 0.3,
+            min_confidence: 0.5,
+        }
+    }
+}
+
+/// Which channels a run may touch: `[scope]`, shared by every sub-app.
+///
+/// These were `channel_profile_name`, `selected_groups` and `ignore_groups` in
+/// `guide.toml`. They moved to the host file because "which channels am I responsible for"
+/// is the same question for every sub-app, and answering it twice lets two apps disagree
+/// about the same install.
+///
+/// Deliberately without a per-app override: no app needs one yet, and an optional `[scope]`
+/// table in an app's file would mean the form, the CSV preamble and the validation each had
+/// to know about a second place to look. Adding it later is a decision per app, not a
+/// default.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ScopeConfig {
+    /// Profile names to scope to, comma-separated. The first one is used by actions that
+    /// need exactly one.
+    pub profiles: String,
+    /// Only process channels in these groups, comma-separated. Supports `*` and `?`
+    /// wildcards. Cannot be combined with `ignore_groups`.
+    pub groups: String,
+    /// Exclude channels in these groups, applied after `groups`.
+    pub ignore_groups: String,
+}
+
+/// How long CSV reports are kept: `[exports]`, shared by every sub-app.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExportsConfig {
+    /// Delete this app's exports older than this many days. 0 keeps everything.
+    pub retention_days: u32,
 }
 
 /// Name-comparison settings shared by every sub-app.
@@ -328,6 +423,9 @@ pub struct CrosstalkConfig {
     pub dispatcharr: DispatcharrConfig,
     pub ai: AiConfig,
     pub matching: MatchingConfig,
+    /// What a run may touch. Shared, so every sub-app selects the same channels.
+    pub scope: ScopeConfig,
+    pub exports: ExportsConfig,
     pub jobs: JobsConfig,
     /// Cron expressions per `<app>.<action>`, for example `guide.match_apply = "0 4 * * *"`.
     pub schedules: BTreeMap<String, String>,
@@ -408,11 +506,13 @@ impl CrosstalkConfig {
         let overlay: toml::Table = Figment::from(Env::prefixed(env_prefix).split("__"))
             .extract()
             .map_err(|error| anyhow::anyhow!("invalid environment override: {error}"))?;
-        const SECTIONS: [&str; 6] = [
+        const SECTIONS: [&str; 8] = [
             "server",
             "dispatcharr",
             "ai",
             "matching",
+            "scope",
+            "exports",
             "jobs",
             "schedules",
         ];
@@ -561,6 +661,51 @@ impl CrosstalkConfig {
             }
         }
 
+        // The scope rules were the guide app's own until the values moved here; they are
+        // still configuration mistakes an operator can fix, not empty results to explain.
+        if !self.scope.groups.trim().is_empty() && !self.scope.ignore_groups.trim().is_empty() {
+            report.errors.push(
+                "scope.groups and scope.ignore_groups cannot both be set: use one or the other"
+                    .to_string(),
+            );
+        }
+
+        let verify = &self.ai.verify;
+        if verify.verify_band_low > verify.verify_band_high {
+            report.errors.push(format!(
+                "ai.verify.verify_band_low ({}) is above ai.verify.verify_band_high ({})",
+                verify.verify_band_low, verify.verify_band_high
+            ));
+        }
+        if verify.reject_threshold >= verify.accept_threshold {
+            report.errors.push(format!(
+                "ai.verify.reject_threshold ({}) must be below ai.verify.accept_threshold ({})",
+                verify.reject_threshold, verify.accept_threshold
+            ));
+        }
+        if verify.rescue_floor > verify.verify_band_low {
+            report.errors.push(format!(
+                "ai.verify.rescue_floor ({}) is above ai.verify.verify_band_low ({}), so a \
+                 rescued channel would be one the band already covers",
+                verify.rescue_floor, verify.verify_band_low
+            ));
+        }
+        if verify.shortlist == 0 {
+            report
+                .errors
+                .push("ai.verify.shortlist must be at least 1".to_string());
+        }
+        if verify.enabled && verify.provider.trim().is_empty() {
+            report
+                .errors
+                .push("ai.verify.enabled is on but ai.verify.provider is empty".to_string());
+        }
+        if verify.enabled && verify.model.trim().is_empty() {
+            report
+                .errors
+                .push("ai.verify.enabled is on but ai.verify.model is empty".to_string());
+        }
+
         for (key, cron) in &self.schedules {
             if !key.contains('.') {
                 report.errors.push(format!(
@@ -688,14 +833,217 @@ impl From<CrosstalkConfig> for SharedConfig {
     }
 }
 
-/// The host's own settings form: the shared matching options.
+/// The host's settings form: every option the UI edits in `crosstalk.toml`.
 ///
 /// These live in the host file, so they need a schema of their own; without one the UI has
 /// nothing to render and the CSV preamble cannot report them under the names operators know.
-pub fn matching_schema() -> crate::subapp::SettingsSchema {
-    use crate::subapp::{FieldKind, FieldSpec, FieldValue, SettingsSchema};
+pub fn host_schema() -> crate::subapp::SettingsSchema {
+    crate::subapp::SettingsSchema::new([shared_fields(), matching_fields()].concat())
+}
 
-    SettingsSchema::new(vec![
+/// The shared half of [`host_schema`]: scope, export retention and the AI policy.
+///
+/// The CSV preamble prints these with every app's report, because they describe the run as
+/// much as the app's own thresholds do.
+pub fn shared_schema() -> crate::subapp::SettingsSchema {
+    crate::subapp::SettingsSchema::new(shared_fields())
+}
+
+/// `[scope]`, `[exports]` and `[ai.verify]`, as form fields.
+fn shared_fields() -> Vec<crate::subapp::FieldSpec> {
+    use crate::subapp::{FieldKind, FieldSpec, FieldValue};
+
+    vec![
+        FieldSpec::section(
+            "_section_scope",
+            "Scope",
+            "Which channels a run may touch. Every sub-app asks the same question, so the \
+             answer lives here once: profiles first, then the group filter. An app's own \
+             source filter (the guide's EPG sources, for example) stays in that app's file.",
+        ),
+        FieldSpec::new(
+            "scope.profiles",
+            "_section_scope",
+            "Channel Profile Names",
+            FieldKind::Text,
+            FieldValue::Text(String::new()),
+        )
+        .with_placeholder("e.g. All, Favorites")
+        .with_help(
+            "Comma-separated profile names. Ignored when empty. Actions that need exactly \
+             one profile use the first name given.",
+        ),
+        FieldSpec::new(
+            "scope.groups",
+            "_section_scope",
+            "Channel Groups",
+            FieldKind::Text,
+            FieldValue::Text(String::new()),
+        )
+        .with_placeholder("e.g. DTV: All, DISH: All")
+        .with_help(
+            "Only process channels in these groups. Empty includes every group. Supports * \
+             and ? wildcards, case-insensitively. Cannot be combined with Ignore Groups.",
+        ),
+        FieldSpec::new(
+            "scope.ignore_groups",
+            "_section_scope",
+            "Ignore Groups",
+            FieldKind::Text,
+            FieldValue::Text(String::new()),
+        )
+        .with_placeholder("e.g. PPV Live Events, 24/7 Streams")
+        .with_help(
+            "Exclude channels in these groups, after the Channel Groups filter. Supports * \
+             and ? wildcards, case-insensitively.",
+        ),
+        FieldSpec::section(
+            "_section_exports",
+            "CSV Exports",
+            "Age-based tidying of the CSV files runs write into the shared exports \
+             directory. Off unless a number of days is set, and the file a run has just \
+             written is always kept.",
+        ),
+        FieldSpec::new(
+            "exports.retention_days",
+            "_section_exports",
+            "Delete CSV Exports Older Than (Days)",
+            FieldKind::Number,
+            FieldValue::Number(0.0),
+        )
+        .with_help(
+            "0 keeps every file, which is the default. Only files named <app>_*.csv are \
+             touched, because the exports directory is shared with other apps.",
+        ),
+        FieldSpec::section(
+            "_section_ai",
+            "AI Verification",
+            "The heuristics decide first and the model only promotes: it is asked about \
+             results in the uncertain band below, or about candidates for a channel the \
+             heuristics could not match at all. A heuristic result at or above an app's own \
+             confidence threshold is never re-checked or vetoed by the model. An AI-accepted \
+             pick is still validated for programme data: when every same-name copy is empty \
+             the channel is left unmatched with a reason saying so, and there is no fallback \
+             to other candidates. A sub-app may still decide never to consult the model; the \
+             guide app's heal never does. The endpoints and keys live under [ai.providers] \
+             in this same file.",
+        ),
+        FieldSpec::new(
+            "ai.verify.enabled",
+            "_section_ai",
+            "Enable AI Verification",
+            FieldKind::Boolean,
+            FieldValue::Boolean(false),
+        )
+        .with_help("When off, matching is purely heuristic and no request is ever made."),
+        FieldSpec::new(
+            "ai.verify.provider",
+            "_section_ai",
+            "AI Provider",
+            FieldKind::Text,
+            FieldValue::Text("typesafe".to_string()),
+        )
+        .with_placeholder("typesafe")
+        .with_help("Name of an [ai.providers.<name>] entry in crosstalk.toml."),
+        FieldSpec::new(
+            "ai.verify.model",
+            "_section_ai",
+            "AI Model",
+            FieldKind::Text,
+            FieldValue::Text("jev-latest".to_string()),
+        )
+        .with_placeholder("jev-latest")
+        .with_help("Model name as the provider spells it."),
+        FieldSpec::new(
+            "ai.verify.verify_band_low",
+            "_section_ai",
+            "Verify Band Low",
+            FieldKind::Number,
+            FieldValue::Number(80.0),
+        )
+        .with_help(
+            "A heuristic score in this band, both ends inclusive, is uncertain enough to ask \
+             the model about.",
+        ),
+        FieldSpec::new(
+            "ai.verify.verify_band_high",
+            "_section_ai",
+            "Verify Band High",
+            FieldKind::Number,
+            FieldValue::Number(94.0),
+        )
+        .with_help(
+            "Scores above this are not offered to the model. Scores at or above the app's \
+             own confidence threshold are never offered either, whatever the band says: the \
+             model promotes inside the band but never re-checks or vetoes a heuristic win.",
+        ),
+        FieldSpec::new(
+            "ai.verify.rescue",
+            "_section_ai",
+            "Rescue Unmatched Channels",
+            FieldKind::Boolean,
+            FieldValue::Boolean(true),
+        )
+        .with_help(
+            "Offer the model a shortlist when no heuristic result reached the band, but some \
+             candidate scored at or above the rescue floor.",
+        ),
+        FieldSpec::new(
+            "ai.verify.rescue_floor",
+            "_section_ai",
+            "Rescue Floor",
+            FieldKind::Number,
+            FieldValue::Number(60.0),
+        )
+        .with_help("Lowest heuristic score worth showing the model during a rescue."),
+        FieldSpec::new(
+            "ai.verify.shortlist",
+            "_section_ai",
+            "Shortlist Size",
+            FieldKind::Number,
+            FieldValue::Number(5.0),
+        )
+        .with_help("How many candidates go into one request. More candidates cost tokens."),
+        FieldSpec::new(
+            "ai.verify.accept_threshold",
+            "_section_ai",
+            "AI Accept Threshold",
+            FieldKind::Number,
+            FieldValue::Number(0.8),
+        )
+        .with_help(
+            "0-1. A candidate is accepted when the model's yes-probability reaches this and \
+             its choice agrees. An accepted pick is still validated for programme data: \
+             when every same-name copy is empty the channel is left unmatched and the \
+             reason says so.",
+        ),
+        FieldSpec::new(
+            "ai.verify.reject_threshold",
+            "_section_ai",
+            "AI Reject Threshold",
+            FieldKind::Number,
+            FieldValue::Number(0.3),
+        )
+        .with_help("0-1. At or below this the candidate is dropped outright."),
+        FieldSpec::new(
+            "ai.verify.min_confidence",
+            "_section_ai",
+            "AI Minimum Confidence",
+            FieldKind::Number,
+            FieldValue::Number(0.5),
+        )
+        .with_help(
+            "0-1. Below this the model's pick is treated as undecided and the channel is left \
+             unmatched.",
+        ),
+    ]
+}
+
+/// `[matching]`, as form fields.
+fn matching_fields() -> Vec<crate::subapp::FieldSpec> {
+    use crate::subapp::{FieldKind, FieldSpec, FieldValue};
+
+    vec![
         FieldSpec::section(
             "_section_normalization",
             "Normalization Toggles",
@@ -769,7 +1117,182 @@ pub fn matching_schema() -> crate::subapp::SettingsSchema {
             FieldValue::Json(std::collections::BTreeMap::new()),
         )
         .with_placeholder("{\"FOX News Channel\": [\"FOX NEWS HD\", \"FoxNews\"]}"),
-    ])
+    ]
+}
+
+/// The host settings as form values, for the settings page and the CSV preamble.
+pub fn host_values(config: &CrosstalkConfig) -> crate::subapp::SettingsValues {
+    let mut values = shared_values(config);
+    values.insert(
+        "matching.ignore_quality_tags",
+        crate::subapp::FieldValue::Boolean(config.matching.ignore_quality_tags),
+    );
+    values.insert(
+        "matching.ignore_regional_tags",
+        crate::subapp::FieldValue::Boolean(config.matching.ignore_regional_tags),
+    );
+    values.insert(
+        "matching.ignore_geographic_tags",
+        crate::subapp::FieldValue::Boolean(config.matching.ignore_geographic_tags),
+    );
+    values.insert(
+        "matching.ignore_misc_tags",
+        crate::subapp::FieldValue::Boolean(config.matching.ignore_misc_tags),
+    );
+    values.insert(
+        "matching.enabled_databases",
+        crate::subapp::FieldValue::Text(config.matching.databases().join(", ")),
+    );
+    values.insert(
+        "matching.custom_aliases",
+        crate::subapp::FieldValue::Json(config.matching.custom_aliases.clone()),
+    );
+    values
+}
+
+/// The shared settings as form values: the ones every app's report prints.
+pub fn shared_values(config: &CrosstalkConfig) -> crate::subapp::SettingsValues {
+    use crate::subapp::{FieldValue, SettingsValues};
+
+    let mut values = SettingsValues::new();
+    values.insert(
+        "scope.profiles",
+        FieldValue::Text(config.scope.profiles.clone()),
+    );
+    values.insert(
+        "scope.groups",
+        FieldValue::Text(config.scope.groups.clone()),
+    );
+    values.insert(
+        "scope.ignore_groups",
+        FieldValue::Text(config.scope.ignore_groups.clone()),
+    );
+    values.insert(
+        "exports.retention_days",
+        FieldValue::Number(f64::from(config.exports.retention_days)),
+    );
+
+    let verify = &config.ai.verify;
+    values.insert("ai.verify.enabled", FieldValue::Boolean(verify.enabled));
+    values.insert(
+        "ai.verify.provider",
+        FieldValue::Text(verify.provider.clone()),
+    );
+    values.insert("ai.verify.model", FieldValue::Text(verify.model.clone()));
+    values.insert(
+        "ai.verify.verify_band_low",
+        FieldValue::Number(f64::from(verify.verify_band_low)),
+    );
+    values.insert(
+        "ai.verify.verify_band_high",
+        FieldValue::Number(f64::from(verify.verify_band_high)),
+    );
+    values.insert("ai.verify.rescue", FieldValue::Boolean(verify.rescue));
+    values.insert(
+        "ai.verify.rescue_floor",
+        FieldValue::Number(f64::from(verify.rescue_floor)),
+    );
+    values.insert(
+        "ai.verify.shortlist",
+        FieldValue::Number(verify.shortlist as f64),
+    );
+    values.insert(
+        "ai.verify.accept_threshold",
+        FieldValue::Number(verify.accept_threshold),
+    );
+    values.insert(
+        "ai.verify.reject_threshold",
+        FieldValue::Number(verify.reject_threshold),
+    );
+    values.insert(
+        "ai.verify.min_confidence",
+        FieldValue::Number(verify.min_confidence),
+    );
+    values
+}
+
+/// Host form values -> `config`, in place.
+///
+/// Fields the form did not submit are left alone, so a partial POST (a test, a script) cannot
+/// silently reset the values it never mentioned. The bounds are the ones the form's own
+/// number inputs enforced when these fields lived in `guide.toml`.
+pub fn apply_host_values(
+    config: &mut CrosstalkConfig,
+    values: &crate::subapp::SettingsValues,
+) -> Result<()> {
+    use crate::subapp::{clamp_u8, clamp_unit, whole_number};
+
+    if let Some(text) = values.text("scope.profiles") {
+        config.scope.profiles = text.to_string();
+    }
+    if let Some(text) = values.text("scope.groups") {
+        config.scope.groups = text.to_string();
+    }
+    if let Some(text) = values.text("scope.ignore_groups") {
+        config.scope.ignore_groups = text.to_string();
+    }
+    if let Some(number) = values.number("exports.retention_days") {
+        config.exports.retention_days = whole_number("exports.retention_days", number, 0, 3_650)?;
+    }
+
+    if let Some(value) = values.bool("ai.verify.enabled") {
+        config.ai.verify.enabled = value;
+    }
+    if let Some(value) = values.bool("ai.verify.rescue") {
+        config.ai.verify.rescue = value;
+    }
+    if let Some(text) = values.text("ai.verify.provider") {
+        config.ai.verify.provider = text.to_string();
+    }
+    if let Some(text) = values.text("ai.verify.model") {
+        config.ai.verify.model = text.to_string();
+    }
+    if let Some(number) = values.number("ai.verify.verify_band_low") {
+        config.ai.verify.verify_band_low = clamp_u8(number)?;
+    }
+    if let Some(number) = values.number("ai.verify.verify_band_high") {
+        config.ai.verify.verify_band_high = clamp_u8(number)?;
+    }
+    if let Some(number) = values.number("ai.verify.rescue_floor") {
+        config.ai.verify.rescue_floor = clamp_u8(number)?;
+    }
+    if let Some(number) = values.number("ai.verify.shortlist") {
+        config.ai.verify.shortlist = whole_number("ai.verify.shortlist", number, 1, 255)? as usize;
+    }
+    if let Some(number) = values.number("ai.verify.accept_threshold") {
+        config.ai.verify.accept_threshold = clamp_unit(number)?;
+    }
+    if let Some(number) = values.number("ai.verify.reject_threshold") {
+        config.ai.verify.reject_threshold = clamp_unit(number)?;
+    }
+    if let Some(number) = values.number("ai.verify.min_confidence") {
+        config.ai.verify.min_confidence = clamp_unit(number)?;
+    }
+
+    if let Some(value) = values.bool("matching.ignore_quality_tags") {
+        config.matching.ignore_quality_tags = value;
+    }
+    if let Some(value) = values.bool("matching.ignore_regional_tags") {
+        config.matching.ignore_regional_tags = value;
+    }
+    if let Some(value) = values.bool("matching.ignore_geographic_tags") {
+        config.matching.ignore_geographic_tags = value;
+    }
+    if let Some(value) = values.bool("matching.ignore_misc_tags") {
+        config.matching.ignore_misc_tags = value;
+    }
+    if let Some(text) = values.text("matching.enabled_databases") {
+        config.matching.enabled_databases = text
+            .split([',', '\n'])
+            .map(str::trim)
+            .filter(|code| !code.is_empty())
+            .map(str::to_string)
+            .collect();
+    }
+    if let Some(map) = values.json("matching.custom_aliases") {
+        config.matching.custom_aliases = map.clone();
+    }
+    Ok(())
 }
 
 /// Result of [`CrosstalkConfig::validate`].
@@ -1004,6 +1527,7 @@ fn resolve_secret(inline: &str, env_name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::subapp::{FieldValue, SettingsValues};
 
     fn write(dir: &Path, name: &str, text: &str) {
         std::fs::write(dir.join(name), text).expect("write");
@@ -1420,6 +1944,39 @@ base_url = "https://api.typesafe.ai/v1"
     }
 
     #[test]
+    fn saving_adds_the_ai_policy_alongside_the_providers() {
+        // `[ai.verify]` is a sibling of the provider tables, so a save has to add a table
+        // into a table that already has sub-tables and still produce valid TOML.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("crosstalk.toml");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            "[ai.providers.typesafe]\nkind = \"typesafe\"\nbase_url = \"https://api.typesafe.ai/v1\"\n",
+        );
+
+        let mut config = CrosstalkConfig::load_file(dir.path()).expect("load");
+        config.ai.verify.enabled = true;
+        config.ai.verify.model = "jev-1.14.0".to_string();
+        config.scope.profiles = "All".to_string();
+        config.exports.retention_days = 30;
+        config.save(&path).expect("save");
+
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.contains("[ai.verify]"), "{text}");
+        assert!(text.contains("[ai.providers.typesafe]"), "{text}");
+        assert!(text.contains("[scope]"), "{text}");
+        assert!(text.contains("[exports]"), "{text}");
+
+        let reloaded = CrosstalkConfig::load_file(dir.path()).expect("the written file parses");
+        assert!(reloaded.ai.verify.enabled);
+        assert_eq!(reloaded.ai.verify.model, "jev-1.14.0");
+        assert_eq!(reloaded.scope.profiles, "All");
+        assert_eq!(reloaded.exports.retention_days, 30);
+        assert!(reloaded.ai.providers.contains_key("typesafe"));
+    }
+
+    #[test]
     fn saving_refuses_a_file_that_does_not_parse() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("crosstalk.toml");
@@ -1490,16 +2047,35 @@ base_url = "https://api.typesafe.ai/v1"
     }
 
     #[test]
-    fn the_host_matching_schema_covers_every_matching_option() {
+    fn the_host_schema_covers_every_shared_and_matching_option() {
         use crate::subapp::FieldValue;
-        let schema = matching_schema();
+        let schema = host_schema();
         let ids: Vec<&str> = schema.editable().map(|field| field.id).collect();
-        assert!(ids.contains(&"matching.ignore_quality_tags"));
-        assert!(ids.contains(&"matching.ignore_regional_tags"));
-        assert!(ids.contains(&"matching.ignore_geographic_tags"));
-        assert!(ids.contains(&"matching.ignore_misc_tags"));
-        assert!(ids.contains(&"matching.enabled_databases"));
-        assert!(ids.contains(&"matching.custom_aliases"));
+        for expected in [
+            "matching.ignore_quality_tags",
+            "matching.ignore_regional_tags",
+            "matching.ignore_geographic_tags",
+            "matching.ignore_misc_tags",
+            "matching.enabled_databases",
+            "matching.custom_aliases",
+            "scope.profiles",
+            "scope.groups",
+            "scope.ignore_groups",
+            "exports.retention_days",
+            "ai.verify.enabled",
+            "ai.verify.provider",
+            "ai.verify.model",
+            "ai.verify.verify_band_low",
+            "ai.verify.verify_band_high",
+            "ai.verify.rescue",
+            "ai.verify.rescue_floor",
+            "ai.verify.shortlist",
+            "ai.verify.accept_threshold",
+            "ai.verify.reject_threshold",
+            "ai.verify.min_confidence",
+        ] {
+            assert!(ids.contains(&expected), "{expected} is not on the form");
+        }
         // Every field carries a default of the right shape, so the form can render.
         for field in schema.editable() {
             let matches = matches!(
@@ -1510,7 +2086,187 @@ base_url = "https://api.typesafe.ai/v1"
                     | (crate::subapp::FieldKind::JsonObject, FieldValue::Json(_))
             );
             assert!(matches, "{} has a mismatched default", field.id);
+            assert!(
+                schema
+                    .sections()
+                    .any(|section| Some(section.id) == field.section),
+                "{} points at an unknown section",
+                field.id
+            );
         }
+    }
+
+    #[test]
+    fn the_shared_schema_is_the_subset_the_reports_print() {
+        let shared: Vec<&str> = shared_schema().editable().map(|field| field.id).collect();
+        assert!(shared.contains(&"scope.profiles"));
+        assert!(shared.contains(&"exports.retention_days"));
+        assert!(shared.contains(&"ai.verify.enabled"));
+        assert!(!shared.contains(&"matching.ignore_quality_tags"));
+    }
+
+    #[test]
+    fn the_shared_settings_load_from_the_host_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            r#"
+[scope]
+profiles = "All, Favorites"
+groups = "DTV: *"
+ignore_groups = ""
+
+[exports]
+retention_days = 7
+
+[ai.verify]
+enabled = true
+provider = "typesafe"
+model = "jev-1.14.0"
+verify_band_low = 70
+verify_band_high = 90
+rescue_floor = 50
+shortlist = 3
+accept_threshold = 0.9
+reject_threshold = 0.1
+min_confidence = 0.6
+"#,
+        );
+        let config = CrosstalkConfig::load(dir.path()).expect("load");
+        assert_eq!(config.scope.profiles, "All, Favorites");
+        assert_eq!(config.scope.groups, "DTV: *");
+        assert!(config.scope.ignore_groups.is_empty());
+        assert_eq!(config.exports.retention_days, 7);
+        assert!(config.ai.verify.enabled);
+        assert_eq!(config.ai.verify.model, "jev-1.14.0");
+        assert_eq!(config.ai.verify.verify_band_low, 70);
+        assert_eq!(config.ai.verify.shortlist, 3);
+        assert_eq!(config.ai.verify.min_confidence, 0.6);
+        // The providers are still their own table, untouched by the policy.
+        assert!(config.ai.providers.is_empty());
+    }
+
+    #[test]
+    fn the_shared_settings_round_trip_through_the_form_values() {
+        let config = CrosstalkConfig::default();
+        let mut rebuilt = CrosstalkConfig::default();
+        apply_host_values(&mut rebuilt, &host_values(&config)).expect("apply");
+        assert_eq!(rebuilt.scope, config.scope);
+        assert_eq!(rebuilt.exports, config.exports);
+        assert_eq!(rebuilt.ai.verify, config.ai.verify);
+        assert_eq!(
+            rebuilt.matching.custom_aliases,
+            config.matching.custom_aliases
+        );
+
+        let mut values = SettingsValues::new();
+        values.insert("scope.profiles", FieldValue::Text("All".to_string()));
+        values.insert("exports.retention_days", FieldValue::Number(30.0));
+        values.insert("ai.verify.verify_band_high", FieldValue::Number(88.0));
+        let mut config = CrosstalkConfig::default();
+        apply_host_values(&mut config, &values).expect("apply");
+        assert_eq!(config.scope.profiles, "All");
+        assert_eq!(config.exports.retention_days, 30);
+        assert_eq!(config.ai.verify.verify_band_high, 88);
+        // A field the form did not submit is left alone.
+        assert_eq!(config.ai.verify.verify_band_low, 80);
+    }
+
+    #[test]
+    fn applying_host_values_enforces_the_old_bounds() {
+        let mut config = CrosstalkConfig::default();
+
+        let mut values = SettingsValues::new();
+        values.insert("exports.retention_days", FieldValue::Number(6.5));
+        let error = apply_host_values(&mut config, &values).expect_err("rejects");
+        assert!(format!("{error}").contains("whole number"), "{error}");
+
+        let mut values = SettingsValues::new();
+        values.insert("exports.retention_days", FieldValue::Number(-1.0));
+        assert!(format!(
+            "{}",
+            apply_host_values(&mut config, &values).expect_err("rejects")
+        )
+        .contains("between"),);
+
+        let mut values = SettingsValues::new();
+        values.insert("ai.verify.accept_threshold", FieldValue::Number(1.5));
+        assert!(apply_host_values(&mut config, &values).is_err());
+
+        let mut values = SettingsValues::new();
+        values.insert("ai.verify.shortlist", FieldValue::Number(0.0));
+        assert!(apply_host_values(&mut config, &values).is_err());
+    }
+
+    #[test]
+    fn the_moved_settings_are_validated_in_the_host_file() {
+        // These rules were `guide.toml`'s; the values moved, so the checks moved with them.
+        let mut config = CrosstalkConfig::default();
+        config.dispatcharr.api_key = "k".to_string();
+        assert!(config.validate().is_ok(), "{:?}", config.validate().errors);
+
+        config.scope.groups = "A".to_string();
+        config.scope.ignore_groups = "B".to_string();
+        config.ai.verify.verify_band_low = 95;
+        config.ai.verify.verify_band_high = 80;
+        config.ai.verify.reject_threshold = 0.9;
+        config.ai.verify.accept_threshold = 0.5;
+        config.ai.verify.shortlist = 0;
+        config.ai.verify.enabled = true;
+        config.ai.verify.provider = String::new();
+        let errors = config.validate().errors;
+        for expected in [
+            "scope.groups and scope.ignore_groups",
+            "ai.verify.verify_band_low",
+            "ai.verify.reject_threshold",
+            "ai.verify.shortlist",
+            "ai.verify.provider is empty",
+        ] {
+            assert!(
+                errors.iter().any(|error| error.contains(expected)),
+                "{expected} not reported: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ai_verify_defaults_match_the_plan() {
+        let verify = AiVerifyConfig::default();
+        assert!(!verify.enabled);
+        assert_eq!(verify.provider, "typesafe");
+        assert_eq!(verify.model, "jev-latest");
+        assert_eq!(verify.verify_band_low, 80);
+        assert_eq!(verify.verify_band_high, 94);
+        assert!(verify.rescue);
+        assert_eq!(verify.rescue_floor, 60);
+        assert_eq!(verify.shortlist, 5);
+        assert_eq!(verify.accept_threshold, 0.8);
+        assert_eq!(verify.reject_threshold, 0.3);
+        assert_eq!(verify.min_confidence, 0.5);
+    }
+
+    #[test]
+    fn the_shared_tables_have_environment_overrides() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            "[scope]\nprofiles = \"All\"\n",
+        );
+        std::env::set_var("CROSSTALK_TESTSCOPE_SCOPE__PROFILES", "All, Favorites");
+        std::env::set_var("CROSSTALK_TESTSCOPE_EXPORTS__RETENTION_DAYS", "9");
+        std::env::set_var("CROSSTALK_TESTSCOPE_AI__VERIFY__ENABLED", "true");
+        let config =
+            CrosstalkConfig::load_prefixed(dir.path(), "CROSSTALK_TESTSCOPE_").expect("load");
+        std::env::remove_var("CROSSTALK_TESTSCOPE_SCOPE__PROFILES");
+        std::env::remove_var("CROSSTALK_TESTSCOPE_EXPORTS__RETENTION_DAYS");
+        std::env::remove_var("CROSSTALK_TESTSCOPE_AI__VERIFY__ENABLED");
+
+        assert_eq!(config.scope.profiles, "All, Favorites");
+        assert_eq!(config.exports.retention_days, 9);
+        assert!(config.ai.verify.enabled);
+        assert_eq!(config.env_overrides, 1, "the value differs from the file");
     }
 
     #[test]

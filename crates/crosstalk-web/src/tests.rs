@@ -406,6 +406,85 @@ async fn the_settings_page_renders_both_host_and_app_forms() {
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("Ignore Quality Tags"), "{body}");
     assert!(body.contains("Save host settings"), "{body}");
+    // The settings shared by every sub-app are editable on the HOST form, because that is
+    // the file they are saved to.
+    for expected in [
+        "scope.profiles",
+        "scope.groups",
+        "scope.ignore_groups",
+        "exports.retention_days",
+        "ai.verify.enabled",
+        "ai.verify.model",
+    ] {
+        assert!(body.contains(expected), "{expected} missing from {body}");
+    }
+}
+
+#[tokio::test]
+async fn saving_host_settings_saves_the_shared_options_to_crosstalk_toml() {
+    let (state, _store, dir) = state(None);
+    std::fs::write(dir.path().join("crosstalk.toml"), "").expect("seed");
+
+    let body = "scope.profiles=All&scope.groups=Sports&scope.ignore_groups=\
+                &exports.retention_days=30&ai.verify.enabled=true&ai.verify.model=jev-1.14.0\
+                &ai.verify.accept_threshold=0.85&matching.enabled_databases=US&ai.verify.rescue=true";
+    let status = post_form(&state, "/settings/host", body).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    let text = std::fs::read_to_string(dir.path().join("crosstalk.toml")).expect("read");
+    assert!(text.contains("[scope]"), "{text}");
+    assert!(text.contains("profiles = \"All\""), "{text}");
+    assert!(text.contains("[exports]"), "{text}");
+    assert!(text.contains("retention_days = 30"), "{text}");
+    assert!(text.contains("[ai.verify]"), "{text}");
+    assert!(text.contains("model = \"jev-1.14.0\""), "{text}");
+
+    // And the live config the next run snapshots carries them.
+    let snapshot = state.snapshot();
+    assert_eq!(snapshot.scope.groups, "Sports");
+    assert_eq!(snapshot.exports.retention_days, 30);
+    assert!(snapshot.ai.verify.enabled);
+    assert_eq!(snapshot.ai.verify.accept_threshold, 0.85);
+}
+
+#[tokio::test]
+async fn a_host_form_save_that_introduces_an_inconsistency_is_refused() {
+    let (state, _store, dir) = state(None);
+    std::fs::write(dir.path().join("crosstalk.toml"), "").expect("seed");
+
+    // Both scope filters at once: a run would refuse the combination, so the save must too.
+    let status = post_form(
+        &state,
+        "/settings/host",
+        "scope.groups=Sports&scope.ignore_groups=PPV&matching.enabled_databases=US",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let text = std::fs::read_to_string(dir.path().join("crosstalk.toml")).expect("read");
+    assert!(!text.contains("Sports"), "nothing was written: {text}");
+}
+
+#[tokio::test]
+async fn a_host_form_number_outside_its_bounds_is_a_400() {
+    let (state, _store, dir) = state(None);
+    std::fs::write(dir.path().join("crosstalk.toml"), "").expect("seed");
+
+    // A fractional retention is not silently truncated to a whole number of days.
+    let status = post_form(
+        &state,
+        "/settings/host",
+        "exports.retention_days=6.5&matching.enabled_databases=US",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let status = post_form(
+        &state,
+        "/settings/host",
+        "ai.verify.accept_threshold=1.5&matching.enabled_databases=US",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

@@ -23,7 +23,7 @@ use crosstalk_matching::callsign::{extract_location, network_keyword, KnownCalls
 use crosstalk_matching::pipeline::Scored;
 use std::collections::BTreeMap;
 
-use crate::settings::AiSettings;
+use crosstalk_core::config::AiVerifyConfig;
 
 /// Why a channel reached the model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,7 +101,7 @@ impl GateOutcome {
 pub fn shortlist(
     scored: &[Scored],
     entries: &[EpgEntry],
-    settings: &AiSettings,
+    settings: &AiVerifyConfig,
 ) -> Option<(GateReason, Vec<usize>)> {
     if !settings.enabled || scored.is_empty() {
         return None;
@@ -170,7 +170,7 @@ pub fn build_request(
     scored: &[Scored],
     offered: &[usize],
     known: &KnownCallsigns,
-    settings: &AiSettings,
+    settings: &AiVerifyConfig,
 ) -> DecisionRequest {
     let callsign = crosstalk_matching::callsign::extract_callsign(&channel.name, known);
     let location = extract_location(&channel.name);
@@ -278,7 +278,7 @@ pub fn combine(
     scored: &[Scored],
     entries: &[EpgEntry],
     offered: &[usize],
-    settings: &AiSettings,
+    settings: &AiVerifyConfig,
 ) {
     outcome.model = response.model.clone();
     outcome.calibrated = response.calibrated;
@@ -397,7 +397,7 @@ pub async fn ask(
     offered: &[usize],
     reason: GateReason,
     known: &KnownCallsigns,
-    settings: &AiSettings,
+    settings: &AiVerifyConfig,
 ) -> GateOutcome {
     let mut outcome = GateOutcome {
         accepted: None,
@@ -469,8 +469,8 @@ mod tests {
         }
     }
 
-    fn settings() -> AiSettings {
-        AiSettings {
+    fn settings() -> AiVerifyConfig {
+        AiVerifyConfig {
             enabled: true,
             provider: "typesafe".to_string(),
             model: "jev-latest".to_string(),
@@ -554,7 +554,7 @@ mod tests {
     fn rescue_can_be_turned_off() {
         let entries = named_entries(&["A"]);
         let ranked = vec![scored(70, 0)];
-        let settings = AiSettings {
+        let settings = AiVerifyConfig {
             rescue: false,
             ..settings()
         };
@@ -565,7 +565,7 @@ mod tests {
     fn disabled_ai_sends_nothing() {
         let entries = named_entries(&["A"]);
         let ranked = vec![scored(90, 0)];
-        let settings = AiSettings {
+        let settings = AiVerifyConfig {
             enabled: false,
             ..settings()
         };
