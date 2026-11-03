@@ -341,6 +341,29 @@ impl MatchingConfig {
         }
     }
 
+    /// These settings in the matcher crate's own terms.
+    ///
+    /// `crosstalk-matching` cannot depend on this crate (the dependency runs the other way),
+    /// so the host hands its values over rather than the matcher reading the file.
+    pub fn matcher_config(&self) -> crosstalk_matching::MatcherConfig {
+        crosstalk_matching::MatcherConfig {
+            flags: self.normalize_flags(),
+            databases: self.databases(),
+            custom_aliases: self.custom_aliases.clone(),
+        }
+    }
+
+    /// Build the matcher a sub-app runs with.
+    ///
+    /// Every app builds its matcher here, so the flags, aliases and callsigns a run uses are
+    /// the ones the host file states and the profile's parity sweep guards.
+    pub fn matcher(
+        &self,
+        profile: crosstalk_matching::MatchProfile,
+    ) -> crosstalk_matching::Matcher {
+        crosstalk_matching::Matcher::from_config(&self.matcher_config(), profile)
+    }
+
     /// Which country databases to load.
     ///
     /// An explicit list wins. An empty list falls back to the plugin's rule: every

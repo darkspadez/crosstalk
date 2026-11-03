@@ -433,6 +433,11 @@ impl Matcher {
         &self.known
     }
 
+    /// The `user_ignored_tags` list this matcher scores with, in the plugin's order.
+    pub fn tags(&self) -> Vec<String> {
+        self.normalizer.flags().ignored_tags()
+    }
+
     pub fn options(&self) -> MatchOptions {
         self.options
     }

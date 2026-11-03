@@ -12,15 +12,18 @@
 //! one already assigned), take the first candidate that clears the threshold AND has
 //! programmes, then apply only those.
 
-use crate::scope::{ScopedChannels, ScopedEntries};
+use crate::scope::ScopedEntries;
 use crate::settings::GuideSettings;
 use anyhow::{Context, Result};
 use crosstalk_core::csv_report;
 use crosstalk_core::dispatcharr::{EpgEntry, HasPrograms, ProgramWindow, World};
 use crosstalk_core::jobs::{JobContext, ProgressEvent};
+use crosstalk_core::match_run::{self, ConfidenceBand};
+use crosstalk_core::scope::ScopedChannels;
 use crosstalk_core::store::RunRow;
-use crosstalk_core::subapp::JobOutcome;
-use crosstalk_matching::pipeline::{CandidateIndex, MatchOptions, Matcher, Scored};
+use crosstalk_core::subapp::{JobOutcome, OutcomeBuilder};
+use crosstalk_matching::pipeline::{CandidateIndex, Scored};
+use crosstalk_matching::MatchProfile;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -240,12 +243,7 @@ pub async fn run(
     let scanned = scoped_channels.channels.len();
 
     // Step 2: search a replacement for each broken channel.
-    let matcher = Arc::new(Matcher::new(
-        context.config().matching.normalize_flags(),
-        crate::matcher_aliases(context),
-        Arc::new(crate::known_callsigns(context)),
-        MatchOptions::default(),
-    ));
+    let matcher = Arc::new(context.config().matching.matcher(MatchProfile::EpgJanitor));
     let names: Vec<String> = scoped_entries
         .entries
         .iter()
@@ -256,26 +254,20 @@ pub async fn run(
         matcher.normalizer(),
         matcher.known(),
     ));
-    let tags = crate::tag_list(context.config().matching.normalize_flags());
+    let tags = matcher.tags();
 
-    // Step 2a: score every broken channel off the async runtime (P3), the same
-    // spawn_blocking + rayon shape matching uses, so a big heal never stalls a Tokio
-    // worker. `par_iter` preserves order on collect: `scored_all[i]` is broken[i].
-    let scored_all: Vec<Vec<Scored>> = {
-        let matcher = Arc::clone(&matcher);
-        let index = Arc::clone(&index);
-        let broken_names: Vec<String> = broken.iter().map(|channel| channel.name.clone()).collect();
-        tokio::task::spawn_blocking(move || {
-            use rayon::prelude::*;
-            let tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
-            broken_names
-                .par_iter()
-                .map(|name| matcher.score_candidates(name, &index, &tag_refs, None))
-                .collect()
-        })
-        .await
-        .context("the scoring stage panicked")?
-    };
+    // Step 2a: score every broken channel off the async runtime (P3), through the shared
+    // scoring stage: no progress bar, because only the broken channels are scored.
+    // `scored_all[i]` is `broken[i]`.
+    let broken_names: Vec<String> = broken.iter().map(|channel| channel.name.clone()).collect();
+    let scored_all: Vec<Vec<Scored>> = match_run::score_names(
+        &broken_names,
+        Arc::clone(&matcher),
+        Arc::clone(&index),
+        &tags,
+        None,
+    )
+    .await?;
 
     // Step 2b: walk each broken channel's ranked list serially, concurrently across
     // channels (P1). Picks resolve by channel order below. Work runs in batches so
@@ -470,6 +462,7 @@ pub async fn run(
             .map(|name| name.to_string_lossy().to_string());
         csv_report::prune_exports(
             &context.exports_dir(),
+            crate::EXPORT_PREFIX,
             context.config().exports.retention_days,
             name.as_deref(),
         );
@@ -495,16 +488,16 @@ fn reason_for(row: &HealRow, threshold: u8, allow_without_programs: bool) -> Str
         ),
         _ => {
             let confidence = row.confidence;
-            if confidence >= 95 {
-                format!("Excellent replacement match ({confidence}%)")
-            } else if confidence >= 85 {
-                format!("High confidence replacement ({confidence}%)")
-            } else if confidence >= 75 {
-                format!("Good replacement match ({confidence}%)")
-            } else if confidence >= 60 {
-                format!("Moderate confidence replacement ({confidence}%)")
-            } else {
-                format!("Low confidence replacement ({confidence}%)")
+            match ConfidenceBand::of(confidence) {
+                ConfidenceBand::Excellent => {
+                    format!("Excellent replacement match ({confidence}%)")
+                }
+                ConfidenceBand::High => format!("High confidence replacement ({confidence}%)"),
+                ConfidenceBand::Good => format!("Good replacement match ({confidence}%)"),
+                ConfidenceBand::Moderate => {
+                    format!("Moderate confidence replacement ({confidence}%)")
+                }
+                ConfidenceBand::Low => format!("Low confidence replacement ({confidence}%)"),
             }
         }
     };
@@ -524,75 +517,75 @@ fn write_report(
     rows: &[HealRow],
     dry_run: bool,
 ) -> Result<Option<PathBuf>> {
-    let path = csv_report::report_path(
-        &context.exports_dir(),
-        if dry_run {
-            "heal_preview"
-        } else {
-            "heal_applied"
-        },
-    );
-
     let replacements = rows.iter().filter(|row| row.new_epg_id.is_some()).count();
     let applied = rows
         .iter()
         .filter(|row| row.status == HealStatus::Healed)
         .count();
 
-    let preamble = csv_report::preamble(
-        context.config(),
-        &crate::settings::schema(),
-        &crate::settings::to_values(settings),
+    let exports_dir = context.exports_dir();
+    let report = csv_report::Report::new(
+        &exports_dir,
+        crate::EXPORT_PREFIX,
+        if dry_run {
+            "heal_preview"
+        } else {
+            "heal_applied"
+        },
         if dry_run {
             "Scan and Heal Preview Report"
         } else {
             "Scan and Heal Applied Report"
         },
-        scanned,
-        &[
-            ("Broken assignments examined", rows.len().to_string()),
-            ("Replacements found", replacements.to_string()),
-            (
-                "Replacements written",
-                if dry_run {
-                    "none, this was a preview".to_string()
-                } else {
-                    applied.to_string()
-                },
-            ),
-        ],
+    )
+    .channels_processed(scanned)
+    .result("Broken assignments examined", rows.len())
+    .result("Replacements found", replacements)
+    .result(
+        "Replacements written",
+        if dry_run {
+            "none, this was a preview".to_string()
+        } else {
+            applied.to_string()
+        },
     );
 
-    csv_report::write_report(&path, &preamble, &COLUMNS, |writer| {
-        for row in rows {
-            // Names and reasons come from Dispatcharr: defuse spreadsheet formulas.
-            writer.write_record([
-                row.channel_id.to_string(),
-                csv_report::safe_cell(&row.channel_name),
-                row.channel_number
-                    .map(|number| format!("{number}"))
-                    .unwrap_or_default(),
-                csv_report::safe_cell(&row.channel_group),
-                csv_report::safe_cell(&row.original_epg_name),
-                csv_report::safe_cell(&row.original_epg_source),
-                csv_report::safe_cell(
-                    &row.new_epg_name
-                        .clone()
-                        .unwrap_or_else(|| "N/A".to_string()),
-                ),
-                csv_report::safe_cell(
-                    &row.new_epg_source
-                        .clone()
-                        .unwrap_or_else(|| "N/A".to_string()),
-                ),
-                row.confidence.to_string(),
-                csv_report::safe_cell(&row.method),
-                row.status.as_str().to_string(),
-                csv_report::safe_cell(&row.reason),
-            ])?;
-        }
-        Ok(())
-    })?;
+    let path = report.write(
+        context.config(),
+        &crate::settings::schema(),
+        &crate::settings::to_values(settings),
+        &COLUMNS,
+        |writer| {
+            for row in rows {
+                // Names and reasons come from Dispatcharr: defuse spreadsheet formulas.
+                writer.write_record([
+                    row.channel_id.to_string(),
+                    csv_report::safe_cell(&row.channel_name),
+                    row.channel_number
+                        .map(|number| format!("{number}"))
+                        .unwrap_or_default(),
+                    csv_report::safe_cell(&row.channel_group),
+                    csv_report::safe_cell(&row.original_epg_name),
+                    csv_report::safe_cell(&row.original_epg_source),
+                    csv_report::safe_cell(
+                        &row.new_epg_name
+                            .clone()
+                            .unwrap_or_else(|| "N/A".to_string()),
+                    ),
+                    csv_report::safe_cell(
+                        &row.new_epg_source
+                            .clone()
+                            .unwrap_or_else(|| "N/A".to_string()),
+                    ),
+                    row.confidence.to_string(),
+                    csv_report::safe_cell(&row.method),
+                    row.status.as_str().to_string(),
+                    csv_report::safe_cell(&row.reason),
+                ])?;
+            }
+            Ok(())
+        },
+    )?;
     Ok(Some(path))
 }
 
@@ -609,15 +602,21 @@ pub fn outcome(result: &HealOutcome, dry_run: bool, threshold: u8) -> JobOutcome
         .filter(|row| row.status == HealStatus::SkippedLowConfidence)
         .count();
 
-    let mut summary = format!(
+    let mut outcome = OutcomeBuilder::new(format!(
         "Scan & Heal {}: scanned {}, {} broken, {} replacement(s) found",
         if dry_run { "preview" } else { "applied" },
         result.scanned,
         result.broken,
         result.replacements
-    );
+    ))
+    .count("scanned", result.scanned as i64)
+    .count("broken", result.broken as i64)
+    .count("replacements", result.replacements as i64)
+    .count("low_confidence", low_confidence as i64)
+    .count("healed", high_confidence as i64)
+    .count("applied", result.applied as i64);
     if low_confidence > 0 {
-        summary.push_str(&format!(", {low_confidence} below threshold"));
+        outcome = outcome.note(format!("{low_confidence} below threshold"));
     }
     if dry_run {
         let would_apply = result
@@ -625,25 +624,14 @@ pub fn outcome(result: &HealOutcome, dry_run: bool, threshold: u8) -> JobOutcome
             .iter()
             .filter(|row| row.new_epg_id.is_some() && row.confidence >= threshold)
             .count();
-        summary.push_str(&format!(", {would_apply} would be applied"));
+        outcome = outcome.note(format!("{would_apply} would be applied"));
     } else {
-        summary.push_str(&format!(
-            ", {high_confidence} healed, {} assignments written",
+        outcome = outcome.note(format!(
+            "{high_confidence} healed, {} assignments written",
             result.applied
         ));
     }
-
-    let mut outcome = JobOutcome::new(summary)
-        .with_count("scanned", result.scanned as i64)
-        .with_count("broken", result.broken as i64)
-        .with_count("replacements", result.replacements as i64)
-        .with_count("low_confidence", low_confidence as i64)
-        .with_count("healed", high_confidence as i64)
-        .with_count("applied", result.applied as i64);
-    if let Some(report) = result.report.clone() {
-        outcome = outcome.with_report(report);
-    }
-    outcome
+    outcome.report(result.report.clone()).build()
 }
 
 #[cfg(test)]
@@ -810,7 +798,7 @@ mod tests {
     fn scoped(world: &World) -> (ScopedChannels, ScopedEntries) {
         let scope = crosstalk_core::config::ScopeConfig::default();
         (
-            crate::scope::scope_channels(world, &scope).expect("channels"),
+            crosstalk_core::scope::scope_channels(world, &scope).expect("channels"),
             crate::scope::scope_entries(world, ""),
         )
     }

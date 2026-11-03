@@ -410,6 +410,54 @@ impl JobOutcome {
     }
 }
 
+/// Assemble a run's outcome: the one-line summary, the counts and the CSV it wrote.
+///
+/// Every action ends by saying what it did, and the shape is the same each time: a sentence,
+/// a `, {clause}` per thing worth mentioning, the machine-readable counts, and the report. The
+/// clauses are the app's own wording; the collection is this.
+#[derive(Debug, Clone, Default)]
+pub struct OutcomeBuilder {
+    summary: String,
+    counts: BTreeMap<String, i64>,
+    report: Option<PathBuf>,
+}
+
+impl OutcomeBuilder {
+    pub fn new(summary: impl Into<String>) -> Self {
+        Self {
+            summary: summary.into(),
+            counts: BTreeMap::new(),
+            report: None,
+        }
+    }
+
+    /// Append `, {note}` to the summary: a clause such as `3 below threshold`.
+    pub fn note(mut self, note: impl std::fmt::Display) -> Self {
+        self.summary.push_str(&format!(", {note}"));
+        self
+    }
+
+    /// A machine-readable count, shown in the UI and stored with the run.
+    pub fn count(mut self, key: impl Into<String>, value: i64) -> Self {
+        self.counts.insert(key.into(), value);
+        self
+    }
+
+    /// The CSV the action wrote, if it wrote one.
+    pub fn report(mut self, report: Option<PathBuf>) -> Self {
+        self.report = report;
+        self
+    }
+
+    pub fn build(self) -> JobOutcome {
+        JobOutcome {
+            summary: self.summary,
+            counts: self.counts,
+            report_path: self.report,
+        }
+    }
+}
+
 /// A crosstalk sub-app.
 pub trait SubApp: Send + Sync {
     /// Stable id, used in URLs, schedule keys and the CLI.

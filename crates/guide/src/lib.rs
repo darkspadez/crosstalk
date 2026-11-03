@@ -1,14 +1,15 @@
 //! `guide`: crosstalk's EPG assignment sub-app.
 //!
-//! The matching pipeline lives in `crosstalk-matching`; this crate owns the operator-facing
-//! half: the actions, the settings, the scope filters, the reports, and the AI gate.
+//! The matching engine lives in `crosstalk-matching`, and the parts every sub-app reuses — the
+//! channel scope, the matching walk, the AI gate, the report writer — live in `crosstalk-core`.
+//! This crate owns the operator-facing half: the actions, the settings, the EPG source filter,
+//! the EPG reason wording, and the write itself.
 //!
 //! Only the matching actions are implemented. The Python plugin's cleanup actions (remove
 //! by regex, strip from hidden channels, add a bad-EPG suffix, clear exports) and its
 //! freshness watchdog are deliberately out of scope for this version, as is the anonymous
 //! usage counter.
 
-pub mod ai_gate;
 pub mod heal;
 pub mod matching;
 pub mod scope;
@@ -25,52 +26,11 @@ use std::sync::OnceLock;
 pub const APP_ID: &str = "guide";
 pub const APP_NAME: &str = "Guide";
 
-/// Build the alias table for a run: the built-ins plus any custom entries in the host config.
-pub fn matcher_aliases(context: &JobContext) -> crosstalk_matching::alias::AliasMap {
-    let mut aliases = crosstalk_matching::alias::AliasMap::builtin();
-    let custom = &context.config().matching.custom_aliases;
-    if !custom.is_empty() {
-        aliases = aliases.with_overrides(
-            custom
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect(),
-        );
-    }
-    aliases
-}
-
-/// The callsign allowlist for a run: the shipped FCC table plus whatever the enabled channel
-/// databases contribute.
-pub fn known_callsigns(context: &JobContext) -> crosstalk_matching::callsign::KnownCallsigns {
-    let mut known = crosstalk_matching::callsign::KnownCallsigns::shipped()
-        .cloned()
-        .unwrap_or_default();
-    let databases = context.config().matching.databases();
-    let codes: Vec<&str> = databases.iter().map(String::as_str).collect();
-    for callsign in crosstalk_matching::data::known_callsigns_for(&codes).to_vec() {
-        known.insert(&callsign);
-    }
-    known
-}
-
-/// The `user_ignored_tags` list a run passes, in the plugin's order.
-pub fn tag_list(flags: crosstalk_matching::normalize::NormalizeFlags) -> Vec<String> {
-    let mut tags = Vec::new();
-    if flags.ignore_quality {
-        tags.push("quality".to_string());
-    }
-    if flags.ignore_regional {
-        tags.push("regional".to_string());
-    }
-    if flags.ignore_geographic {
-        tags.push("geographic".to_string());
-    }
-    if flags.ignore_misc {
-        tags.push("misc".to_string());
-    }
-    tags
-}
+/// The file-name prefix this app's CSV exports carry inside the shared exports directory.
+///
+/// `/data/exports` is shared with other plugins and, later, with the other crosstalk sub-apps,
+/// so each app only ever considers files its own prefix names.
+pub const EXPORT_PREFIX: &str = "guide_";
 
 /// The action ids, as used in schedules and URLs.
 pub const ACTION_VALIDATE: &str = "validate";
@@ -261,7 +221,8 @@ impl GuideApp {
         ));
         let world = client.load_world().await?;
 
-        let scoped_channels = scope::scope_channels(&world, &context.config().scope)?;
+        let scoped_channels =
+            crosstalk_core::scope::scope_channels(&world, &context.config().scope)?;
         let scoped_entries = scope::scope_entries(&world, &settings.epg_sources_to_match);
 
         if scoped_channels.channels.is_empty() {
@@ -278,20 +239,7 @@ impl GuideApp {
 
         // Built once per run: one session, one concurrency cap, one audit trail. The policy
         // is the host's `[ai.verify]`, shared with every other sub-app that matches names.
-        let policy = &context.config().ai.verify;
-        let ai = crosstalk_core::ai::AiService::from_config(context.config());
-        let ai = if policy.enabled && ai.has(&policy.provider) {
-            Some(ai)
-        } else {
-            if policy.enabled {
-                tracing::warn!(
-                    "ai.verify.enabled is on but provider {:?} is not configured; matching \
-                     without it",
-                    policy.provider
-                );
-            }
-            None
-        };
+        let ai = crosstalk_core::ai_gate::service(context.config());
 
         let result = matching::run(
             context,
@@ -317,7 +265,8 @@ impl GuideApp {
         let client = context.dispatcharr()?;
         let world = client.load_world().await?;
 
-        let scoped_channels = scope::scope_channels(&world, &context.config().scope)?;
+        let scoped_channels =
+            crosstalk_core::scope::scope_channels(&world, &context.config().scope)?;
         let filter = scope::heal_source_filter(&settings);
         let scoped_entries = scope::scope_entries(&world, filter);
 

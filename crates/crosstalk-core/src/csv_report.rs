@@ -19,9 +19,6 @@ use std::time::{Duration, SystemTime};
 /// Seconds in a day, for the retention arithmetic.
 const SECONDS_PER_DAY: u64 = 86_400;
 
-/// The file-name prefix this app owns inside a shared exports directory.
-pub const EXPORT_PREFIX: &str = "guide_";
-
 /// Build the commented preamble that opens every report.
 ///
 /// `results` are `(label, value)` pairs saying what the run DID, printed above the settings
@@ -189,6 +186,97 @@ where
     Ok(())
 }
 
+/// One CSV export: the path, the preamble and the header every app repeats.
+///
+/// An action writes its report in a few lines: build this, say how many channels it looked at
+/// and what it did, then hand over the columns and the cells. Everything shared with the other
+/// sub-apps lives here — the app's own prefix, the timestamped path, the commented preamble
+/// naming the settings, the CRLF writer and the retention tidy-up — so only the columns and the
+/// cell contents are the app's own.
+pub struct Report<'a> {
+    exports_dir: &'a Path,
+    prefix: &'a str,
+    stem: &'a str,
+    title: &'a str,
+    channels_processed: usize,
+    results: Vec<(String, String)>,
+}
+
+impl<'a> Report<'a> {
+    /// A report that will be written to `{exports_dir}/{prefix}{stem}_{timestamp}.csv`.
+    pub fn new(exports_dir: &'a Path, prefix: &'a str, stem: &'a str, title: &'a str) -> Self {
+        Self {
+            exports_dir,
+            prefix,
+            stem,
+            title,
+            channels_processed: 0,
+            results: Vec::new(),
+        }
+    }
+
+    /// How many channels the run looked at.
+    pub fn channels_processed(mut self, count: usize) -> Self {
+        self.channels_processed = count;
+        self
+    }
+
+    /// One `Label: value` line saying what the run DID, printed above the settings.
+    pub fn result(mut self, label: &str, value: impl std::fmt::Display) -> Self {
+        self.results.push((label.to_string(), value.to_string()));
+        self
+    }
+
+    /// Write the report and return its path.
+    ///
+    /// Rows go through a callback so a caller can stream them rather than build the whole
+    /// table first.
+    pub fn write<F>(
+        &self,
+        host: &CrosstalkConfig,
+        schema: &SettingsSchema,
+        values: &SettingsValues,
+        header: &[&str],
+        rows: F,
+    ) -> Result<PathBuf>
+    where
+        F: FnOnce(&mut csv::Writer<std::fs::File>) -> Result<()>,
+    {
+        let path = report_path(self.exports_dir, self.prefix, self.stem);
+        let results: Vec<(&str, String)> = self
+            .results
+            .iter()
+            .map(|(label, value)| (label.as_str(), value.clone()))
+            .collect();
+        let preamble = preamble(
+            host,
+            schema,
+            values,
+            self.title,
+            self.channels_processed,
+            &results,
+        );
+        write_report(&path, &preamble, header, rows)?;
+        Ok(path)
+    }
+
+    /// Delete this app's older exports, keeping the one just written.
+    ///
+    /// Called after a successful run only: deleting the history before an apply that then
+    /// fails would throw it away while producing nothing to replace it.
+    pub fn prune(&self, retention_days: u32, written: &Path) -> usize {
+        let name = written
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string());
+        prune_exports(
+            self.exports_dir,
+            self.prefix,
+            retention_days,
+            name.as_deref(),
+        )
+    }
+}
+
 /// Defuse a spreadsheet formula before it reaches the CSV.
 ///
 /// Channel and guide names come from Dispatcharr, which an operator does not control:
@@ -217,9 +305,10 @@ pub struct ExportFile {
 /// Whether a file was written by this app.
 ///
 /// One definition, used by both the age rule and any "clear exports" action: when the two
-/// decided this separately they disagreed in between.
-pub fn is_our_export(name: &str) -> bool {
-    name.starts_with(EXPORT_PREFIX) && name.ends_with(".csv")
+/// decided this separately they disagreed in between. `prefix` is the app's own, because
+/// `/data/exports` is shared with other plugins and, later, with the other sub-apps.
+pub fn is_our_export(name: &str, prefix: &str) -> bool {
+    name.starts_with(prefix) && name.ends_with(".csv")
 }
 
 /// Which of this app's exports are old enough to delete.
@@ -229,6 +318,7 @@ pub fn is_our_export(name: &str) -> bool {
 /// survives so a small number cannot empty the directory.
 pub fn exports_to_delete(
     entries: &[ExportFile],
+    prefix: &str,
     retention_days: u32,
     now: SystemTime,
     protect: Option<&str>,
@@ -239,7 +329,7 @@ pub fn exports_to_delete(
 
     let mut mine: Vec<(&str, SystemTime)> = entries
         .iter()
-        .filter(|entry| is_our_export(&entry.name))
+        .filter(|entry| is_our_export(&entry.name, prefix))
         .map(|entry| (entry.name.as_str(), entry.modified))
         .collect();
     if mine.is_empty() {
@@ -271,7 +361,12 @@ pub fn exports_to_delete(
 ///
 /// Never raises for a filesystem problem after a successful export: a failure to tidy up must
 /// not turn a completed run into a reported error. Returns how many were removed.
-pub fn prune_exports(directory: &Path, retention_days: u32, protect: Option<&str>) -> usize {
+pub fn prune_exports(
+    directory: &Path,
+    prefix: &str,
+    retention_days: u32,
+    protect: Option<&str>,
+) -> usize {
     if retention_days == 0 {
         return 0;
     }
@@ -288,7 +383,7 @@ pub fn prune_exports(directory: &Path, retention_days: u32, protect: Option<&str
         })
         .collect();
 
-    let doomed = exports_to_delete(&files, retention_days, SystemTime::now(), protect);
+    let doomed = exports_to_delete(&files, prefix, retention_days, SystemTime::now(), protect);
     let mut removed = 0;
     for name in doomed {
         match std::fs::remove_file(directory.join(&name)) {
@@ -305,11 +400,11 @@ pub fn prune_exports(directory: &Path, retention_days: u32, protect: Option<&str
 }
 
 /// The report path for a run: a timestamped file inside the exports directory.
-pub fn report_path(exports_dir: &Path, stem: &str) -> PathBuf {
+pub fn report_path(exports_dir: &Path, prefix: &str, stem: &str) -> PathBuf {
     // Milliseconds as well as seconds: two runs started from the UI in the same second
     // must not overwrite each other's report.
     let stamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f");
-    exports_dir.join(format!("{EXPORT_PREFIX}{stem}_{stamp}.csv"))
+    exports_dir.join(format!("{prefix}{stem}_{stamp}.csv"))
 }
 
 #[cfg(test)]
@@ -333,10 +428,13 @@ mod tests {
 
     #[test]
     fn only_our_own_files_are_considered() {
-        assert!(is_our_export("guide_match_preview_20260101_000000.csv"));
-        assert!(!is_our_export("other_plugin_export.csv"));
-        assert!(!is_our_export("guide_notes.txt"));
-        assert!(!is_our_export("guide_backup.csv.bak"));
+        assert!(is_our_export(
+            "guide_match_preview_20260101_000000.csv",
+            "guide_"
+        ));
+        assert!(!is_our_export("other_plugin_export.csv", "guide_"));
+        assert!(!is_our_export("guide_notes.txt", "guide_"));
+        assert!(!is_our_export("guide_backup.csv.bak", "guide_"));
     }
 
     #[test]
@@ -351,7 +449,7 @@ mod tests {
                 modified: at(1),
             },
         ];
-        assert!(exports_to_delete(&entries, 0, SystemTime::now(), None).is_empty());
+        assert!(exports_to_delete(&entries, "guide_", 0, SystemTime::now(), None).is_empty());
     }
 
     #[test]
@@ -366,7 +464,7 @@ mod tests {
                 modified: at(1),
             },
         ];
-        let doomed = exports_to_delete(&entries, 7, SystemTime::now(), None);
+        let doomed = exports_to_delete(&entries, "guide_", 7, SystemTime::now(), None);
         assert_eq!(doomed, vec!["guide_old.csv".to_string()]);
     }
 
@@ -384,7 +482,13 @@ mod tests {
                 modified: at(20 * 86_400),
             },
         ];
-        let doomed = exports_to_delete(&entries, 7, SystemTime::now(), Some("guide_b.csv"));
+        let doomed = exports_to_delete(
+            &entries,
+            "guide_",
+            7,
+            SystemTime::now(),
+            Some("guide_b.csv"),
+        );
         assert_eq!(doomed, vec!["guide_a.csv".to_string()]);
     }
 
@@ -394,7 +498,7 @@ mod tests {
             name: "guide_only.csv".to_string(),
             modified: at(365 * 86_400),
         }];
-        assert!(exports_to_delete(&entries, 1, SystemTime::now(), None).is_empty());
+        assert!(exports_to_delete(&entries, "guide_", 1, SystemTime::now(), None).is_empty());
     }
 
     #[test]
@@ -409,12 +513,12 @@ mod tests {
                 modified: at(1),
             },
         ];
-        assert!(exports_to_delete(&entries, 7, SystemTime::now(), None).is_empty());
+        assert!(exports_to_delete(&entries, "guide_", 7, SystemTime::now(), None).is_empty());
     }
 
     #[test]
     fn an_empty_directory_deletes_nothing() {
-        assert!(exports_to_delete(&[], 7, SystemTime::now(), None).is_empty());
+        assert!(exports_to_delete(&[], "guide_", 7, SystemTime::now(), None).is_empty());
     }
 
     #[test]
@@ -430,7 +534,7 @@ mod tests {
             },
         ];
         // The future-dated file is the newest, so it is the survivor, not a deletion.
-        let doomed = exports_to_delete(&entries, 7, SystemTime::now(), None);
+        let doomed = exports_to_delete(&entries, "guide_", 7, SystemTime::now(), None);
         assert!(!doomed.contains(&"guide_future.csv".to_string()));
     }
 
@@ -556,6 +660,46 @@ mod tests {
     }
 
     #[test]
+    fn the_builder_writes_the_path_the_preamble_and_the_rows() {
+        // What an app has to do for a report: name it, say what happened, hand over the
+        // cells. Everything else is the builder's.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let report = Report::new(
+            dir.path(),
+            "streams_",
+            "probe_preview",
+            "Probe Preview Report",
+        )
+        .channels_processed(4)
+        .result("Streams found", 3);
+        let path = report
+            .write(
+                &CrosstalkConfig::default(),
+                &SettingsSchema::new(vec![]),
+                &SettingsValues::new(),
+                &["channel_name"],
+                |writer| {
+                    writer.write_record([safe_cell("=ESPN")])?;
+                    Ok(())
+                },
+            )
+            .expect("write");
+
+        assert!(path.exists(), "{}", path.display());
+        let name = path
+            .file_name()
+            .expect("name")
+            .to_string_lossy()
+            .to_string();
+        assert!(name.starts_with("streams_probe_preview_"), "{name}");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.contains("Probe Preview Report"), "{text}");
+        assert!(text.contains("Channels processed: 4"), "{text}");
+        assert!(text.contains("Streams found: 3"), "{text}");
+        assert!(text.contains("'=ESPN"), "{text}");
+    }
+
+    #[test]
     fn pruning_removes_old_files_and_keeps_the_protected_one() {
         let dir = tempfile::tempdir().expect("tempdir");
         let old = dir.path().join("guide_old.csv");
@@ -569,7 +713,7 @@ mod tests {
         set_modified(&old, old_time);
         set_modified(&foreign, old_time);
 
-        let removed = prune_exports(dir.path(), 7, Some("guide_fresh.csv"));
+        let removed = prune_exports(dir.path(), "guide_", 7, Some("guide_fresh.csv"));
         assert_eq!(removed, 1);
         assert!(!old.exists());
         assert!(fresh.exists());
@@ -585,19 +729,19 @@ mod tests {
         let old = dir.path().join("guide_old.csv");
         std::fs::write(&old, "x").expect("write");
         set_modified(&old, SystemTime::now() - Duration::from_secs(90 * 86_400));
-        assert_eq!(prune_exports(dir.path(), 0, None), 0);
+        assert_eq!(prune_exports(dir.path(), "guide_", 0, None), 0);
         assert!(old.exists());
     }
 
     #[test]
     fn report_paths_carry_the_prefix_and_a_timestamp() {
-        let path = report_path(Path::new("/exports"), "match_preview");
+        let path = report_path(Path::new("/exports"), "guide_", "match_preview");
         let name = path
             .file_name()
             .expect("name")
             .to_string_lossy()
             .to_string();
-        assert!(is_our_export(&name), "{name}");
+        assert!(is_our_export(&name, "guide_"), "{name}");
         assert!(name.contains("match_preview"), "{name}");
         assert_eq!(path.parent(), Some(Path::new("/exports")));
     }

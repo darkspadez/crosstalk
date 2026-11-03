@@ -13,6 +13,11 @@
 //! Both stages stay faithful to the plugin's order: the highest-scoring candidate that both
 //! clears the threshold and has programmes is the one that wins.
 //!
+//! Only the EPG half lives here. The scoring stage, the validation walk and the AI gate are in
+//! `crosstalk_core` (`match_run`, `ai_gate`), because streams and lineup run the same loop
+//! against their own candidates. So is the report writer; what stays local is the EPG row, the
+//! EPG reason wording, and the write itself.
+//!
 //! AI contract (owner Q4): the model may PROMOTE a candidate inside the verify band or above
 //! the rescue floor, and never re-checks or vetoes a heuristic result at or above
 //! `match_confidence_threshold` — a confident match never reaches the model at all.
@@ -23,19 +28,21 @@
 //! candidate cleared the threshold, so falling back would contradict the threshold itself.
 //! Heal never consults the model.
 
-use crate::ai_gate;
-use crate::scope::{ScopedChannels, ScopedEntries};
+use crate::scope::ScopedEntries;
 use crate::settings::GuideSettings;
 use anyhow::{Context, Result};
+use crosstalk_core::ai_gate;
 use crosstalk_core::csv_report;
-use crosstalk_core::dispatcharr::{EpgEntry, HasPrograms, ProgramWindow, World};
+use crosstalk_core::dispatcharr::{DispatcharrClient, EpgEntry, HasPrograms, ProgramWindow, World};
 use crosstalk_core::jobs::{JobContext, ProgressEvent};
+use crosstalk_core::match_run::{self, CandidateProbe, ConfidenceBand, ScoreProgress, WalkRules};
+use crosstalk_core::scope::ScopedChannels;
 use crosstalk_core::store::RunRow;
-use crosstalk_core::subapp::JobOutcome;
-use crosstalk_matching::pipeline::{CandidateIndex, MatchOptions, Matcher, Scored};
+use crosstalk_core::subapp::{JobOutcome, OutcomeBuilder};
+use crosstalk_matching::pipeline::{CandidateIndex, Scored};
+use crosstalk_matching::MatchProfile;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// The columns the auto-match report carries.
@@ -106,20 +113,6 @@ impl MatchRow {
     }
 }
 
-/// The concurrent bound for the AI fan-out: the configured provider's own cap.
-///
-/// The single source of truth is `[ai.providers.<name>].max_concurrency` in the host
-/// config, which both backends also enforce on their own HTTP semaphores. An unknown
-/// provider name falls back to the default cap (8); validation enforces a minimum of 1.
-pub(crate) fn ai_fanout_bound(config: &crosstalk_core::CrosstalkConfig, provider: &str) -> usize {
-    config
-        .ai
-        .providers
-        .get(provider)
-        .map(|provider| provider.max_concurrency.max(1))
-        .unwrap_or(8)
-}
-
 /// Channels per concurrent batch in stage 2. The batch bounds how many validations are
 /// in flight at once on top of the semaphore caps, and a cancel is honoured between
 /// batches rather than only after the whole scope.
@@ -159,18 +152,12 @@ pub async fn run(
         .iter()
         .map(|entry| entry.name.clone())
         .collect();
-    let matcher = Matcher::new(
-        config.matching.normalize_flags(),
-        crate::matcher_aliases(context),
-        Arc::new(crate::known_callsigns(context)),
-        MatchOptions::default(),
-    );
+    let matcher = Arc::new(config.matching.matcher(MatchProfile::EpgJanitor));
     let index = Arc::new(CandidateIndex::build(
         &names,
         matcher.normalizer(),
         matcher.known(),
     ));
-    let matcher = Arc::new(matcher);
 
     let total = scoped_channels.channels.len() as u64;
     context.progress(&ProgressEvent::new(
@@ -180,52 +167,27 @@ pub async fn run(
         "scoring channels",
     ));
 
-    // Stage 1: scoring, in parallel. Progress comes from the atomic counter every 500
-    // channels (P7): at 20k channels the stage runs ~10 s, which is long enough to go
-    // silent otherwise. `progress` is `&self` over a `Send + Sync` sink, so rayon
-    // workers can publish directly; rayon preserves order on collect, so `scored` stays
-    // in channel order.
-    let scored: Vec<(usize, Vec<Scored>)> = {
-        let matcher = Arc::clone(&matcher);
-        let index = Arc::clone(&index);
-        let channels = scoped_channels.channels.clone();
-        let tags = crate::tag_list(config.matching.normalize_flags());
-        let progress = context.clone();
-        let total_channels = channels.len();
-
-        tokio::task::spawn_blocking(move || {
-            use rayon::prelude::*;
-            let counter = AtomicUsize::new(0);
-            // Published `current` must be monotonic: rayon workers finish out of order,
-            // so a later-finishing worker with a smaller `done` must not move the
-            // bar backwards. Only the largest value so far is published.
-            let max_sent = AtomicUsize::new(0);
-            let results: Vec<(usize, Vec<Scored>)> = channels
-                .par_iter()
-                .enumerate()
-                .map(|(position, channel)| {
-                    let ranked =
-                        matcher.score_candidates(&channel.name, &index, &tags_refs(&tags), None);
-                    let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if done % 500 == 0 || done == total_channels {
-                        let prev = max_sent.fetch_max(done, Ordering::Relaxed);
-                        if done > prev {
-                            progress.progress(&ProgressEvent::new(
-                                "guide.match",
-                                done as u64,
-                                total_channels as u64,
-                                "scoring channels",
-                            ));
-                        }
-                    }
-                    (position, ranked)
-                })
-                .collect();
-            results
-        })
-        .await
-        .context("the scoring stage panicked")?
-    };
+    // Stage 1: scoring, in parallel. Progress comes from the shared stage, which publishes
+    // every 500 channels (P7): at 20k channels the stage runs ~10 s, which is long enough to
+    // go silent otherwise. Rayon preserves order on collect, so the results stay in channel
+    // order.
+    let channel_names: Vec<String> = scoped_channels
+        .channels
+        .iter()
+        .map(|channel| channel.name.clone())
+        .collect();
+    let scored: Vec<Vec<Scored>> = match_run::score_names(
+        &channel_names,
+        Arc::clone(&matcher),
+        Arc::clone(&index),
+        &matcher.tags(),
+        Some(ScoreProgress {
+            context,
+            action: "guide.match",
+            phase: "scoring channels",
+        }),
+    )
+    .await?;
 
     context.progress(&ProgressEvent::new(
         "guide.match",
@@ -236,8 +198,16 @@ pub async fn run(
 
     // Stage 2: validation, in score order, memoised by the client.
     let ai_settings = &config.ai.verify;
-    let window = ProgramWindow::ahead(settings.check_hours);
     let threshold = settings.match_confidence_threshold;
+    // The walk only asks Dispatcharr when the operator has not waived the programme check.
+    let rules = WalkRules {
+        threshold,
+        validate: !settings.allow_epg_without_programs,
+    };
+    let probe = EpgProbe {
+        client,
+        window: ProgramWindow::ahead(settings.check_hours),
+    };
     let allow_without_programs = settings.allow_epg_without_programs;
     let source_names: HashMap<i64, String> = scoped_entries
         .sources
@@ -250,8 +220,8 @@ pub async fn run(
     let mut gates: Vec<Option<(ai_gate::GateReason, Vec<usize>)>> =
         Vec::with_capacity(scored.len());
     let mut skipped: Vec<bool> = Vec::with_capacity(scored.len());
-    for (position, ranked) in &scored {
-        let channel = &scoped_channels.channels[*position];
+    for (ordinal, ranked) in scored.iter().enumerate() {
+        let channel = &scoped_channels.channels[ordinal];
         if channel.has_epg_override() {
             skipped.push(true);
             gates.push(None);
@@ -262,12 +232,13 @@ pub async fn run(
         // Only a channel the heuristics are unsure about reaches the model.
         // A heuristic result that already clears the threshold is a confident match and
         // is never re-checked by the model.
-        let already_confident = ranked.first().is_some_and(|entry| entry.score >= threshold);
-        gates.push(if already_confident {
-            None
-        } else {
-            ai_gate::shortlist(ranked, &scoped_entries.entries, ai_settings)
-        });
+        gates.push(
+            if match_run::needs_gate(ranked.first().map(|entry| entry.score), threshold) {
+                ai_gate::shortlist(ranked, &scoped_entries.entries, ai_settings)
+            } else {
+                None
+            },
+        );
     }
 
     // The AI gate fans out (P2), bounded by the provider's own cap; the programme
@@ -276,14 +247,14 @@ pub async fn run(
     // serial, which preserves the ranked-order winner semantics exactly, and both phases
     // resolve in channel order. Work runs in batches so a cancel is honoured between
     // them rather than only after the whole scope.
-    let ai_bound = ai_fanout_bound(context.config(), &ai_settings.provider);
+    let ai_bound = ai_gate::fanout_bound(context.config(), &ai_settings.provider);
     let validation_bound = config.dispatcharr.concurrency.max(1);
-    // Copyable borrows for the `async move` futures below: `&window` inline would capture
-    // `window` itself by value and move it on the first batch.
-    let window_ref = &window;
+    // Copyable borrows for the `async move` futures below: `&probe` inline would capture
+    // `probe` itself by value and move it on the first batch.
+    let probe_ref = &probe;
     let mut ai_outcomes: Vec<Option<ai_gate::GateOutcome>> =
         (0..scored.len()).map(|_| None).collect();
-    let mut walks: Vec<Option<WalkResult>> = (0..scored.len()).map(|_| None).collect();
+    let mut walks: Vec<Option<match_run::WalkResult>> = (0..scored.len()).map(|_| None).collect();
 
     for batch_start in (0..scored.len()).step_by(BATCH_CHANNELS) {
         if context.is_cancelled() {
@@ -300,9 +271,9 @@ pub async fn run(
                     if skipped[ordinal] {
                         return None;
                     }
-                    let (position, ranked) = &scored[ordinal];
+                    let ranked = &scored[ordinal];
                     let (reason, offered) = gates[ordinal].clone()?;
-                    let channel = &scoped_channels.channels[*position];
+                    let channel = &scoped_channels.channels[ordinal];
                     let cancel = context.clone();
                     let model = ai_settings.model.clone();
                     let known = matcher.known();
@@ -312,25 +283,7 @@ pub async fn run(
                         // unanswered outcome is the "no result" value; the batch
                         // cancel check below turns it into an abort.
                         if cancel.is_cancelled() {
-                            return (
-                                ordinal,
-                                ai_gate::GateOutcome {
-                                    accepted: None,
-                                    reason,
-                                    picked: None,
-                                    probability: None,
-                                    confidence: None,
-                                    decision: "cancelled by the operator".to_string(),
-                                    model,
-                                    calibrated: false,
-                                    latency_ms: 0,
-                                    input_tokens: 0,
-                                    output_tokens: 0,
-                                    request: serde_json::json!({}),
-                                    response: serde_json::json!({}),
-                                    answered: false,
-                                },
-                            );
+                            return (ordinal, ai_gate::GateOutcome::cancelled(reason, model));
                         }
                         let outcome = ai_gate::ask(
                             ai,
@@ -365,27 +318,25 @@ pub async fn run(
         // Phase C: validate every channel's walk concurrently; each walk is serial.
         {
             use futures::{stream, StreamExt};
-            let resolved: Vec<(usize, WalkResult)> =
+            let resolved: Vec<(usize, match_run::WalkResult)> =
                 stream::iter((batch_start..batch_end).filter_map(|ordinal| {
                     if skipped[ordinal] {
                         return None;
                     }
-                    let (_, ranked) = &scored[ordinal];
+                    let ranked = &scored[ordinal];
                     let accepted = ai_outcomes[ordinal]
                         .as_ref()
                         .filter(|outcome| outcome.answered)
                         .and_then(|outcome| outcome.accepted);
                     let cancel = context.clone();
                     Some(async move {
-                        let walked = walk_for_channel(
-                            client,
+                        let walked = match_run::walk(
                             &cancel,
-                            window_ref,
-                            ranked,
                             &scoped_entries.entries,
+                            ranked,
                             accepted,
-                            threshold,
-                            allow_without_programs,
+                            rules,
+                            probe_ref,
                         )
                         .await;
                         (ordinal, walked)
@@ -413,8 +364,8 @@ pub async fn run(
     }
 
     let mut rows = Vec::with_capacity(scoped_channels.channels.len());
-    for (ordinal, (position, ranked)) in scored.iter().enumerate() {
-        let channel = &scoped_channels.channels[*position];
+    for (ordinal, ranked) in scored.iter().enumerate() {
+        let channel = &scoped_channels.channels[ordinal];
         let mut row = MatchRow {
             channel_id: channel.id,
             channel_name: channel.name.clone(),
@@ -450,7 +401,7 @@ pub async fn run(
         }
 
         // The concurrent walk resolved the winner in ranked order; this only maps it
-        // back onto the row. See `walk_for_channel` for the search order.
+        // back onto the row. See `match_run::walk` for the search order.
         let walked = walks[ordinal]
             .as_ref()
             .expect("every non-skipped channel was validated");
@@ -563,6 +514,7 @@ pub async fn run(
             .map(|name| name.to_string_lossy().to_string());
         csv_report::prune_exports(
             &context.exports_dir(),
+            crate::EXPORT_PREFIX,
             context.config().exports.retention_days,
             name.as_deref(),
         );
@@ -577,151 +529,28 @@ pub async fn run(
     })
 }
 
-fn tags_refs(tags: &[String]) -> Vec<&str> {
-    tags.iter().map(String::as_str).collect()
-}
-
-/// What one channel's validation walk found, in owned form so the concurrent phase can
-/// hand it to the ordered row assembly.
-struct WalkResult {
-    /// Position in the channel's ranked list that won, if any.
-    chosen: Option<usize>,
-    /// Score of the last candidate rejected for lack of programmes, if any.
-    best_rejected: Option<u8>,
-    /// The model's pick and its score, when it accepted a name whose every same-name
-    /// guide entry is empty.
-    ai_empty: Option<(String, u8)>,
-}
-
-/// One channel's validation walk: the first ranked candidate that clears the threshold
-/// AND carries programme data wins. An accepted AI pick replaces the heuristic order:
-/// every same-name entry is validated in ranked order and the first live duplicate
-/// wins, even when the exact picked entry is empty. When every same-name copy is empty
-/// the channel is left unmatched with an `ai_empty` reason saying exactly that — there
-/// is no fallback to other heuristic candidates, which by construction all scored below
-/// the threshold (the model only runs when nothing cleared it), so falling back would
-/// contradict the threshold itself.
+/// Whether a scoped EPG entry carries programme data in the run's window.
 ///
-/// Serial per channel and dependency-free across channels, so the caller runs one of
-/// these per channel concurrently and resolves the winners in channel order.
-#[allow(clippy::too_many_arguments)]
-async fn walk_for_channel(
-    client: &crosstalk_core::dispatcharr::DispatcharrClient,
-    context: &JobContext,
-    window: &ProgramWindow,
-    ranked: &[Scored],
-    entries: &[EpgEntry],
-    accepted: Option<usize>,
-    threshold: u8,
-    allow_without_programs: bool,
-) -> WalkResult {
-    // Every `has_programs` call below is preceded by a cancel check so a cancel
-    // lands within one in-flight round. The empty result is the "no result"
-    // value: the outer batch check turns it into an abort.
-    fn empty() -> WalkResult {
-        WalkResult {
-            chosen: None,
-            best_rejected: None,
-            ai_empty: None,
-        }
-    }
-    if context.is_cancelled() {
-        return empty();
-    }
-    if let Some(position) = accepted {
-        let picked_name = ranked
-            .get(position)
-            .and_then(|candidate| entries.get(candidate.index).map(|entry| entry.name.clone()));
-        if let Some(picked_name) = picked_name {
-            for (rank_position, candidate) in ranked.iter().enumerate() {
-                let Some(entry) = entries.get(candidate.index) else {
-                    continue;
-                };
-                if entry.name != picked_name {
-                    continue;
-                }
-                let has = if allow_without_programs {
-                    HasPrograms::Yes
-                } else {
-                    match entry.epg_source {
-                        Some(source) => {
-                            if context.is_cancelled() {
-                                return empty();
-                            }
-                            client
-                                .has_programs(&entry.tvg_id, source, window)
-                                .await
-                                .unwrap_or(HasPrograms::No)
-                        }
-                        None => HasPrograms::No,
-                    }
-                };
-                if has == HasPrograms::Yes {
-                    return WalkResult {
-                        chosen: Some(rank_position),
-                        best_rejected: None,
-                        ai_empty: None,
-                    };
-                }
-            }
-            let score = ranked.get(position).map(|candidate| candidate.score);
-            return WalkResult {
-                chosen: None,
-                best_rejected: score,
-                ai_empty: score.map(|score| (picked_name, score)),
-            };
-        }
-        return WalkResult {
-            chosen: None,
-            best_rejected: None,
-            ai_empty: None,
-        };
-    }
+/// The one EPG-specific half of the shared walk. A failed check is "no", never an error: one
+/// broken entry must not fail a run that can still match the rest.
+struct EpgProbe<'a> {
+    client: &'a DispatcharrClient,
+    window: ProgramWindow,
+}
 
-    let mut best_rejected = None;
-    for (rank_position, candidate) in ranked.iter().enumerate() {
-        if context.is_cancelled() {
-            return empty();
-        }
-        let Some(entry) = entries.get(candidate.index) else {
-            continue;
+#[async_trait::async_trait]
+impl CandidateProbe<EpgEntry> for EpgProbe<'_> {
+    async fn carries_data(&self, entry: &EpgEntry) -> bool {
+        // Without a source there is nothing to ask about; the plugin's own query would find
+        // nothing either.
+        let Some(source) = entry.epg_source else {
+            return false;
         };
-        if candidate.score >= threshold {
-            if allow_without_programs {
-                return WalkResult {
-                    chosen: Some(rank_position),
-                    best_rejected,
-                    ai_empty: None,
-                };
-            }
-            let Some(source) = entry.epg_source else {
-                continue;
-            };
-            if context.is_cancelled() {
-                return empty();
-            }
-            let has = client
-                .has_programs(&entry.tvg_id, source, window)
-                .await
-                .unwrap_or(HasPrograms::No);
-            match has {
-                HasPrograms::Yes => {
-                    return WalkResult {
-                        chosen: Some(rank_position),
-                        best_rejected,
-                        ai_empty: None,
-                    };
-                }
-                HasPrograms::No => {
-                    best_rejected = Some(candidate.score);
-                }
-            }
-        }
-    }
-    WalkResult {
-        chosen: None,
-        best_rejected,
-        ai_empty: None,
+        self.client
+            .has_programs(&entry.tvg_id, source, &self.window)
+            .await
+            .unwrap_or(HasPrograms::No)
+            == HasPrograms::Yes
     }
 }
 
@@ -740,16 +569,12 @@ fn reason_for(
     }
     if row.epg_data_id.is_some() {
         let score = row.score;
-        let mut reason = if score >= 95 {
-            format!("Excellent match ({score}%)")
-        } else if score >= 85 {
-            format!("High confidence match ({score}%)")
-        } else if score >= 75 {
-            format!("Good match ({score}%)")
-        } else if score >= 60 {
-            format!("Moderate confidence match ({score}%)")
-        } else {
-            format!("Low confidence match ({score}%)")
+        let mut reason = match ConfidenceBand::of(score) {
+            ConfidenceBand::Excellent => format!("Excellent match ({score}%)"),
+            ConfidenceBand::High => format!("High confidence match ({score}%)"),
+            ConfidenceBand::Good => format!("Good match ({score}%)"),
+            ConfidenceBand::Moderate => format!("Moderate confidence match ({score}%)"),
+            ConfidenceBand::Low => format!("Low confidence match ({score}%)"),
         };
         if !row.method.is_empty() && row.method != "None" {
             reason.push_str(&format!(" - {}", row.method));
@@ -785,80 +610,78 @@ fn write_report(
     dry_run: bool,
 ) -> Result<Option<PathBuf>> {
     let exports_dir = context.exports_dir();
-    let stem = if dry_run {
-        "match_preview"
-    } else {
-        "match_applied"
-    };
-    let path = csv_report::report_path(&exports_dir, stem);
-
-    let preamble = csv_report::preamble(
-        context.config(),
-        &crate::settings::schema(),
-        &crate::settings::to_values(settings),
+    let report = csv_report::Report::new(
+        &exports_dir,
+        crate::EXPORT_PREFIX,
+        if dry_run {
+            "match_preview"
+        } else {
+            "match_applied"
+        },
         if dry_run {
             "Auto-Match Preview Report"
         } else {
             "Auto-Match Applied Report"
         },
-        scoped_channels.channels.len(),
-        &[
-            ("Channels with a match found", matched.len().to_string()),
-            ("Matches carrying program data", matched.len().to_string()),
-            (
-                "Callsigns extracted",
-                rows.iter()
-                    .filter(|row| row.callsign.is_some())
-                    .count()
-                    .to_string(),
-            ),
-            (
-                "Assignments this run applies",
-                if dry_run {
-                    "none, this was a preview".to_string()
-                } else {
-                    matched.len().to_string()
-                },
-            ),
-        ],
+    )
+    .channels_processed(scoped_channels.channels.len())
+    .result("Channels with a match found", matched.len())
+    .result("Matches carrying program data", matched.len())
+    .result(
+        "Callsigns extracted",
+        rows.iter().filter(|row| row.callsign.is_some()).count(),
+    )
+    .result(
+        "Assignments this run applies",
+        if dry_run {
+            "none, this was a preview".to_string()
+        } else {
+            matched.len().to_string()
+        },
     );
 
-    csv_report::write_report(&path, &preamble, &COLUMNS, |writer| {
-        // Names and reasons come from Dispatcharr: defuse spreadsheet formulas.
-        let safe = |text: &str| csv_report::safe_cell(text);
-        let safe_opt = |text: &Option<String>| {
-            text.as_deref()
-                .map(csv_report::safe_cell)
-                .unwrap_or_default()
-        };
-        for row in rows {
-            writer.write_record([
-                row.channel_id.to_string(),
-                safe(&row.channel_name),
-                row.channel_number
-                    .map(|number| format!("{number}"))
-                    .unwrap_or_default(),
-                safe(&row.channel_group),
-                safe(&row.method),
-                row.score.to_string(),
-                row.callsign
-                    .as_deref()
+    let path = report.write(
+        context.config(),
+        &crate::settings::schema(),
+        &crate::settings::to_values(settings),
+        &COLUMNS,
+        |writer| {
+            // Names and reasons come from Dispatcharr: defuse spreadsheet formulas.
+            let safe = |text: &str| csv_report::safe_cell(text);
+            let safe_opt = |text: &Option<String>| {
+                text.as_deref()
                     .map(csv_report::safe_cell)
-                    .unwrap_or_else(|| "N/A".to_string()),
-                safe_opt(&row.epg_source_name),
-                row.epg_data_id.map(|id| id.to_string()).unwrap_or_default(),
-                safe_opt(&row.epg_channel_name),
-                row.current_epg_id
-                    .map(|id| id.to_string())
-                    .unwrap_or_default(),
-                safe_opt(&row.current_epg_name),
-                if row.has_program_data { "Yes" } else { "No" }.to_string(),
-                safe(&row.reason),
-                safe_opt(&row.ai_decision),
-            ])?;
-        }
-        Ok(())
-    })?;
+                    .unwrap_or_default()
+            };
+            for row in rows {
+                writer.write_record([
+                    row.channel_id.to_string(),
+                    safe(&row.channel_name),
+                    row.channel_number
+                        .map(|number| format!("{number}"))
+                        .unwrap_or_default(),
+                    safe(&row.channel_group),
+                    safe(&row.method),
+                    row.score.to_string(),
+                    row.callsign
+                        .as_deref()
+                        .map(csv_report::safe_cell)
+                        .unwrap_or_else(|| "N/A".to_string()),
+                    safe_opt(&row.epg_source_name),
+                    row.epg_data_id.map(|id| id.to_string()).unwrap_or_default(),
+                    safe_opt(&row.epg_channel_name),
+                    row.current_epg_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_default(),
+                    safe_opt(&row.current_epg_name),
+                    if row.has_program_data { "Yes" } else { "No" }.to_string(),
+                    safe(&row.reason),
+                    safe_opt(&row.ai_decision),
+                ])?;
+            }
+            Ok(())
+        },
+    )?;
     Ok(Some(path))
 }
 
@@ -875,29 +698,24 @@ pub fn outcome(result: &MatchOutcome, dry_run: bool) -> JobOutcome {
         .filter(|row| row.skipped.is_some())
         .count();
 
-    let mut summary = format!(
+    let mut outcome = OutcomeBuilder::new(format!(
         "Auto-match {}: {}/{} matched",
         if dry_run { "preview" } else { "applied" },
         matched,
         result.channels
-    );
+    ))
+    .count("channels", result.channels as i64)
+    .count("candidates", result.candidates as i64)
+    .count("matched", matched as i64)
+    .count("skipped", skipped as i64)
+    .count("applied", result.applied as i64);
     if skipped > 0 {
-        summary.push_str(&format!(", {skipped} skipped"));
+        outcome = outcome.note(format!("{skipped} skipped"));
     }
     if !dry_run {
-        summary.push_str(&format!(", {} assignments written", result.applied));
+        outcome = outcome.note(format!("{} assignments written", result.applied));
     }
-
-    let mut outcome = JobOutcome::new(summary)
-        .with_count("channels", result.channels as i64)
-        .with_count("candidates", result.candidates as i64)
-        .with_count("matched", matched as i64)
-        .with_count("skipped", skipped as i64)
-        .with_count("applied", result.applied as i64);
-    if let Some(report) = result.report.clone() {
-        outcome = outcome.with_report(report);
-    }
-    outcome
+    outcome.report(result.report.clone()).build()
 }
 
 /// Fill in the group name for each row, using the world the run loaded.
@@ -1103,7 +921,7 @@ mod tests {
     fn scoped(world: &World) -> (ScopedChannels, ScopedEntries) {
         let scope = crosstalk_core::config::ScopeConfig::default();
         (
-            crate::scope::scope_channels(world, &scope).expect("channels"),
+            crosstalk_core::scope::scope_channels(world, &scope).expect("channels"),
             crate::scope::scope_entries(world, ""),
         )
     }
@@ -1420,44 +1238,6 @@ mod tests {
         assert!(
             espn.ai_decision.is_some(),
             "the decision is recorded even when it is no"
-        );
-    }
-
-    #[test]
-    fn the_ai_fanout_bound_comes_from_the_provider_config() {
-        let mut config = crosstalk_core::CrosstalkConfig::default();
-        assert_eq!(
-            ai_fanout_bound(&config, "typesafe"),
-            8,
-            "an unconfigured provider falls back to the default cap"
-        );
-
-        config.ai.providers.insert(
-            "typesafe".to_string(),
-            crosstalk_core::config::AiProviderConfig {
-                kind: "typesafe".to_string(),
-                max_concurrency: 3,
-                ..crosstalk_core::config::AiProviderConfig::default()
-            },
-        );
-        assert_eq!(
-            ai_fanout_bound(&config, "typesafe"),
-            3,
-            "the provider's own max_concurrency bounds the fan-out"
-        );
-
-        config.ai.providers.insert(
-            "zero".to_string(),
-            crosstalk_core::config::AiProviderConfig {
-                kind: "typesafe".to_string(),
-                max_concurrency: 0,
-                ..crosstalk_core::config::AiProviderConfig::default()
-            },
-        );
-        assert_eq!(
-            ai_fanout_bound(&config, "zero"),
-            1,
-            "a zero cap still allows one request rather than deadlocking"
         );
     }
 

@@ -6,12 +6,15 @@
 //! without either knowing about the other.
 
 pub mod ai;
+pub mod ai_gate;
 pub mod config;
 pub mod csv_report;
 pub mod dispatcharr;
 pub mod jobs;
+pub mod match_run;
 pub mod runner;
 pub mod scheduler;
+pub mod scope;
 pub mod store;
 pub mod subapp;
 pub mod wildcard;
@@ -20,7 +23,7 @@ pub use ai::{AiService, Answer, Decider, DecisionRequest, DecisionResponse, Ques
 pub use config::{ConfigReport, CrosstalkConfig, SharedConfig};
 pub use csv_report::{
     exports_to_delete, is_our_export, preamble, prune_exports, report_path, safe_cell,
-    write_report, ExportFile,
+    write_report, ExportFile, Report,
 };
 pub use dispatcharr::{
     Channel, DispatcharrClient, EpgEntry, EpgSource, HasPrograms, ProgramWindow, World,
@@ -30,8 +33,8 @@ pub use runner::{ActiveRun, JobRunner, StartedRun};
 pub use scheduler::{ScheduleInfo, Scheduler};
 pub use store::{AiDecision, RunRecord, RunRow, RunStatus, Store};
 pub use subapp::{
-    ActionKind, ActionSpec, FieldKind, FieldSpec, FieldValue, JobOutcome, Registry, SettingsSchema,
-    SettingsValues, SubApp,
+    ActionKind, ActionSpec, FieldKind, FieldSpec, FieldValue, JobOutcome, OutcomeBuilder, Registry,
+    SettingsSchema, SettingsValues, SubApp,
 };
 pub use wildcard::{expand_patterns, parse_tokens};
 
