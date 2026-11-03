@@ -1,4 +1,4 @@
-//! `janitor` settings: the values, and the form schema the UI and the CSV preamble use.
+//! `guide` settings: the values, and the form schema the UI and the CSV preamble use.
 //!
 //! The field ids, labels and help text follow the Python plugin's `plugin.json`, because
 //! operators already know those names and the CSV preamble prints them. The AI block is new
@@ -55,14 +55,14 @@ impl Default for AiSettings {
     }
 }
 
-/// Everything `janitor.toml` holds.
+/// Everything `guide.toml` holds.
 ///
 /// The `Default` impl is written out rather than derived: `#[serde(default)]` fills
 /// missing fields from it, so a derived one would silently default every threshold to 0,
 /// which is a valid-looking configuration that rejects nothing.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
-pub struct JanitorSettings {
+pub struct GuideSettings {
     /// Profile names to scope to, comma-separated. The first one is used by actions that
     /// need exactly one.
     pub channel_profile_name: String,
@@ -71,7 +71,7 @@ pub struct JanitorSettings {
     pub epg_sources_to_match: String,
     /// How far ahead programme data must exist for a match to count.
     pub check_hours: u32,
-    pub automatch_confidence_threshold: u8,
+    pub match_confidence_threshold: u8,
     pub allow_epg_without_programs: bool,
     pub heal_fallback_sources: String,
     pub heal_confidence_threshold: u8,
@@ -80,7 +80,7 @@ pub struct JanitorSettings {
     pub ai: AiSettings,
 }
 
-impl Default for JanitorSettings {
+impl Default for GuideSettings {
     fn default() -> Self {
         Self {
             channel_profile_name: String::new(),
@@ -89,7 +89,7 @@ impl Default for JanitorSettings {
             epg_sources_to_match: String::new(),
             // The plugin's shipped defaults.
             check_hours: 12,
-            automatch_confidence_threshold: 95,
+            match_confidence_threshold: 95,
             allow_epg_without_programs: false,
             heal_fallback_sources: String::new(),
             heal_confidence_threshold: 95,
@@ -101,7 +101,7 @@ impl Default for JanitorSettings {
 
 /// Section ids, so a field never points at a section that does not exist.
 pub const SECTION_SCOPE: &str = "_section_scope";
-pub const SECTION_AUTOMATCH: &str = "_section_automatch";
+pub const SECTION_MATCH: &str = "_section_match";
 pub const SECTION_HEAL: &str = "_section_heal";
 pub const SECTION_AI: &str = "_section_ai";
 pub const SECTION_HOUSEKEEPING: &str = "_section_housekeeping";
@@ -175,15 +175,15 @@ pub fn schema() -> SettingsSchema {
         )
         .with_help("Window used to validate that a matched EPG actually has programme data."),
         FieldSpec::section(
-            SECTION_AUTOMATCH,
+            SECTION_MATCH,
             "Auto-Match",
             "Apply Auto-Match is not additive: it OVERWRITES an existing assignment whenever \
              a new match scores above the threshold, so a channel already on the right guide \
              can be moved. Preview first and read the CSV.",
         ),
         FieldSpec::new(
-            "automatch_confidence_threshold",
-            SECTION_AUTOMATCH,
+            "match_confidence_threshold",
+            SECTION_MATCH,
             "Auto-Match Confidence Threshold",
             FieldKind::Number,
             FieldValue::Number(95.0),
@@ -194,7 +194,7 @@ pub fn schema() -> SettingsSchema {
         ),
         FieldSpec::new(
             "allow_epg_without_programs",
-            SECTION_AUTOMATCH,
+            SECTION_MATCH,
             "Allow EPG Without Program Data",
             FieldKind::Boolean,
             FieldValue::Boolean(false),
@@ -367,14 +367,14 @@ pub fn schema() -> SettingsSchema {
             FieldValue::Number(0.0),
         )
         .with_help(
-            "0 keeps every file, which is the default. Only files named epg_janitor_*.csv are \
+            "0 keeps every file, which is the default. Only files named guide_*.csv are \
              touched, because the exports directory is shared with other apps.",
         ),
     ])
 }
 
-/// `janitor.toml` -> settings values.
-pub fn to_values(settings: &JanitorSettings) -> SettingsValues {
+/// `guide.toml` -> settings values.
+pub fn to_values(settings: &GuideSettings) -> SettingsValues {
     let mut values = SettingsValues::new();
     values.insert(
         "channel_profile_name",
@@ -397,8 +397,8 @@ pub fn to_values(settings: &JanitorSettings) -> SettingsValues {
         FieldValue::Number(f64::from(settings.check_hours)),
     );
     values.insert(
-        "automatch_confidence_threshold",
-        FieldValue::Number(f64::from(settings.automatch_confidence_threshold)),
+        "match_confidence_threshold",
+        FieldValue::Number(f64::from(settings.match_confidence_threshold)),
     );
     values.insert(
         "allow_epg_without_programs",
@@ -454,8 +454,8 @@ pub fn to_values(settings: &JanitorSettings) -> SettingsValues {
     values
 }
 
-/// Settings values -> `janitor.toml`, keeping anything the form does not know about.
-pub fn apply_values(settings: &mut JanitorSettings, values: &SettingsValues) -> Result<()> {
+/// Settings values -> `guide.toml`, keeping anything the form does not know about.
+pub fn apply_values(settings: &mut GuideSettings, values: &SettingsValues) -> Result<()> {
     if let Some(text) = values.text("channel_profile_name") {
         settings.channel_profile_name = text.to_string();
     }
@@ -474,8 +474,8 @@ pub fn apply_values(settings: &mut JanitorSettings, values: &SettingsValues) -> 
     if let Some(number) = values.number("check_hours") {
         settings.check_hours = whole_number("check_hours", number, 0, 8_760)?;
     }
-    if let Some(number) = values.number("automatch_confidence_threshold") {
-        settings.automatch_confidence_threshold = clamp_u8(number)?;
+    if let Some(number) = values.number("match_confidence_threshold") {
+        settings.match_confidence_threshold = clamp_u8(number)?;
     }
     if let Some(number) = values.number("heal_confidence_threshold") {
         settings.heal_confidence_threshold = clamp_u8(number)?;
@@ -550,23 +550,23 @@ fn clamp_unit(value: f64) -> Result<f64> {
     Ok(value)
 }
 
-/// Load `janitor.toml`, falling back to defaults when missing.
-pub fn load(path: &Path) -> Result<JanitorSettings> {
+/// Load `guide.toml`, falling back to defaults when missing.
+pub fn load(path: &Path) -> Result<GuideSettings> {
     if !path.exists() {
-        return Ok(JanitorSettings::default());
+        return Ok(GuideSettings::default());
     }
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
 }
 
-/// Write `janitor.toml` through the comment-preserving writer.
-pub fn save(path: &Path, settings: &JanitorSettings) -> Result<()> {
+/// Write `guide.toml` through the comment-preserving writer.
+pub fn save(path: &Path, settings: &GuideSettings) -> Result<()> {
     crosstalk_core::config::save_with_comments(path, settings)
 }
 
 /// Problems an operator needs to fix, as human-readable strings.
-pub fn validate(settings: &JanitorSettings) -> Vec<String> {
+pub fn validate(settings: &GuideSettings) -> Vec<String> {
     let mut errors = Vec::new();
     if !settings.selected_groups.trim().is_empty() && !settings.ignore_groups.trim().is_empty() {
         errors.push(
@@ -586,8 +586,8 @@ pub fn validate(settings: &JanitorSettings) -> Vec<String> {
             settings.ai.reject_threshold, settings.ai.accept_threshold
         ));
     }
-    if settings.automatch_confidence_threshold == 0 {
-        errors.push("automatch_confidence_threshold must be at least 1".to_string());
+    if settings.match_confidence_threshold == 0 {
+        errors.push("match_confidence_threshold must be at least 1".to_string());
     }
     if settings.ai.rescue_floor > settings.ai.verify_band_low {
         errors.push(format!(
@@ -636,9 +636,9 @@ mod tests {
 
     #[test]
     fn defaults_round_trip_through_values() {
-        let settings = JanitorSettings::default();
+        let settings = GuideSettings::default();
         let values = to_values(&settings);
-        let mut rebuilt = JanitorSettings::default();
+        let mut rebuilt = GuideSettings::default();
         apply_values(&mut rebuilt, &values).expect("apply");
         assert_eq!(rebuilt, settings);
     }
@@ -647,13 +647,13 @@ mod tests {
     fn every_editable_field_has_a_mapping() {
         // A field with no accessor in `to_values`/`apply_values` would render an empty form
         // control and silently drop the operator's edit.
-        let settings = JanitorSettings {
+        let settings = GuideSettings {
             channel_profile_name: "All".to_string(),
             selected_groups: "A".to_string(),
             ignore_groups: "B".to_string(),
             epg_sources_to_match: "C".to_string(),
             check_hours: 5,
-            automatch_confidence_threshold: 70,
+            match_confidence_threshold: 70,
             allow_epg_without_programs: true,
             heal_fallback_sources: "D".to_string(),
             heal_confidence_threshold: 75,
@@ -681,16 +681,16 @@ mod tests {
             );
         }
 
-        let mut rebuilt = JanitorSettings::default();
+        let mut rebuilt = GuideSettings::default();
         apply_values(&mut rebuilt, &values).expect("apply");
         assert_eq!(rebuilt, settings);
     }
 
     #[test]
     fn apply_rejects_out_of_range_numbers() {
-        let mut settings = JanitorSettings::default();
+        let mut settings = GuideSettings::default();
         let mut values = SettingsValues::new();
-        values.insert("automatch_confidence_threshold", FieldValue::Number(120.0));
+        values.insert("match_confidence_threshold", FieldValue::Number(120.0));
         assert!(apply_values(&mut settings, &values).is_err());
 
         let mut values = SettingsValues::new();
@@ -700,7 +700,7 @@ mod tests {
 
     #[test]
     fn validate_catches_conflicting_and_inverted_settings() {
-        let mut settings = JanitorSettings::default();
+        let mut settings = GuideSettings::default();
         assert!(validate(&settings).is_empty());
 
         settings.selected_groups = "A".to_string();
@@ -709,7 +709,7 @@ mod tests {
         settings.ai.verify_band_high = 80;
         settings.ai.reject_threshold = 0.9;
         settings.ai.accept_threshold = 0.5;
-        settings.automatch_confidence_threshold = 0;
+        settings.match_confidence_threshold = 0;
         let errors = validate(&settings);
         assert_eq!(errors.len(), 4, "{errors:?}");
     }
@@ -717,16 +717,16 @@ mod tests {
     #[test]
     fn save_and_load_preserve_comments() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("janitor.toml");
+        let path = dir.path().join("guide.toml");
         std::fs::write(
             &path,
             "# Chosen to match the Python plugin's defaults\ncheck_hours = 99\n",
         )
         .expect("seed");
 
-        let settings = JanitorSettings {
+        let settings = GuideSettings {
             check_hours: 6,
-            ..JanitorSettings::default()
+            ..GuideSettings::default()
         };
         save(&path, &settings).expect("save");
         let text = std::fs::read_to_string(&path).expect("read");
@@ -739,7 +739,7 @@ mod tests {
     #[test]
     fn unknown_keys_are_rejected_loudly() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("janitor.toml");
+        let path = dir.path().join("guide.toml");
         std::fs::write(&path, "check_hourss = 99\n").expect("seed");
         let error = load(&path).expect_err("rejects the typo");
         assert!(
@@ -759,7 +759,7 @@ mod tests {
     fn a_missing_file_means_defaults() {
         let dir = tempfile::tempdir().expect("tempdir");
         let loaded = load(&dir.path().join("absent.toml")).expect("load");
-        assert_eq!(loaded, JanitorSettings::default());
+        assert_eq!(loaded, GuideSettings::default());
     }
 
     #[test]

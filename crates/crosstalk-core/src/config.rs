@@ -329,7 +329,7 @@ pub struct CrosstalkConfig {
     pub ai: AiConfig,
     pub matching: MatchingConfig,
     pub jobs: JobsConfig,
-    /// Cron expressions per `<app>.<action>`, for example `janitor.automatch = "0 4 * * *"`.
+    /// Cron expressions per `<app>.<action>`, for example `guide.match_apply = "0 4 * * *"`.
     pub schedules: BTreeMap<String, String>,
     /// Directory the configuration was loaded from. Not part of the file.
     #[serde(skip)]
@@ -564,7 +564,7 @@ impl CrosstalkConfig {
         for (key, cron) in &self.schedules {
             if !key.contains('.') {
                 report.errors.push(format!(
-                    "schedules.{key} must be <app>.<action>, e.g. janitor.automatch"
+                    "schedules.{key} must be <app>.<action>, e.g. guide.match_apply"
                 ));
             }
             // Parsed, not merely counted: a five-field expression with a misspelled weekday
@@ -1042,7 +1042,7 @@ enabled_databases = ["US", "UK"]
 "Fox News Channel" = ["FNC"]
 
 [schedules]
-"janitor.automatch" = "0 4 * * *"
+"guide.match_apply" = "0 4 * * *"
 "#,
         );
         let config = CrosstalkConfig::load(dir.path()).expect("load");
@@ -1066,7 +1066,7 @@ enabled_databases = ["US", "UK"]
         assert_eq!(
             config
                 .schedules
-                .get("janitor.automatch")
+                .get("guide.match_apply")
                 .map(String::as_str),
             Some("0 4 * * *")
         );
@@ -1260,7 +1260,7 @@ enabled_databases = ["US", "UK"]
         );
         config
             .schedules
-            .insert("janitor".to_string(), "every day".to_string());
+            .insert("guide".to_string(), "every day".to_string());
         let report = config.validate();
         assert!(report
             .errors
@@ -1364,7 +1364,7 @@ base_url = "https://api.typesafe.ai/v1"
 "ESPN" = ["ESPN US"]
 
 [schedules]
-"janitor.automatch" = "0 4 * * *"
+"guide.match_apply" = "0 4 * * *"
 "#,
         );
 

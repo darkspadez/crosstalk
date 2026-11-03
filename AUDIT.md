@@ -21,8 +21,8 @@ Ship-readiness by use case:
 | Use case | Verdict |
 |---|---|
 | `crosstalk simulate` (offline tuning) | ✅ Ship it |
-| `crosstalk run janitor *_preview` by hand, loopback | ✅ Ship it |
-| `crosstalk run janitor *_apply --yes` by hand | ⚠️ Usable with backups; see H4 |
+| `crosstalk run guide *_preview` by hand, loopback | ✅ Ship it |
+| `crosstalk run guide *_apply --yes` by hand | ⚠️ Usable with backups; see H4 |
 | Daemon + web UI on loopback, no token (shipped default) | ❌ **Not safe** — see H1 (CSRF) |
 | Daemon on LAN / scheduled applies unattended | ❌ **Not yet** — H1, H4, H5, M3 |
 | Docker per README quick-start | ❌ **Broken as written** — M6 |
@@ -63,9 +63,9 @@ operator visits** (H1).
   omitted `dry_run` form field on a channel-touching action means **apply** (`dry_run=false`).
 - **Exploit:** Operator runs the shipped default (loopback, no token) and visits any page. The
   page auto-submits a cross-origin form POST to
-  `http://127.0.0.1:8730/apps/janitor/actions/automatch_apply`. It's a CORS "simple request" —
+  `http://127.0.0.1:8730/apps/guide/actions/match_apply`. It's a CORS "simple request" —
   no preflight, response readability irrelevant, the side effect is the attack. It can first
-  POST `/settings/janitor` (e.g. threshold → 1). DNS-rebinding and any local process work too;
+  POST `/settings/guide` (e.g. threshold → 1). DNS-rebinding and any local process work too;
   there is no `Host` allowlist.
 - **Partial mitigation:** With a token, the cookie is `SameSite=Strict`, which blunts cross-site
   cookie POSTs in modern browsers. The no-token mode (the default the README leads with) has
@@ -75,7 +75,7 @@ operator visits** (H1).
   a server-side `confirm=true` for `Write`/`Destructive` actions mirroring `--yes`.
 
 ### H2. Heal's `SKIPPED_LOW_CONFIDENCE` path is dead code — heal reports are materially wrong
-- **Where:** `crates/janitor/src/heal.rs:223` (`if candidate.score < threshold { break; }`),
+- **Where:** `crates/guide/src/heal.rs:223` (`if candidate.score < threshold { break; }`),
   making the `SkippedLowConfidence` branch at `heal.rs:255` unreachable.
 - **Verified by reading:** Candidates are score-descending, so the loop breaks before ever
   recording a sub-threshold candidate. A channel whose only working replacement scores 60–94 is
@@ -113,7 +113,7 @@ and run it unconditionally in CI. [Phase 2: done via the plugin submodule + comm
 
 ### H4. The one write call (`batch_set_epg`) is the least reliable call in the system
 - **Where:** `crates/crosstalk-core/src/dispatcharr.rs:639+`; callers
-  `automatch.rs:398-404`, `heal.rs:286-293`.
+  `matching.rs:398-404`, `heal.rs:286-293`.
 - **Verified:** GETs get retry + `Retry-After` + one 401 refresh. The POST gets **none** of
   that, and all associations go in **one request** under the default 30 s timeout. A JWT lapse
   or a Dispatcharr restart at the end of a 20-minute apply fails the run *after* minutes of
@@ -141,7 +141,7 @@ and run it unconditionally in CI. [Phase 2: done via the plugin submodule + comm
 - **Effect:** Two guide entries with the same name (routine: same channel in two sources) —
   only the first gets the fuzzy 85–100; the rest fall back to structural-only, often 0. Python
   keys fuzzy scores **by name** (`plugin.py:1147-1153`), so all duplicates inherit it. This
-  changes winners in both automatch and heal (e.g. first duplicate is in a dead source, second
+  changes winners in both match and heal (e.g. first duplicate is in a dead source, second
   has the programmes).
 - **Why tests missed it:** Every parity corpus dedupes names (`parity_sweep.py` uses a
   `seen`-set; `match_sim` fixtures dedupe), so the case is structurally invisible to the suite.
@@ -150,16 +150,16 @@ and run it unconditionally in CI. [Phase 2: done via the plugin submodule + comm
 
 ### H7. Config typos are silently ignored — `crosstalk validate` says "settings valid"
 - **Where:** No `deny_unknown_fields` anywhere; all structs are `#[serde(default)]`
-  (`config.rs` throughout; `janitor/src/settings.rs:51-53`).
+  (`config.rs` throughout; `guide/src/settings.rs:51-53`).
 - **Verified by the infra audit empirically:** `portt = 9999`, `check_hourss = 99` pass
   validation and silently fall back to defaults. For a tool whose entire UX is "edit TOML,
-  check with validate", a misspelled `automatch_confidence_threshold` or `bind` failing
+  check with validate", a misspelled `match_confidence_threshold` or `bind` failing
   silently is a safety bug, not a UX nit.
 - **Fix:** `#[serde(deny_unknown_fields)]` on all config structs (or at minimum a
   warn-on-unknown-key pass that `validate` reports as an error).
 
 ### H8. Scheduler + UI runs are not mutually exclusive with the CLI, and scheduled applies are always armed
-- **Where:** `scheduler.rs:152-160` fires `automatch_apply` with `dry_run=false` and no
+- **Where:** `scheduler.rs:152-160` fires `match_apply` with `dry_run=false` and no
   confirmation — a permanent `--yes`. Combined with H5 and the per-process `busy` lock
   (`runner.rs`), a `crosstalk run` CLI invocation and a daemon run on the same install have
   **no shared lock at all** (the lock is in-memory per process; SQLite has no `busy_timeout`,
@@ -182,7 +182,7 @@ volume. *Fix: call it after each run (e.g. keep 90 days / ≥20 runs), and expos
 ### M2. Host settings saved in the UI do nothing until restart — and the UI says "Saved."
 `routes.rs:460-469` writes the file; the daemon keeps using the startup
 `Arc<CrosstalkConfig>` snapshot. Matching toggles/databases changed in the UI silently don't
-affect subsequent runs (janitor settings *are* re-read per run — the asymmetry makes it worse).
+affect subsequent runs (guide settings *are* re-read per run — the asymmetry makes it worse).
 *Fix: reload config on save and swap the `Arc`, or label host settings "requires restart".*
 
 ### M3. Config write-back downgrades file permissions on secret-bearing files
@@ -204,12 +204,12 @@ the comment or use `subtle`.*
 ### M5. AI gate: correct shape, four defects inside
 1. **Threshold contract change (by design, undocumented as a parity break):** an AI-accepted
    candidate is assigned with heuristic score 60–94 while
-   `automatch_confidence_threshold = 95` (`automatch.rs:232-296`). When AI is on, the
+   `match_confidence_threshold = 95` (`matching.rs:232-296`). When AI is on, the
    threshold no longer means what the settings page says.
 2. **AI pick with no programmes blocks the heuristic fallback:** the if/else at
-   `automatch.rs:263-296` skips the candidate walk entirely, leaving a channel unmatched even
+   `matching.rs:263-296` skips the candidate walk entirely, leaving a channel unmatched even
    when candidate #2 was ≥ threshold with programmes.
-3. **Decisions are recorded twice** (`automatch.rs:254` and `:292`/`:325`). Currently harmless
+3. **Decisions are recorded twice** (`matching.rs:254` and `:292`/`:325`). Currently harmless
    only because `record_ai_decision` is `INSERT OR REPLACE` on `(run_id, ordinal)` — it's a
    wasted write and a landmine if that ever becomes `INSERT`.
 4. **The model is told a different callsign than the matcher used:** `ai_gate.rs:130-133`
@@ -248,20 +248,20 @@ under `config/exports/` (the real layout) aren't ignored either.
 - `pipeline.rs:966-973` rebuilds the query token `HashSet` **for every matched candidate**;
   `index.name(candidate).to_uppercase()` per pair (`:902`).
 - **Heal runs its entire O(broken × entries) loop synchronously inside `async fn`**
-  (`heal.rs:190-268`) — it stalls a Tokio worker for the duration, unlike automatch's
-  `spawn_blocking`+rayon. Automatch stage-2 validation is also serial awaits despite the module
+  (`heal.rs:190-268`) — it stalls a Tokio worker for the duration, unlike matching's
+  `spawn_blocking`+rayon. Match stage-2 validation is also serial awaits despite the module
   doc claiming client-concurrency bounding (only the memo cache helps repeats).
 *Fix: precompute `Vec<char>` in `CandidateIndex`; hoist the query token set; move heal into
 `spawn_blocking`; validate candidates with `buffer_unordered(concurrency)`.*
 
-### M9. Automatch candidate walk diverges from the plugin's reporting (assignment outcome mostly same)
+### M9. Match candidate walk diverges from the plugin's reporting (assignment outcome mostly same)
 - Python returns the first candidate *with programmes* irrespective of threshold and reports
   **its** score/method; Rust only walks ≥ threshold and, when nothing validates, reports
   `ranked.first()`'s score with the reason "Best match (100%) carries no programme data…"
-  (`automatch.rs:330-337`) — a misleading report row (nothing was matched at 100%).
-- Rust skips `epg_source == None` candidates (`automatch.rs:306-308`, `heal.rs:230-232`);
+  (`matching.rs:330-337`) — a misleading report row (nothing was matched at 100%).
+- Rust skips `epg_source == None` candidates (`matching.rs:306-308`, `heal.rs:230-232`);
   Python validates by EPG id and would accept a sourceless entry with programmes.
-- Rust skips EPG-override channels (`automatch.rs:216-224`); the plugin re-matches them.
+- Rust skips EPG-override channels (`matching.rs:216-224`); the plugin re-matches them.
   Deliberate, safer — but it is a parity break and should be documented as one, in the CSV
   reason (it is) **and** in the README parity claim (it isn't).
 
@@ -272,7 +272,7 @@ under `config/exports/` (the real layout) aren't ignored either.
 | # | Finding | Where |
 |---|---|---|
 | L1 | CSV download reads `report_path` from DB unconfined (not remotely exploitable today; confine to `exports_dir` before any future feature writes user-influenced paths) | `routes.rs:306-337` |
-| L2 | CSV formula injection: Dispatcharr-controlled names starting `= + - @` written raw into exports | `csv_report.rs:172`, `automatch.rs:536` |
+| L2 | CSV formula injection: Dispatcharr-controlled names starting `= + - @` written raw into exports | `csv_report.rs:172`, `matching.rs:536` |
 | L3 | Plaintext `http://` to a non-loopback Dispatcharr/AI accepted with no warning (admin key in cleartext) | `config.rs:440-444` |
 | L4 | Error responses leak `{error:#}` chains + absolute paths to the caller | `routes.rs:246,420,466` |
 | L5 | `channels()/groups()/profiles()/epg_sources()` are envelope-intolerant (bare `Vec<T>` only), unlike the hardened `epg_entries()` | `dispatcharr.rs` |
@@ -331,7 +331,7 @@ corrections (Docker steps, parity-claim scoping, SSE→polling, override-skip di
 | # | Question | Decision |
 |---|---|---|
 | Q1 | Trust model | **Tokenless loopback stays supported** — fix H1 with CSRF tokens + server-side confirm for destructive actions. Token/LAN modes unchanged. |
-| Q2 | Parity contract | **Split contract** (answered "2 and 3"): `match_all_streams` and below stay strict-parity; automatch/heal become Rust-native products. README parity claims get rewritten to say exactly this. |
+| Q2 | Parity contract | **Split contract** (answered "2 and 3"): `match_all_streams` and below stay strict-parity; match/heal become Rust-native products. README parity claims get rewritten to say exactly this. |
 | Q3 | Fix scope | **Full remediation roadmap** (Section 7, all phases), not just the weekend pass. |
 | Q4 | AI authority | AI may **promote within the verify band**, never veto a heuristic win. Fix M5 defects (fallback walk, single record, same allowlist, concurrent calls). Heal stays heuristic-only, documented. |
 | Q5 | Heal semantics | **Plugin-style reporting**: sub-threshold working replacements are recorded (`SKIPPED_LOW_CONFIDENCE` / `REPLACEMENT_PREVIEW`) but never applied. H2 is a bug, fix it. |
@@ -347,7 +347,7 @@ corrections (Docker steps, parity-claim scoping, SSE→polling, override-skip di
 ### Revised roadmap (supersedes Section 7 ordering where they conflict)
 
 1. **Safety weekend pass** — H2 heal walk, H6 duplicate names, H1 CSRF+confirm, H5 shutdown drain, H7 strict config, M3 `0600` config saves, M7 ignore files. Nothing unattended before this lands.
-2. **Parity made real** — submodule the plugin (Q12), commit `normalize_io`, extend the gate to duplicate names + non-default flags; rewrite README parity claims to the Q2 split contract. (Automatch/heal-shaped parity walks were dropped per the Q2 split contract: actions are Rust-native, so matching-core walks are covered by the match/score sweep kinds plus janitor unit/E2E tests instead.)3. **Write-path reliability** — H4 POST retry/refresh/chunking; M1 prune at 15 days (Q16); L6 `busy_timeout`.
+2. **Parity made real** — submodule the plugin (Q12), commit `normalize_io`, extend the gate to duplicate names + non-default flags; rewrite README parity claims to the Q2 split contract. (Match/heal-shaped parity walks were dropped per the Q2 split contract: actions are Rust-native, so matching-core walks are covered by the match/score sweep kinds plus guide unit/E2E tests instead.)3. **Write-path reliability** — H4 POST retry/refresh/chunking; M1 prune at 15 days (Q16); L6 `busy_timeout`.
 4. **Hot reload** — config swap + schedule re-arm on save (Q8); M2 resolved by construction.
 5. **Performance for 20k+ interactive** (Q6) — char-vector precompute, query-set hoisting, concurrent programme validation, heal in `spawn_blocking`/rayon, scoring-stage progress.
 6. **AI hardening** (Q4/Q9/Q13) — fallthrough walk, single decision record, run allowlist in requests, concurrent AI calls; live-verify the decision-model + local backends once the provider is named.

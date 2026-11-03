@@ -1,10 +1,10 @@
 [package]
-name = "janitor"
+name = "crosstalk-guide"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "crosstalk sub-app: fast, accurate EPG matcher for Dispatcharr"
+description = "crosstalk sub-app: assign and repair Dispatcharr channels' EPG guides"
 
 [dependencies]
 crosstalk-core.workspace = true

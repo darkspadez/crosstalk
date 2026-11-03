@@ -581,7 +581,7 @@ mod tests {
         assert_eq!(values.text("name"), Some("All"));
     }
 
-    /// A minimal sub-app, so the registry can be tested without depending on janitor (which
+    /// A minimal sub-app, so the registry can be tested without depending on the guide app (which
     /// depends on this crate, so it cannot be referenced here).
     struct StubApp;
 

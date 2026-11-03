@@ -2,7 +2,7 @@
 #
 # This file holds everything the host owns: the Dispatcharr connection, the AI providers,
 # the HTTP listener, the thread pool and the shared name-matching options. Each sub-app has
-# its own file next to this one (janitor.toml, ...) for its thresholds and scope filters.
+# its own file next to this one (guide.toml, ...) for its thresholds and scope filters.
 #
 # Every value can be overridden by an environment variable named CROSSTALK_<SECTION>__<KEY>
 # in upper case, for example CROSSTALK_SERVER__PORT=9100. A double underscore separates
@@ -88,5 +88,5 @@ run_history_days = 15
 # Schedules, as `<app>.<action>` with a cron expression. Five fields (minute hour day month
 # weekday) is what most people write, and six (with seconds) is accepted. They fire in UTC.
 # [schedules]
-# "janitor.automatch_apply" = "0 4 * * *"
-# "janitor.heal_apply" = "0 6 * * *"
+# "guide.match_apply" = "0 4 * * *"
+# "guide.heal_apply" = "0 6 * * *"

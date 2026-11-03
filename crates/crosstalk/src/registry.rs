@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 /// Every sub-app compiled into this binary.
 pub fn builtin() -> Registry {
-    Registry::new(vec![Arc::new(janitor::JanitorApp::new())])
+    Registry::new(vec![Arc::new(crosstalk_guide::GuideApp::new())])
 }
 
 #[cfg(test)]
@@ -17,10 +17,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn janitor_is_linked_in() {
+    fn guide_is_linked_in() {
         let registry = builtin();
-        let app = registry.get("janitor").expect("janitor is linked");
-        assert_eq!(app.name(), "EPG Janitor");
+        let app = registry.get("guide").expect("guide is linked");
+        assert_eq!(app.name(), "Guide");
         assert!(!app.actions().is_empty());
         assert!(!app.schema().fields().is_empty());
     }

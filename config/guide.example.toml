@@ -1,6 +1,6 @@
-# EPG Janitor settings.
+# Guide settings.
 #
-# This file holds what Janitor decides for itself: which channels and EPG sources are in
+# This file holds what the guide app decides for itself: which channels and EPG sources are in
 # scope, the confidence thresholds, and how the AI verifier behaves. Anything shared with
 # other sub-apps (normalisation toggles, country databases, aliases) is in crosstalk.toml.
 #
@@ -24,7 +24,7 @@ check_hours = 12
 
 # 0-100. Matches below this are rejected. 95 is strict; lower values accept more matches at
 # higher false-positive risk.
-automatch_confidence_threshold = 95
+match_confidence_threshold = 95
 # Accept an EPG entry with no current schedule. Usually off, but needed for the first
 # auto-match against a freshly added source: Dispatcharr only imports programmes for
 # channels already mapped, so a new source starts empty.
@@ -39,7 +39,7 @@ csv_retention_days = 0
 
 # The heuristics decide first and the model only promotes. It is asked about results in
 # the band below, or about candidates for a channel the heuristics could not match at
-# all. A heuristic result at or above automatch_confidence_threshold is never re-checked
+# all. A heuristic result at or above match_confidence_threshold is never re-checked
 # or vetoed by the model. An AI-accepted pick is still validated for programme data:
 # when every same-name copy is empty the channel is left unmatched with a reason saying
 # so. Heal never consults the model.

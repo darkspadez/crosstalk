@@ -15,7 +15,7 @@
 //!
 //! AI contract (owner Q4): the model may PROMOTE a candidate inside the verify band or above
 //! the rescue floor, and never re-checks or vetoes a heuristic result at or above
-//! `automatch_confidence_threshold` — a confident match never reaches the model at all.
+//! `match_confidence_threshold` — a confident match never reaches the model at all.
 //! An AI-accepted pick replaces the heuristic order for same-name guide entries only: every
 //! same-name copy is tried in ranked order, and when none carries programme data the
 //! channel is left unmatched with a reason saying so. There is deliberately no fallback
@@ -25,7 +25,7 @@
 
 use crate::ai_gate;
 use crate::scope::{ScopedChannels, ScopedEntries};
-use crate::settings::JanitorSettings;
+use crate::settings::GuideSettings;
 use anyhow::{Context, Result};
 use crosstalk_core::csv_report;
 use crosstalk_core::dispatcharr::{EpgEntry, HasPrograms, ProgramWindow, World};
@@ -127,7 +127,7 @@ const BATCH_CHANNELS: usize = 256;
 
 /// What an auto-match run produced.
 #[derive(Debug, Clone, Default)]
-pub struct AutoMatchOutcome {
+pub struct MatchOutcome {
     pub rows: Vec<MatchRow>,
     pub report: Option<PathBuf>,
     /// How many assignments the API confirmed, after an apply.
@@ -143,13 +143,13 @@ pub struct AutoMatchOutcome {
 /// entry.
 pub async fn run(
     context: &JobContext,
-    settings: &JanitorSettings,
+    settings: &GuideSettings,
     ai: Option<&crosstalk_core::ai::AiService>,
     world: &World,
     scoped_channels: &ScopedChannels,
     scoped_entries: &ScopedEntries,
     dry_run: bool,
-) -> Result<AutoMatchOutcome> {
+) -> Result<MatchOutcome> {
     let client = context.dispatcharr()?;
     let config = context.config();
 
@@ -174,7 +174,7 @@ pub async fn run(
 
     let total = scoped_channels.channels.len() as u64;
     context.progress(&ProgressEvent::new(
-        "janitor.automatch",
+        "guide.match",
         0,
         total,
         "scoring channels",
@@ -211,7 +211,7 @@ pub async fn run(
                         let prev = max_sent.fetch_max(done, Ordering::Relaxed);
                         if done > prev {
                             progress.progress(&ProgressEvent::new(
-                                "janitor.automatch",
+                                "guide.match",
                                 done as u64,
                                 total_channels as u64,
                                 "scoring channels",
@@ -228,7 +228,7 @@ pub async fn run(
     };
 
     context.progress(&ProgressEvent::new(
-        "janitor.automatch",
+        "guide.match",
         total,
         total,
         "validating candidates",
@@ -236,7 +236,7 @@ pub async fn run(
 
     // Stage 2: validation, in score order, memoised by the client.
     let window = ProgramWindow::ahead(settings.check_hours);
-    let threshold = settings.automatch_confidence_threshold;
+    let threshold = settings.match_confidence_threshold;
     let allow_without_programs = settings.allow_epg_without_programs;
     let source_names: HashMap<i64, String> = scoped_entries
         .sources
@@ -401,7 +401,7 @@ pub async fn run(
         // Progress after each batch so the network phases are not silent on big
         // scopes, and an abort as soon as a cancel landed inside the batch.
         context.progress(&ProgressEvent::new(
-            "janitor.automatch",
+            "guide.match",
             batch_end as u64,
             total,
             "validating candidates",
@@ -511,7 +511,7 @@ pub async fn run(
 
         if rows.len() % 200 == 0 {
             context.progress(&ProgressEvent::new(
-                "janitor.automatch",
+                "guide.match",
                 rows.len() as u64,
                 total,
                 "validating candidates",
@@ -567,7 +567,7 @@ pub async fn run(
         );
     }
 
-    Ok(AutoMatchOutcome {
+    Ok(MatchOutcome {
         rows,
         report,
         applied,
@@ -777,7 +777,7 @@ fn reason_for(
 
 fn write_report(
     context: &JobContext,
-    settings: &JanitorSettings,
+    settings: &GuideSettings,
     scoped_channels: &ScopedChannels,
     rows: &[MatchRow],
     matched: &[&MatchRow],
@@ -785,9 +785,9 @@ fn write_report(
 ) -> Result<Option<PathBuf>> {
     let exports_dir = context.exports_dir();
     let stem = if dry_run {
-        "automatch_preview"
+        "match_preview"
     } else {
-        "automatch_applied"
+        "match_applied"
     };
     let path = csv_report::report_path(&exports_dir, stem);
 
@@ -862,7 +862,7 @@ fn write_report(
 }
 
 /// The outcome the runner records.
-pub fn outcome(result: &AutoMatchOutcome, dry_run: bool) -> JobOutcome {
+pub fn outcome(result: &MatchOutcome, dry_run: bool) -> JobOutcome {
     let matched = result
         .rows
         .iter()
@@ -1100,7 +1100,7 @@ mod tests {
     }
 
     fn scoped(world: &World) -> (ScopedChannels, ScopedEntries) {
-        let settings = JanitorSettings::default();
+        let settings = GuideSettings::default();
         (
             crate::scope::scope_channels(world, &settings).expect("channels"),
             crate::scope::scope_entries(world, ""),
@@ -1119,7 +1119,7 @@ mod tests {
                 .expect("fixture wires a client")
                 .clone(),
         );
-        let settings = JanitorSettings::default();
+        let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
 
         run(&context, &settings, None, &world, &channels, &entries, true)
@@ -1129,9 +1129,7 @@ mod tests {
         let scoring: Vec<_> = sink
             .events()
             .into_iter()
-            .filter(|event| {
-                event.action == "janitor.automatch" && event.phase == "scoring channels"
-            })
+            .filter(|event| event.action == "guide.match" && event.phase == "scoring channels")
             .collect();
         assert!(!scoring.is_empty(), "the scoring stage reported progress");
         let last = scoring.last().expect("at least one scoring event");
@@ -1144,7 +1142,7 @@ mod tests {
         // wiremock would report an unmatched request only for a path with no mock, so the
         // guard is the `applied` count.
         let (_server, world, context) = fixture("espn.us").await;
-        let settings = JanitorSettings::default();
+        let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
 
         let result = run(&context, &settings, None, &world, &channels, &entries, true)
@@ -1174,7 +1172,7 @@ mod tests {
         assert_eq!(result.applied, 0);
         let report = result.report.expect("report written");
         let text = std::fs::read_to_string(&report).expect("read report");
-        assert!(text.contains("# EPG Janitor"));
+        assert!(text.contains("# crosstalk guide"));
         assert!(text.contains("channel_name,channel_number"));
         assert!(text.contains("ESPN HD"));
     }
@@ -1182,7 +1180,7 @@ mod tests {
     #[tokio::test]
     async fn an_apply_writes_the_assignment() {
         let (_server, world, context) = fixture("espn.us").await;
-        let settings = JanitorSettings::default();
+        let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
 
         let result = run(
@@ -1197,7 +1195,7 @@ mod tests {
     async fn a_candidate_without_programmes_is_rejected() {
         // The only entry has no programmes, so nothing may be applied even though it scores.
         let (_server, world, context) = fixture("some-other-tvg").await;
-        let settings = JanitorSettings::default();
+        let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
 
         let result = run(&context, &settings, None, &world, &channels, &entries, true)
@@ -1215,9 +1213,9 @@ mod tests {
     #[tokio::test]
     async fn allow_without_programs_accepts_an_empty_guide() {
         let (_server, world, context) = fixture("some-other-tvg").await;
-        let settings = JanitorSettings {
+        let settings = GuideSettings {
             allow_epg_without_programs: true,
-            ..JanitorSettings::default()
+            ..GuideSettings::default()
         };
         let (channels, entries) = scoped(&world);
         let result = run(&context, &settings, None, &world, &channels, &entries, true)
@@ -1289,19 +1287,19 @@ mod tests {
     fn ai_settings(
         probability: f64,
         calls: Arc<AtomicUsize>,
-    ) -> (crosstalk_core::ai::AiService, JanitorSettings) {
+    ) -> (crosstalk_core::ai::AiService, GuideSettings) {
         let service = crosstalk_core::ai::AiService::with_decider(
             "typesafe",
             Arc::new(FixedDecider { probability, calls }),
         );
-        let settings = JanitorSettings {
+        let settings = GuideSettings {
             ai: crate::settings::AiSettings {
                 enabled: true,
                 provider: "typesafe".to_string(),
                 model: "stub".to_string(),
                 ..crate::settings::AiSettings::default()
             },
-            ..JanitorSettings::default()
+            ..GuideSettings::default()
         };
         (service, settings)
     }
@@ -1489,7 +1487,7 @@ mod tests {
 
         let store = crosstalk_core::store::Store::in_memory().expect("store");
         let run_id = store
-            .start_run("janitor", "automatch_preview", true)
+            .start_run("guide", "match_preview", true)
             .expect("run");
         let context = JobContext::new(base_context.config_arc(), Arc::new(VecSink::new()))
             .with_dispatcharr(
@@ -1551,20 +1549,20 @@ mod tests {
         .await;
         let service =
             crosstalk_core::ai::AiService::with_decider("typesafe", Arc::new(FailingDecider));
-        let settings = JanitorSettings {
+        let settings = GuideSettings {
             ai: crate::settings::AiSettings {
                 enabled: true,
                 provider: "typesafe".to_string(),
                 model: "stub".to_string(),
                 ..crate::settings::AiSettings::default()
             },
-            ..JanitorSettings::default()
+            ..GuideSettings::default()
         };
         let (channels, entries) = scoped(&world);
 
         let store = crosstalk_core::store::Store::in_memory().expect("store");
         let run_id = store
-            .start_run("janitor", "automatch_preview", true)
+            .start_run("guide", "match_preview", true)
             .expect("run");
         let context = JobContext::new(base_context.config_arc(), Arc::new(VecSink::new()))
             .with_dispatcharr(
@@ -1758,7 +1756,7 @@ mod tests {
         let (_server, mut world, context) = fixture("espn.us").await;
         world.channels[0].epg_data_id = Some(99);
         world.channels[0].effective_epg_data_id = Some(7);
-        let settings = JanitorSettings::default();
+        let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
 
         let result = run(&context, &settings, None, &world, &channels, &entries, true)
@@ -1900,7 +1898,7 @@ mod tests {
     #[test]
     fn the_outcome_reports_the_counts() {
         let outcome = outcome(
-            &AutoMatchOutcome {
+            &MatchOutcome {
                 rows: vec![row("A", 100, Some(1)), row("B", 0, None)],
                 report: Some(PathBuf::from("/exports/a.csv")),
                 applied: 1,
@@ -1921,7 +1919,7 @@ mod tests {
         // (and the in-future checks) must abort instead of validating.
         let (_server, world, context) = fixture("espn.us").await;
         context.cancel();
-        let settings = JanitorSettings::default();
+        let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
         let error = run(&context, &settings, None, &world, &channels, &entries, true)
             .await
@@ -1934,7 +1932,7 @@ mod tests {
         // formulas when the CSV is opened. The writer prefixes such cells with a quote.
         // `=ESPN` still normalises to ESPN, so the match itself is unaffected.
         let (_server, world, context) = fixture_full("espn.us", "=ESPN", "=ESPN HD").await;
-        let settings = JanitorSettings::default();
+        let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
         let result = run(&context, &settings, None, &world, &channels, &entries, true)
             .await

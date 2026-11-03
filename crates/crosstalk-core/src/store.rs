@@ -14,6 +14,12 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+/// The data version, kept in `PRAGMA user_version`.
+///
+/// The schema itself is created with `IF NOT EXISTS`, so it needs no version; what does need
+/// one is the one-time rename of recorded history below, which must not run twice.
+const DATA_VERSION: i64 = 1;
+
 /// How a run ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -229,6 +235,7 @@ impl Store {
                  finished_at = COALESCE(finished_at, ?1) WHERE status = 'running'",
                 params![chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)],
             )?;
+            rename_recorded_history(connection)?;
             Ok(())
         })
     }
@@ -526,6 +533,39 @@ impl Store {
     }
 }
 
+/// Rename the pre-rename history once: the sub-app is `guide` and its matching actions are
+/// `match_*`.
+///
+/// The store records what it was told, so a database written by an earlier build would show
+/// the old names in the UI and make `recent_runs_for("guide")` miss every old run. The rewrite
+/// is one transaction, and the version stamp makes it idempotent: a later open sees
+/// `DATA_VERSION` and touches nothing. Nothing else is renamed — the old rows carry no other
+/// reference to the app.
+fn rename_recorded_history(connection: &Connection) -> Result<()> {
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version >= DATA_VERSION {
+        return Ok(());
+    }
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute("UPDATE runs SET app = 'guide' WHERE app = 'janitor'", [])?;
+    transaction.execute(
+        "UPDATE runs SET action = 'match_preview' WHERE action = 'automatch_preview'",
+        [],
+    )?;
+    transaction.execute(
+        "UPDATE runs SET action = 'match_apply' WHERE action = 'automatch_apply'",
+        [],
+    )?;
+    transaction.execute(
+        "UPDATE settings_history SET app = 'guide' WHERE app = 'janitor'",
+        [],
+    )?;
+    // `PRAGMA` takes no bound parameter, and the value is a constant of this build.
+    transaction.execute_batch(&format!("PRAGMA user_version = {DATA_VERSION}"))?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn map_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
     let counts: String = row.get(8)?;
     let status: String = row.get(6)?;
@@ -570,7 +610,7 @@ mod tests {
     fn a_run_round_trips() {
         let store = Store::in_memory().expect("store");
         let run_id = store
-            .start_run("janitor", "automatch_apply", false)
+            .start_run("guide", "match_apply", false)
             .expect("start");
 
         let running = store.run(run_id).expect("run").expect("present");
@@ -608,9 +648,7 @@ mod tests {
     #[test]
     fn rows_are_replaced_not_duplicated() {
         let store = Store::in_memory().expect("store");
-        let run_id = store
-            .start_run("janitor", "heal_apply", true)
-            .expect("start");
+        let run_id = store.start_run("guide", "heal_apply", true).expect("start");
         store
             .append_rows(run_id, &[sample_row(0, "ESPN", 100)])
             .expect("first");
@@ -626,7 +664,7 @@ mod tests {
     fn ai_decisions_round_trip() {
         let store = Store::in_memory().expect("store");
         let run_id = store
-            .start_run("janitor", "automatch_preview", true)
+            .start_run("guide", "match_preview", true)
             .expect("start");
         let decision = AiDecision {
             row_ordinal: 3,
@@ -653,7 +691,7 @@ mod tests {
     fn recent_runs_are_newest_first_and_filterable() {
         let store = Store::in_memory().expect("store");
         let first = store
-            .start_run("janitor", "automatch_preview", true)
+            .start_run("guide", "match_preview", true)
             .expect("start");
         // SQLite's timestamp resolution is a second, so order by id as well; this sleeps to
         // make the timestamps differ where the platform allows it.
@@ -665,9 +703,9 @@ mod tests {
         assert_eq!(all[0].id, second);
         assert_eq!(all[1].id, first);
 
-        let janitor_only = store.recent_runs_for("janitor", 10).expect("runs");
-        assert_eq!(janitor_only.len(), 1);
-        assert_eq!(janitor_only[0].id, first);
+        let guide_only = store.recent_runs_for("guide", 10).expect("runs");
+        assert_eq!(guide_only.len(), 1);
+        assert_eq!(guide_only[0].id, first);
 
         assert_eq!(store.run_count().expect("count"), 2);
     }
@@ -676,7 +714,7 @@ mod tests {
     fn settings_changes_are_recorded() {
         let store = Store::in_memory().expect("store");
         store
-            .record_settings_change("janitor", &serde_json::json!({"check_hours": 6}))
+            .record_settings_change("guide", &serde_json::json!({"check_hours": 6}))
             .expect("record");
         let count: i64 = store
             .with_connection(|connection| {
@@ -694,7 +732,7 @@ mod tests {
     fn pruning_keeps_recent_runs_and_a_minimum() {
         let store = Store::in_memory().expect("store");
         let run_id = store
-            .start_run("janitor", "automatch_preview", true)
+            .start_run("guide", "match_preview", true)
             .expect("start");
         store
             .finish_run(
@@ -726,7 +764,7 @@ mod tests {
     fn pruning_off_by_default() {
         let store = Store::in_memory().expect("store");
         store
-            .start_run("janitor", "automatch_preview", true)
+            .start_run("guide", "match_preview", true)
             .expect("start");
         assert_eq!(store.prune(0, 0).expect("prune"), 0);
         assert_eq!(store.run_count().expect("count"), 1);
@@ -736,7 +774,7 @@ mod tests {
     fn a_running_run_is_never_pruned() {
         let store = Store::in_memory().expect("store");
         let run_id = store
-            .start_run("janitor", "automatch_apply", false)
+            .start_run("guide", "match_apply", false)
             .expect("start");
         let old = (chrono::Utc::now() - chrono::Duration::days(30))
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -768,7 +806,7 @@ mod tests {
         {
             let store = Store::open(&path).expect("open");
             let run_id = store
-                .start_run("janitor", "automatch_preview", true)
+                .start_run("guide", "match_preview", true)
                 .expect("start");
             store
                 .finish_run(
@@ -782,5 +820,127 @@ mod tests {
         }
         let store = Store::open(&path).expect("reopen");
         assert_eq!(store.run_count().expect("count"), 1);
+    }
+
+    #[test]
+    fn a_fresh_database_is_stamped_without_touching_history() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("crosstalk.db");
+        let store = Store::open(&path).expect("open");
+        let version: i64 = store
+            .with_connection(|connection| {
+                connection
+                    .query_row("PRAGMA user_version", [], |row| row.get(0))
+                    .map_err(Into::into)
+            })
+            .expect("version");
+        assert_eq!(version, DATA_VERSION);
+        // A fresh database has nothing to rename and stays usable.
+        let run_id = store
+            .start_run("guide", "match_preview", true)
+            .expect("start");
+        assert_eq!(store.recent_runs_for("guide", 10).expect("runs").len(), 1);
+        assert_eq!(
+            store.run(run_id).expect("run").expect("present").app,
+            "guide"
+        );
+    }
+
+    #[test]
+    fn an_old_history_is_renamed_and_only_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("crosstalk.db");
+        {
+            let store = Store::open(&path).expect("open");
+            for (action, dry_run) in [("automatch_preview", true), ("automatch_apply", false)] {
+                let run_id = store.start_run("janitor", action, dry_run).expect("start");
+                store
+                    .finish_run(
+                        run_id,
+                        RunStatus::Succeeded,
+                        Some("ok"),
+                        &serde_json::json!({}),
+                        None,
+                    )
+                    .expect("finish");
+            }
+            // A heal run keeps its action: only the app is renamed.
+            let heal_id = store
+                .start_run("janitor", "heal_preview", true)
+                .expect("start");
+            store
+                .finish_run(
+                    heal_id,
+                    RunStatus::Succeeded,
+                    Some("ok"),
+                    &serde_json::json!({}),
+                    None,
+                )
+                .expect("finish");
+            // A row already written under the new name must survive untouched.
+            let guide_id = store
+                .start_run("guide", "match_preview", true)
+                .expect("start");
+            store
+                .finish_run(
+                    guide_id,
+                    RunStatus::Succeeded,
+                    Some("ok"),
+                    &serde_json::json!({}),
+                    None,
+                )
+                .expect("finish");
+            store
+                .record_settings_change("janitor", &serde_json::json!({"check_hours": 6}))
+                .expect("record");
+            // Rewind the stamp: this is what a database written before the rename looks like.
+            store
+                .with_connection(|connection| {
+                    connection
+                        .execute_batch("PRAGMA user_version = 0")
+                        .map_err(Into::into)
+                })
+                .expect("rewind");
+        }
+
+        let store = Store::open(&path).expect("reopen");
+        let runs = store.recent_runs_for("guide", 10).expect("runs");
+        assert_eq!(runs.len(), 4);
+        // Newest first: the pre-existing guide row was written last.
+        assert_eq!(runs[0].action, "match_preview");
+        assert!(runs.iter().all(|run| run.app == "guide"));
+        let actions: Vec<&str> = runs.iter().map(|run| run.action.as_str()).collect();
+        assert!(actions.contains(&"match_apply"));
+        assert!(actions.contains(&"heal_preview"));
+        // The heal run kept its action; only the app was renamed.
+        let heal = runs
+            .iter()
+            .find(|run| run.action == "heal_preview")
+            .expect("heal");
+        assert_eq!(heal.app, "guide");
+        assert!(store
+            .recent_runs_for("janitor", 10)
+            .expect("runs")
+            .is_empty());
+
+        let apps: Vec<String> = store
+            .with_connection(|connection| {
+                let mut statement = connection.prepare("SELECT app FROM settings_history")?;
+                let apps = statement
+                    .query_map([], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()?;
+                Ok(apps)
+            })
+            .expect("settings history");
+        assert_eq!(apps, vec!["guide".to_string()]);
+
+        // A second open is a no-op: the stamp says the rewrite already ran, so a row written
+        // afterwards keeps whatever app it was given.
+        store
+            .start_run("janitor", "automatch_apply", false)
+            .expect("start");
+        let store = Store::open(&path).expect("reopen again");
+        assert_eq!(store.recent_runs_for("janitor", 10).expect("runs").len(), 1);
+        assert_eq!(store.recent_runs_for("guide", 10).expect("runs").len(), 4);
     }
 }

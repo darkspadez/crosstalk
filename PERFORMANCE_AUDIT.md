@@ -30,7 +30,7 @@ build — is noise by comparison.
 | Programme validation (concurrent @8, target) | ~7–25 s | ~7–25 s | client semaphore |
 | AI gate (serial, today, if 10% of channels qualify) | ~100–600 s | same | provider RTT |
 | SQLite record 20k rows | 0.04 s | — | — |
-| **Total automatch today (typical)** | **~1–3 min** | **~2–4 min** | **validation** |
+| **Total match run today (typical)** | **~1–3 min** | **~2–4 min** | **validation** |
 | **Total after Phase 5 (target)** | **< 30 s** | **< 45 s** | scoring |
 
 So: **do the perf audit now (done), implement in roadmap order, re-audit after Phase 5.**
@@ -47,7 +47,7 @@ cancel/shutdown can strand a run, AUDIT H5).
 | Operation | Throughput | Per call | Notes |
 |---|---|---|---|
 | `normalize_name` | 36,600 /s | 27 µs | Expensive for a string function; regex-table driven |
-| `normalize_name` + 4 janitor tags | 27,900 /s | 36 µs | Tag path costs +33% (tag-regex cache lock ×4/call) |
+| `normalize_name` + 4 guide tags | 27,900 /s | 36 µs | Tag path costs +33% (tag-regex cache lock ×4/call) |
 | `calculate_similarity` (short names) | 1,690,000 /s | 0.6 µs | |
 | `calculate_similarity` (long, similar) | 292,000 /s | 3.4 µs | Full DP, no early exit benefit |
 | `CandidateIndex::build` | ~29,000 names/s | 35 µs/name | 100→13 ms, 1k→35 ms, 5k→188 ms, 20k→693 ms |
@@ -94,8 +94,8 @@ Local fake server, 5 ms artificial delay (≈9 ms real RTT with overhead):
 | 5,000 | ~45 s | ~6 s |
 | 20,000 | ~180 s | ~23 s |
 
-Automatch stage 2 (`automatch.rs:198-327`), heal step 1 (`heal.rs:138-161`) and the AI gate
-(`automatch.rs:241`) all `await` one request at a time inside the per-channel loop. The
+Match stage 2 (`matching.rs:198-327`), heal step 1 (`heal.rs:138-161`) and the AI gate
+(`matching.rs:241`) all `await` one request at a time inside the per-channel loop. The
 client's semaphore (`dispatcharr.rs`, cap 8) can never be contended by a single serial caller
 — it only helps if callers are spawned concurrently. Memoisation (`DashMap` per
 `(tvg_id, source, window)`) caps the damage at *distinct* entries, which on a first run
@@ -122,21 +122,21 @@ SQLite is not a problem at this scale. The M1 retention issue in AUDIT.md is abo
 ## 3. Findings (prioritized)
 
 ### P1 — Serial programme validation dominates every real run
-`automatch.rs:198+`, `heal.rs:138+`. See §2.4. **Fix in Phase 3, not Phase 5:**
+`matching.rs:198+`, `heal.rs:138+`. See §2.4. **Fix in Phase 3, not Phase 5:**
 `buffer_unordered(client_concurrency)` over channels needing checks; keep memoisation.
 *Acceptance: 5,000 distinct checks < 10 s against a 5 ms-delay fake.*
 
 ### P2 — AI gate is serial and multiplies P1 when enabled
-`automatch.rs:241` awaits one provider request per qualifying channel. At Jev-class latency
+`matching.rs:241` awaits one provider request per qualifying channel. At Jev-class latency
 (70–500 ms per the TypeSafe docs), 2,000 qualifying channels = **2–17 minutes** serial.
 *Fix: same concurrent fan-out, bounded by the provider's `max_concurrency` (8).*
 *Acceptance: 500 AI decisions < 30 s against a 200 ms-delay fake.*
 
 ### P3 — Heal blocks a Tokio worker for its whole scoring loop
-`heal.rs:190-268` runs O(broken × entries) synchronously in `async fn` — unlike automatch's
-`spawn_blocking`+rayon (`automatch.rs:161`). On the daemon this stalls an HTTP worker for
+`heal.rs:190-268` runs O(broken × entries) synchronously in `async fn` — unlike matching's
+`spawn_blocking`+rayon (`matching.rs:161`). On the daemon this stalls an HTTP worker for
 the duration (page latency above was measured *without* a heal running).
-*Fix: `spawn_blocking` + rayon over broken channels, same as automatch.*
+*Fix: `spawn_blocking` + rayon over broken channels, same as matching.*
 *Acceptance: `/health` stays < 50 ms during a 5k-broken-channel heal.*
 
 ### P4 — `simulate` (the parity oracle) is single-threaded
@@ -162,8 +162,8 @@ it's pure repeated work when the entry list hasn't changed between runs.
 *Fix (optional, after P5): cache the index keyed by (entry-set hash, flags, alias hash) in
 the daemon.* *Acceptance: second consecutive run's build stage < 50 ms.*
 
-### P7 — No progress during automatch scoring stage
-`automatch.rs:161-176`: the rayon stage emits nothing until it finishes (the `counter`
+### P7 — No progress during the match scoring stage
+`matching.rs:161-176`: the rayon stage emits nothing until it finishes (the `counter`
 atomic is incremented and never read). At 20k×20k that's ~12 s of UI silence — tolerable;
 at sequential speeds it wouldn't be. *Fix: report from the atomic every ~500 channels via
 the existing paced sink.*
@@ -184,7 +184,7 @@ Re-run, on the same machine class, and compare against §2:
 2. `crosstalk simulate` 5k×5k — target < 5 s, output still `cmp`-identical to Python.
 3. Fake-Dispatcharr latency test (5 ms delay) — 5k distinct programme checks < 10 s;
    500 AI decisions (200 ms delay) < 30 s; `/health` < 50 ms during a heal.
-4. End-to-end automatch on the live instance (AUDIT roadmap Phase 7): 20k channels,
+4. End-to-end match run on the live instance (AUDIT roadmap Phase 7): 20k channels,
    target < 30 s preview wall time.
 
 If a target is missed, the re-audit files it as a new finding rather than re-litigating

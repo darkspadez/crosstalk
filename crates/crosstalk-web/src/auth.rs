@@ -256,7 +256,7 @@ mod tests {
         assert!(is_public("/static/app.css"));
         assert!(is_public("/health"));
         assert!(!is_public("/"));
-        assert!(!is_public("/apps/janitor"));
+        assert!(!is_public("/apps/guide"));
     }
 }
 

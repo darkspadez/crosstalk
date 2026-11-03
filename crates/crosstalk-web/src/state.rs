@@ -495,8 +495,8 @@ mod tests {
     fn counts_skip_zeroes() {
         let run = RunRecord {
             id: 1,
-            app: "janitor".to_string(),
-            action: "automatch".to_string(),
+            app: "guide".to_string(),
+            action: "match".to_string(),
             dry_run: true,
             started_at: String::new(),
             finished_at: None,

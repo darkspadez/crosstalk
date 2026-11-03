@@ -1,4 +1,4 @@
-//! `janitor`: crosstalk's EPG matcher sub-app.
+//! `guide`: crosstalk's EPG assignment sub-app.
 //!
 //! The matching pipeline lives in `crosstalk-matching`; this crate owns the operator-facing
 //! half: the actions, the settings, the scope filters, the reports, and the AI gate.
@@ -9,8 +9,8 @@
 //! usage counter.
 
 pub mod ai_gate;
-pub mod automatch;
 pub mod heal;
+pub mod matching;
 pub mod scope;
 pub mod settings;
 
@@ -22,8 +22,8 @@ use crosstalk_core::subapp::{
 use std::path::Path;
 use std::sync::OnceLock;
 
-pub const APP_ID: &str = "janitor";
-pub const APP_NAME: &str = "EPG Janitor";
+pub const APP_ID: &str = "guide";
+pub const APP_NAME: &str = "Guide";
 
 /// Build the alias table for a run: the built-ins plus any custom entries in the host config.
 pub fn matcher_aliases(context: &JobContext) -> crosstalk_matching::alias::AliasMap {
@@ -74,23 +74,23 @@ pub fn tag_list(flags: crosstalk_matching::normalize::NormalizeFlags) -> Vec<Str
 
 /// The action ids, as used in schedules and URLs.
 pub const ACTION_VALIDATE: &str = "validate";
-pub const ACTION_AUTOMATCH_PREVIEW: &str = "automatch_preview";
-pub const ACTION_AUTOMATCH_APPLY: &str = "automatch_apply";
+pub const ACTION_MATCH_PREVIEW: &str = "match_preview";
+pub const ACTION_MATCH_APPLY: &str = "match_apply";
 pub const ACTION_HEAL_PREVIEW: &str = "heal_preview";
 pub const ACTION_HEAL_APPLY: &str = "heal_apply";
 pub const ACTION_STATUS: &str = "status";
 
 /// The sub-app itself.
 #[derive(Debug, Default)]
-pub struct JanitorApp;
+pub struct GuideApp;
 
-impl JanitorApp {
+impl GuideApp {
     pub fn new() -> Self {
         Self
     }
 }
 
-impl SubApp for JanitorApp {
+impl SubApp for GuideApp {
     fn id(&self) -> &'static str {
         APP_ID
     }
@@ -124,14 +124,14 @@ impl SubApp for JanitorApp {
             // Reads the run store, not Dispatcharr.
             .offline(),
             ActionSpec::new(
-                ACTION_AUTOMATCH_PREVIEW,
+                ACTION_MATCH_PREVIEW,
                 "Preview Auto-Match (Dry Run)",
                 "Score every in-scope channel against the eligible EPG entries and write a \
                  CSV. Changes nothing.",
                 ActionKind::Read,
             ),
             ActionSpec::new(
-                ACTION_AUTOMATCH_APPLY,
+                ACTION_MATCH_APPLY,
                 "Apply Auto-Match EPG Assignments",
                 "Assign the matched EPG entry to every channel that clears the confidence \
                  threshold.",
@@ -211,7 +211,7 @@ impl SubApp for JanitorApp {
     }
 }
 
-impl JanitorApp {
+impl GuideApp {
     async fn dispatch(
         &self,
         action: &str,
@@ -221,8 +221,8 @@ impl JanitorApp {
         match action {
             ACTION_VALIDATE => self.validate(context),
             ACTION_STATUS => Ok(self.status(context)),
-            ACTION_AUTOMATCH_PREVIEW => self.auto_match(context, true).await,
-            ACTION_AUTOMATCH_APPLY => self.auto_match(context, dry_run).await,
+            ACTION_MATCH_PREVIEW => self.auto_match(context, true).await,
+            ACTION_MATCH_APPLY => self.auto_match(context, dry_run).await,
             ACTION_HEAL_PREVIEW => self.heal(context, true).await,
             ACTION_HEAL_APPLY => self.heal(context, dry_run).await,
             other => bail!("{APP_NAME} has no action {other:?}"),
@@ -239,7 +239,7 @@ impl JanitorApp {
 
         let client = context.dispatcharr()?;
         context.progress(&crosstalk_core::jobs::ProgressEvent::new(
-            ACTION_AUTOMATCH_PREVIEW,
+            ACTION_MATCH_PREVIEW,
             0,
             0,
             "loading Dispatcharr data",
@@ -275,7 +275,7 @@ impl JanitorApp {
             None
         };
 
-        let result = automatch::run(
+        let result = matching::run(
             context,
             &settings,
             ai.as_ref(),
@@ -285,7 +285,7 @@ impl JanitorApp {
             dry_run,
         )
         .await?;
-        Ok(automatch::outcome(&result, dry_run))
+        Ok(matching::outcome(&result, dry_run))
     }
 
     /// Preview or apply scan-and-heal.
@@ -378,8 +378,8 @@ mod tests {
     use crosstalk_core::config::CrosstalkConfig;
     use crosstalk_core::subapp::FieldValue;
 
-    fn app() -> JanitorApp {
-        JanitorApp::new()
+    fn app() -> GuideApp {
+        GuideApp::new()
     }
 
     #[test]
@@ -390,8 +390,8 @@ mod tests {
             vec![
                 ACTION_VALIDATE,
                 ACTION_STATUS,
-                ACTION_AUTOMATCH_PREVIEW,
-                ACTION_AUTOMATCH_APPLY,
+                ACTION_MATCH_PREVIEW,
+                ACTION_MATCH_APPLY,
                 ACTION_HEAL_PREVIEW,
                 ACTION_HEAL_APPLY,
             ]
@@ -414,10 +414,10 @@ mod tests {
         // Blue reads.
         assert_eq!(kind(ACTION_VALIDATE), ActionKind::Read);
         assert_eq!(kind(ACTION_STATUS), ActionKind::Read);
-        assert_eq!(kind(ACTION_AUTOMATCH_PREVIEW), ActionKind::Read);
+        assert_eq!(kind(ACTION_MATCH_PREVIEW), ActionKind::Read);
         assert_eq!(kind(ACTION_HEAL_PREVIEW), ActionKind::Read);
         // Auto-match can move an assignment that already works: red.
-        assert_eq!(kind(ACTION_AUTOMATCH_APPLY), ActionKind::Destructive);
+        assert_eq!(kind(ACTION_MATCH_APPLY), ActionKind::Destructive);
         // Heal only replaces assignments it proved empty, and removes none: orange.
         assert_eq!(kind(ACTION_HEAL_APPLY), ActionKind::Write);
     }
@@ -427,7 +427,7 @@ mod tests {
         let actions = app().actions();
         let apply = actions
             .iter()
-            .find(|action| action.id == ACTION_AUTOMATCH_APPLY)
+            .find(|action| action.id == ACTION_MATCH_APPLY)
             .expect("apply action");
         assert_eq!(apply.kind, ActionKind::Destructive);
         assert!(apply.confirm.is_some());
@@ -435,7 +435,7 @@ mod tests {
 
         let preview = actions
             .iter()
-            .find(|action| action.id == ACTION_AUTOMATCH_PREVIEW)
+            .find(|action| action.id == ACTION_MATCH_PREVIEW)
             .expect("preview action");
         assert_eq!(preview.kind, ActionKind::Read);
         assert!(!preview.kind.touches_channels());
@@ -542,7 +542,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let context = JobContext::for_tests(CrosstalkConfig::load(dir.path()).expect("load"));
         let error = app()
-            .dispatch(ACTION_AUTOMATCH_APPLY, &context, false)
+            .dispatch(ACTION_MATCH_APPLY, &context, false)
             .await
             .expect_err("no session");
         // The settings load first, and with the shipped defaults they are valid, so the

@@ -1,4 +1,8 @@
-# Crosstalk: Rust host for Dispatcharr tools, with Janitor as the first sub-app
+# Crosstalk: Rust host for Dispatcharr tools, with guide as the first sub-app
+
+> This file records the original build plan for the first sub-app. `guide` was called
+> `janitor` while that plan was written; the names below are the current ones. The plan for
+> the four sub-apps (guide, streams, lineup, events) is `plans/plugin-consolidation.md`.
 
 ## Context
 
@@ -9,7 +13,7 @@ substring, token-sort Levenshtein) with sibling-number, time-shift, regional and
 callsign-anchor guards. That pipeline beats Dispatcharr's built-in mapper.
 
 Goal: rebuild it as `crosstalk`, a long-running Rust daemon that hosts multiple sub-apps.
-`janitor` is the first: a fast, multi-threaded, accurate EPG matcher for Dispatcharr.
+`guide` is the first: a fast, multi-threaded, accurate EPG matcher for Dispatcharr.
 Because matching is a yes/no decision, an optional AI verifier using TypeSafe's System One
 models (Jev) is wired in at the host level so any sub-app can use it.
 
@@ -27,9 +31,9 @@ models (Jev) is wired in at the host level so any sub-app can use it.
 | Parity | Strict parity with the Python matcher first; behaviour changes only behind opt-in flags |
 | AI role | Heuristics primary. AI verifies borderline scores and rescues unmatched channels. High-confidence heuristic matches never hit the AI |
 | AI providers | TypeSafe System One (native) + OpenAI-compatible fallback behind one trait |
-| Model selection | `janitor.toml` names `ai.provider` and `ai.model` literally; `crosstalk.toml` holds provider endpoints, keys, concurrency |
+| Model selection | `guide.toml` names `ai.provider` and `ai.model` literally; `crosstalk.toml` holds provider endpoints, keys, concurrency |
 | Plugin model | Compile-time crates in one Cargo workspace, `SubApp` trait, static registry |
-| Shared options | `crosstalk.toml [matching]`: normalisation toggles, enabled country DBs, custom aliases. `janitor.toml`: thresholds, check window, scope filters, heal sources, AI gates |
+| Shared options | `crosstalk.toml [matching]`: normalisation toggles, enabled country DBs, custom aliases. `guide.toml`: thresholds, check window, scope filters, heal sources, AI gates |
 | Storage | Embedded SQLite (`crosstalk.db`) for runs, results, AI decisions. CSVs still written |
 | Repo | `git init` at crosstalk root; Python plugin moves to `reference/` and is git-ignored |
 
@@ -100,7 +104,7 @@ run checks through a semaphore (default 8), and only check the head of each cand
   irrelevant state hurts. Keep sibling-number, time-shift and region guards in code; send
   only the shortlist; write precise criteria.
 
-### How Janitor uses it (one request per channel that needs AI)
+### How the guide app uses it (one request per channel that needs AI)
 
 State object: `channel` (name, group, number, heuristic-extracted callsign, state, city,
 network) and `candidates[]` (id, name, source name, heuristic score, method). Shortlist =
@@ -119,7 +123,7 @@ Code combines: accept candidate i only if `best == i`, `same_i >= accept_thresho
 "AI undecided". Every AI decision (request id, model, probabilities, latency, tokens) is
 stored in SQLite and shown in the UI.
 
-Two gates in `janitor.toml`:
+Two gates in `guide.toml`:
 - `ai.verify_band = [lo, hi]` (default `[80, 94]`): best heuristic score inside the band
   and below the confidence threshold -> ask AI; an accepted answer promotes the row to
   "AI verified" with score = heuristic score, method suffixed `+ AI`.
@@ -143,7 +147,7 @@ crosstalk/
   Dockerfile, docker-compose.example.yml
   config/
     crosstalk.example.toml
-    janitor.example.toml
+    guide.example.toml
   data/                           # shipped read-only data, embedded with include_dir
     channels/US_channels.json ... MX_channels.json
     us_station_callsigns.json
@@ -156,7 +160,7 @@ crosstalk/
     crosstalk-matching/           # lib: pure matcher (normalise, similarity, callsign, alias,
                                   #      match_all_streams, structural scoring, location). No IO.
     crosstalk-web/                # lib: axum router, Askama templates, htmx partials, SSE, auth
-    janitor/                      # lib: SubApp impl: auto-match, heal, CSV reports, settings schema
+    guide/                        # lib: SubApp impl: match, heal, CSV reports, settings schema
   reference/                      # git-ignored; the Python plugin lives here
   PLAN.md
 ```
@@ -215,30 +219,30 @@ crosstalk/
 - `wildcard.rs`: port of `expand_patterns` (glob via `globset` case-insensitive, literal
   with `ci_plain`).
 
-### Crate: janitor
+### Crate: guide
 
-- `settings.rs`: `JanitorSettings` (profile names, selected/ignore groups, EPG sources
-  to match, check_hours, automatch threshold, allow_epg_without_programs, heal fallback
+- `settings.rs`: `GuideSettings` (profile names, selected/ignore groups, EPG sources
+  to match, check_hours, match threshold, allow_epg_without_programs, heal fallback
   sources, heal threshold, csv_retention_days, `ai { enabled, provider, model,
   verify_band, rescue, rescue_floor, shortlist, accept/reject/min_confidence }`) plus
   the schema with the Python labels and help text.
 - `scope.rs`: resolve groups / ignore groups / profiles / EPG sources against the API
   (validation errors identical in meaning to `_validate_and_filter_groups`), order EPG
   entries by source priority, drop inactive sources.
-- `automatch.rs`: build `CandidateIndex` once; `par_iter` channels -> ranked candidates
+- `matching.rs`: build `CandidateIndex` once; `par_iter` channels -> ranked candidates
   -> async validation stage (program-data check, then AI gate) -> rows; CSV with the
   Python column set plus `ai_decision`; apply via `batch_set_epg`; record run.
 - `heal.rs`: find broken (assigned but no programmes in window), search replacements
   excluding the current id, statuses `NO_REPLACEMENT_FOUND` / `REPLACEMENT_PREVIEW` /
   `HEALED` / `SKIPPED_LOW_CONFIDENCE`, CSV columns as Python.
 - `reasons.rs`: `match_reason` / `heal_reason` text ported verbatim, with AI suffixes.
-- `lib.rs`: `JanitorApp: SubApp` with actions `validate`, `automatch_preview`,
-  `automatch_apply` (destructive, confirm), `heal_preview`, `heal_apply` (write, confirm).
+- `lib.rs`: `GuideApp: SubApp` with actions `validate`, `match_preview`,
+  `match_apply` (destructive, confirm), `heal_preview`, `heal_apply` (write, confirm).
 
 ### Crate: crosstalk-web
 
 - axum router mounted by the daemon: `/` dashboard (sub-apps, last runs, scheduler),
-  `/apps/janitor` (actions with the Python colour semantics: blue read, green write-no-
+  `/apps/guide` (actions with the Python colour semantics: blue read, green write-no-
   assignment, orange write, red destructive + confirm), `/runs/:id` (progress via SSE,
   results table with filters, reason column, AI panel, CSV download), `/settings`
   (crosstalk + per-app forms generated from `SettingsSchema`, validation errors inline),
@@ -248,10 +252,10 @@ crosstalk/
 
 ### Crate: crosstalk (bin)
 
-- `crosstalk serve --config /config` (daemon), `crosstalk validate`, `crosstalk run janitor
-  automatch --preview` (one-shot, same code path, for cron users and tests),
-  `crosstalk simulate --channels x.csv --streams y.m3u` (port of `match_sim.py` for the
-  parity oracle).
+- `crosstalk serve --config /config` (daemon), `crosstalk validate`, `crosstalk run guide
+  match --preview` (one-shot, same code path, for cron users and tests),
+  `crosstalk simulate-streams --channels x.csv --streams y.m3u` (port of `match_sim.py` for
+  the parity oracle).
 
 ## Files to create / modify
 
@@ -263,11 +267,11 @@ New repository, so everything is new. The critical paths:
 - `crates/crosstalk-matching/tests/{golden,fuzzy_matcher_port,regressions}.rs` +
   `tests/fixtures/matcher_golden_baseline.json`
 - `crates/crosstalk-core/src/{lib,config,subapp,dispatcharr,ai,jobs,store,csv,wildcard}.rs`
-- `crates/janitor/src/{lib,settings,scope,automatch,heal,reasons}.rs`
+- `crates/guide/src/{lib,settings,scope,matching,heal,reasons}.rs`
 - `crates/crosstalk-web/src/{lib,routes,auth,sse}.rs`, `templates/*.html`, `static/app.css`
 - `crates/crosstalk/src/main.rs`
 - `data/channels/*.json`, `data/us_station_callsigns.json`, `data/aliases.json`
-- `config/crosstalk.example.toml`, `config/janitor.example.toml`
+- `config/crosstalk.example.toml`, `config/guide.example.toml`
 - `Dockerfile`, `docker-compose.example.yml`, `README.md`
 
 ## Reuse
@@ -300,7 +304,7 @@ New repository, so everything is new. The critical paths:
 - [x] Port `alias.rs` and `pipeline.rs` (`CandidateIndex`, `match_all_streams`,
       `find_best_match`); port the behavioural cases from `test_fuzzy_matcher.py` and
       `test_regressions.py` as Rust tests.
-- [x] Build `crosstalk simulate` and diff its per-stream CSV against `tools/match_sim.py`
+- [x] Build `crosstalk simulate-streams` and diff its per-stream CSV against `tools/match_sim.py`
       on the same inputs. Exit criterion: identical scores and methods on the full table.
 
 ### Phase 2: crosstalk-core
@@ -313,16 +317,16 @@ New repository, so everything is new. The critical paths:
 - [x] AI: `Decider` trait, TypeSafe backend (retry, semaphore, decision log), OpenAI-compat
       backend; tests against recorded responses.
 
-### Phase 3: janitor
+### Phase 3: guide
 - [x] Settings + schema, scope resolution, EPG ordering by priority.
 - [x] Auto-match preview/apply with rayon matching stage and async validation stage.
 - [x] Scan & heal preview/apply.
 - [x] AI verify-band and rescue gates; reason text; CSV `ai_decision` column.
-- [x] `crosstalk run janitor ...` one-shot path and `validate`.
+- [x] `crosstalk run guide ...` one-shot path and `validate`.
 
 ### Phase 4: web UI and daemon
 - [x] axum app, auth middleware, login page, dashboard.
-- [x] Janitor action page with colour semantics and confirm dialogs.
+- [x] Guide action page with colour semantics and confirm dialogs.
 - [x] Run page: SSE progress, results table, AI panel, CSV download.
 - [x] Settings pages generated from schemas, TOML write-back with validation.
 - [x] Scheduler UI (enable per action, cron string, next run).
@@ -335,10 +339,10 @@ New repository, so everything is new. The critical paths:
 
 - `cargo test --workspace`: golden baseline, ported matcher tests, CSV/wildcard tests,
   Dispatcharr client against wiremock, AI backends against recorded fixtures.
-- Parity oracle: `crosstalk simulate` vs `python3 tools/match_sim.py` on the same
+- Parity oracle: `crosstalk simulate-streams` vs `python3 tools/match_sim.py` on the same
   channels CSV and M3U; `diff` of `per_stream_matches.csv` must be empty before any
   opt-in flag is added.
-- Live preview against a real Dispatcharr: `crosstalk run janitor automatch --preview`
+- Live preview against a real Dispatcharr: `crosstalk run guide match --preview`
   writes a CSV, changes nothing, and the daemon's run page shows the same rows. Compare
   row-for-row with a Python plugin preview CSV from the same instance.
 - Live apply on a small test group, then confirm `channels_updated` in the API response,

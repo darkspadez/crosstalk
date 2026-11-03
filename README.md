@@ -1,8 +1,8 @@
 # crosstalk
 
 A Rust daemon that hosts tools for [Dispatcharr](https://github.com/Dispatcharr/Dispatcharr),
-with **EPG Janitor** as its first sub-app: a fast, multi-threaded EPG matcher that assigns
-guides to channels and repairs assignments that carry no programme data.
+with **guide** as its first sub-app: a fast, multi-threaded EPG matcher that assigns guides
+to channels and repairs assignments that carry no programme data.
 
 It replaces the Python EPG Janitor plugin, which runs inside Dispatcharr and reads its database
 through the Django ORM. crosstalk is a separate process that talks to Dispatcharr over its REST
@@ -25,7 +25,7 @@ serve several tools from one binary.
 ```bash
 # 1. Configure
 cp config/crosstalk.example.toml config/crosstalk.toml
-cp config/janitor.example.toml config/janitor.toml
+cp config/guide.example.toml config/guide.toml
 
 # 2. Point it at Dispatcharr and give it a key
 #    config/crosstalk.toml: base_url = "http://dispatcharr:9191"
@@ -35,10 +35,10 @@ cp config/janitor.example.toml config/janitor.toml
 crosstalk validate --config config
 
 # 4. Preview a run — this writes a CSV and changes nothing
-crosstalk run janitor automatch_preview --config config
+crosstalk run guide match_preview --config config
 
 # 5. Apply it, once the preview looks right
-crosstalk run janitor automatch_apply --config config --yes
+crosstalk run guide match_apply --config config --yes
 
 # 6. Or run the daemon and use the web UI
 crosstalk serve --config config
@@ -49,7 +49,7 @@ With Docker:
 ```bash
 cp docker-compose.example.yml docker-compose.yml
 cp config/crosstalk.example.toml config/crosstalk.toml
-cp config/janitor.example.toml config/janitor.toml
+cp config/guide.example.toml config/guide.toml
 
 # Point config/crosstalk.toml at Dispatcharr. From inside the container
 # "localhost" is the container itself, so use a reachable address:
@@ -81,7 +81,7 @@ The UI listens on <http://localhost:8730>.
 | `crosstalk serve --config <dir>` | Run the daemon: REST API, scheduler and web UI |
 | `crosstalk validate --config <dir>` | Check the configuration files and each app's settings |
 | `crosstalk run <app> <action> [--dry-run] [--yes]` | Run one action once and exit |
-| `crosstalk simulate --channels <csv> --streams <m3u>` | Offline stream-to-channel simulation, for tuning without touching a live install |
+| `crosstalk simulate-streams --channels <csv> --streams <m3u>` | Offline stream-to-channel simulation, for tuning without touching a live install |
 
 `crosstalk run` refuses an action that changes data unless `--yes` is passed, because a
 one-shot run has no dialog to confirm in.
@@ -95,7 +95,7 @@ Two files, split by who owns the option:
   toggles, which country databases to load, and custom aliases. Those are shared because two
   apps disagreeing about whether `[HD]` is stripped would give two different answers for the
   same channel.
-- **`janitor.toml`** (sub-app): scope filters, confidence thresholds, the AI gate, CSV
+- **`guide.toml`** (sub-app): scope filters, confidence thresholds, the AI gate, CSV
   retention.
 
 Every value can be overridden by an environment variable named `CROSSTALK_<SECTION>__<KEY>`,
@@ -121,8 +121,8 @@ no daemon restart (a run already in progress finishes with the settings it start
 |---|---|---|
 | `validate` | blue | Check the settings for consistency, without touching Dispatcharr |
 | `status` | blue | Show what the last run did |
-| `automatch_preview` | blue | Score and write a report; changes nothing |
-| `automatch_apply` | **red** | Assign guides, overwriting an existing assignment when a new match clears the threshold |
+| `match_preview` | blue | Score and write a report; changes nothing |
+| `match_apply` | **red** | Assign guides, overwriting an existing assignment when a new match clears the threshold |
 | `heal_preview` | blue | Look for replacements for empty assignments; changes nothing |
 | `heal_apply` | **orange** | Replace empty assignments. Never removes an assignment it cannot prove is empty |
 
@@ -140,7 +140,7 @@ prose. Two things happen only:
 
 The contract, precisely:
 
-- A heuristic result at or above `automatch_confidence_threshold` (default 95) never
+- A heuristic result at or above `match_confidence_threshold` (default 95) never
   reaches the model. The model may promote inside the band, but it never re-checks or
   vetoes a heuristic win.
 - Promotion happens only inside the verify band or above the rescue floor — nowhere else.
@@ -166,7 +166,7 @@ max_concurrency = 8          # the public endpoint rate-limits around eight
 ```
 
 ```toml
-# janitor.toml
+# guide.toml
 [ai]
 enabled = true
 provider = "typesafe"
@@ -189,8 +189,8 @@ the probabilities and the latency.
 ```toml
 # crosstalk.toml
 [schedules]
-"janitor.automatch_apply" = "0 4 * * *"
-"janitor.heal_apply" = "0 6 * * *"
+"guide.match_apply" = "0 4 * * *"
+"guide.heal_apply" = "0 6 * * *"
 ```
 
 Five fields (`minute hour day month weekday`) or six (with seconds). Schedules fire in **UTC**,
@@ -243,27 +243,27 @@ than asserted — but only for the core. The split contract is:
 
 - **Strict parity**: the matching primitives (normalisation, callsign/location/network
 extraction) and the full `match_all_streams` pipeline are byte-identical ports.
-`crosstalk simulate` produces **byte-identical** reports to the plugin's own offline tool
-across four configurations: default flags and `--custom-aliases` (which change matching
+`crosstalk simulate-streams` produces **byte-identical** reports to the plugin's own offline
+tool across four configurations: default flags and `--custom-aliases` (which change matching
 output), `--no-ignore-quality` (which catches Rust wrongly applying the flag), and
 `--countries US` (which proves flag acceptance and call-sign DB merge parity). Duplicate
 stream names in the sim corpus exercise parser dedupe — they are removed before matching,
-so duplicate *candidates* reach the matcher in the automatch/heal unit tests for the H6
+so duplicate *candidates* reach the matcher in the match/heal unit tests for the H6
 duplicate-name fix, not via sim. `scripts/parity_sweep.py` compares the primitives over
 hundreds of thousands of cases in a full local run (no `--limit`); the bounded CI sweeps
 cover ~4,800 normalize, ~900 per-name (callsign/location/network), and ~1,200
 match/score cases. Both gates run in CI against the plugin pinned as a submodule in
 `reference/`.
-- **Rust-native actions**: `automatch` and `heal` reuse the parity-checked pipeline but
+- **Rust-native actions**: `match` and `heal` reuse the parity-checked pipeline but
 make their own product decisions. They are not ports, and row-for-row equality with the
 plugin is not claimed for them.
 
 Deliberate divergences from the plugin (actions only, never the pipeline):
 
 - **EPG-override channels are skipped**: a channel whose guide was set by hand is left
-alone by automatch; the plugin re-matches it. Skipping is safer, and the CSV reason says so.
+alone by match; the plugin re-matches it. Skipping is safer, and the CSV reason says so.
 - **AI promotion within the verify band**: with the AI gate on, an AI-accepted candidate can
-be assigned while its heuristic score (60–94) sits below `automatch_confidence_threshold`
+be assigned while its heuristic score (60–94) sits below `match_confidence_threshold`
 (default 95). The threshold still gates every heuristic assignment; AI may promote inside
 the band but never veto a heuristic win, and heal never consults AI at all.
 - **Heal preview statuses are plugin-style**: a working replacement below the threshold is
@@ -271,7 +271,7 @@ reported as `SKIPPED_LOW_CONFIDENCE` / `REPLACEMENT_PREVIEW` with its real score
 never applied.
 - **Sourceless candidates are skipped**: entries with no EPG source are not considered as
 replacements; the plugin validates by EPG id and can accept one.
-- **Automatch reporting walks only validated candidates**: when nothing validates, the row
+- **Match reporting walks only validated candidates**: when nothing validates, the row
 reports the top-ranked candidate and says no programme data was found, where the plugin
 reports the first programme-carrying candidate regardless of threshold.
 - **CSV formula guard**: cells starting with `=`, `+`, `-` or `@` are prefixed with a single
@@ -300,7 +300,7 @@ strict-parity and what is deliberately Rust-native.
 ```
 crates/crosstalk-matching   pure, IO-free matcher: normalisation, similarity, callsigns, pipeline
 crates/crosstalk-core       host: config, sub-app trait, Dispatcharr client, AI, store, runner, CSV
-crates/janitor              the EPG matcher sub-app: scope, auto-match, heal, AI gate, settings
+crates/guide                the guide sub-app: scope, matching, heal, AI gate, settings
 crates/crosstalk-web        axum + Askama UI and JSON API
 crates/crosstalk            the binary: CLI, registry, daemon
 data/                       embedded channel databases, FCC callsigns, aliases

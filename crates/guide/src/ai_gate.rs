@@ -8,7 +8,7 @@
 //!   * **rescue** — no candidate reached the band, but some candidate scored above the rescue
 //!     floor. The heuristics found nothing; the model may still see the match.
 //!
-//! A heuristic result at or above the automatch confidence threshold NEVER reaches the
+//! A heuristic result at or above the match confidence threshold NEVER reaches the
 //! model: the model may promote inside the band, but it never re-checks or vetoes a
 //! heuristic win. Spending latency and tokens to re-check results the heuristics are
 //! already sure about would make the tool slower without making it more accurate.

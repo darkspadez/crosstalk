@@ -20,7 +20,7 @@ use std::time::{Duration, SystemTime};
 const SECONDS_PER_DAY: u64 = 86_400;
 
 /// The file-name prefix this app owns inside a shared exports directory.
-pub const EXPORT_PREFIX: &str = "epg_janitor_";
+pub const EXPORT_PREFIX: &str = "guide_";
 
 /// Build the commented preamble that opens every report.
 ///
@@ -36,7 +36,7 @@ pub fn preamble(
 ) -> Vec<String> {
     let mut lines = Vec::new();
     lines.push(format!(
-        "# EPG Janitor v{} - {report_title}",
+        "# crosstalk guide v{} - {report_title}",
         env!("CARGO_PKG_VERSION")
     ));
     lines.push(
@@ -86,7 +86,7 @@ fn render_settings(schema: &SettingsSchema, values: &SettingsValues) -> Vec<(Str
 /// One setting, read the way a person reading the report needs it.
 fn render_setting(id: &str, kind: &crate::subapp::FieldKind, value: &FieldValue) -> String {
     match (id, kind) {
-        ("automatch_confidence_threshold", _) | ("heal_confidence_threshold", _) => {
+        ("match_confidence_threshold", _) | ("heal_confidence_threshold", _) => {
             format!("{} out of 100, higher is stricter", value.render())
         }
         ("check_hours", _) => format!("{} hours ahead of now", value.render()),
@@ -319,23 +319,21 @@ mod tests {
 
     #[test]
     fn only_our_own_files_are_considered() {
-        assert!(is_our_export(
-            "epg_janitor_automatch_preview_20260101_000000.csv"
-        ));
+        assert!(is_our_export("guide_match_preview_20260101_000000.csv"));
         assert!(!is_our_export("other_plugin_export.csv"));
-        assert!(!is_our_export("epg_janitor_notes.txt"));
-        assert!(!is_our_export("epg_janitor_backup.csv.bak"));
+        assert!(!is_our_export("guide_notes.txt"));
+        assert!(!is_our_export("guide_backup.csv.bak"));
     }
 
     #[test]
     fn retention_off_keeps_everything() {
         let entries = vec![
             ExportFile {
-                name: "epg_janitor_a.csv".to_string(),
+                name: "guide_a.csv".to_string(),
                 modified: at(90 * 86_400),
             },
             ExportFile {
-                name: "epg_janitor_b.csv".to_string(),
+                name: "guide_b.csv".to_string(),
                 modified: at(1),
             },
         ];
@@ -346,16 +344,16 @@ mod tests {
     fn older_files_are_deleted_and_the_newest_survives() {
         let entries = vec![
             ExportFile {
-                name: "epg_janitor_old.csv".to_string(),
+                name: "guide_old.csv".to_string(),
                 modified: at(30 * 86_400),
             },
             ExportFile {
-                name: "epg_janitor_new.csv".to_string(),
+                name: "guide_new.csv".to_string(),
                 modified: at(1),
             },
         ];
         let doomed = exports_to_delete(&entries, 7, SystemTime::now(), None);
-        assert_eq!(doomed, vec!["epg_janitor_old.csv".to_string()]);
+        assert_eq!(doomed, vec!["guide_old.csv".to_string()]);
     }
 
     #[test]
@@ -364,22 +362,22 @@ mod tests {
         // it, which is the case that matters after a clock change.
         let entries = vec![
             ExportFile {
-                name: "epg_janitor_a.csv".to_string(),
+                name: "guide_a.csv".to_string(),
                 modified: at(30 * 86_400),
             },
             ExportFile {
-                name: "epg_janitor_b.csv".to_string(),
+                name: "guide_b.csv".to_string(),
                 modified: at(20 * 86_400),
             },
         ];
-        let doomed = exports_to_delete(&entries, 7, SystemTime::now(), Some("epg_janitor_b.csv"));
-        assert_eq!(doomed, vec!["epg_janitor_a.csv".to_string()]);
+        let doomed = exports_to_delete(&entries, 7, SystemTime::now(), Some("guide_b.csv"));
+        assert_eq!(doomed, vec!["guide_a.csv".to_string()]);
     }
 
     #[test]
     fn at_least_one_file_always_survives() {
         let entries = vec![ExportFile {
-            name: "epg_janitor_only.csv".to_string(),
+            name: "guide_only.csv".to_string(),
             modified: at(365 * 86_400),
         }];
         assert!(exports_to_delete(&entries, 1, SystemTime::now(), None).is_empty());
@@ -393,7 +391,7 @@ mod tests {
                 modified: at(365 * 86_400),
             },
             ExportFile {
-                name: "epg_janitor_mine.csv".to_string(),
+                name: "guide_mine.csv".to_string(),
                 modified: at(1),
             },
         ];
@@ -409,17 +407,17 @@ mod tests {
     fn a_future_timestamp_is_not_deleted() {
         let entries = vec![
             ExportFile {
-                name: "epg_janitor_future.csv".to_string(),
+                name: "guide_future.csv".to_string(),
                 modified: SystemTime::now() + Duration::from_secs(86_400),
             },
             ExportFile {
-                name: "epg_janitor_newest.csv".to_string(),
+                name: "guide_newest.csv".to_string(),
                 modified: at(1),
             },
         ];
         // The future-dated file is the newest, so it is the survivor, not a deletion.
         let doomed = exports_to_delete(&entries, 7, SystemTime::now(), None);
-        assert!(!doomed.contains(&"epg_janitor_future.csv".to_string()));
+        assert!(!doomed.contains(&"guide_future.csv".to_string()));
     }
 
     #[test]
@@ -434,7 +432,7 @@ mod tests {
                 FieldValue::Number(12.0),
             ),
             FieldSpec::new(
-                "automatch_confidence_threshold",
+                "match_confidence_threshold",
                 "_s",
                 "Auto-Match Confidence Threshold",
                 FieldKind::Number,
@@ -489,7 +487,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("report.csv");
         let preamble = vec![
-            "# EPG Janitor - test".to_string(),
+            "# crosstalk guide - test".to_string(),
             "# A line, with a comma".to_string(),
         ];
         write_report(&path, &preamble, &["channel_name", "score"], |writer| {
@@ -500,7 +498,7 @@ mod tests {
 
         let text = std::fs::read_to_string(&path).expect("read");
         let mut lines = text.lines();
-        assert_eq!(lines.next(), Some("# EPG Janitor - test"));
+        assert_eq!(lines.next(), Some("# crosstalk guide - test"));
         // The comma in a comment must not cause quoting.
         assert_eq!(lines.next(), Some("# A line, with a comma"));
         assert_eq!(lines.next(), Some("channel_name,score"));
@@ -510,8 +508,8 @@ mod tests {
     #[test]
     fn pruning_removes_old_files_and_keeps_the_protected_one() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let old = dir.path().join("epg_janitor_old.csv");
-        let fresh = dir.path().join("epg_janitor_fresh.csv");
+        let old = dir.path().join("guide_old.csv");
+        let fresh = dir.path().join("guide_fresh.csv");
         let foreign = dir.path().join("other_plugin.csv");
         for path in [&old, &fresh, &foreign] {
             std::fs::write(path, "x").expect("write");
@@ -521,7 +519,7 @@ mod tests {
         set_modified(&old, old_time);
         set_modified(&foreign, old_time);
 
-        let removed = prune_exports(dir.path(), 7, Some("epg_janitor_fresh.csv"));
+        let removed = prune_exports(dir.path(), 7, Some("guide_fresh.csv"));
         assert_eq!(removed, 1);
         assert!(!old.exists());
         assert!(fresh.exists());
@@ -534,7 +532,7 @@ mod tests {
     #[test]
     fn pruning_does_nothing_when_retention_is_off() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let old = dir.path().join("epg_janitor_old.csv");
+        let old = dir.path().join("guide_old.csv");
         std::fs::write(&old, "x").expect("write");
         set_modified(&old, SystemTime::now() - Duration::from_secs(90 * 86_400));
         assert_eq!(prune_exports(dir.path(), 0, None), 0);
@@ -543,14 +541,14 @@ mod tests {
 
     #[test]
     fn report_paths_carry_the_prefix_and_a_timestamp() {
-        let path = report_path(Path::new("/exports"), "automatch_preview");
+        let path = report_path(Path::new("/exports"), "match_preview");
         let name = path
             .file_name()
             .expect("name")
             .to_string_lossy()
             .to_string();
         assert!(is_our_export(&name), "{name}");
-        assert!(name.contains("automatch_preview"), "{name}");
+        assert!(name.contains("match_preview"), "{name}");
         assert_eq!(path.parent(), Some(Path::new("/exports")));
     }
 

@@ -1,10 +1,10 @@
-//! crosstalk: the host daemon for Dispatcharr tools, with `janitor` as its first sub-app.
+//! crosstalk: the host daemon for Dispatcharr tools, with `guide` as its first sub-app.
 //!
 //! Subcommands:
 //!   * `serve`   — run the daemon (REST API, scheduler, web UI)
 //!   * `run`     — run one sub-app action once, without the daemon
 //!   * `validate` — check configuration against Dispatcharr
-//!   * `simulate` — offline stream-to-channel match simulation (the parity oracle)
+//!   * `simulate-streams` — offline stream-to-channel match simulation (the parity oracle)
 
 mod registry;
 mod simulate;
@@ -39,7 +39,8 @@ enum Command {
     /// Validate the configuration files and each sub-app's settings.
     Validate(ConfigArgs),
     /// Offline stream-to-channel match simulation.
-    Simulate(SimulateArgs),
+    #[command(name = "simulate-streams")]
+    SimulateStreams(SimulateArgs),
 }
 
 #[derive(Args, Debug)]
@@ -51,9 +52,9 @@ struct ServeArgs {
 
 #[derive(Args, Debug)]
 struct RunArgs {
-    /// Sub-app id, for example `janitor`.
+    /// Sub-app id, for example `guide`.
     app: String,
-    /// Action id, for example `automatch`.
+    /// Action id, for example `match_apply`.
     action: String,
     /// Directory holding the configuration files.
     #[arg(long, default_value = "config", env = "CROSSTALK_CONFIG_DIR")]
@@ -74,7 +75,7 @@ struct ConfigArgs {
 
 #[derive(Args, Debug)]
 struct SimulateArgs {
-    /// Channels CSV, for example a Janitor export.
+    /// Channels CSV, for example a guide export.
     #[arg(long)]
     channels: PathBuf,
     /// Provider M3U.
@@ -123,7 +124,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Simulate(args) => {
+        Command::SimulateStreams(args) => {
             let tags = [
                 !args.no_ignore_quality,
                 !args.no_ignore_regional,
@@ -266,7 +267,7 @@ async fn wait_for_drain(runner: &JobRunner, timeout: std::time::Duration) {
 fn install_logging() {
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_env("RUST_LOG").unwrap_or_else(|_| {
-        EnvFilter::new("info,crosstalk_core=info,crosstalk_web=info,janitor=info")
+        EnvFilter::new("info,crosstalk_core=info,crosstalk_web=info,crosstalk_guide=info")
     });
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -369,7 +370,7 @@ fn run_once(args: RunArgs) -> Result<()> {
 /// The preview action that stands in for an apply action.
 fn preview_counterpart(action: &str) -> Option<&'static str> {
     match action {
-        "automatch_apply" => Some("automatch_preview"),
+        "match_apply" => Some("match_preview"),
         "heal_apply" => Some("heal_preview"),
         _ => None,
     }
@@ -462,6 +463,6 @@ mod shutdown_tests {
         let runner = idle_runner();
         runner.shutdown();
         wait_for_drain(&runner, std::time::Duration::from_secs(5)).await;
-        assert!(runner.start("janitor", "automatch_preview", true).is_err());
+        assert!(runner.start("guide", "match_preview", true).is_err());
     }
 }

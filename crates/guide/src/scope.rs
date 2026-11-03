@@ -11,7 +11,7 @@
 //!   * channel database selection is a separate decision that never widens the candidate set
 //!     at run time; it only decides which reference names the matcher knows.
 
-use crate::settings::JanitorSettings;
+use crate::settings::GuideSettings;
 use anyhow::{bail, Result};
 use crosstalk_core::dispatcharr::{
     Channel, ChannelGroup, ChannelProfile, EpgEntry, EpgSource, World,
@@ -34,7 +34,7 @@ pub struct ScopedChannels {
 /// Fails with the plugin's own wording when both group settings are set, when a named profile
 /// does not exist, or when no group matches: those are configuration mistakes an operator can
 /// fix, not empty results to be explained later.
-pub fn scope_channels(world: &World, settings: &JanitorSettings) -> Result<ScopedChannels> {
+pub fn scope_channels(world: &World, settings: &GuideSettings) -> Result<ScopedChannels> {
     let selected = settings.selected_groups.trim();
     let ignored = settings.ignore_groups.trim();
     if !selected.is_empty() && !ignored.is_empty() {
@@ -317,7 +317,7 @@ pub fn scope_entries(world: &World, filter: &str) -> ScopedEntries {
 /// The fallback source filter heal should search, which falls back to the auto-match filter.
 ///
 /// Mirrors the plugin: an empty heal filter means "the same sources auto-match uses".
-pub fn heal_source_filter(settings: &JanitorSettings) -> &str {
+pub fn heal_source_filter(settings: &GuideSettings) -> &str {
     let heal = settings.heal_fallback_sources.trim();
     if heal.is_empty() {
         settings.epg_sources_to_match.trim()
@@ -417,8 +417,8 @@ mod tests {
         }
     }
 
-    fn defaults() -> JanitorSettings {
-        JanitorSettings::default()
+    fn defaults() -> GuideSettings {
+        GuideSettings::default()
     }
 
     #[test]
@@ -430,7 +430,7 @@ mod tests {
 
     #[test]
     fn both_group_settings_is_an_error() {
-        let settings = JanitorSettings {
+        let settings = GuideSettings {
             selected_groups: "Sports".to_string(),
             ignore_groups: "PPV*".to_string(),
             ..defaults()
@@ -441,7 +441,7 @@ mod tests {
 
     #[test]
     fn selected_groups_filter_and_describe() {
-        let settings = JanitorSettings {
+        let settings = GuideSettings {
             selected_groups: "Sports".to_string(),
             ..defaults()
         };
@@ -452,7 +452,7 @@ mod tests {
 
     #[test]
     fn selected_groups_accept_wildcards() {
-        let settings = JanitorSettings {
+        let settings = GuideSettings {
             selected_groups: "Spo*".to_string(),
             ..defaults()
         };
@@ -462,7 +462,7 @@ mod tests {
 
     #[test]
     fn an_unknown_selected_group_is_an_error() {
-        let settings = JanitorSettings {
+        let settings = GuideSettings {
             selected_groups: "Nope".to_string(),
             ..defaults()
         };
@@ -472,7 +472,7 @@ mod tests {
 
     #[test]
     fn ignored_groups_exclude_and_describe() {
-        let settings = JanitorSettings {
+        let settings = GuideSettings {
             ignore_groups: "PPV*".to_string(),
             ..defaults()
         };
@@ -484,7 +484,7 @@ mod tests {
 
     #[test]
     fn an_unknown_ignored_group_only_warns() {
-        let settings = JanitorSettings {
+        let settings = GuideSettings {
             ignore_groups: "Nope".to_string(),
             ..defaults()
         };
@@ -494,7 +494,7 @@ mod tests {
 
     #[test]
     fn profiles_are_matched_case_insensitively() {
-        let settings = JanitorSettings {
+        let settings = GuideSettings {
             channel_profile_name: "favorites".to_string(),
             ..defaults()
         };
@@ -506,7 +506,7 @@ mod tests {
 
     #[test]
     fn several_profiles_union_their_channels() {
-        let settings = JanitorSettings {
+        let settings = GuideSettings {
             channel_profile_name: "Favorites, Empty".to_string(),
             ..defaults()
         };
@@ -518,7 +518,7 @@ mod tests {
 
     #[test]
     fn an_unknown_profile_is_an_error_naming_the_available_ones() {
-        let settings = JanitorSettings {
+        let settings = GuideSettings {
             channel_profile_name: "Nope".to_string(),
             ..defaults()
         };
@@ -530,7 +530,7 @@ mod tests {
 
     #[test]
     fn an_empty_profile_is_an_error() {
-        let settings = JanitorSettings {
+        let settings = GuideSettings {
             channel_profile_name: "Empty".to_string(),
             ..defaults()
         };
@@ -540,7 +540,7 @@ mod tests {
 
     #[test]
     fn profile_and_group_filters_combine() {
-        let settings = JanitorSettings {
+        let settings = GuideSettings {
             channel_profile_name: "All".to_string(),
             selected_groups: "PPV*".to_string(),
             ..defaults()
@@ -610,15 +610,15 @@ mod tests {
     }
 
     #[test]
-    fn heal_falls_back_to_the_automatch_filter() {
-        let settings = JanitorSettings {
+    fn heal_falls_back_to_the_match_filter() {
+        let settings = GuideSettings {
             epg_sources_to_match: "Schedules Direct".to_string(),
             heal_fallback_sources: String::new(),
             ..defaults()
         };
         assert_eq!(heal_source_filter(&settings), "Schedules Direct");
 
-        let settings = JanitorSettings {
+        let settings = GuideSettings {
             epg_sources_to_match: "Schedules Direct".to_string(),
             heal_fallback_sources: "XMLTV".to_string(),
             ..defaults()

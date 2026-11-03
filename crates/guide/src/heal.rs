@@ -13,7 +13,7 @@
 //! programmes, then apply only those.
 
 use crate::scope::{ScopedChannels, ScopedEntries};
-use crate::settings::JanitorSettings;
+use crate::settings::GuideSettings;
 use anyhow::{Context, Result};
 use crosstalk_core::csv_report;
 use crosstalk_core::dispatcharr::{EpgEntry, HasPrograms, ProgramWindow, World};
@@ -123,7 +123,7 @@ pub struct HealOutcome {
 /// Run scan & heal.
 pub async fn run(
     context: &JobContext,
-    settings: &JanitorSettings,
+    settings: &GuideSettings,
     world: &World,
     scoped_channels: &ScopedChannels,
     scoped_entries: &ScopedEntries,
@@ -149,7 +149,7 @@ pub async fn run(
     // The checks fan out (P1), bounded by the Dispatcharr concurrency; assignments that
     // need no request resolve without one. Broken channels collect in channel order.
     context.progress(&ProgressEvent::new(
-        "janitor.heal",
+        "guide.heal",
         0,
         scoped_channels.channels.len() as u64,
         "checking existing assignments",
@@ -259,7 +259,7 @@ pub async fn run(
     let tags = crate::tag_list(context.config().matching.normalize_flags());
 
     // Step 2a: score every broken channel off the async runtime (P3), the same
-    // spawn_blocking + rayon shape automatch uses, so a big heal never stalls a Tokio
+    // spawn_blocking + rayon shape matching uses, so a big heal never stalls a Tokio
     // worker. `par_iter` preserves order on collect: `scored_all[i]` is broken[i].
     let scored_all: Vec<Vec<Scored>> = {
         let matcher = Arc::clone(&matcher);
@@ -347,7 +347,7 @@ pub async fn run(
             }
         }
         context.progress(&ProgressEvent::new(
-            "janitor.heal",
+            "guide.heal",
             batch_end as u64,
             broken_ref.len() as u64,
             "searching replacements",
@@ -416,7 +416,7 @@ pub async fn run(
 
         if position % 50 == 0 {
             context.progress(&ProgressEvent::new(
-                "janitor.heal",
+                "guide.heal",
                 position as u64,
                 broken.len() as u64,
                 "searching replacements",
@@ -438,7 +438,7 @@ pub async fn run(
 
     // Step 3: write the report BEFORE applying, so it reflects the plan. On an apply
     // failure the CSV still exists on disk recording what was attempted and confirmed,
-    // and the error below names it (mirroring automatch, which also reports before it
+    // and the error below names it (mirroring matching, which also reports before it
     // writes). The run record itself cannot link it: the runner drops the report path on
     // a failed run.
     let report = write_report(context, settings, scanned, &rows, dry_run)?;
@@ -519,7 +519,7 @@ fn reason_for(row: &HealRow, threshold: u8, allow_without_programs: bool) -> Str
 
 fn write_report(
     context: &JobContext,
-    settings: &JanitorSettings,
+    settings: &GuideSettings,
     scanned: usize,
     rows: &[HealRow],
     dry_run: bool,
@@ -808,7 +808,7 @@ mod tests {
     }
 
     fn scoped(world: &World) -> (ScopedChannels, ScopedEntries) {
-        let settings = JanitorSettings::default();
+        let settings = GuideSettings::default();
         (
             crate::scope::scope_channels(world, &settings).expect("channels"),
             crate::scope::scope_entries(world, ""),
@@ -818,7 +818,7 @@ mod tests {
     #[tokio::test]
     async fn a_broken_assignment_gets_a_working_replacement() {
         let (_server, world, context) = fixture(false, true).await;
-        let settings = JanitorSettings::default();
+        let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
 
         let result = run(&context, &settings, &world, &channels, &entries, true)
@@ -836,7 +836,7 @@ mod tests {
     #[tokio::test]
     async fn an_apply_writes_the_replacement() {
         let (_server, world, context) = fixture(false, true).await;
-        let settings = JanitorSettings::default();
+        let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
         let result = run(&context, &settings, &world, &channels, &entries, false)
             .await
@@ -851,7 +851,7 @@ mod tests {
         // on disk and names it in the error (the runner drops the report path on failure).
         let (_server, world, context) =
             fixture_with_names("ESPN HD", "ESPN (broken)", "ESPN", false, true, false).await;
-        let settings = JanitorSettings::default();
+        let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
         let error = run(&context, &settings, &world, &channels, &entries, false)
             .await
@@ -883,7 +883,7 @@ mod tests {
         // with `=`, `+` or `@` must reach the CSV quoted, never as live formulas.
         let (_server, world, context) =
             fixture_with_names("+ESPN HD", "=ESPN (broken)", "@ESPN", false, true, true).await;
-        let settings = JanitorSettings::default();
+        let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
         let result = run(&context, &settings, &world, &channels, &entries, true)
             .await
@@ -914,7 +914,7 @@ mod tests {
     #[tokio::test]
     async fn a_working_assignment_is_never_touched() {
         let (_server, world, context) = fixture(true, true).await;
-        let settings = JanitorSettings::default();
+        let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
         let result = run(&context, &settings, &world, &channels, &entries, false)
             .await
@@ -927,7 +927,7 @@ mod tests {
     #[tokio::test]
     async fn a_channel_with_no_working_replacement_is_left_alone() {
         let (_server, world, context) = fixture(false, false).await;
-        let settings = JanitorSettings::default();
+        let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
         let result = run(&context, &settings, &world, &channels, &entries, false)
             .await
@@ -954,7 +954,7 @@ mod tests {
             true,
         )
         .await;
-        let settings = JanitorSettings::default();
+        let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
         assert!(settings.heal_confidence_threshold > 50);
 
@@ -1101,7 +1101,7 @@ mod tests {
         // the in-future checks plus the batch guards must abort the run.
         let (_server, world, context) = fixture(false, true).await;
         context.cancel();
-        let settings = JanitorSettings::default();
+        let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
         let error = run(&context, &settings, &world, &channels, &entries, true)
             .await

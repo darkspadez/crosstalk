@@ -1000,7 +1000,7 @@ async fn a_csv_outside_the_exports_directory_is_not_served() {
     std::fs::create_dir_all(&exports).expect("exports");
 
     // A report inside the exports directory downloads as before.
-    let inside = exports.join("epg_janitor_test.csv");
+    let inside = exports.join("guide_test.csv");
     std::fs::write(&inside, "channel_name\nESPN\n").expect("write");
     let run_id = store.start_run("echo", "peek", true).expect("run");
     store
