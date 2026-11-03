@@ -1,8 +1,10 @@
 # crosstalk
 
-A Rust daemon that hosts tools for [Dispatcharr](https://github.com/Dispatcharr/Dispatcharr),
-with **guide** as its first sub-app: a fast, multi-threaded EPG matcher that assigns guides
-to channels and repairs assignments that carry no programme data.
+A Rust daemon that hosts tools for [Dispatcharr](https://github.com/Dispatcharr/Dispatcharr).
+One binary, one config directory, one scheduler and one web UI serve several sub-apps, each
+defined by what it manages rather than by the plugin it replaces. **guide** is the one that
+ships today: a fast, multi-threaded EPG matcher that assigns guides to channels, repairs or
+removes assignments that carry no programme data, and keeps the EPG sources themselves fresh.
 
 It replaces the Python EPG Janitor plugin, which runs inside Dispatcharr and reads its database
 through the Django ORM. crosstalk is a separate process that talks to Dispatcharr over its REST
@@ -17,8 +19,30 @@ serve several tools from one binary.
   East/West feeds apart.
 - **Scan & heal** finds assignments that carry no programme data and replaces them, touching
   only assignments it can prove are empty.
+- **Scan** reports which in-scope channels have a guide but no programme data in the check
+  window. It changes nothing, and its result set is what the cleanup actions work from.
+- **Clean up** marks or removes the guides a scan found empty, as five presets over the same
+  channel-ops primitive: append a bad-EPG suffix (`tag_missing_*`), unassign (`clear_missing_*`),
+  unassign where the guide's name matches a REGEX (`clear_by_regex_*`), unassign across whole
+  groups (`clear_groups_*`), and unassign from channels disabled in scope (`clear_hidden_*`).
+  Each one previews before it writes, and each one re-reads the channels first, so a stale scan
+  can only be out of date — never wrong about a channel.
+- **Watchdog** audits every active EPG source that has channels mapped to it, refreshes the
+  ones that are errored or whose guide ends inside a threshold, then re-reads them and records
+  whether that helped. Dispatcharr's own refresh has no retry and no freshness awareness, so a
+  source that starts failing — or whose guide simply runs out — stays broken until someone
+  notices. A schedule is what arms the watchdog, which makes the action its interval.
 - **Optionally asks an AI** about the cases the heuristics are unsure of — and never about the
   ones they are sure of. See [AI verification](#ai-verification).
+
+## Roadmap
+
+Three more sub-apps are planned, again defined by what they manage: **streams** (which streams
+have a channel, in what order, and whether they work), **lineup** (the channel list itself:
+names, numbers, groups, logos, creation) and **events** (time-bound event channels). Each lands
+as its own phase of [`plans/plugin-consolidation.md`](plans/plugin-consolidation.md), which
+also maps every action of the remaining Dispatcharr plugins onto those four apps and records
+what is deliberately not ported. Nothing here promises a date.
 
 ## Quick start
 
@@ -97,7 +121,7 @@ last couple of minutes are kept in case a run is still using one.
 Two files, split by who owns the option:
 
 - **`crosstalk.toml`** (host): the Dispatcharr connection, AI providers, the HTTP listener, the
-  thread pool, the directories, the schedules, and every option the sub-apps must agree on:
+  thread pool, the directories, the schedules — and every option the sub-apps must agree on:
   - `[matching]` — the normalisation toggles, which country databases to load, and custom
     aliases. Two apps disagreeing about whether `[HD]` is stripped would give two different
     answers for the same channel.
@@ -105,11 +129,18 @@ Two files, split by who owns the option:
     "Which channels am I responsible for" is the same question for every sub-app.
   - `[exports]` — `retention_days`, how long CSV reports are kept.
   - `[ai.verify]` — when a borderline match is worth asking a model about, and how its answer
-    is read. The endpoints and keys stay under `[ai.providers]` in the same file.
+    is read. The endpoints and keys stay under `[ai.providers.<name>]` in the same file.
 - **`guide.toml`** (sub-app): what is genuinely the guide's own — the EPG sources to match,
   the check window, the auto-match and heal confidence thresholds, the heal fallback sources,
   the cleanup suffix and REGEX, and the watchdog's threshold, timeout, exclude list and
   recovery logging.
+
+The rest of `crosstalk.toml` is `[server]` (`bind`, `port`, `token`/`token_env`), `[dispatcharr]`
+(`base_url`, an API key or a JWT fallback, `timeout_secs`, `concurrency`), `[ai.providers.<name>]`
+(the endpoints, keys and concurrency caps), `[jobs]` (worker threads, the exports and data
+directories, `run_history_days`) and `[schedules]` (see [Scheduling](#scheduling)).
+[`config/crosstalk.example.toml`](config/crosstalk.example.toml) and
+[`config/guide.example.toml`](config/guide.example.toml) document every key with its why.
 
 The split is a clean break: `guide.toml` rejects the old `channel_profile_name`,
 `selected_groups`, `ignore_groups`, `csv_retention_days` and `[ai]` keys, and the error says
@@ -140,7 +171,7 @@ no daemon restart (a run already in progress finishes with the settings it start
 | Action | Colour | What it does |
 |---|---|---|
 | `validate` | blue | Check the settings for consistency, without touching Dispatcharr |
-| `status` | blue | Show what the last run did |
+| `status` | blue | Show what the last run did, and whether a run is in progress |
 | `match_preview` | blue | Score and write a report; changes nothing |
 | `match_apply` | **red** | Assign guides, overwriting an existing assignment when a new match clears the threshold |
 | `heal_preview` | blue | Look for replacements for empty assignments; changes nothing |
@@ -152,7 +183,7 @@ no daemon restart (a run already in progress finishes with the settings it start
 | `clear_missing_apply` | **red** | Unassign the guide of the channels the last scan found with no programme data |
 | `clear_hidden_preview` | blue | Show which channels disabled in `[scope] profiles` would lose their guide; changes nothing |
 | `clear_hidden_apply` | **red** | Unassign the guide of every channel disabled in `[scope] profiles`. Never deletes programme data |
-| `clear_by_regex_preview` | blue | Show which channels would lose their guide because its name matches `epg_regex_to_remove` |
+| `clear_by_regex_preview` | blue | Show which channels would lose their guide because the guide's name matches `epg_regex_to_remove` |
 | `clear_by_regex_apply` | **red** | Unassign the guide where its name matches the REGEX, within `[scope]` |
 | `clear_groups_preview` | blue | Show every channel in `[scope] groups` that would lose its guide |
 | `clear_groups_apply` | **red** | Unassign the guide of EVERY channel in `[scope] groups` |
@@ -160,7 +191,7 @@ no daemon restart (a run already in progress finishes with the settings it start
 | `watchdog_apply` | **orange** | Refresh each stale source on Dispatcharr, then re-read it and record whether that helped (`recovered` / `still_broken`). Never renames or unassigns a channel |
 
 Button colour is the consequence, and it is the same convention the Python plugin used: blue
-reads, orange writes channel data, red can move an assignment. Orange and red always confirm.
+reads, orange writes data but removes no assignment, red can move an assignment. Orange and red always confirm.
 
 Every action that writes is a `<verb>_preview` / `<verb>_apply` pair, so `--dry-run` on the
 apply runs the preview and a schedule key names the half you mean. The cleanup actions select
@@ -308,7 +339,7 @@ so duplicate *candidates* reach the matcher in the match/heal unit tests for the
 duplicate-name fix, not via sim. `scripts/parity_sweep.py` compares the primitives over
 hundreds of thousands of cases in a full local run (no `--limit`); the bounded CI sweeps
 cover ~4,800 normalize, ~900 per-name (callsign/location/network), and ~1,200
-match/score cases. Both gates run in CI against the plugin pinned as a submodule in
+match/score cases. All three gates run in CI against the plugin pinned as a submodule in
 `reference/`.
 - **Rust-native actions**: `match`, `heal` and the cleanup presets reuse the parity-checked
 pipeline but make their own product decisions. They are not ports, and row-for-row equality
@@ -316,59 +347,38 @@ with the plugin is not claimed for them. `scripts/channel_ops_parity.py` compare
 *selection* and the resulting payloads of every cleanup action against the plugin's own
 logic, which is the part where equality is claimed.
 
-Deliberate divergences from the plugin (actions only, never the pipeline):
+## Differences from the plugins
 
-- **EPG-override channels are skipped**: a channel whose guide was set by hand is left
-alone by match; the plugin re-matches it. Skipping is safer, and the CSV reason says so.
-- **AI promotion within the verify band**: with the AI gate on, an AI-accepted candidate can
-be assigned while its heuristic score (60–94) sits below `match_confidence_threshold`
-(default 95). The threshold still gates every heuristic assignment; AI may promote inside
-the band but never veto a heuristic win, and heal never consults AI at all.
-- **Heal preview statuses are plugin-style**: a working replacement below the threshold is
-reported as `SKIPPED_LOW_CONFIDENCE` / `REPLACEMENT_PREVIEW` with its real score, but
-never applied.
-- **Sourceless candidates are skipped**: entries with no EPG source are not considered as
-replacements; the plugin validates by EPG id and can accept one.
-- **Match reporting walks only validated candidates**: when nothing validates, the row
-reports the top-ranked candidate and says no programme data was found, where the plugin
-reports the first programme-carrying candidate regardless of threshold.
-- **CSV formula guard**: cells starting with `=`, `+`, `-` or `@` are prefixed with a single
-quote, so crosstalk CSVs differ from the plugin's for such names. The quote is a
-spreadsheet display instruction that keeps the text inert — open the CSV in a text
-editor (rather than a spreadsheet) and the quote is visible as part of the value.
-- **`clear_hidden` only unassigns**: the plugin also deleted each entry's `ProgramData` rows,
-which blanks the guide of every *visible* channel sharing that entry. crosstalk never
-deletes programme data.
-- **`clear_groups` refuses an empty `[scope] groups`**: the plugin treats the same empty
-filter as "every channel", which makes one press unassign every guide in the install.
-- **The cleanup actions select from the run store**: the plugin kept a JSON results file. The
-scan's rows are the result set, so they are queryable and cannot be overwritten by an
-unrelated run; there is no `export_results` action either, because every run already writes
-its CSV.
-- **A stale scan cannot tag or clear the wrong channel**: the plugin applied the ids stored by
-the last scan without re-reading them. crosstalk re-reads every channel, and skips a channel
-whose guide changed since the scan (with the reason in the CSV).
-- **A failed programme lookup is "unknown", never "missing"**: the plugin's check is one SQL
-query and cannot fail per channel; over REST one can. A channel the scan could not check is
-left out of the result set (counted as `unchecked` in the summary and the CSV), so the cleanup
-actions can neither tag nor clear it.
-- **The watchdog is scheduled, not enabled**: the plugin's `watchdog_enabled` and
-`watchdog_check_interval_hours` are gone in favour of `[schedules]`, and the plugin's single
-button became `watchdog_preview` / `watchdog_apply`. The apply is **orange** rather than the
-plugin's green: it queues refreshes on Dispatcharr, which is a write.
-- **A queued refresh is waited for, with a timeout**: the plugin's refresh ran inline, so it had
-nothing to wait for. crosstalk polls the source for `watchdog_refresh_timeout_minutes` and
-reports a wait that lapsed as "did not settle" rather than as a failed refresh.
-- **"Has mapped channels" comes from the channel list**, not from the server-side
-`has_channels` annotation: channel → its own EPG entry → that entry's source is exactly the
-plugin's ORM query, and it costs no request.
-- **A recovery is a log line and a run row**, not a Dispatcharr System Event, which crosstalk
-has none of. `watchdog_log_on_recovery` keeps the same meaning. A re-read that fails counts as
-"no improvement" where the plugin distinguished a vanished source from a database error.
-- **The watchdog wants an administrator's API key**: the programme search only returns rows
-on guide data a channel the key's user can reach is mapped to, so a lesser key reads some
-sources short or empty — and its refresh POSTs answer 403. The run warns in the summary when
-the key is not an administrator's; the plugin, running as Django, never had a key at all.
+crosstalk is a port, not a fork, and every place where it behaves differently is listed here
+with the reason. The matching pipeline is not in this table: it is a strict port, and the gates
+above hold it to byte equality. Only `guide` exists so far, so every row is a difference from
+EPG Janitor; later phases add rows here rather than a second table.
+
+| Difference | Reason |
+|---|---|
+| EPG-override channels are skipped by `match` | A channel whose guide was set by hand in Dispatcharr keeps it; the plugin re-matches and overwrites. Skipping is safer, and the CSV reason says so. |
+| AI may promote inside the verify band | With the AI gate on, an AI-accepted candidate can be assigned while its heuristic score (60–94) sits below `match_confidence_threshold` (default 95). The threshold still gates every heuristic assignment: the model never re-checks or vetoes one, and heal never asks it at all. |
+| Heal reports a below-threshold replacement without applying it | The row keeps the plugin's `SKIPPED_LOW_CONFIDENCE` / `REPLACEMENT_PREVIEW` wording and the real score, so a preview shows what was nearly a match; the write still needs the threshold. |
+| Candidates with no EPG source are never replacements | Heal validates by `tvg_id` and source, so an entry without a source cannot be checked; the plugin validates by EPG id alone and can accept one. |
+| Match reports only walk candidates at or above the threshold | When nothing is applied, the row still carries the top-ranked candidate's score and method: “below threshold” when no candidate qualified for a programme check, “carries no programme data” when a checked one was empty. The plugin checks every scored candidate and reports the first programme-carrying one whatever its score, so the same channel can show a lower score with programmes behind it. |
+| Programme data that cannot be read is “unknown”, never “missing” | The plugin's check is one SQL query and cannot fail per channel; over REST one can. A channel the scan could not check is left out of the result set (counted as `unchecked` in the summary and the CSV), so no cleanup can tag or clear it. |
+| Cleanup selections come from the run store, not a results file | `scan` stores its result set as run rows: queryable, kept with its CSV, and not overwritten by an unrelated run. There is no age limit for the same reason, and no `export_results` action — every run already writes its CSV. |
+| Every selection is intersected with `[scope]` again at apply time | The plugin applied the ids its scan had stored, so a settings change in between could reach a channel outside the scope. An id that is gone or out of scope is reported as skipped. |
+| A channel whose guide changed since the scan is skipped | The plan re-reads every channel, so an old scan can only be out of date — never double-tagged, and never clearing a guide that was reassigned. |
+| `clear_hidden` only unassigns | The plugin also deleted each entry's `ProgramData` rows, which blanks the guide of every *visible* channel sharing that entry. crosstalk never deletes programme data. |
+| `clear_groups` refuses an empty `[scope] groups` | The plugin treats the same empty filter as “every channel”, which makes one press unassign every guide in the install. |
+| Clearing a guide skips a channel with an EPG override | Clearing the channel's own column would not change what is shown, which is the same reason match skips one. |
+| `clear_by_regex` accepts Rust `regex`, not Python `re` | Backreferences and lookaround are refused with an explanation rather than silently matching something else, and the pattern is matched case-sensitively and unanchored as in the plugin. |
+| `Clear exports` is a host command and a button, not an action | One retention rule over every app's `<app>_*.csv` replaces each plugin's `clear_csv_exports`. Only crosstalk's own files are touched, so a directory shared with the plugins keeps theirs. |
+| The watchdog is armed by a schedule | `watchdog_enabled` and `watchdog_check_interval_hours` are gone: the host owns schedules, so `"guide.watchdog_apply" = "0 */6 * * *"` is the interval — and a schedule naming `watchdog_preview` stays a preview. |
+| The watchdog is a preview/apply pair, and the apply is **orange** | The plugin's single button audited and refreshed in one press, and was painted green although it rewrites guide data. Here the audit is a read, the refresh confirms, and neither touches a channel. |
+| A queued refresh is waited for, with a timeout | The plugin's refresh ran inline, so it had nothing to wait for. crosstalk polls until the source settles and reports a wait that lapsed as “did not settle” rather than as a failed refresh. |
+| The guide horizon costs requests, not one SQL aggregate | Over REST there is no “latest programme per source” route, so staleness is one probe per source and the exact horizon about 28 indexed counts — paid only by a source the run is about to refresh. |
+| “Has mapped channels” comes from the channel list | channel → its own EPG entry → that entry's source is exactly the plugin's ORM query, and reusing the world the run already loaded costs no extra request. |
+| A recovery is a log line and a run row | crosstalk has no Dispatcharr System Events. `watchdog_log_on_recovery` keeps its meaning, every source gets a row either way, and a re-read that fails counts as “no improvement” where the plugin distinguished a vanished source from a database error. |
+| The watchdog wants an administrator's API key | The programme search only returns rows on guide data a channel the key's user can reach is mapped to, so a lesser key reads sources short or empty — and its refresh POSTs answer 403. The run warns when the key is not an administrator's; the plugin, inside Django, had no key at all. |
+| CSV cells that look like formulas are quoted | A cell starting with `=`, `+`, `-` or `@` gets a leading single quote, so such names differ from the plugin's CSV. It is a spreadsheet display instruction: a text editor shows the quote as part of the value. |
+| The plugin's action ids and its usage counter are not carried over | `janitor` became `guide` and `automatch_*` became `match_*`, and the plugin's own ids appear in no schedule, URL or CSV. Anonymous usage reporting is not ported: a run is recorded in crosstalk's own store and sent nowhere. |
 
 ## Development
 
@@ -380,25 +390,33 @@ cargo fmt --all
 ./scripts/sim_parity.sh --quick # the oracle: Rust vs the Python tool, byte for byte
 python3 scripts/parity_sweep.py --kinds normalize,callsign,location,network --limit 300
 python3 scripts/parity_sweep.py --kinds match,score --limit 300 --pool 60
+python3 -I scripts/channel_ops_parity.py   # the cleanup selections and payloads
+
+./scripts/upstream_drift.sh     # what the plugin changed since the pin, in files we port
 ```
 
 The Python plugin lives in `reference/` as a pinned git submodule: the parity gates compare
 against that exact commit. See [How matching works](#how-matching-works) for what is
-strict-parity and what is deliberately Rust-native.
+strict-parity and what is deliberately Rust-native, and `scripts/upstream_drift.sh` — which
+also runs on the weekly CI schedule — for when upstream has moved past that pin.
 
 ### Layout
 
 ```
 crates/crosstalk-matching   pure, IO-free matcher: normalisation, similarity, callsigns, pipeline
 crates/crosstalk-core       host: config, sub-app trait, Dispatcharr client, AI, store, runner, CSV
-crates/guide                the guide sub-app: scope, matching, heal, cleanup presets, watchdog
+crates/guide                the guide sub-app: scope, matching, heal, scan, cleanup presets, watchdog
 crates/crosstalk-web        axum + Askama UI and JSON API
 crates/crosstalk            the binary: CLI, registry, daemon
 data/                       embedded channel databases, FCC callsigns, aliases
+scripts/                    the parity gates and the upstream-drift report
 ```
 
 A new sub-app is a crate implementing `SubApp` plus one line in `crates/crosstalk/src/registry.rs`.
 
 ## Licence
 
-MIT.
+crosstalk is MIT; see [LICENSE](LICENSE). The code and data ported from EPG Janitor are
+credited, with the upstream licence text and the pinned reference commit, in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) — both files ship in the release tarball and
+in the container image, under `/usr/share/doc/crosstalk/`.

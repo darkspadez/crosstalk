@@ -87,7 +87,8 @@ jobs:
         run: |
           name="crosstalk-${GITHUB_REF_NAME//\//-}-linux-${{ matrix.arch }}"
           mkdir -p "dist/$name"
-          cp "target/${{ matrix.target }}/release/crosstalk" README.md "dist/$name/"
+          cp "target/${{ matrix.target }}/release/crosstalk" README.md LICENSE \
+            THIRD_PARTY_NOTICES.md "dist/$name/"
           cp config/*.example.toml "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           echo "name=$name" >> "$GITHUB_OUTPUT"
