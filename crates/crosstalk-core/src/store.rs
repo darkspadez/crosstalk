@@ -77,10 +77,70 @@ pub struct RunRecord {
     pub report_path: Option<String>,
 }
 
-/// One row of a run: a channel and what was decided for it.
+/// What a run row is about.
+///
+/// Rows started out channel-shaped, and the later apps needed to record other things: a probe
+/// measures provider streams, and the guide's watchdog checks EPG sources. Rather than reuse
+/// `channel_id` for an id from another table (which made a row impossible to read without
+/// knowing which action wrote it, and could aim a restore at whatever channel carried that
+/// number), the row says what its id belongs to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Subject {
+    /// A channel, which every channel operation and every guide action writes.
+    #[default]
+    Channel,
+    /// A provider stream, as probe rows record (`channel_id` carries the stream id).
+    Stream,
+    /// An EPG source, as the watchdog records (`channel_id` carries the source id).
+    EpgSource,
+}
+
+impl Subject {
+    /// The stored form, which is also the wire form.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Channel => "channel",
+            Self::Stream => "stream",
+            Self::EpgSource => "epg_source",
+        }
+    }
+
+    /// How the UI names it. `Stream` is a provider stream rather than a channel's list, which
+    /// is why it says so.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Channel => "Channel",
+            Self::Stream => "Stream",
+            Self::EpgSource => "EPG source",
+        }
+    }
+
+    /// Parse the stored form. An unknown value is read as a channel: a row written by a newer
+    /// build is still a row, and refusing it would hide it from the run page.
+    fn parse(text: &str) -> Self {
+        match text {
+            "stream" => Self::Stream,
+            "epg_source" => Self::EpgSource,
+            _ => Self::Channel,
+        }
+    }
+}
+
+impl std::fmt::Display for Subject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One row of a run: what it is about (a channel, a stream, an EPG source) and what was
+/// decided for it.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RunRow {
     pub ordinal: i64,
+    /// What `channel_id` is an id of. Channel rows keep the pre-subject meaning, which is what
+    /// the DEFAULT on the column backfills.
+    pub subject: Subject,
     pub channel_id: i64,
     pub channel_name: String,
     pub channel_group: String,
@@ -239,6 +299,8 @@ impl Store {
                     field            TEXT    NOT NULL DEFAULT '',
                     before_value     TEXT,
                     after_value      TEXT,
+                    -- What channel_id is an id of: channel (default), stream, epg_source.
+                    subject          TEXT    NOT NULL DEFAULT 'channel',
                     PRIMARY KEY (run_id, ordinal)
                 );
                 CREATE INDEX IF NOT EXISTS run_rows_channel ON run_rows(run_id, channel_id);
@@ -364,9 +426,9 @@ impl Store {
                     "INSERT OR REPLACE INTO run_rows (run_id, ordinal, channel_id, channel_name, \
                      channel_group, channel_number, current_epg_name, epg_data_id, epg_name, \
                      epg_source, score, method, status, reason, ai_decision, field, \
-                     before_value, after_value) \
+                     before_value, after_value, subject) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
-                     ?16, ?17, ?18)",
+                     ?16, ?17, ?18, ?19)",
                 )?;
                 for row in rows {
                     statement.execute(params![
@@ -388,6 +450,7 @@ impl Store {
                         row.field,
                         row.before_value,
                         row.after_value,
+                        row.subject.as_str(),
                     ])?;
                 }
             }
@@ -523,12 +586,14 @@ impl Store {
             let mut statement = connection.prepare(
                 "SELECT ordinal, channel_id, channel_name, channel_group, channel_number, \
                  current_epg_name, epg_data_id, epg_name, epg_source, score, method, status, \
-                 reason, ai_decision, field, before_value, after_value FROM run_rows \
+                 reason, ai_decision, field, before_value, after_value, subject FROM run_rows \
                  WHERE run_id = ?1 ORDER BY ordinal",
             )?;
             let rows = statement.query_map(params![run_id], |row| {
+                let subject: String = row.get(17)?;
                 Ok(RunRow {
                     ordinal: row.get(0)?,
+                    subject: Subject::parse(&subject),
                     channel_id: row.get(1)?,
                     channel_name: row.get(2)?,
                     channel_group: row.get(3)?,
@@ -649,11 +714,13 @@ impl Store {
     }
 }
 
-/// Add the columns channel operations record, when this database predates them.
+/// Add the columns channel operations and the run-row subject record, when this database
+/// predates them.
 ///
 /// `CREATE TABLE IF NOT EXISTS` leaves an existing `run_rows` alone, so a store written by an
 /// earlier build would reject the new inserts. The columns are nullable or defaulted, so an
-/// old row reads back as "no channel-operation data", which is exactly what it is.
+/// old row reads back as "no channel-operation data" and as a channel row, which is what it
+/// was — except for the watchdog's rows, which the backfill below re-labels as EPG sources.
 fn add_run_row_columns(connection: &Connection) -> Result<()> {
     let mut statement = connection.prepare("PRAGMA table_info(run_rows)")?;
     let existing: std::collections::HashSet<String> = statement
@@ -663,12 +730,26 @@ fn add_run_row_columns(connection: &Connection) -> Result<()> {
         ("field", "TEXT NOT NULL DEFAULT ''"),
         ("before_value", "TEXT"),
         ("after_value", "TEXT"),
+        // The DEFAULT is the backfill for every ordinary row: before this column existed all
+        // of them were about a channel. The watchdog's rows are the exception, below.
+        ("subject", "TEXT NOT NULL DEFAULT 'channel'"),
     ] {
         if !existing.contains(name) {
             connection.execute_batch(&format!(
                 "ALTER TABLE run_rows ADD COLUMN {name} {definition}"
             ))?;
         }
+    }
+    // Watchdog rows predate the column: they carry an EPG SOURCE id in `channel_id` and mark
+    // themselves with `field = 'epg_source'` (the field they observed, not one they wrote), so
+    // the DEFAULT would mislabel them as channels. Runs once, in the same pass that adds the
+    // column — the `subject != 'epg_source'` guard is what makes it safe to re-run anyway.
+    if !existing.contains("subject") {
+        connection.execute(
+            "UPDATE run_rows SET subject = 'epg_source' \
+             WHERE field = 'epg_source' AND subject != 'epg_source'",
+            [],
+        )?;
     }
     Ok(())
 }
@@ -730,6 +811,7 @@ mod tests {
     fn sample_row(ordinal: i64, name: &str, score: i64) -> RunRow {
         RunRow {
             ordinal,
+            subject: Subject::Channel,
             channel_id: ordinal + 100,
             channel_name: name.to_string(),
             channel_group: "Sports".to_string(),
@@ -817,6 +899,98 @@ mod tests {
         assert_eq!(rows[0].field, "epg_data_id");
         assert_eq!(rows[0].before_value.as_deref(), Some("31"));
         assert_eq!(rows[0].after_value.as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn a_subject_round_trips_and_defaults_to_a_channel() {
+        let store = Store::in_memory().expect("store");
+        let run_id = store.start_run("streams", "probe", false).expect("start");
+        store
+            .append_rows(
+                run_id,
+                &[
+                    RunRow {
+                        ordinal: 0,
+                        subject: Subject::Channel,
+                        channel_id: 7,
+                        channel_name: "ESPN".to_string(),
+                        ..RunRow::default()
+                    },
+                    RunRow {
+                        ordinal: 1,
+                        subject: Subject::Stream,
+                        channel_id: 51_000,
+                        channel_name: "ESPN HD (alt)".to_string(),
+                        ..RunRow::default()
+                    },
+                    RunRow {
+                        ordinal: 2,
+                        subject: Subject::EpgSource,
+                        channel_id: 4,
+                        channel_name: "Schedules Direct".to_string(),
+                        field: "epg_source".to_string(),
+                        ..RunRow::default()
+                    },
+                ],
+            )
+            .expect("rows");
+
+        let rows = store.rows(run_id).expect("rows");
+        assert_eq!(rows[0].subject, Subject::Channel);
+        assert_eq!(rows[1].subject, Subject::Stream);
+        assert_eq!(rows[2].subject, Subject::EpgSource);
+        // The stored form is the stable one; the label is only for the page.
+        assert_eq!(rows[2].subject.as_str(), "epg_source");
+        assert_eq!(rows[2].subject.label(), "EPG source");
+        assert_eq!(Subject::default(), Subject::Channel);
+    }
+
+    #[test]
+    fn a_store_written_before_the_subject_column_backfills_the_watchdog_rows() {
+        // The column arrived with the streams phase. Watchdog rows were written with an EPG
+        // SOURCE id in `channel_id` and `field = 'epg_source'`, so the DEFAULT alone would
+        // call them channels and a restore would read a source id as a channel id.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("runs.db");
+        {
+            let connection = Connection::open(&path).expect("open");
+            connection
+                .execute_batch(
+                    "CREATE TABLE runs (id INTEGER PRIMARY KEY AUTOINCREMENT, app TEXT NOT NULL, \
+                     action TEXT NOT NULL, dry_run INTEGER NOT NULL, started_at TEXT NOT NULL, \
+                     finished_at TEXT, status TEXT NOT NULL, summary TEXT, \
+                     counts TEXT NOT NULL DEFAULT '{}', report_path TEXT); \
+                     CREATE TABLE run_rows (run_id INTEGER NOT NULL, ordinal INTEGER NOT NULL, \
+                     channel_id INTEGER NOT NULL, channel_name TEXT NOT NULL, \
+                     channel_group TEXT NOT NULL DEFAULT '', channel_number REAL, \
+                     current_epg_name TEXT, epg_data_id INTEGER, epg_name TEXT, epg_source TEXT, \
+                     score INTEGER NOT NULL DEFAULT 0, method TEXT NOT NULL DEFAULT '', \
+                     status TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '', \
+                     ai_decision TEXT, field TEXT NOT NULL DEFAULT '', before_value TEXT, \
+                     after_value TEXT, PRIMARY KEY (run_id, ordinal)); \
+                     INSERT INTO runs (app, action, dry_run, started_at, status) \
+                     VALUES ('guide', 'watchdog_apply', 0, '2026-11-01T00:00:00Z', 'succeeded'); \
+                     INSERT INTO run_rows (run_id, ordinal, channel_id, channel_name, field) \
+                     VALUES (1, 0, 4, 'Schedules Direct', 'epg_source'); \
+                     INSERT INTO run_rows (run_id, ordinal, channel_id, channel_name, field) \
+                     VALUES (1, 1, 7, 'ESPN', 'name');",
+                )
+                .expect("old schema");
+            connection
+                .execute_batch("PRAGMA user_version = 1")
+                .expect("stamp version");
+        }
+
+        let store = Store::open(&path).expect("reopens");
+        let rows = store.rows(1).expect("rows");
+        assert_eq!(rows[0].subject, Subject::EpgSource);
+        assert_eq!(rows[1].subject, Subject::Channel);
+
+        // And the backfill is idempotent: a second open changes nothing, and a channel row
+        // that happens to carry the `epg_source` field label is not rewritten.
+        drop(store);
+        let store = Store::open(&path).expect("reopens again");
+        assert_eq!(store.rows(1).expect("rows")[0].subject, Subject::EpgSource);
     }
 
     #[test]

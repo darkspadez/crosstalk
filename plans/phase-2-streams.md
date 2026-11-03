@@ -301,3 +301,11 @@ Each step: DeepSeek implements → gate → Muse reviews and fixes → gate → 
 Same as phase 1: DeepSeek V4.1 Flash (neuralwatt) implements each step, Muse Spark 1.3
 Contributor reviews and fixes after each step, Opus 5.5 reviews and fixes at the end of the
 phase. The orchestrator runs gates and owns commits; nothing is pushed without approval.
+
+## Execution notes
+- Step 2: Dispatcharr's `edit/bulk` accepts `streams` per row (ordered, replaces the list, one
+  transaction, whole chunk 400s on one bad id). `RestStreamListWriter` uses it in 500-row
+  chunks with per-channel fallback: ~42 requests for 20k channels instead of 20k.
+- Step 2: a channel's group cannot be cleared over REST (`channel_group_id` has no
+  `allow_null`). `MoveGroup(None)` plans and records, but apply refuses it per row. Restore of a
+  channel whose recorded group was "No Group" needs the bridge; README divergences must say so.

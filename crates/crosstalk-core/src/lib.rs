@@ -25,9 +25,10 @@ mod test_app;
 
 pub use ai::{AiService, Answer, Decider, DecisionRequest, DecisionResponse, Question, Verdict};
 pub use channel_ops::{
-    apply, plan, plan_with_options, run_rows, write_ops_report, ApplyReport, Change, Field, Op,
-    OpKind, Plan, PlanOptions, RenameKind, ReportSpec, RowStatus, SelectedChannel, Selection, Skip,
-    Value,
+    apply, apply_with_writer, parse_stream_ids, plan, plan_with_options, rows_for_field, run_rows,
+    write_ops_report, ApplyReport, Change, Field, ListedStream, Op, OpKind, Plan, PlanOptions,
+    RenameKind, ReportSpec, RestStreamListWriter, RowStatus, SelectedChannel, Selection, SetValue,
+    Skip, StreamListWriter, Value,
 };
 pub use config::{ConfigReport, CrosstalkConfig, SharedConfig};
 pub use csv_report::{
@@ -37,14 +38,14 @@ pub use csv_report::{
 };
 pub use dispatcharr::{
     Channel, ChannelCreate, ChannelEdit, ChannelGroup, ChannelProfile, ChannelRegexRename,
-    DispatcharrClient, EpgEntry, EpgHorizon, EpgRefresh, EpgSource, EpgSourceEdit, EpgSourceState,
-    HasPrograms, Logo, M3uAccount, PluginActionInfo, PluginInfo, ProgramWindow, QueuedTask, Set,
-    Stream, StreamsToChannels, World, WorldKind, WorldKinds,
+    CurrentProgram, DispatcharrClient, EpgEntry, EpgHorizon, EpgRefresh, EpgSource, EpgSourceEdit,
+    EpgSourceState, HasPrograms, Logo, M3uAccount, PluginActionInfo, PluginInfo, ProgramWindow,
+    QueuedTask, Set, Stream, StreamsToChannels, World, WorldKind, WorldKinds,
 };
 pub use jobs::{JobContext, ProgressEvent, ProgressSink};
 pub use runner::{ActiveRun, JobRunner, StartedRun};
 pub use scheduler::{ScheduleInfo, Scheduler};
-pub use store::{AiDecision, RunRecord, RunRow, RunStatus, Store};
+pub use store::{AiDecision, RunRecord, RunRow, RunStatus, Store, Subject};
 pub use subapp::{
     ActionKind, ActionSpec, FieldKind, FieldSpec, FieldValue, JobOutcome, OutcomeBuilder, Registry,
     SettingsSchema, SettingsValues, SubApp,

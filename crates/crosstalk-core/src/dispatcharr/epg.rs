@@ -16,6 +16,11 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use std::time::Duration;
 
+/// How many programmes the placeholder matcher asks about per request. Upstream the view
+/// silently truncates `epg_data_ids` to 50, so a longer list would answer only its first 50
+/// entries with no error to notice.
+const CURRENT_PROGRAMS_CHUNK_SIZE: usize = 50;
+
 /// How long [`DispatcharrClient::await_epg_refresh`] waits between polls. A fetch-and-parse of
 /// a large XMLTV file takes minutes, so a tighter interval would only add requests.
 const EPG_REFRESH_POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -260,6 +265,49 @@ impl DispatcharrClient {
                 format!("checking whether EPG source {source_id} still covers {cutoff}")
             })?;
         Ok(!rows.results.is_empty())
+    }
+
+    /// The programmes airing right now on these EPG entries.
+    ///
+    /// `POST /epg/current-programs/` — there is no GET route on that view. The body is
+    /// `{"epg_data_ids": [...]}` and the answer is a FLAT array of
+    /// [`CurrentProgram`]s, each carrying the `epg_data_id` it belongs to; an entry with
+    /// nothing airing is simply absent. Up to [`CURRENT_PROGRAMS_CHUNK_SIZE`] ids per request
+    /// (the view truncates silently beyond that), so this chunks and concatenates.
+    ///
+    /// Two things a caller must not misread: an entry whose guide index is still being built
+    /// answers `{"epg_data_id": N, "parsing": true}` instead of a programme (see
+    /// [`CurrentProgram::is_parsing`]), and an id that does not exist is ignored rather than
+    /// rejected. POST is `IsAdmin` upstream, so this needs an administrator's key.
+    ///
+    /// The placeholder matcher is what reads this: it matches a placeholder channel's or
+    /// stream's name against what is airing on its guide entry, which is one request per 50
+    /// entries rather than a programme search per entry.
+    pub async fn current_programs(&self, epg_data_ids: &[i64]) -> Result<Vec<CurrentProgram>> {
+        if epg_data_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut programs: Vec<CurrentProgram> = Vec::with_capacity(epg_data_ids.len());
+        for chunk in epg_data_ids.chunks(CURRENT_PROGRAMS_CHUNK_SIZE) {
+            let body = serde_json::json!({ "epg_data_ids": chunk });
+            let answered: Vec<CurrentProgram> = self
+                .write_json(
+                    &reqwest::Method::POST,
+                    "/epg/current-programs/",
+                    Some(&body),
+                    Retry::Idempotent,
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "reading what is airing on {} EPG entr{}",
+                        chunk.len(),
+                        if chunk.len() == 1 { "y" } else { "ies" }
+                    )
+                })?;
+            programs.extend(answered);
+        }
+        Ok(programs)
     }
 
     /// The latest programme end time on an EPG source, over the default bracket: the last

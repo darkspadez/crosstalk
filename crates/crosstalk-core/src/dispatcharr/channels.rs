@@ -400,10 +400,9 @@ impl DispatcharrClient {
     ///
     /// `PATCH /channels/channels/{id}/` with `streams`: the array order becomes the playback
     /// order (`ChannelSerializer.update` writes `ChannelStream.order` from the index), and
-    /// streams missing from the array are unlinked. ONE CHANNEL PER REQUEST — Dispatcharr has
-    /// no per-stream assignment route, so a run that reorders every channel of a large
-    /// install pays one request each; that is what makes bulk stream assignment the bridge's
-    /// first candidate.
+    /// streams missing from the array are unlinked. This is the one-channel form;
+    /// [`Self::bulk_set_channel_streams`] carries many channels per request through
+    /// `edit/bulk`, and falls back to this route to attribute a rejected chunk per channel.
     ///
     /// Retried: re-applying the same list rewrites the same orders.
     pub async fn set_channel_streams(
@@ -425,6 +424,93 @@ impl DispatcharrClient {
                 stream_ids.len()
             )
         })
+    }
+
+    /// Set many channels' ordered stream lists through the bulk edit.
+    ///
+    /// `PATCH /channels/channels/edit/bulk/` with one `{id, streams}` row per channel
+    /// (`edit_bulk` in `apps/channels/api_views.py`): the `streams` array REPLACES the
+    /// channel's whole list and its INDEX is the playback order (`order = enumerate(ids)`),
+    /// streams missing from the array are unlinked, and the chunk applies in a single
+    /// transaction. A streams-only row carries no other column, so it skips the column update
+    /// and only touches the `ChannelStream` rows.
+    ///
+    /// One invalid row rejects its WHOLE chunk before anything is written — a bad stream id
+    /// fails the row's `PrimaryKeyRelatedField` validation, an unknown channel id is
+    /// reported, and `edit_bulk` answers 400 with the per-row errors — so a rejected chunk is
+    /// retried row by row through [`Self::set_channel_streams`] and the failures are
+    /// attributed per channel instead of failing ~500 channels over one bad id. A chunk is
+    /// also rejected whole when two rows name the same channel, or when one list names the
+    /// same stream twice (the `unique_channel_stream` constraint); the per-channel retry
+    /// attributes those too.
+    ///
+    /// Chunked at `CHANNEL_EDIT_CHUNK_SIZE` with the same idempotent retry as
+    /// [`Self::edit_channels`]: re-applying the same lists rewrites the same orders, so a
+    /// retried chunk is safe. The answer is in input order, one entry per channel; an `Err`
+    /// is that channel's failure and does not stop the others.
+    pub async fn bulk_set_channel_streams(
+        &self,
+        lists: &[(i64, Vec<i64>)],
+    ) -> Vec<(i64, Result<()>)> {
+        let mut results = Vec::with_capacity(lists.len());
+        for chunk in lists.chunks(CHANNEL_EDIT_CHUNK_SIZE) {
+            let edits: Vec<ChannelEdit> = chunk
+                .iter()
+                .map(|(channel_id, stream_ids)| {
+                    let mut edit = ChannelEdit::new(*channel_id);
+                    edit.streams = Some(stream_ids.clone());
+                    edit
+                })
+                .collect();
+            match self.patch_channel_edits(&edits).await {
+                Ok(_) => results.extend(chunk.iter().map(|(id, _)| (*id, Ok(())))),
+                Err(_) => {
+                    // The chunk was rejected whole; attribute it per channel.
+                    for (channel_id, stream_ids) in chunk {
+                        let result = self
+                            .set_channel_streams(*channel_id, stream_ids)
+                            .await
+                            .map(|_| ());
+                        results.push((*channel_id, result));
+                    }
+                }
+            }
+        }
+        results
+    }
+
+    /// Write one stream's probe output.
+    ///
+    /// `PATCH /channels/streams/{id}/` with `stream_stats`: `StreamSerializer` keeps
+    /// `stream_stats` writable even for a provider stream (it makes the descriptive columns
+    /// read-only, not this one), so a probe can write what it measured without touching
+    /// anything else about the stream.
+    ///
+    /// `stream_stats_updated_at` is sent with it. Nothing upstream stamps it for an API write
+    /// — only the live proxy does, on a play — and Dispatcharr's own stats delta
+    /// (`/channels/<id>/streams/stats/?since=…`) filters on it, so leaving it stale would hide
+    /// the write from every reader of that column. One clock, the caller's.
+    ///
+    /// Retried like a read: re-applying the same stats changes nothing a reader can see
+    /// beyond the timestamp.
+    pub async fn update_stream_stats(
+        &self,
+        stream_id: i64,
+        stats: &serde_json::Value,
+    ) -> Result<Stream> {
+        let body = serde_json::json!({
+            "stream_stats": stats,
+            "stream_stats_updated_at": chrono::Utc::now()
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        });
+        self.write_json(
+            &reqwest::Method::PATCH,
+            &format!("/channels/streams/{stream_id}/"),
+            Some(&body),
+            Retry::Idempotent,
+        )
+        .await
+        .with_context(|| format!("writing the stats of stream {stream_id}"))
     }
 
     /// Assign or clear EPG entries on channels.

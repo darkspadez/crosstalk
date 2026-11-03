@@ -408,6 +408,41 @@ async fn a_channel_operation_row_shows_its_field_and_both_sides() {
 }
 
 #[tokio::test]
+async fn a_watchdog_row_is_labelled_as_an_epg_source() {
+    // A watchdog row carries a source id where a channel id would be. The page says which it
+    // is, so nobody reads "4" as channel 4 — which is what the phase-1 footnote had to explain
+    // in prose instead.
+    let (state, store, _dir) = state(None);
+    let run_id = store
+        .start_run("guide", "watchdog_apply", false)
+        .expect("run");
+    store
+        .append_rows(
+            run_id,
+            &[crosstalk_core::store::RunRow {
+                ordinal: 0,
+                subject: crosstalk_core::store::Subject::EpgSource,
+                channel_id: 4,
+                channel_name: "Schedules Direct".to_string(),
+                field: "epg_source".to_string(),
+                method: "watchdog".to_string(),
+                status: "stale".to_string(),
+                reason: "stale; status error -> success".to_string(),
+                ..Default::default()
+            }],
+        )
+        .expect("rows");
+
+    let (status, body) = get(&state, &format!("/runs/{run_id}/rows")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("EPG source"), "{body}");
+    assert!(body.contains("Schedules Direct"), "{body}");
+    // The column says what the rows are about rather than claiming they are channels.
+    assert!(body.contains("<th>Subject</th>"), "{body}");
+    assert!(!body.contains("<th>Channel</th>"), "{body}");
+}
+
+#[tokio::test]
 async fn the_json_api_answers_with_the_same_data() {
     let (state, store, _dir) = state(None);
     store.start_run("echo", "peek", true).expect("run");

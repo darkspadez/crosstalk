@@ -133,6 +133,8 @@ pub struct UiSettings {
 /// How a run row reads in the table.
 #[derive(Debug, Clone)]
 pub struct UiRow {
+    /// What this row is about, as the page labels it: a channel, a stream or an EPG source.
+    pub subject: String,
     pub channel_id: i64,
     pub channel_name: String,
     /// The channel number as printed, empty when it has none.
@@ -264,6 +266,7 @@ pub fn fields(schema: &SettingsSchema, values: &SettingsValues) -> Vec<UiField> 
 /// only meaningful to a restore.
 pub fn run_row(row: &RunRow) -> UiRow {
     UiRow {
+        subject: row.subject.label().to_string(),
         channel_id: row.channel_id,
         channel_name: row.channel_name.clone(),
         channel_number: row
@@ -556,9 +559,31 @@ mod tests {
         let ui = run_row(&row);
         assert_eq!(ui.status_class, "matched");
         assert_eq!(ui.epg_name, "ESPN HD");
+        // A row says what it is about; a channel row is the default.
+        assert_eq!(ui.subject, "Channel");
 
         let empty = run_row(&RunRow::default());
         assert_eq!(empty.epg_name, "");
+    }
+
+    #[test]
+    fn a_row_is_labelled_by_what_it_is_about() {
+        let watchdog = RunRow {
+            subject: crosstalk_core::store::Subject::EpgSource,
+            channel_id: 4,
+            channel_name: "Schedules Direct".to_string(),
+            field: "epg_source".to_string(),
+            ..RunRow::default()
+        };
+        assert_eq!(run_row(&watchdog).subject, "EPG source");
+
+        let probe = RunRow {
+            subject: crosstalk_core::store::Subject::Stream,
+            channel_id: 51_000,
+            channel_name: "ESPN HD (alt)".to_string(),
+            ..RunRow::default()
+        };
+        assert_eq!(run_row(&probe).subject, "Stream");
     }
 
     #[test]

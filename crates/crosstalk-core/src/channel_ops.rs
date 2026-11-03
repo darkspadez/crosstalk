@@ -37,6 +37,13 @@
 //!   * a channel with an EPG *override* is skipped by [`Op::ClearEpg`]: clearing the channel's
 //!     own column would not change what is shown, and the guide action already treats an
 //!     override the same way when matching.
+//!   * a move to "No Group" ([`Op::MoveGroup`] with `group_id: None`) is planned and reported
+//!     but cannot be APPLIED over REST: Dispatcharr's `ChannelSerializer` declares
+//!     `channel_group_id` as a `PrimaryKeyRelatedField` without `allow_null`, so a null is a
+//!     400 for the whole `edit/bulk` chunk. [`apply`] refuses those rows with that reason
+//!     instead of sending a payload that fails. The column is nullable and the model allows
+//!     it (deleting a group leaves its channels with none), so this is an API gap rather than
+//!     a crosstalk limitation, and a bridge-backed writer can close it later.
 //!
 //! Without [`PlanOptions::suffix_present_skips_rest`] the operations are independent: a
 //! rename that is a no-op is reported as a skip and the rest still run, which is what
@@ -44,20 +51,50 @@
 //! `tag_missing` preset opts into the plugin's coupling instead: `add_bad_epg_suffix` with
 //! `remove_epg_with_suffix` skips an already-suffixed channel ENTIRELY, so it keeps its
 //! guide too (2508-2514).
+//!
+//! # Per-channel values
+//!
+//! Most operations apply one value to every selected channel. Restore, visibility and stream
+//! lists need the other shape — a different value per channel — and [`Op::Set`] is it: a map
+//! from channel id to the value that one channel gets, with every channel the map does not
+//! name left untouched.
+//!
+//! It is an [`Op`] rather than a `Plan` constructor on purpose. [`plan`] stays the ONE place
+//! that re-reads the current state of each channel, decides what is a no-op and records the
+//! before values a later restore reads; a plan built from changes would compute those
+//! somewhere else, over a world that may already be stale, and the two paths would drift.
+//! Being an op also means a per-channel write gets the selection, the scope intersection, the
+//! CSV, the run rows and the batched apply for free — the same guarantees every other write
+//! has.
+//!
+//! No-op dropping stays per channel: a channel the map names whose current value already
+//! equals the requested one is reported in [`Plan::skipped`], exactly like a uniform op that
+//! changes nothing, while a channel the map does not name gets no row at all (it is outside
+//! the operation's target set rather than a no-op).
+//!
+//! # Stream lists
+//!
+//! [`Field::Streams`] carries a channel's whole ordered stream list, so stream assignment
+//! gets the same plan/preview/CSV/run-row/restore treatment as a rename. The plan compares
+//! against the order the channel already has ([`Channel::streams`]) and only a different list
+//! becomes a change. Applying it goes through a [`StreamListWriter`] — a seam, not a detail:
+//! the REST implementation writes hundreds of channels per `edit/bulk` request (falling back
+//! to one PATCH per channel to attribute a rejected chunk), and a Dispatcharr plugin (the
+//! bridge) can replace it behind the same trait if REST ever stops being fast enough.
 
 use crate::config::ScopeConfig;
 use crate::csv_report::{self, Report};
 use crate::dispatcharr::{
-    Channel, ChannelEdit, DispatcharrClient, EpgEntry, Set, World, WorldKind,
+    Channel, ChannelEdit, DispatcharrClient, EpgEntry, Set, Stream, World, WorldKind,
 };
 use crate::jobs::JobContext;
 use crate::scope::{scope_channels, ScopedChannels};
-use crate::store::RunRow;
+use crate::store::{RunRow, Subject};
 use crate::subapp::{SettingsSchema, SettingsValues, SubApp};
 use crate::wildcard::parse_tokens;
 use anyhow::{bail, Context, Result};
 use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -81,6 +118,12 @@ pub const TEMPLATE_PLACEHOLDERS: [&str; 5] = ["{name}", "{group}", "{number}", "
 
 /// Progress is published at most this often, like the plugin's own two-second flush.
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Stream ids per `streams` wire value: the run-row form a restore parses back.
+const STREAM_WIRE_SEPARATOR: char = ',';
+
+/// How many entries of an ordered stream list the report prints before summarizing.
+const STREAMS_SHOWN: usize = 6;
 
 /// What a plan may touch: the app's `[scope]`, plus the action's own filter.
 ///
@@ -171,11 +214,16 @@ impl Selection {
     /// the scan found it on (a scan row records the assignment it examined there, with
     /// `current_epg_name` as its name). The expectation is what makes a stale result set safe
     /// to re-plan.
+    ///
+    /// Only [`Subject::Channel`] rows are read. A run's rows can now be about a provider
+    /// stream or an EPG source, whose `channel_id` column holds an id from another table
+    /// entirely: reading one of those as a channel id would aim the selection at whatever
+    /// channel happens to carry that number.
     pub fn from_scan_rows(rows: &[RunRow], scope: &ScopeConfig) -> Self {
         let mut selection = Self::in_scope(scope);
         let mut ids: Vec<i64> = Vec::with_capacity(rows.len());
         let mut seen: HashSet<i64> = HashSet::with_capacity(rows.len());
-        for row in rows {
+        for row in rows.iter().filter(|row| row.subject == Subject::Channel) {
             if seen.insert(row.channel_id) {
                 ids.push(row.channel_id);
             }
@@ -234,9 +282,9 @@ pub enum Op {
     Rename {
         kind: RenameKind,
     },
-    /// Move every selected channel into this group.
+    /// Move every selected channel into this group; `None` is "No Group".
     MoveGroup {
-        group_id: i64,
+        group_id: Option<i64>,
     },
     /// Enable or disable every selected channel in this profile.
     SetMembership {
@@ -249,6 +297,88 @@ pub enum Op {
     },
     /// Unassign the guide entry (`epg_data_id = null`).
     ClearEpg,
+    /// Set one field to a value PER CHANNEL: what restore, visibility and stream lists need.
+    ///
+    /// A channel missing from `values` is left untouched and gets no row; a channel the map
+    /// names whose current value already equals the requested one is reported as a skip, so
+    /// no-op dropping keeps working per channel. Every [`SetValue`] has to match the field
+    /// (a `Name` for `name`, a `Group` for `channel_group_id`, …) and [`plan`] refuses a
+    /// mismatched pair rather than silently dropping it.
+    Set {
+        field: Field,
+        // JSON and TOML objects only have string keys, so the map is deserialized by
+        // `channel_values` rather than by serde's own map decoder.
+        #[serde(deserialize_with = "channel_values")]
+        values: HashMap<i64, SetValue>,
+    },
+}
+
+/// Deserialize a per-channel value map from an object keyed by channel id.
+///
+/// serde's object keys are strings (both in JSON and in TOML), so a `HashMap<i64, _>` cannot
+/// be decoded directly; the keys are parsed here instead. The in-code shape stays a map,
+/// because that is what a restore and visibility build.
+fn channel_values<'de, D>(deserializer: D) -> std::result::Result<HashMap<i64, SetValue>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw: HashMap<String, SetValue> = HashMap::deserialize(deserializer)?;
+    raw.into_iter()
+        .map(|(key, value)| {
+            let id = key.trim().parse::<i64>().map_err(|_| {
+                serde::de::Error::custom(format!(
+                    "channel id {key:?} in a per-channel set is not an integer"
+                ))
+            })?;
+            Ok((id, value))
+        })
+        .collect()
+}
+
+/// The value one channel gets from [`Op::Set`], in the shape its field takes.
+///
+/// Separate from [`Value`] because these are the values a caller ASKS for, while [`Value`] is
+/// what a plan reports (ids with the names they print as, so the report needs no world).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetValue {
+    /// A channel name.
+    Name(String),
+    /// A channel group; `None` is "No Group".
+    Group(Option<i64>),
+    /// An EPG entry; `None` unassigns the guide.
+    Epg(Option<i64>),
+    /// `hidden_from_output`, or a profile membership's `enabled`.
+    Flag(bool),
+    /// An ordered stream list, replacing the channel's own.
+    Streams(Vec<i64>),
+}
+
+impl SetValue {
+    /// What this value is, in words, for a refusal's message.
+    fn shape(&self) -> &'static str {
+        match self {
+            Self::Name(_) => "name",
+            Self::Group(_) => "group",
+            Self::Epg(_) => "EPG entry",
+            Self::Flag(_) => "flag",
+            Self::Streams(_) => "stream list",
+        }
+    }
+
+    /// Whether this value can be written to that field. A `name` takes a [`Self::Name`] and
+    /// nothing else; a membership and `hidden_from_output` both take a [`Self::Flag`].
+    fn fits(&self, field: Field) -> bool {
+        matches!(
+            (field, self),
+            (Field::Name, Self::Name(_))
+                | (Field::Group, Self::Group(_))
+                | (Field::Epg, Self::Epg(_))
+                | (Field::HiddenFromOutput, Self::Flag(_))
+                | (Field::Membership(_), Self::Flag(_))
+                | (Field::Streams, Self::Streams(_))
+        )
+    }
 }
 
 impl Op {
@@ -260,6 +390,7 @@ impl Op {
             Self::SetMembership { .. } => OpKind::SetMembership,
             Self::SetHiddenFromOutput { .. } => OpKind::SetHiddenFromOutput,
             Self::ClearEpg => OpKind::ClearEpg,
+            Self::Set { .. } => OpKind::Set,
         }
     }
 
@@ -271,6 +402,7 @@ impl Op {
             Self::SetMembership { profile_id, .. } => Field::Membership(*profile_id),
             Self::SetHiddenFromOutput { .. } => Field::HiddenFromOutput,
             Self::ClearEpg => Field::Epg,
+            Self::Set { field, .. } => *field,
         }
     }
 }
@@ -314,6 +446,10 @@ impl RenameKind {
 }
 
 /// One field a change writes, as the report and a restore name it.
+///
+/// The label is both the API's own field name (it is what a CSV row and a run row carry, and
+/// what [`Self::from_label`] parses back) and the serialized form, so an [`Op::Set`] names its
+/// field the same way a restore reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
     Name,
@@ -322,6 +458,8 @@ pub enum Field {
     HiddenFromOutput,
     /// A profile membership; the id is the profile.
     Membership(i64),
+    /// The channel's ordered stream list.
+    Streams,
 }
 
 impl Field {
@@ -333,6 +471,7 @@ impl Field {
             Self::Epg => "epg_data_id".to_string(),
             Self::HiddenFromOutput => "hidden_from_output".to_string(),
             Self::Membership(profile_id) => format!("profile_membership:{profile_id}"),
+            Self::Streams => "streams".to_string(),
         }
     }
 
@@ -346,11 +485,30 @@ impl Field {
             "channel_group_id" => Some(Self::Group),
             "epg_data_id" => Some(Self::Epg),
             "hidden_from_output" => Some(Self::HiddenFromOutput),
+            "streams" => Some(Self::Streams),
             _ => label
                 .strip_prefix("profile_membership:")
                 .and_then(|id| id.parse().ok())
                 .map(Self::Membership),
         }
+    }
+}
+
+impl Serialize for Field {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.label())
+    }
+}
+
+impl<'de> Deserialize<'de> for Field {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let label = String::deserialize(deserializer)?;
+        Self::from_label(&label).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "unknown channel field {label:?}; use name, channel_group_id, epg_data_id, \
+                 hidden_from_output, streams or profile_membership:<id>"
+            ))
+        })
     }
 }
 
@@ -362,6 +520,9 @@ pub enum OpKind {
     SetMembership,
     SetHiddenFromOutput,
     ClearEpg,
+    /// A per-channel [`Op::Set`]. The report's `field` column says which field it wrote; this
+    /// only says the value came per channel.
+    Set,
 }
 
 impl OpKind {
@@ -372,8 +533,18 @@ impl OpKind {
             Self::SetMembership => "set_membership",
             Self::SetHiddenFromOutput => "set_hidden_from_output",
             Self::ClearEpg => "clear_epg",
+            Self::Set => "set",
         }
     }
+}
+
+/// One stream of a plan's ordered list: the id the API writes, and the name it prints as when
+/// the run loaded streams. The name is cosmetic — a world without the streams slice still
+/// plans and applies the same list, it just prints ids.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedStream {
+    pub id: i64,
+    pub name: Option<String>,
 }
 
 /// One field's value, as a plan records it.
@@ -390,10 +561,16 @@ pub enum Value {
     Epg(Option<(i64, String)>),
     /// `hidden_from_output`, or a profile membership's `enabled`.
     Flag(bool),
+    /// A channel's ordered stream list, in playback order.
+    Streams(Vec<ListedStream>),
 }
 
 impl Value {
     /// How the report prints it: names, not ids, and `yes`/`no` for a flag.
+    ///
+    /// A long stream list is counted rather than printed whole: a report line is for reading,
+    /// and a channel can carry dozens of streams. A short one prints its names (or ids, when
+    /// the run loaded no streams).
     pub fn display(&self) -> String {
         match self {
             Self::Name(name) => name.clone(),
@@ -402,16 +579,32 @@ impl Value {
             Self::Epg(Some((_, name))) => name.clone(),
             Self::Epg(None) => "No EPG".to_string(),
             Self::Flag(flag) => if *flag { "yes" } else { "no" }.to_string(),
+            Self::Streams(list) => display_streams(list),
         }
     }
 
-    /// The machine value a restore reads back: an id, `none`, or `true`/`false`.
+    /// The machine value a restore reads back: an id, `none`, `true`/`false`, or the stream
+    /// ids of a list (comma-separated, `none` for an empty one).
     pub fn wire(&self) -> String {
         match self {
             Self::Name(name) => name.clone(),
             Self::Group(Some((id, _))) | Self::Epg(Some((id, _))) => id.to_string(),
             Self::Group(None) | Self::Epg(None) => "none".to_string(),
             Self::Flag(flag) => flag.to_string(),
+            Self::Streams(list) if list.is_empty() => "none".to_string(),
+            Self::Streams(list) => list
+                .iter()
+                .map(|stream| stream.id.to_string())
+                .collect::<Vec<_>>()
+                .join(&STREAM_WIRE_SEPARATOR.to_string()),
+        }
+    }
+
+    /// The stream ids of an ordered list, for the writer a stream change goes through.
+    pub fn stream_ids(&self) -> Option<Vec<i64>> {
+        match self {
+            Self::Streams(list) => Some(list.iter().map(|stream| stream.id).collect()),
+            _ => None,
         }
     }
 }
@@ -630,16 +823,14 @@ pub fn plan_with_options(
         ignore_groups: selection.ignore_groups.clone(),
     };
     let scoped = scope_channels(world, &scope)?;
-    // Built once: a guide lookup per channel against ~55k entries would be quadratic.
-    let entries: Entries<'_> = world
-        .entries
-        .iter()
-        .map(|entry| (entry.id, entry))
-        .collect();
+    // Built once: a guide or stream lookup per channel against ~55k rows would be quadratic.
+    // The stream index is only worth building when an operation writes a stream list.
+    let needs_streams = ops.iter().any(|op| op.field() == Field::Streams);
+    let lookups = Lookups::of(world, needs_streams);
     let mut skipped: Vec<Skip> = Vec::new();
     let selected = narrow(
         world,
-        &entries,
+        &lookups,
         &scoped,
         selection,
         regex.as_ref(),
@@ -681,7 +872,7 @@ pub fn plan_with_options(
             }
             apply_op(
                 world,
-                &entries,
+                &lookups,
                 channel,
                 &group,
                 op,
@@ -737,13 +928,65 @@ pub fn plan_with_options(
     })
 }
 
+/// Writes many channels' ordered stream lists: the seam every stream-list write goes through.
+///
+/// `edit/bulk` carries hundreds of channels per request, but the request PATTERN is still
+/// the whole cost at ~20k channels — and a Dispatcharr plugin (the bridge, which can write
+/// `ChannelStream` rows in one transaction) may replace REST entirely. Keeping that decision
+/// behind a trait keeps it out of the plan, the report and every action: [`apply`] uses
+/// [`RestStreamListWriter`]; [`apply_with_writer`] takes any implementation.
+///
+/// The batch form is the primitive on purpose. One invalid row rejects its whole `edit/bulk`
+/// chunk, so per-channel results are what lets a caller attribute a failure to its channel
+/// instead of failing hundreds of rows over one bad id: the REST writer falls back to one
+/// PATCH per channel for a rejected chunk, and every entry of the answer is one channel's
+/// outcome. `Ok` means the server confirmed the write; an `Err` is that channel's failure
+/// and does not stop the others. The answer is in input order, one entry per channel.
+#[async_trait::async_trait]
+pub trait StreamListWriter: Send + Sync {
+    /// Replace each channel's stream list, in playback order (index 0 plays first).
+    async fn write_many(&self, lists: &[(i64, Vec<i64>)]) -> Vec<(i64, Result<()>)>;
+}
+
+/// The REST implementation: `edit/bulk` rows in chunks of 500, one PATCH per channel when a
+/// chunk is rejected.
+///
+/// [`DispatcharrClient::bulk_set_channel_streams`] owns the chunking, the retry and the
+/// fallback; this type only picks the client. Re-applying the same lists rewrites the same
+/// orders, so a retried write is safe.
+pub struct RestStreamListWriter {
+    client: DispatcharrClient,
+}
+
+impl RestStreamListWriter {
+    /// The writer [`apply`] uses.
+    pub fn new(client: DispatcharrClient) -> Self {
+        Self { client }
+    }
+}
+
+impl std::fmt::Debug for RestStreamListWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RestStreamListWriter")
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait::async_trait]
+impl StreamListWriter for RestStreamListWriter {
+    async fn write_many(&self, lists: &[(i64, Vec<i64>)]) -> Vec<(i64, Result<()>)> {
+        self.client.bulk_set_channel_streams(lists).await
+    }
+}
+
 /// Apply a plan, one request per endpoint, recording every row's outcome.
 ///
 /// The writes are batched the way the API wants them: a rename, a group move and a hide are
-/// three fields of one `edit/bulk` row, memberships go one call per profile, and the guides
-/// are cleared through `batch-set-epg`. `action` is the id the progress events are published
-/// under; cancellation is checked between batches, so a cancelled run stops at the last batch
-/// it finished rather than mid-request.
+/// three fields of one `edit/bulk` row, memberships go one call per profile, the guides are
+/// cleared through `batch-set-epg`, and stream lists go through a [`StreamListWriter`] in one
+/// batched write. `action` is the id the progress events are published under;
+/// cancellation is checked between batches, so a cancelled run stops at the last batch it
+/// finished rather than mid-request.
 ///
 /// A failing batch marks ITS rows failed with the client's message, which names the chunk and
 /// how many rows before it were confirmed — the same partial-progress wording
@@ -755,6 +998,21 @@ pub async fn apply(
     context: &JobContext,
     action: &str,
 ) -> ApplyReport {
+    let writer = RestStreamListWriter::new(client.clone());
+    apply_with_writer(client, plan, context, action, &writer).await
+}
+
+/// [`apply`] with a caller-supplied [`StreamListWriter`].
+///
+/// The hook a bridge-backed writer needs; everything except the stream-list stage is the same
+/// code [`apply`] runs.
+pub async fn apply_with_writer(
+    client: &DispatcharrClient,
+    plan: &Plan,
+    context: &JobContext,
+    action: &str,
+    writer: &dyn StreamListWriter,
+) -> ApplyReport {
     let mut changes = plan.changes.clone();
     let total = changes.len() as u64;
     let mut progress = context.paced(action, total, PROGRESS_INTERVAL);
@@ -763,11 +1021,19 @@ pub async fn apply(
     // 1. Names, groups and visibility: one `edit/bulk` request.
     let mut edits: BTreeMap<i64, ChannelEdit> = BTreeMap::new();
     let mut edit_rows: Vec<usize> = Vec::new();
+    let mut no_group_rows: Vec<usize> = Vec::new();
     for (index, change) in plan.changes.iter().enumerate() {
         if !matches!(
             change.field,
             Field::Name | Field::Group | Field::HiddenFromOutput
         ) {
+            continue;
+        }
+        if change.field == Field::Group && matches!(&change.after, Value::Group(None)) {
+            // The one channel edit the API cannot express, and one invalid row rejects its
+            // whole chunk — so it is reported here rather than sent. A channel that also has a
+            // rename in this plan keeps it: each field is its own row.
+            no_group_rows.push(index);
             continue;
         }
         edit_rows.push(index);
@@ -776,8 +1042,9 @@ pub async fn apply(
             .or_insert_with(|| ChannelEdit::new(change.channel_id));
         match (&change.field, &change.after) {
             (Field::Name, Value::Name(name)) => edit.name = Some(name.clone()),
-            (Field::Group, Value::Group(group)) => {
-                edit.channel_group_id = group.as_ref().map_or(Set::Null, |(id, _)| Set::Value(*id));
+            // A `None` group target was filtered out above; this endpoint cannot clear one.
+            (Field::Group, Value::Group(Some((id, _)))) => {
+                edit.channel_group_id = Set::Value(*id);
             }
             (Field::HiddenFromOutput, Value::Flag(hidden)) => {
                 edit.hidden_from_output = Some(*hidden);
@@ -803,6 +1070,17 @@ pub async fn apply(
             }
         }
         done += edit_rows.len() as u64;
+    }
+    if !no_group_rows.is_empty() {
+        // A cancelled run says so, like every other batch it never reached; otherwise the
+        // reason is the API's own gap.
+        let reason = if context.is_cancelled() {
+            CANCELLED
+        } else {
+            NO_GROUP_UNSUPPORTED
+        };
+        mark(&mut changes, &no_group_rows, RowStatus::Failed, reason);
+        done += no_group_rows.len() as u64;
     }
 
     // 2. Profile memberships: one call per profile.
@@ -839,7 +1117,8 @@ pub async fn apply(
         done += rows.len() as u64;
     }
 
-    // 3. Guides: one `batch-set-epg` call, which chunks and retries internally.
+    // 3. Guides: one `batch-set-epg` call, which chunks and retries internally. A clear and a
+    //    per-channel assignment are the same write, differing only in the id sent.
     let mut epg_rows: Vec<usize> = Vec::new();
     let mut associations: Vec<(i64, Option<i64>)> = Vec::new();
     for (index, change) in plan.changes.iter().enumerate() {
@@ -852,7 +1131,10 @@ pub async fn apply(
         if context.is_cancelled() {
             mark(&mut changes, &epg_rows, RowStatus::Failed, CANCELLED);
         } else {
-            progress.set(done, &format!("clearing {} guide(s)", associations.len()));
+            progress.set(
+                done,
+                &format!("writing {} guide assignment(s)", associations.len()),
+            );
             match client.batch_set_epg(&associations).await {
                 Ok(_) => mark(&mut changes, &epg_rows, RowStatus::Ok, ""),
                 Err(error) => mark(
@@ -861,6 +1143,69 @@ pub async fn apply(
                     RowStatus::Failed,
                     &format!("{error:#}"),
                 ),
+            }
+        }
+        done += epg_rows.len() as u64;
+    }
+
+    // 4. Stream lists: one batched write through the writer, which is the seam a
+    //    bridge-backed implementation replaces. A rejected chunk does not fail its siblings:
+    //    the writer attributes failures per channel (the REST one retries a rejected chunk's
+    //    rows one at a time), so every row below gets its own outcome, like the edit/bulk
+    //    stage above gives its rows.
+    let stream_rows: Vec<usize> = plan
+        .changes
+        .iter()
+        .enumerate()
+        .filter(|(_, change)| change.field == Field::Streams && change.after.stream_ids().is_some())
+        .map(|(index, _)| index)
+        .collect();
+    if !stream_rows.is_empty() {
+        if context.is_cancelled() {
+            mark(&mut changes, &stream_rows, RowStatus::Failed, CANCELLED);
+        } else {
+            let lists: Vec<(i64, Vec<i64>)> = stream_rows
+                .iter()
+                .map(|index| {
+                    let change = &plan.changes[*index];
+                    (
+                        change.channel_id,
+                        change.after.stream_ids().unwrap_or_default(),
+                    )
+                })
+                .collect();
+            progress.set(done, &format!("writing {} stream list(s)", lists.len()));
+            // One change per field per channel: `record` folds a second write to the same
+            // field, so a channel id names exactly one row.
+            let by_channel: HashMap<i64, usize> = stream_rows
+                .iter()
+                .map(|index| (plan.changes[*index].channel_id, *index))
+                .collect();
+            let mut answered: HashSet<usize> = HashSet::with_capacity(stream_rows.len());
+            for (channel_id, result) in writer.write_many(&lists).await {
+                if let Some(index) = by_channel.get(&channel_id) {
+                    answered.insert(*index);
+                    match result {
+                        Ok(()) => {
+                            changes[*index].status = RowStatus::Ok;
+                            changes[*index].reason.clear();
+                        }
+                        Err(error) => {
+                            changes[*index].status = RowStatus::Failed;
+                            changes[*index].reason = format!("{error:#}");
+                        }
+                    }
+                }
+            }
+            // A writer that answers fewer rows than it was given is a bug, not a success:
+            // the unanswered rows fail loudly rather than sitting at `planned` forever.
+            for index in &stream_rows {
+                if !answered.contains(index) {
+                    changes[*index].status = RowStatus::Failed;
+                    changes[*index].reason = "the stream-list writer returned no result for \
+                     this channel"
+                        .to_string();
+                }
             }
         }
     }
@@ -883,6 +1228,12 @@ pub async fn apply(
 
 /// What a batch of rows gets when the run was cancelled before it ran.
 const CANCELLED: &str = "not applied: the run was cancelled";
+
+/// Why a "No Group" move fails. See the module docs: the API cannot express it, so sending it
+/// would fail the whole chunk it shares — and take the renames in that chunk down with it.
+const NO_GROUP_UNSUPPORTED: &str =
+    "not applied: Dispatcharr's channel edit cannot clear a channel group (its serializer \
+     rejects a null channel_group_id), so this move has to be made in the Dispatcharr UI";
 
 /// What a channel-ops report needs from its caller: the app it belongs to and the settings
 /// the preamble names.
@@ -995,14 +1346,18 @@ pub fn write_ops_report(
 /// The plan's rows in the store's shape, for `JobContext::record_rows`.
 ///
 /// `field`/`before_value`/`after_value` are the generic slots a later `restore` reads: the
-/// writable field's name and its two machine values (an id, `none`, or `true`/`false`). The
-/// identity columns keep the state the run found, so a rename can be undone from its own row.
+/// writable field's name and its two machine values (an id, `none`, the stream ids of a list,
+/// or `true`/`false`). The identity columns keep the state the run found, so a rename can be
+/// undone from its own row. Every row here is about a channel — that is what these operations
+/// write — which is what `subject` says, so a reader of a mixed run cannot mistake one for a
+/// stream or EPG source row.
 pub fn run_rows(plan: &Plan, applied: Option<&ApplyReport>) -> Vec<RunRow> {
     let changes: &[Change] = applied.map_or(&plan.changes, |report| report.changes.as_slice());
     let mut rows = Vec::with_capacity(changes.len() + plan.skipped.len());
     for (ordinal, change) in changes.iter().enumerate() {
         rows.push(RunRow {
             ordinal: ordinal as i64,
+            subject: Subject::Channel,
             channel_id: change.channel_id,
             channel_name: change.channel_name.clone(),
             channel_group: change.channel_group.clone(),
@@ -1028,6 +1383,7 @@ pub fn run_rows(plan: &Plan, applied: Option<&ApplyReport>) -> Vec<RunRow> {
     for (offset, skip) in plan.skipped.iter().enumerate() {
         rows.push(RunRow {
             ordinal: (changes.len() + offset) as i64,
+            subject: Subject::Channel,
             channel_id: skip.channel_id,
             channel_name: skip.channel_name.clone(),
             channel_group: skip.channel_group.clone(),
@@ -1102,6 +1458,7 @@ struct Working {
     group: Option<i64>,
     epg: Option<i64>,
     hidden: bool,
+    streams: Vec<i64>,
 }
 
 impl Working {
@@ -1111,6 +1468,7 @@ impl Working {
             group: channel.channel_group_id,
             epg: channel.current_epg_id(),
             hidden: channel.hidden_from_output,
+            streams: channel.streams.clone(),
         }
     }
 }
@@ -1121,12 +1479,16 @@ impl Working {
 /// options arm it and this rename is a no-op because the suffix is already present, the
 /// suffix is stored in `guarded` and the plan loop skips every later operation.
 ///
+/// A per-channel [`Op::Set`] is resolved here, once, and each of its values goes through the
+/// same handler a uniform operation does: a per-channel group move cannot drift from a
+/// [`Op::MoveGroup`], and per-channel no-op dropping is the uniform one.
+///
 /// Ten parameters, like the AI gate's `ask`: one per thing an evaluation threads through,
 /// and bundling them would only move the list behind a struct literal at this one call site.
 #[allow(clippy::too_many_arguments)]
 fn apply_op(
     world: &World,
-    entries: &Entries<'_>,
+    lookups: &Lookups<'_>,
     channel: &Channel,
     group: &str,
     op: &Op,
@@ -1161,7 +1523,7 @@ fn apply_op(
                     .display_number()
                     .map(|number| format!("{number}"))
                     .unwrap_or_default(),
-                epg: epg_values(entries, current.epg)
+                epg: epg_values(lookups, current.epg)
                     .map(|(_, name)| name)
                     .unwrap_or_else(|| "No EPG".to_string()),
                 id: channel.id.to_string(),
@@ -1202,139 +1564,399 @@ fn apply_op(
             current.name = after;
         }
         Op::MoveGroup { group_id } => {
-            if current.group == Some(*group_id) {
-                skipped.push(
-                    Skip::of(
-                        channel,
-                        group,
-                        format!(
-                            "the channel is already in group {}",
-                            quote_list(&[world.group_name(Some(*group_id))])
-                        ),
-                    )
-                    .with_op(kind, Field::Group),
-                );
-                return;
-            }
-            record(
-                planned,
-                Change::planned(
-                    channel,
-                    group,
-                    kind,
-                    Field::Group,
-                    Value::Group(group_values(world, current.group)),
-                    Value::Group(group_values(world, Some(*group_id))),
-                ),
+            plan_group(
+                channel, group, kind, *group_id, world, current, planned, skipped,
             );
-            current.group = Some(*group_id);
         }
         Op::SetMembership {
             profile_id,
             enabled,
         } => {
-            let Some(profile) = world
-                .profiles
-                .iter()
-                .find(|profile| profile.id == *profile_id)
-            else {
-                // `plan` validated the profile against the world; reaching here is a bug.
-                return;
-            };
-            let now = profile.channels.contains(&channel.id);
-            if now == *enabled {
-                skipped.push(
-                    Skip::of(
-                        channel,
-                        group,
-                        format!(
-                            "the channel is already {} in profile {}",
-                            if *enabled { "enabled" } else { "disabled" },
-                            quote_list(std::slice::from_ref(&profile.name))
-                        ),
-                    )
-                    .with_op(kind, Field::Membership(*profile_id)),
-                );
-                return;
-            }
-            record(
+            plan_membership(
+                channel,
+                group,
+                kind,
+                *profile_id,
+                *enabled,
+                world,
                 planned,
-                Change::planned(
-                    channel,
-                    group,
-                    kind,
-                    Field::Membership(*profile_id),
-                    Value::Flag(now),
-                    Value::Flag(*enabled),
-                ),
+                skipped,
             );
         }
         Op::SetHiddenFromOutput { hidden } => {
-            if current.hidden == *hidden {
-                skipped.push(
+            plan_hidden(channel, group, kind, *hidden, current, planned, skipped);
+        }
+        Op::ClearEpg => {
+            plan_epg(
+                channel, group, kind, None, lookups, current, planned, skipped,
+            );
+        }
+        Op::Set { field, values } => {
+            // A channel the map does not name is outside this operation's target set: no
+            // change and no row, rather than one skip per untouched channel.
+            let Some(value) = values.get(&channel.id) else {
+                return;
+            };
+            match (field, value) {
+                (Field::Name, SetValue::Name(name)) => {
+                    plan_name(channel, group, kind, name, current, planned, skipped);
+                }
+                (Field::Group, SetValue::Group(target)) => {
+                    plan_group(
+                        channel, group, kind, *target, world, current, planned, skipped,
+                    );
+                }
+                (Field::Epg, SetValue::Epg(target)) => {
+                    plan_epg(
+                        channel, group, kind, *target, lookups, current, planned, skipped,
+                    );
+                }
+                (Field::HiddenFromOutput, SetValue::Flag(hidden)) => {
+                    plan_hidden(channel, group, kind, *hidden, current, planned, skipped);
+                }
+                (Field::Membership(profile_id), SetValue::Flag(enabled)) => plan_membership(
+                    channel,
+                    group,
+                    kind,
+                    *profile_id,
+                    *enabled,
+                    world,
+                    planned,
+                    skipped,
+                ),
+                (Field::Streams, SetValue::Streams(ids)) => {
+                    plan_streams(
+                        channel, group, kind, ids, lookups, current, planned, skipped,
+                    );
+                }
+                // `require_world` refuses a value that does not fit its field before a plan
+                // starts, so reaching here is a bug rather than a configuration mistake.
+                (_, value) => skipped.push(
                     Skip::of(
                         channel,
                         group,
                         format!(
-                            "the channel is already {}",
-                            if *hidden {
-                                "hidden from output"
-                            } else {
-                                "shown in output"
-                            }
+                            "a value of type {} cannot be written to {}",
+                            value.shape(),
+                            field.label()
                         ),
                     )
-                    .with_op(kind, Field::HiddenFromOutput),
-                );
-                return;
-            }
-            record(
-                planned,
-                Change::planned(
-                    channel,
-                    group,
-                    kind,
-                    Field::HiddenFromOutput,
-                    Value::Flag(current.hidden),
-                    Value::Flag(*hidden),
+                    .with_op(kind, *field),
                 ),
-            );
-            current.hidden = *hidden;
-        }
-        Op::ClearEpg => {
-            if current.epg.is_none() {
-                skipped.push(
-                    Skip::of(channel, group, "the channel has no guide assigned")
-                        .with_op(kind, Field::Epg),
-                );
-                return;
             }
-            if channel.has_epg_override() {
-                skipped.push(
-                    Skip::of(
-                        channel,
-                        group,
-                        "an EPG override pins a different guide, so clearing the channel's own \
-                 entry would not change what is shown",
-                    )
-                    .with_op(kind, Field::Epg),
-                );
-                return;
-            }
-            record(
-                planned,
-                Change::planned(
-                    channel,
-                    group,
-                    kind,
-                    Field::Epg,
-                    Value::Epg(epg_values(entries, current.epg)),
-                    Value::Epg(None),
-                ),
-            );
-            current.epg = None;
         }
     }
+}
+
+/// Plan a name this operation states outright: the per-channel form of a rename.
+///
+/// A rename renders one (suffix, prefix, template); this one is already a name. The two share
+/// the refusals that matter — an empty name, or the name the channel already has — so a
+/// restore of a name cannot write something a rename would have skipped.
+fn plan_name(
+    channel: &Channel,
+    group: &str,
+    kind: OpKind,
+    name: &str,
+    current: &mut Working,
+    planned: &mut Vec<Change>,
+    skipped: &mut Vec<Skip>,
+) {
+    if name.trim().is_empty() {
+        // Dispatcharr rejects a blank name; a per-channel value could carry one.
+        skipped.push(
+            Skip::of(
+                channel,
+                group,
+                "the name would be empty, which would be rejected",
+            )
+            .with_op(kind, Field::Name),
+        );
+        return;
+    }
+    if current.name == name {
+        skipped.push(
+            Skip::of(channel, group, "the channel already has this name")
+                .with_op(kind, Field::Name),
+        );
+        return;
+    }
+    record(
+        planned,
+        Change::planned(
+            channel,
+            group,
+            kind,
+            Field::Name,
+            Value::Name(current.name.clone()),
+            Value::Name(name.to_string()),
+        ),
+    );
+    current.name = name.to_string();
+}
+
+/// Plan a group, from [`Op::MoveGroup`] or from a per-channel value.
+///
+/// A target of `None` is "No Group", which `edit/bulk` writes as a null `channel_group_id`.
+#[allow(clippy::too_many_arguments)]
+fn plan_group(
+    channel: &Channel,
+    group: &str,
+    kind: OpKind,
+    target: Option<i64>,
+    world: &World,
+    current: &mut Working,
+    planned: &mut Vec<Change>,
+    skipped: &mut Vec<Skip>,
+) {
+    if current.group == target {
+        let reason = match target {
+            Some(id) => format!(
+                "the channel is already in group {}",
+                quote_list(&[world.group_name(Some(id))])
+            ),
+            None => "the channel already has no group".to_string(),
+        };
+        skipped.push(Skip::of(channel, group, reason).with_op(kind, Field::Group));
+        return;
+    }
+    record(
+        planned,
+        Change::planned(
+            channel,
+            group,
+            kind,
+            Field::Group,
+            Value::Group(group_values(world, current.group)),
+            Value::Group(group_values(world, target)),
+        ),
+    );
+    current.group = target;
+}
+
+/// Plan a profile membership.
+#[allow(clippy::too_many_arguments)]
+fn plan_membership(
+    channel: &Channel,
+    group: &str,
+    kind: OpKind,
+    profile_id: i64,
+    enabled: bool,
+    world: &World,
+    planned: &mut Vec<Change>,
+    skipped: &mut Vec<Skip>,
+) {
+    let Some(profile) = world
+        .profiles
+        .iter()
+        .find(|profile| profile.id == profile_id)
+    else {
+        // `plan` validated the profile against the world; reaching here is a bug.
+        return;
+    };
+    let now = profile.channels.contains(&channel.id);
+    if now == enabled {
+        skipped.push(
+            Skip::of(
+                channel,
+                group,
+                format!(
+                    "the channel is already {} in profile {}",
+                    if enabled { "enabled" } else { "disabled" },
+                    quote_list(std::slice::from_ref(&profile.name))
+                ),
+            )
+            .with_op(kind, Field::Membership(profile_id)),
+        );
+        return;
+    }
+    record(
+        planned,
+        Change::planned(
+            channel,
+            group,
+            kind,
+            Field::Membership(profile_id),
+            Value::Flag(now),
+            Value::Flag(enabled),
+        ),
+    );
+}
+
+/// Plan the global `hidden_from_output` flag.
+fn plan_hidden(
+    channel: &Channel,
+    group: &str,
+    kind: OpKind,
+    hidden: bool,
+    current: &mut Working,
+    planned: &mut Vec<Change>,
+    skipped: &mut Vec<Skip>,
+) {
+    if current.hidden == hidden {
+        skipped.push(
+            Skip::of(
+                channel,
+                group,
+                format!(
+                    "the channel is already {}",
+                    if hidden {
+                        "hidden from output"
+                    } else {
+                        "shown in output"
+                    }
+                ),
+            )
+            .with_op(kind, Field::HiddenFromOutput),
+        );
+        return;
+    }
+    record(
+        planned,
+        Change::planned(
+            channel,
+            group,
+            kind,
+            Field::HiddenFromOutput,
+            Value::Flag(current.hidden),
+            Value::Flag(hidden),
+        ),
+    );
+    current.hidden = hidden;
+}
+
+/// Plan the guide: [`Op::ClearEpg`] is a `None` target, a per-channel value may assign one.
+#[allow(clippy::too_many_arguments)]
+fn plan_epg(
+    channel: &Channel,
+    group: &str,
+    kind: OpKind,
+    target: Option<i64>,
+    lookups: &Lookups<'_>,
+    current: &mut Working,
+    planned: &mut Vec<Change>,
+    skipped: &mut Vec<Skip>,
+) {
+    if current.epg == target {
+        let reason = match target {
+            Some(_) => "the channel is already on this guide".to_string(),
+            None => "the channel has no guide assigned".to_string(),
+        };
+        skipped.push(Skip::of(channel, group, reason).with_op(kind, Field::Epg));
+        return;
+    }
+    if target.is_none() && channel.has_epg_override() {
+        skipped.push(
+            Skip::of(
+                channel,
+                group,
+                "an EPG override pins a different guide, so clearing the channel's own \
+                 entry would not change what is shown",
+            )
+            .with_op(kind, Field::Epg),
+        );
+        return;
+    }
+    record(
+        planned,
+        Change::planned(
+            channel,
+            group,
+            kind,
+            Field::Epg,
+            Value::Epg(epg_values(lookups, current.epg)),
+            Value::Epg(epg_values(lookups, target)),
+        ),
+    );
+    current.epg = target;
+}
+
+/// Plan an ordered stream list: the channel's whole list, in playback order.
+///
+/// The comparison is against the order the channel already has, not against a set: swapping
+/// two streams is a real change, because the order decides which one plays first.
+#[allow(clippy::too_many_arguments)]
+fn plan_streams(
+    channel: &Channel,
+    group: &str,
+    kind: OpKind,
+    ids: &[i64],
+    lookups: &Lookups<'_>,
+    current: &mut Working,
+    planned: &mut Vec<Change>,
+    skipped: &mut Vec<Skip>,
+) {
+    if current.streams == ids {
+        skipped.push(
+            Skip::of(
+                channel,
+                group,
+                "the channel's stream list is already this one, in this order",
+            )
+            .with_op(kind, Field::Streams),
+        );
+        return;
+    }
+    record(
+        planned,
+        Change::planned(
+            channel,
+            group,
+            kind,
+            Field::Streams,
+            Value::Streams(lookups.streams(&current.streams)),
+            Value::Streams(lookups.streams(ids)),
+        ),
+    );
+    current.streams = ids.to_vec();
+}
+
+/// A stream list as the report prints it: names when the run has them, ids otherwise, and a
+/// count instead of the tail of a long one.
+fn display_streams(list: &[ListedStream]) -> String {
+    if list.is_empty() {
+        return "no streams".to_string();
+    }
+    let shown: Vec<String> = list
+        .iter()
+        .take(STREAMS_SHOWN)
+        .map(|stream| match &stream.name {
+            Some(name) => name.clone(),
+            None => stream.id.to_string(),
+        })
+        .collect();
+    let mut text = shown.join(", ");
+    if list.len() > STREAMS_SHOWN {
+        text.push_str(&format!(", … ({} total)", list.len()));
+    }
+    text
+}
+
+/// Parse a `streams` wire value back into ids, for a restore.
+///
+/// `none` (and an empty string) is the EMPTY list: a channel with no streams is a real value a
+/// restore may have to put back, which is not the same as "no value was recorded".
+pub fn parse_stream_ids(wire: &str) -> Option<Vec<i64>> {
+    let wire = wire.trim();
+    if wire.is_empty() || wire.eq_ignore_ascii_case("none") {
+        return Some(Vec::new());
+    }
+    wire.split(STREAM_WIRE_SEPARATOR)
+        .map(|id| id.trim().parse::<i64>().ok())
+        .collect()
+}
+
+/// The rows of a run that wrote one field, in run order — what a later restore reverses.
+///
+/// Selected by the store's `field` column, never by `channel_id` alone: a run can carry rows
+/// about several subjects (a probe's streams, a watchdog's EPG sources), and only the channel
+/// rows of the field asked for are something a channel operation can put back. `status` is not
+/// filtered here; a caller decides for itself whether a `planned` (preview) row counts.
+pub fn rows_for_field(rows: &[RunRow], field: Field) -> Vec<&RunRow> {
+    let label = field.label();
+    rows.iter()
+        .filter(|row| row.subject == Subject::Channel && row.field == label)
+        .collect()
 }
 
 /// Record a change, folding it into an earlier change to the same field.
@@ -1354,8 +1976,51 @@ fn record(planned: &mut Vec<Change>, change: Change) {
     }
 }
 
-/// Guide entries by id, for the per-channel lookups of one plan.
-type Entries<'a> = HashMap<i64, &'a EpgEntry>;
+/// Guide entries and streams by id, for the per-channel lookups of one plan.
+///
+/// Both are optional detail rather than state: a guide name is printed in the report, and a
+/// stream name in a stream list. A world loaded without one of those slices plans and applies
+/// the same changes, it just prints the id instead of the name.
+struct Lookups<'a> {
+    entries: HashMap<i64, &'a EpgEntry>,
+    streams: HashMap<i64, &'a Stream>,
+}
+
+impl<'a> Lookups<'a> {
+    /// Index the world's guide entries, and its streams when the plan needs them.
+    fn of(world: &'a World, with_streams: bool) -> Self {
+        Self {
+            entries: world
+                .entries
+                .iter()
+                .map(|entry| (entry.id, entry))
+                .collect(),
+            streams: if with_streams {
+                world
+                    .streams
+                    .iter()
+                    .map(|stream| (stream.id, stream))
+                    .collect()
+            } else {
+                HashMap::new()
+            },
+        }
+    }
+
+    /// The ordered list as a plan records it: ids, with the names the world knows.
+    fn streams(&self, ids: &[i64]) -> Vec<ListedStream> {
+        ids.iter()
+            .map(|id| ListedStream {
+                id: *id,
+                name: self
+                    .streams
+                    .get(id)
+                    .map(|stream| stream.name.clone())
+                    .filter(|name| !name.is_empty()),
+            })
+            .collect()
+    }
+}
 
 /// The group value for a group id, name included so the report needs no world.
 fn group_values(world: &World, group: Option<i64>) -> Option<(i64, String)> {
@@ -1363,9 +2028,10 @@ fn group_values(world: &World, group: Option<i64>) -> Option<(i64, String)> {
 }
 
 /// The EPG entry value for an entry id, name included for the same reason.
-fn epg_values(entries: &Entries<'_>, entry: Option<i64>) -> Option<(i64, String)> {
+fn epg_values(lookups: &Lookups<'_>, entry: Option<i64>) -> Option<(i64, String)> {
     let id = entry?;
-    let name = entries
+    let name = lookups
+        .entries
         .get(&id)
         .map(|entry| entry.name.clone())
         .unwrap_or_else(|| format!("EPG {id}"));
@@ -1373,9 +2039,9 @@ fn epg_values(entries: &Entries<'_>, entry: Option<i64>) -> Option<(i64, String)
 }
 
 /// The guide entry of a channel, if it has one and the world carries entries.
-fn entry_of<'a>(entries: &Entries<'a>, channel: &Channel) -> Option<&'a EpgEntry> {
+fn entry_of<'a>(lookups: &Lookups<'a>, channel: &Channel) -> Option<&'a EpgEntry> {
     let id = channel.current_epg_id()?;
-    entries.get(&id).copied()
+    lookups.entries.get(&id).copied()
 }
 
 /// Fail early when the world was loaded without a slice the plan needs.
@@ -1384,12 +2050,17 @@ fn require_world(world: &World, selection: &Selection, ops: &[Op]) -> Result<()>
     let needs_groups = !selection.groups.trim().is_empty()
         || !selection.ignore_groups.trim().is_empty()
         || ops.iter().any(|op| match op {
-            Op::MoveGroup { .. } => true,
+            // A `None` target is "No Group", which needs no group list to name.
+            Op::MoveGroup { group_id } => group_id.is_some(),
             // Without the groups slice a `{group}` renders as "No Group" for every
             // channel, which a preview would present as a real rename.
             Op::Rename {
                 kind: RenameKind::Template(template),
             } => template.contains("{group}"),
+            Op::Set {
+                field: Field::Group,
+                ..
+            } => true,
             _ => false,
         });
     if needs_groups {
@@ -1397,7 +2068,16 @@ fn require_world(world: &World, selection: &Selection, ops: &[Op]) -> Result<()>
     }
     let needs_profiles = !selection.profiles.trim().is_empty()
         || !selection.hidden_in_profiles.trim().is_empty()
-        || ops.iter().any(|op| matches!(op, Op::SetMembership { .. }));
+        || ops.iter().any(|op| {
+            matches!(
+                op,
+                Op::SetMembership { .. }
+                    | Op::Set {
+                        field: Field::Membership(_),
+                        ..
+                    }
+            )
+        });
     if needs_profiles {
         world.require(WorldKind::Profiles)?;
     }
@@ -1407,14 +2087,21 @@ fn require_world(world: &World, selection: &Selection, ops: &[Op]) -> Result<()>
             Op::Rename {
                 kind: RenameKind::Template(template),
             } => template.contains("{epg}"),
+            Op::Set {
+                field: Field::Epg, ..
+            } => true,
             _ => false,
         });
     if needs_entries {
         world.require(WorldKind::EpgEntries)?;
     }
+    // A stream list is planned from the channel's own `streams` ids, which come with the
+    // channel list; the streams slice only adds the names a report prints, so it is not
+    // required here and a run without it writes exactly the same list.
 
-    // A bad id in an operation is a configuration mistake an apply would turn into a 400 for
-    // the whole chunk, so it fails here instead.
+    // A bad group or profile id in an operation is a configuration mistake an apply would turn
+    // into a 400 for the whole chunk, so it fails here instead. Stream and guide ids are left
+    // to the write: the plan runs without those slices, and a bad one fails its own row.
     for op in ops {
         match op {
             Op::Rename { kind } => match kind {
@@ -1431,42 +2118,30 @@ fn require_world(world: &World, selection: &Selection, ops: &[Op]) -> Result<()>
                 }
                 _ => {}
             },
-            Op::MoveGroup { group_id }
-                if !world.groups.iter().any(|group| group.id == *group_id) =>
-            {
-                let available: Vec<String> = world
-                    .groups
-                    .iter()
-                    .map(|group| format!("{} ({})", group.name, group.id))
-                    .collect();
-                bail!(
-                    "no channel group with id {group_id}; available: {}",
-                    if available.is_empty() {
-                        "(none)".to_string()
-                    } else {
-                        available.join(", ")
+            Op::MoveGroup { group_id } => require_group(world, *group_id)?,
+            Op::SetMembership { profile_id, .. } => require_profile(world, *profile_id)?,
+            Op::Set { field, values } => {
+                // A value of the wrong shape for its field would silently write nothing, so
+                // it is refused here with the channel that carried it.
+                let mut groups: Vec<i64> = Vec::new();
+                for (channel_id, value) in values {
+                    if !value.fits(*field) {
+                        bail!(
+                            "channel {channel_id}: a value of type {} cannot be written to \
+                             {}; a Set writes values of the field's own shape",
+                            value.shape(),
+                            field.label()
+                        );
                     }
-                );
-            }
-            Op::SetMembership { profile_id, .. }
-                if !world
-                    .profiles
-                    .iter()
-                    .any(|profile| profile.id == *profile_id) =>
-            {
-                let available: Vec<String> = world
-                    .profiles
-                    .iter()
-                    .map(|profile| format!("{} ({})", profile.name, profile.id))
-                    .collect();
-                bail!(
-                    "no channel profile with id {profile_id}; available: {}",
-                    if available.is_empty() {
-                        "(none)".to_string()
-                    } else {
-                        available.join(", ")
+                    match (field, value) {
+                        (Field::Group, SetValue::Group(Some(group_id))) => groups.push(*group_id),
+                        (Field::Membership(profile_id), _) => require_profile(world, *profile_id)?,
+                        _ => {}
                     }
-                );
+                }
+                for group_id in groups {
+                    require_group(world, Some(group_id))?;
+                }
             }
             _ => {}
         }
@@ -1474,10 +2149,58 @@ fn require_world(world: &World, selection: &Selection, ops: &[Op]) -> Result<()>
     Ok(())
 }
 
+/// Fail when a group id is not in the world, naming the ones that are.
+fn require_group(world: &World, group_id: Option<i64>) -> Result<()> {
+    let Some(group_id) = group_id else {
+        // "No Group" is a group id of null, which no group list has to contain.
+        return Ok(());
+    };
+    if world.groups.iter().any(|group| group.id == group_id) {
+        return Ok(());
+    }
+    let available: Vec<String> = world
+        .groups
+        .iter()
+        .map(|group| format!("{} ({})", group.name, group.id))
+        .collect();
+    bail!(
+        "no channel group with id {group_id}; available: {}",
+        if available.is_empty() {
+            "(none)".to_string()
+        } else {
+            available.join(", ")
+        }
+    )
+}
+
+/// Fail when a profile id is not in the world, naming the ones that are.
+fn require_profile(world: &World, profile_id: i64) -> Result<()> {
+    if world
+        .profiles
+        .iter()
+        .any(|profile| profile.id == profile_id)
+    {
+        return Ok(());
+    }
+    let available: Vec<String> = world
+        .profiles
+        .iter()
+        .map(|profile| format!("{} ({})", profile.name, profile.id))
+        .collect();
+    bail!(
+        "no channel profile with id {profile_id}; available: {}",
+        if available.is_empty() {
+            "(none)".to_string()
+        } else {
+            available.join(", ")
+        }
+    )
+}
+
 /// The channels a selection resolves to, plus the skips worth reporting.
 fn narrow<'a>(
     world: &World,
-    entries: &Entries<'_>,
+    lookups: &Lookups<'_>,
     scoped: &'a ScopedChannels,
     selection: &Selection,
     regex: Option<&Regex>,
@@ -1529,7 +2252,7 @@ fn narrow<'a>(
 
     if let Some(regex) = regex {
         channels.retain(|channel| {
-            entry_of(entries, channel).is_some_and(|entry| regex.is_match(&entry.name))
+            entry_of(lookups, channel).is_some_and(|entry| regex.is_match(&entry.name))
         });
     }
 
@@ -1539,10 +2262,10 @@ fn narrow<'a>(
             None => true,
             Some(expected) if *expected == channel.current_epg_id() => true,
             Some(expected) => {
-                let was = epg_values(entries, *expected)
+                let was = epg_values(lookups, *expected)
                     .map(|(_, name)| name)
                     .unwrap_or_else(|| "no guide".to_string());
-                let now = epg_values(entries, channel.current_epg_id())
+                let now = epg_values(lookups, channel.current_epg_id())
                     .map(|(_, name)| name)
                     .unwrap_or_else(|| "no guide".to_string());
                 stale.push(Skip::of(
@@ -1679,6 +2402,23 @@ mod tests {
                     id: 33,
                     name: "Náutica Ñ".to_string(),
                     ..EpgEntry::default()
+                },
+            ],
+            streams: vec![
+                crate::dispatcharr::Stream {
+                    id: 100,
+                    name: "ESPN HD (primary)".to_string(),
+                    ..crate::dispatcharr::Stream::default()
+                },
+                crate::dispatcharr::Stream {
+                    id: 101,
+                    name: "ESPN HD (backup)".to_string(),
+                    ..crate::dispatcharr::Stream::default()
+                },
+                crate::dispatcharr::Stream {
+                    id: 102,
+                    name: "CNN (primary)".to_string(),
+                    ..crate::dispatcharr::Stream::default()
                 },
             ],
             ..World::default()
@@ -2142,7 +2882,7 @@ mod tests {
                 ..Selection::default()
             },
             &[
-                Op::MoveGroup { group_id: 20 },
+                Op::MoveGroup { group_id: Some(20) },
                 Op::Rename {
                     kind: RenameKind::Suffix(" [BadEPG]".to_string()),
                 },
@@ -2228,7 +2968,7 @@ mod tests {
                 channel_ids: Some(vec![1, 3]),
                 ..Selection::default()
             },
-            &[Op::MoveGroup { group_id: 20 }],
+            &[Op::MoveGroup { group_id: Some(20) }],
         )
         .expect("plans");
         assert_eq!(plan.changes.len(), 1);
@@ -2253,7 +2993,7 @@ mod tests {
         let error = plan_ops(
             &world(),
             &Selection::default(),
-            &[Op::MoveGroup { group_id: 99 }],
+            &[Op::MoveGroup { group_id: Some(99) }],
         )
         .expect_err("rejects");
         assert!(
@@ -2410,11 +3150,400 @@ mod tests {
             Field::Epg,
             Field::HiddenFromOutput,
             Field::Membership(2),
+            Field::Streams,
         ] {
             assert_eq!(Field::from_label(&field.label()), Some(field));
         }
         assert_eq!(Field::from_label(""), None);
         assert_eq!(Field::from_label("profile_membership:xx"), None);
+        assert_eq!(Field::from_label("no_such_field"), None);
+    }
+
+    // ---- per-channel values and stream lists -------------------------------
+
+    fn set_op(field: Field, values: &[(i64, SetValue)]) -> Op {
+        Op::Set {
+            field,
+            values: values.iter().cloned().collect(),
+        }
+    }
+
+    #[test]
+    fn a_per_channel_set_writes_only_the_channels_it_names() {
+        // Visibility's shape: enable one channel, disable the other, and a channel the map
+        // does not name gets neither a change nor a skip.
+        let plan = plan_ops(
+            &world(),
+            &Selection::default(),
+            &[set_op(
+                Field::HiddenFromOutput,
+                &[(1, SetValue::Flag(false)), (2, SetValue::Flag(true))],
+            )],
+        )
+        .expect("plans");
+        assert_eq!(plan.selected.len(), 5);
+        assert_eq!(plan.changes.len(), 1);
+        assert_eq!(plan.changes[0].channel_id, 2);
+        assert_eq!(plan.changes[0].before, Value::Flag(false));
+        assert_eq!(plan.changes[0].after, Value::Flag(true));
+        // ESPN is already shown, which is a no-op for the one channel the map names.
+        let skipped: Vec<i64> = plan.skipped.iter().map(|skip| skip.channel_id).collect();
+        assert_eq!(skipped, vec![1]);
+        assert!(plan.skipped[0].reason.contains("already shown"));
+    }
+
+    #[test]
+    fn a_per_channel_set_drops_no_ops_per_channel() {
+        // Restore's shape: the values come from a run, and a channel that already has the
+        // value it is asked for must not be written again.
+        let plan = plan_ops(
+            &world(),
+            &Selection::default(),
+            &[set_op(
+                Field::Name,
+                &[
+                    (1, SetValue::Name("ESPN [recovered]".to_string())),
+                    (4, SetValue::Name("Télé-Québec".to_string())),
+                ],
+            )],
+        )
+        .expect("plans");
+        assert_eq!(plan.changes.len(), 1);
+        assert_eq!(plan.changes[0].channel_id, 1);
+        assert_eq!(plan.changes[0].op.label(), "set");
+        assert_eq!(plan.changes[0].field, Field::Name);
+        assert_eq!(plan.skipped.len(), 1);
+        assert_eq!(plan.skipped[0].channel_id, 4);
+        assert!(plan.skipped[0].reason.contains("already has this name"));
+    }
+
+    #[test]
+    fn a_per_channel_set_writes_a_group_and_can_clear_the_guide() {
+        let plan = plan_ops(
+            &world(),
+            &Selection::default(),
+            &[set_op(
+                Field::Group,
+                &[(1, SetValue::Group(None)), (3, SetValue::Group(Some(10)))],
+            )],
+        )
+        .expect("plans");
+        assert_eq!(plan.changes.len(), 2);
+        let espn = plan
+            .changes
+            .iter()
+            .find(|change| change.channel_id == 1)
+            .expect("ESPN moves");
+        assert_eq!(espn.before, Value::Group(Some((10, "Sports".to_string()))));
+        assert_eq!(espn.after, Value::Group(None));
+        // `none` is what `edit/bulk` turns into a null `channel_group_id`.
+        assert_eq!(espn.after.wire(), "none");
+
+        let plan = plan_ops(
+            &world(),
+            &Selection::default(),
+            &[set_op(
+                Field::Epg,
+                &[(1, SetValue::Epg(None)), (3, SetValue::Epg(Some(31)))],
+            )],
+        )
+        .expect("plans");
+        assert_eq!(plan.changes.len(), 2);
+        assert!(plan.changes.iter().any(|change| change.channel_id == 3
+            && change.after == Value::Epg(Some((31, "ESPN HD".to_string())))));
+        // PPV 1 already has no guide, and the map asks for none.
+        assert!(!plan.changes.iter().any(|change| change.channel_id == 5));
+    }
+
+    #[test]
+    fn a_per_channel_membership_set_reads_the_flag_per_profile() {
+        let plan = plan_ops(
+            &world(),
+            &Selection::default(),
+            &[set_op(
+                Field::Membership(2),
+                &[(1, SetValue::Flag(false)), (3, SetValue::Flag(true))],
+            )],
+        )
+        .expect("plans");
+        assert_eq!(plan.changes.len(), 2);
+        assert!(plan
+            .changes
+            .iter()
+            .all(|change| change.field == Field::Membership(2)));
+    }
+
+    #[test]
+    fn a_per_channel_set_refuses_a_value_of_the_wrong_shape() {
+        let error = plan_ops(
+            &world(),
+            &Selection::default(),
+            &[set_op(Field::Name, &[(1, SetValue::Group(Some(10)))])],
+        )
+        .expect_err("rejects");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("channel 1: a value of type group cannot be written to name"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_per_channel_set_refuses_a_group_the_world_lacks() {
+        let error = plan_ops(
+            &world(),
+            &Selection::default(),
+            &[set_op(Field::Group, &[(1, SetValue::Group(Some(99)))])],
+        )
+        .expect_err("rejects");
+        assert!(
+            format!("{error:#}").contains("no channel group with id 99"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn a_per_channel_set_of_nothing_touches_nothing() {
+        // A restore with no rows has nothing to put back; that is an empty plan, not an
+        // error and not "every channel".
+        let plan = plan_ops(
+            &world(),
+            &Selection::default(),
+            &[Op::Set {
+                field: Field::Name,
+                values: HashMap::new(),
+            }],
+        )
+        .expect("plans");
+        assert_eq!(plan.selected.len(), 5);
+        assert!(plan.changes.is_empty());
+        assert!(plan.skipped.is_empty());
+    }
+
+    #[test]
+    fn a_per_channel_op_parses_from_json() {
+        // The JSON harness (`examples/channel_ops_io.rs`) and a future config both spell an op
+        // this way: the field by its API label, the values as an object keyed by channel id.
+        let op: Op = serde_json::from_value(serde_json::json!({
+            "op": "set",
+            "field": "streams",
+            "values": {"1": {"streams": [101, 100]}, "3": {"streams": []}}
+        }))
+        .expect("parses");
+        assert_eq!(op.kind(), OpKind::Set);
+        assert_eq!(op.field(), Field::Streams);
+        match &op {
+            Op::Set { values, .. } => {
+                assert_eq!(values.get(&1), Some(&SetValue::Streams(vec![101, 100])));
+                assert_eq!(values.get(&3), Some(&SetValue::Streams(Vec::new())));
+            }
+            other => panic!("unexpected op {other:?}"),
+        }
+
+        // A move to "No Group", and the label that names a profile membership.
+        let op: Op = serde_json::from_value(serde_json::json!({
+            "op": "move_group", "group_id": null
+        }))
+        .expect("parses");
+        assert_eq!(op, Op::MoveGroup { group_id: None });
+        let op: Op = serde_json::from_value(serde_json::json!({
+            "op": "set",
+            "field": "profile_membership:2",
+            "values": {"1": {"flag": false}}
+        }))
+        .expect("parses");
+        assert_eq!(op.field(), Field::Membership(2));
+    }
+
+    #[test]
+    fn an_unknown_field_label_is_refused() {
+        let error = serde_json::from_value::<Op>(serde_json::json!({
+            "op": "set", "field": "logo_id", "values": {}
+        }))
+        .expect_err("rejects");
+        assert!(
+            error.to_string().contains("unknown channel field"),
+            "{error}"
+        );
+        // A channel id that is not a number is refused rather than silently dropped.
+        let error = serde_json::from_value::<Op>(serde_json::json!({
+            "op": "set", "field": "name", "values": {"espn": {"name": "x"}}
+        }))
+        .expect_err("rejects");
+        assert!(error.to_string().contains("is not an integer"), "{error}");
+    }
+
+    #[test]
+    fn moving_a_channel_to_no_group_targets_a_null_group() {
+        let plan = plan_ops(
+            &world(),
+            &Selection {
+                channel_ids: Some(vec![1, 5]),
+                ..Selection::default()
+            },
+            &[Op::MoveGroup { group_id: None }],
+        )
+        .expect("plans");
+        assert_eq!(plan.changes.len(), 1);
+        assert_eq!(plan.changes[0].channel_id, 1);
+        assert_eq!(plan.changes[0].after, Value::Group(None));
+        assert_eq!(plan.changes[0].after.wire(), "none");
+        // Local has no group already.
+        assert!(plan
+            .skipped
+            .iter()
+            .any(|skip| skip.channel_id == 5 && skip.reason.contains("already has no group")));
+    }
+
+    #[test]
+    fn a_stream_list_is_compared_in_order_not_as_a_set() {
+        let mut fixture = world();
+        fixture.channels[0].streams = vec![100, 101];
+        let reordered = set_op(Field::Streams, &[(1, SetValue::Streams(vec![101, 100]))]);
+        let plan = plan_ops(&fixture, &Selection::default(), &[reordered]).expect("plans");
+        assert_eq!(plan.changes.len(), 1);
+        let change = &plan.changes[0];
+        assert_eq!(change.field, Field::Streams);
+        // The report prints the NAMES the world knows, not the ids.
+        assert_eq!(
+            change.before.display(),
+            "ESPN HD (primary), ESPN HD (backup)"
+        );
+        assert_eq!(
+            change.after.display(),
+            "ESPN HD (backup), ESPN HD (primary)"
+        );
+        // The machine value is the ids, which is what a restore parses back.
+        assert_eq!(change.before.wire(), "100,101");
+        assert_eq!(change.after.wire(), "101,100");
+        assert_eq!(parse_stream_ids(&change.after.wire()), Some(vec![101, 100]));
+
+        // The same list in the same order is not a change.
+        let plan = plan_ops(
+            &fixture,
+            &Selection::default(),
+            &[set_op(
+                Field::Streams,
+                &[(1, SetValue::Streams(vec![100, 101]))],
+            )],
+        )
+        .expect("plans");
+        assert!(plan.changes.is_empty());
+        assert!(plan.skipped[0].reason.contains("already this one"));
+    }
+
+    #[test]
+    fn a_stream_list_prints_ids_when_the_world_loaded_no_streams() {
+        // `load_world_with` leaves an unrequested slice empty, so this is what a run without
+        // `WorldKind::Streams` actually hands the plan: the same changes, printed by id.
+        let mut fixture = world();
+        fixture.streams.clear();
+        fixture.loaded = crate::dispatcharr::WorldKinds::only(WorldKind::Channels);
+        let plan = plan_ops(
+            &fixture,
+            &Selection::default(),
+            &[set_op(
+                Field::Streams,
+                &[(1, SetValue::Streams(vec![100, 101]))],
+            )],
+        )
+        .expect("plans");
+        assert_eq!(plan.changes[0].after.display(), "100, 101");
+        // An empty list is a real value ("the channel has no streams"), not a missing one.
+        assert_eq!(Value::Streams(Vec::new()).display(), "no streams");
+        assert_eq!(Value::Streams(Vec::new()).wire(), "none");
+        assert_eq!(parse_stream_ids("none"), Some(Vec::new()));
+        assert_eq!(parse_stream_ids(""), Some(Vec::new()));
+        assert_eq!(parse_stream_ids("1, 2"), Some(vec![1, 2]));
+        assert_eq!(parse_stream_ids("1,x"), None);
+    }
+
+    #[test]
+    fn a_long_stream_list_is_counted_rather_than_printed_whole() {
+        let ids: Vec<i64> = (1..=9).collect();
+        let value = Value::Streams(
+            ids.iter()
+                .map(|id| ListedStream {
+                    id: *id,
+                    name: None,
+                })
+                .collect(),
+        );
+        assert_eq!(value.display(), "1, 2, 3, 4, 5, 6, … (9 total)");
+        assert_eq!(value.wire(), "1,2,3,4,5,6,7,8,9");
+    }
+
+    #[test]
+    fn rows_are_selected_by_field_and_subject() {
+        let rows = vec![
+            RunRow {
+                ordinal: 0,
+                subject: Subject::Channel,
+                channel_id: 1,
+                field: "epg_data_id".to_string(),
+                before_value: Some("31".to_string()),
+                ..RunRow::default()
+            },
+            RunRow {
+                ordinal: 1,
+                subject: Subject::Channel,
+                channel_id: 2,
+                field: "epg_data_id".to_string(),
+                ..RunRow::default()
+            },
+            // A watchdog row: an EPG SOURCE id in `channel_id`, and the same field label.
+            RunRow {
+                ordinal: 2,
+                subject: Subject::EpgSource,
+                channel_id: 1,
+                field: "epg_source".to_string(),
+                ..RunRow::default()
+            },
+            RunRow {
+                ordinal: 3,
+                subject: Subject::Channel,
+                channel_id: 3,
+                field: "name".to_string(),
+                ..RunRow::default()
+            },
+        ];
+        let guides: Vec<i64> = rows_for_field(&rows, Field::Epg)
+            .iter()
+            .map(|row| row.channel_id)
+            .collect();
+        assert_eq!(guides, vec![1, 2]);
+        assert_eq!(rows_for_field(&rows, Field::Name).len(), 1);
+        assert!(rows_for_field(&rows, Field::Streams).is_empty());
+    }
+
+    #[test]
+    fn a_scan_selection_ignores_rows_about_other_subjects() {
+        // A probe or watchdog row's `channel_id` is an id from another table; reading it as a
+        // channel would aim the selection at whatever channel carries that number.
+        let rows = vec![
+            RunRow {
+                ordinal: 0,
+                subject: Subject::Channel,
+                channel_id: 7,
+                epg_data_id: Some(31),
+                ..RunRow::default()
+            },
+            RunRow {
+                ordinal: 1,
+                subject: Subject::EpgSource,
+                channel_id: 8,
+                ..RunRow::default()
+            },
+            RunRow {
+                ordinal: 2,
+                subject: Subject::Stream,
+                channel_id: 9,
+                ..RunRow::default()
+            },
+        ];
+        let selection = Selection::from_scan_rows(&rows, &scope());
+        assert_eq!(selection.channel_ids, Some(vec![7]));
+        assert_eq!(selection.expected_epg.len(), 1);
     }
 
     // ---- apply -------------------------------------------------------------
@@ -2485,7 +3614,7 @@ mod tests {
                 Op::Rename {
                     kind: RenameKind::Suffix(" [BadEPG]".to_string()),
                 },
-                Op::MoveGroup { group_id: 20 },
+                Op::MoveGroup { group_id: Some(20) },
                 Op::SetMembership {
                     profile_id: 2,
                     enabled: false,
@@ -2611,6 +3740,347 @@ mod tests {
         );
     }
 
+    /// A [`StreamListWriter`] that records the batches it was asked to write, for the routing
+    /// tests.
+    #[derive(Default)]
+    struct RecordingWriter {
+        batches: std::sync::Mutex<Vec<StreamBatch>>,
+        /// Channels whose write fails, to check that a failure is per channel.
+        failing: Vec<i64>,
+        /// Channels left unanswered, to check that a short answer fails loudly.
+        unanswered: Vec<i64>,
+    }
+
+    /// One `write_many` call, as the writer received it.
+    type StreamBatch = Vec<(i64, Vec<i64>)>;
+
+    impl RecordingWriter {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn batches(&self) -> Vec<StreamBatch> {
+            self.batches.lock().expect("calls lock").clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StreamListWriter for RecordingWriter {
+        async fn write_many(&self, lists: &[(i64, Vec<i64>)]) -> Vec<(i64, Result<()>)> {
+            self.batches
+                .lock()
+                .expect("calls lock")
+                .push(lists.to_vec());
+            lists
+                .iter()
+                .filter(|(id, _)| !self.unanswered.contains(id))
+                .map(|(id, _)| {
+                    if self.failing.contains(id) {
+                        (*id, Err(anyhow::anyhow!("stream {id} was rejected")))
+                    } else {
+                        (*id, Ok(()))
+                    }
+                })
+                .collect()
+        }
+    }
+
+    fn stream_world() -> World {
+        let mut fixture = world();
+        fixture.channels[0].streams = vec![100, 101];
+        fixture.channels[2].streams = vec![102];
+        fixture
+    }
+
+    #[tokio::test]
+    async fn stream_lists_go_through_the_writer_in_one_batch() {
+        // The writer is batched: one call carrying every channel's list, in plan order.
+        let server = MockServer::start().await;
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        let context = JobContext::for_tests(crate::config::CrosstalkConfig::default());
+        let plan = plan_ops(
+            &stream_world(),
+            &Selection::default(),
+            &[set_op(
+                Field::Streams,
+                &[
+                    (1, SetValue::Streams(vec![101, 100])),
+                    (3, SetValue::Streams(vec![102, 100])),
+                ],
+            )],
+        )
+        .expect("plans");
+        assert_eq!(plan.changes.len(), 2);
+
+        let writer = RecordingWriter::new();
+        let report =
+            apply_with_writer(&client, &plan, &context, "streams.sort_apply", &writer).await;
+        assert!(report.all_ok(), "{:#?}", report.changes);
+        assert_eq!(
+            writer.batches(),
+            vec![vec![(1, vec![101, 100]), (3, vec![102, 100])]]
+        );
+        // Nothing was sent to the API: the writer owns that decision.
+        assert_eq!(
+            server.received_requests().await.unwrap_or_default().len(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stream_write_that_fails_fails_only_its_own_row() {
+        let server = MockServer::start().await;
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        let context = JobContext::for_tests(crate::config::CrosstalkConfig::default());
+        let plan = plan_ops(
+            &stream_world(),
+            &Selection::default(),
+            &[set_op(
+                Field::Streams,
+                &[
+                    (1, SetValue::Streams(vec![101])),
+                    (3, SetValue::Streams(vec![100])),
+                ],
+            )],
+        )
+        .expect("plans");
+        let writer = RecordingWriter {
+            failing: vec![1],
+            ..RecordingWriter::new()
+        };
+
+        let report =
+            apply_with_writer(&client, &plan, &context, "streams.sort_apply", &writer).await;
+        assert_eq!(report.ok, 1);
+        assert_eq!(report.failed, 1);
+        let failed = report
+            .changes
+            .iter()
+            .find(|change| change.channel_id == 1)
+            .expect("failed row");
+        assert_eq!(failed.status, RowStatus::Failed);
+        assert!(failed.reason.contains("was rejected"), "{}", failed.reason);
+        let written = report
+            .changes
+            .iter()
+            .find(|change| change.channel_id == 3)
+            .expect("ok row");
+        assert_eq!(written.status, RowStatus::Ok);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_stream_stage_writes_nothing_and_says_so() {
+        let server = MockServer::start().await;
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        let context = JobContext::for_tests(crate::config::CrosstalkConfig::default());
+        context.cancel();
+        let plan = plan_ops(
+            &stream_world(),
+            &Selection::default(),
+            &[set_op(Field::Streams, &[(1, SetValue::Streams(vec![101]))])],
+        )
+        .expect("plans");
+
+        let writer = RecordingWriter::new();
+        let report =
+            apply_with_writer(&client, &plan, &context, "streams.sort_apply", &writer).await;
+        assert!(writer.batches().is_empty());
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.changes[0].reason, CANCELLED);
+    }
+
+    #[tokio::test]
+    async fn a_channel_the_writer_never_answers_fails_loudly() {
+        // A short answer is a bug in the writer, not a success: the row fails with the
+        // writer's name on it rather than sitting at `planned` forever.
+        let server = MockServer::start().await;
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        let context = JobContext::for_tests(crate::config::CrosstalkConfig::default());
+        let plan = plan_ops(
+            &stream_world(),
+            &Selection::default(),
+            &[set_op(
+                Field::Streams,
+                &[
+                    (1, SetValue::Streams(vec![101])),
+                    (3, SetValue::Streams(vec![100])),
+                ],
+            )],
+        )
+        .expect("plans");
+        let writer = RecordingWriter {
+            unanswered: vec![3],
+            ..RecordingWriter::new()
+        };
+
+        let report =
+            apply_with_writer(&client, &plan, &context, "streams.sort_apply", &writer).await;
+        assert_eq!(report.ok, 1);
+        assert_eq!(report.failed, 1);
+        let silent = report
+            .changes
+            .iter()
+            .find(|change| change.channel_id == 3)
+            .expect("unanswered row");
+        assert_eq!(silent.status, RowStatus::Failed);
+        assert!(silent.reason.contains("no result"), "{}", silent.reason);
+    }
+
+    #[tokio::test]
+    async fn the_default_apply_writes_stream_lists_in_one_bulk_request() {
+        // [`apply`] uses the REST writer, which is batched: two channels' lists go out as
+        // two `edit/bulk` rows in ONE request, not one PATCH per channel.
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/channels/channels/edit/bulk/"))
+            .and(body_json(serde_json::json!([
+                {"id": 1, "streams": [101, 100]},
+                {"id": 3, "streams": [102, 100]}
+            ])))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"message": "ok", "channels": [{"id": 1}, {"id": 3}]}),
+            ))
+            .mount(&server)
+            .await;
+
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        let context = JobContext::for_tests(crate::config::CrosstalkConfig::default());
+        let plan = plan_ops(
+            &stream_world(),
+            &Selection::default(),
+            &[set_op(
+                Field::Streams,
+                &[
+                    (1, SetValue::Streams(vec![101, 100])),
+                    (3, SetValue::Streams(vec![102, 100])),
+                ],
+            )],
+        )
+        .expect("plans");
+
+        let report = apply(&client, &plan, &context, "streams.sort_apply").await;
+        assert!(report.all_ok(), "{:#?}", report.changes);
+        assert_eq!(
+            server.received_requests().await.unwrap_or_default().len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn per_channel_values_and_a_group_move_share_one_bulk_edit() {
+        // A per-channel name and a group move are `edit/bulk` rows like any other: the
+        // per-channel part only decides WHICH channel gets which value.
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/channels/channels/edit/bulk/"))
+            .and(body_json(serde_json::json!([
+                {"id": 1, "name": "ESPN [recovered]", "channel_group_id": 20},
+                {"id": 2, "channel_group_id": 20},
+                {"id": 5, "channel_group_id": 20}
+            ])))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "message": "ok",
+                "channels": [{"id": 1}, {"id": 2}, {"id": 5}]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        let context = JobContext::for_tests(crate::config::CrosstalkConfig::default());
+        let plan = plan_ops(
+            &world(),
+            &Selection::default(),
+            &[
+                set_op(
+                    Field::Name,
+                    &[(1, SetValue::Name("ESPN [recovered]".to_string()))],
+                ),
+                Op::MoveGroup { group_id: Some(20) },
+            ],
+        )
+        .expect("plans");
+
+        let writer = RecordingWriter::new();
+        let report =
+            apply_with_writer(&client, &plan, &context, "guide.restore_apply", &writer).await;
+        assert!(report.all_ok(), "{:#?}", report.changes);
+        // Channels 3 and 4 are already in group 20 and are skipped; the other three moved, and
+        // channel 1 also took the per-channel name.
+        assert_eq!(report.ok, 4);
+        assert_eq!(report.failed, 0);
+        assert!(writer.batches().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_move_to_no_group_is_reported_rather_than_sent() {
+        // `ChannelSerializer.channel_group_id` has no `allow_null`, so a null is a 400 for the
+        // whole `edit/bulk` chunk. One bad row must not take the renames in that chunk down
+        // with it, so the move is reported and the rest of the plan still lands.
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/channels/channels/edit/bulk/"))
+            .and(body_json(serde_json::json!([
+                {"id": 1, "name": "ESPN [recovered]"}
+            ])))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"message": "ok", "channels": [{"id": 1}]})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        let context = JobContext::for_tests(crate::config::CrosstalkConfig::default());
+        let plan = plan_ops(
+            &world(),
+            &Selection {
+                channel_ids: Some(vec![1]),
+                ..Selection::default()
+            },
+            &[
+                set_op(
+                    Field::Name,
+                    &[(1, SetValue::Name("ESPN [recovered]".to_string()))],
+                ),
+                Op::MoveGroup { group_id: None },
+            ],
+        )
+        .expect("plans");
+        // The plan itself is fine: the move is a change, recorded with its "none" target.
+        assert_eq!(plan.changes.len(), 2);
+        assert!(plan
+            .changes
+            .iter()
+            .any(|change| change.field == Field::Group && change.after.wire() == "none"));
+
+        let writer = RecordingWriter::new();
+        let report =
+            apply_with_writer(&client, &plan, &context, "guide.restore_apply", &writer).await;
+        assert_eq!(report.ok, 1);
+        assert_eq!(report.failed, 1);
+        let moved = report
+            .changes
+            .iter()
+            .find(|change| change.field == Field::Group)
+            .expect("group row");
+        assert_eq!(moved.status, RowStatus::Failed);
+        assert!(
+            moved.reason.contains("cannot clear a channel group"),
+            "{}",
+            moved.reason
+        );
+        // The rename in the same plan was written.
+        assert_eq!(
+            report
+                .changes
+                .iter()
+                .find(|change| change.field == Field::Name)
+                .expect("name row")
+                .status,
+            RowStatus::Ok
+        );
+    }
+
     // ---- rows --------------------------------------------------------------
 
     #[test]
@@ -2679,6 +4149,47 @@ mod tests {
         assert_eq!(run_rows(&plan, Some(&applied))[0].status, "ok");
         // Without a report the row stays "planned", which is what a dry run records.
         assert_eq!(run_rows(&plan, None)[0].status, "planned");
+    }
+
+    #[test]
+    fn every_channel_row_says_it_is_about_a_channel() {
+        // A restore reads a run's rows by subject as well as by field, so a channel operation
+        // must say which it is: the watchdog's rows share the row shape but not the subject.
+        let plan = plan_ops(&world(), &Selection::default(), &[Op::ClearEpg]).expect("plans");
+        let rows = run_rows(&plan, None);
+        assert!(!rows.is_empty());
+        assert!(rows.iter().all(|row| row.subject == Subject::Channel));
+        // The skip rows carry the same field (a channel with no guide to clear), so the
+        // planned and written rows are the ones with a value on both sides.
+        let written = rows_for_field(&rows, Field::Epg)
+            .iter()
+            .filter(|row| row.status != "skipped")
+            .count();
+        assert_eq!(written, plan.changes.len());
+    }
+
+    #[test]
+    fn a_stream_row_carries_ids_a_restore_can_put_back() {
+        let plan = plan_ops(
+            &stream_world(),
+            &Selection::default(),
+            &[set_op(
+                Field::Streams,
+                &[(1, SetValue::Streams(vec![101, 100]))],
+            )],
+        )
+        .expect("plans");
+        let rows = run_rows(&plan, None);
+        let row = rows_for_field(&rows, Field::Streams)[0];
+        assert_eq!(row.field, "streams");
+        assert_eq!(row.method, "set");
+        assert_eq!(row.before_value.as_deref(), Some("100,101"));
+        assert_eq!(row.after_value.as_deref(), Some("101,100"));
+        // What a restore does with the before value.
+        assert_eq!(
+            parse_stream_ids(row.before_value.as_deref().expect("value")),
+            Some(vec![100, 101])
+        );
     }
 
     #[test]

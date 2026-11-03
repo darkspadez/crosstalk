@@ -84,7 +84,7 @@ use chrono::{DateTime, Utc};
 use crosstalk_core::csv_report;
 use crosstalk_core::dispatcharr::{DispatcharrClient, EpgEntry, EpgHorizon, EpgSourceState, World};
 use crosstalk_core::jobs::{JobContext, ProgressEvent};
-use crosstalk_core::store::RunRow;
+use crosstalk_core::store::{RunRow, Subject};
 use crosstalk_core::subapp::{JobOutcome, OutcomeBuilder, SubApp};
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -972,10 +972,10 @@ fn write_report(
 
 /// One run row per candidate source.
 ///
-/// The store's rows are channel-shaped, and a source is not a channel: the identity columns
-/// carry the source's id and name, `field` says what was observed, and the before/after values
-/// are its refresh status. `reason` carries the horizons and the action, so the run page tells
-/// the whole story without a schema change.
+/// A source is not a channel, so the row says so: `subject` is EPG source and the identity
+/// columns carry the source's id and name. `field` names what was observed (`epg_source`),
+/// the before/after values are its refresh status, and `reason` carries the horizons and the
+/// action, so the run page tells the whole story.
 pub fn run_rows(summary: &Summary) -> Vec<RunRow> {
     summary
         .rows
@@ -983,6 +983,7 @@ pub fn run_rows(summary: &Summary) -> Vec<RunRow> {
         .enumerate()
         .map(|(ordinal, row)| RunRow {
             ordinal: ordinal as i64,
+            subject: Subject::EpgSource,
             channel_id: row.source_id,
             channel_name: row.name.clone(),
             channel_group: String::new(),
@@ -1896,6 +1897,9 @@ mod tests {
             // One row per candidate source, in the order the sources were audited.
             let rows = store.rows(context.run_id().expect("run")).expect("rows");
             assert_eq!(rows.len(), 2);
+            // The identity columns carry the SOURCE here, which is what `subject` says: a
+            // restore reading this run must not take id 20 for a channel id.
+            assert_eq!(rows[0].subject, Subject::EpgSource);
             assert_eq!(rows[0].channel_id, 20);
             assert_eq!(rows[0].channel_name, "epgshare-UK");
             assert_eq!(rows[0].field, "epg_source");
