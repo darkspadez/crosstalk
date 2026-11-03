@@ -4,6 +4,7 @@ members = [
     "crates/crosstalk-matching",
     "crates/crosstalk-core",
     "crates/guide",
+    "crates/streams",
     "crates/crosstalk-web",
     "crates/crosstalk",
 ]
@@ -21,6 +22,7 @@ crosstalk-matching = { path = "crates/crosstalk-matching" }
 crosstalk-core = { path = "crates/crosstalk-core" }
 crosstalk-web = { path = "crates/crosstalk-web" }
 crosstalk-guide = { path = "crates/guide" }
+crosstalk-streams = { path = "crates/streams" }
 
 # Async / runtime
 tokio = { version = "1", features = ["full"] }

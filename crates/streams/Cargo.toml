@@ -1,0 +1,21 @@
+[package]
+name = "crosstalk-streams"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "crosstalk sub-app: which streams a channel has, in what order, and whether they work"
+
+[dependencies]
+crosstalk-core.workspace = true
+
+anyhow.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true

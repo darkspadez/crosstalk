@@ -134,13 +134,20 @@ Two files, split by who owns the option:
   the check window, the auto-match and heal confidence thresholds, the heal fallback sources,
   the cleanup suffix and REGEX, and the watchdog's threshold, timeout, exclude list and
   recovery logging.
+- **`streams.toml`** (sub-app): the stream half of the scope — M3U accounts in priority order,
+  stream groups, the stream-name regex rules — then matching, sorting, probing and triage.
+  Still shared, so not repeated there: Stream-Mapparr's tag handling is `[matching]`, its
+  channel profile and groups are `[scope]` (with its exclude mode being `[scope]
+  ignore_groups`), and both plugins' schedules, windows and "run after a refresh" triggers
+  are `[schedules]`, `[workflows]` and `[hooks]`.
 
 The rest of `crosstalk.toml` is `[server]` (`bind`, `port`, `token`/`token_env`), `[dispatcharr]`
 (`base_url`, an API key or a JWT fallback, `timeout_secs`, `concurrency`), `[ai.providers.<name>]`
 (the endpoints, keys and concurrency caps), `[jobs]` (worker threads, the exports and data
 directories, `run_history_days`) and `[schedules]` (see [Scheduling](#scheduling)).
-[`config/crosstalk.example.toml`](config/crosstalk.example.toml) and
-[`config/guide.example.toml`](config/guide.example.toml) document every key with its why.
+[`config/crosstalk.example.toml`](config/crosstalk.example.toml),
+[`config/guide.example.toml`](config/guide.example.toml) and
+[`config/streams.example.toml`](config/streams.example.toml) document every key with its why.
 
 The split is a clean break: `guide.toml` rejects the old `channel_profile_name`,
 `selected_groups`, `ignore_groups`, `csv_retention_days` and `[ai]` keys, and the error says
@@ -167,6 +174,11 @@ Host settings saved in the UI hot-reload: the next run uses them and schedules r
 no daemon restart (a run already in progress finishes with the settings it started with).
 
 ## Actions
+
+Every action below belongs to the `guide` app (`crosstalk run guide <action>`). The `streams`
+app declares its own list in `crates/streams/src/lib.rs` and currently exposes `validate` and
+`status`; its `match_*`, `sort_*`, `mirror_*`, `probe`, `triage_*`, `restore_*` and
+`visibility_*` pairs arrive with the rest of phase 2.
 
 | Action | Colour | What it does |
 |---|---|---|
@@ -411,6 +423,8 @@ reports each reference separately, against that reference's own list of ported f
 crates/crosstalk-matching   pure, IO-free matcher: normalisation, similarity, callsigns, pipeline
 crates/crosstalk-core       host: config, sub-app trait, Dispatcharr client, AI, store, runner, CSV
 crates/guide                the guide sub-app: scope, matching, heal, scan, cleanup presets, watchdog
+crates/streams              the streams sub-app: stream selection, settings, and (phase 2) match, sort,
+                            mirror, probe, triage, restore, visibility
 crates/crosstalk-web        axum + Askama UI and JSON API
 crates/crosstalk            the binary: CLI, registry, daemon
 data/                       embedded channel databases, FCC callsigns, aliases

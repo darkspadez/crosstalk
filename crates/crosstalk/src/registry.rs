@@ -9,7 +9,10 @@ use std::sync::Arc;
 
 /// Every sub-app compiled into this binary.
 pub fn builtin() -> Registry {
-    Registry::new(vec![Arc::new(crosstalk_guide::GuideApp::new())])
+    Registry::new(vec![
+        Arc::new(crosstalk_guide::GuideApp::new()),
+        Arc::new(crosstalk_streams::StreamsApp::new()),
+    ])
 }
 
 #[cfg(test)]
@@ -23,6 +26,35 @@ mod tests {
         assert_eq!(app.name(), "Guide");
         assert!(!app.actions().is_empty());
         assert!(!app.schema().fields().is_empty());
+    }
+
+    #[test]
+    fn streams_is_linked_in() {
+        // The dashboard, the settings form, `crosstalk validate` and `crosstalk run streams
+        // status` all come off the registry, so being here is the whole wiring.
+        let registry = builtin();
+        let app = registry.get("streams").expect("streams is linked");
+        assert_eq!(app.name(), "Streams");
+        assert!(app.description().contains("stream"));
+        let ids: Vec<&str> = app.actions().iter().map(|action| action.id).collect();
+        assert_eq!(ids, vec!["validate", "status"]);
+        // Every section of the plan's settings layout is in the form.
+        let sections: Vec<&str> = app.schema().sections().map(|s| s.label).collect();
+        assert_eq!(
+            sections,
+            vec![
+                "Stream Selection",
+                "Match",
+                "EPG-Aware Placeholder Matching",
+                "Sort",
+                "Probe",
+                "Triage",
+            ]
+        );
+        assert_eq!(
+            app.settings_path(std::path::Path::new("/config")),
+            std::path::Path::new("/config/streams.toml")
+        );
     }
 
     #[test]

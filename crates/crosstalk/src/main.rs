@@ -297,7 +297,10 @@ async fn wait_for_drain(runner: &JobRunner, timeout: std::time::Duration) {
 fn install_logging() {
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_env("RUST_LOG").unwrap_or_else(|_| {
-        EnvFilter::new("info,crosstalk_core=info,crosstalk_web=info,crosstalk_guide=info")
+        EnvFilter::new(
+            "info,crosstalk_core=info,crosstalk_web=info,crosstalk_guide=info,\
+             crosstalk_streams=info",
+        )
     });
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -720,7 +723,7 @@ mod cli_tests {
         })
         .expect_err("fails");
         assert!(
-            format!("{error}").contains("known apps: guide"),
+            format!("{error}").contains("known apps: guide, streams"),
             "{error:#}"
         );
     }

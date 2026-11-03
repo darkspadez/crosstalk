@@ -510,6 +510,7 @@ dependencies = [
  "crosstalk-core",
  "crosstalk-guide",
  "crosstalk-matching",
+ "crosstalk-streams",
  "crosstalk-web",
  "csv",
  "fancy-regex",
@@ -580,6 +581,21 @@ dependencies = [
  "unicode-general-category",
  "unicode-normalization",
  "unicode_names2",
+]
+
+[[package]]
+name = "crosstalk-streams"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crosstalk-core",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
 ]
 
 [[package]]

@@ -1,0 +1,225 @@
+# Streams settings.
+#
+# This file holds what the streams app decides for itself: which M3U accounts and stream groups
+# it may draw streams from, the matching and sorting rules, the probe, and the triage tags.
+# Everything shared with the other sub-apps lives in crosstalk.toml:
+#
+#   [scope]     the channel half of the scope. Stream-Mapparr's Channel Profile and Channel
+#               Groups are `profiles` and `groups` there, and its Channel Groups Mode
+#               "exclude" is `ignore_groups` (the host models the two modes as two lists
+#               instead of one list plus a switch). IPTV Checker's Channel Groups and mode are
+#               the same two settings.
+#   [matching]  the tag handling. Stream-Mapparr's three Tag Handling presets ARE the four
+#               `ignore_*_tags` booleans, and its Custom Aliases and Channel Database are
+#               `custom_aliases` and `enabled_databases`.
+#   [exports]   CSV retention, which both plugins grew their own copy of.
+#   [schedules], [workflows], [hooks]
+#               both plugins' scheduled times, windows and "run after M3U refresh / IPTV
+#               Checker scan" triggers, e.g.
+#                 [schedules]
+#                 "streams.match_apply" = "0 6 * * *"
+#                 [workflows]
+#                 nightly = ["streams.probe", "streams.sort_apply"]
+#                 [hooks]
+#                 m3u_refresh = ["streams.match_apply"]
+#
+# A retired key is refused with a message naming where it went, rather than silently ignored.
+# The daemon writes back to this file when a setting is changed in the web UI, preserving
+# comments. Defaults are the plugins' own.
+
+# --- Stream Selection ------------------------------------------------------------------
+#
+# Which streams a run may draw from. Every filter here is resolved into a lookup table once
+# per run, because the pool is tens of thousands of streams.
+
+# M3U account names to draw streams from, in PRIORITY ORDER, or empty for every active
+# account. Names match exactly and case-sensitively, as in Stream-Mapparr: a different case
+# names a different account, and only a lone * is a wildcard, standing for every other
+# account. A stream's position in its account's list is its priority when sorting, so the
+# first account named is the one that plays. It is a filter too: without a * entry only the
+# accounts listed are used, so "Free Provider, *" puts Free Provider first and everything
+# else after it, including accounts added later. A disabled account is never used, whatever
+# the list says.
+selected_m3us = ""
+# Stream groups to draw candidate streams from, or empty for every stream group. Names are
+# matched exactly and case-sensitively, as in Stream-Mapparr (Dispatcharr treats "Sports"
+# and "SPORTS" as different groups); there are no wildcards here.
+selected_stream_groups = ""
+# "include" uses only the stream groups listed above; "exclude" uses every stream group
+# except them. Resolved separately from the channel-group filter in [scope], so excluding a
+# channel group does not also invert this list. An empty list means every group either way.
+stream_group_filter_mode = "include"
+
+# A JSON list of [find, replace] regex pairs, applied in order to stream names before
+# matching. Matching only: a stream's name in Dispatcharr is never changed, and quality
+# sorting, zone routing, country restriction and duplicate detection still read the original
+# name. Rust's regex engine is not Python's re, so backreferences and lookaround in a PATTERN
+# are refused with an explanation instead of matching something else; in a REPLACEMENT, \1 and
+# \g<name> work as they do in Python. At most 50 rules, 500 characters each. `streams
+# test_rules` previews what they do.
+#
+#   stream_name_regex_rules = '[["\\s*▎\\s*", " "], ["\\bVIP\\b", ""]]'
+stream_name_regex_rules = ""
+# Extra tags to strip while matching, on top of the [matching] tag handling. Quote a tag to
+# keep its spaces or brackets: 4K, [4K], " East", "[Dead]".
+ignore_tags = ""
+
+# --- Match ------------------------------------------------------------------------------
+#
+# How a channel's stream list is decided. With overwrite_streams on, Match & Assign REPLACES
+# the channel's whole list, so preview first and read the CSV.
+
+# How closely a stream name must match a channel name: relaxed (70) accepts more matches with
+# more false positives, normal (80) is balanced, strict (90) wants high confidence, exact (95)
+# is near-exact only.
+match_sensitivity = "normal"
+# On: remove every existing stream and replace it with the matched ones, so a channel can end
+# a run with fewer streams than it started with. Off: add matches to what is there.
+overwrite_streams = true
+# Keep a channel's hand-made (custom) streams through an overwrite, after the provider ones.
+# Pair it with a fallback player. Off removes them like any other stream.
+keep_custom_streams = true
+# Keep distinct same-named streams from ONE M3U account. Off treats them as duplicates and
+# keeps the first. Same-named streams from DIFFERENT accounts are always kept, and true
+# duplicates (same name, account and URL) are always collapsed.
+allow_same_name_streams = false
+# Only match streams detected as the same country as the channel. A stream with no
+# recognizable country marker is not dropped, it sorts behind same-country matches.
+restrict_matching_to_country = false
+# PREFIX=COUNTRY pairs telling the country filter what a provider prefix means, for a prefix
+# that names a platform rather than a country. Only consulted when nothing else identified
+# the stream, and only at the start of a name: NOW=UK, GO=US.
+stream_prefix_countries = ""
+# How many channels of one name group receive streams; the rest are left alone. At least 1,
+# because 0 would give no channel a stream.
+visible_channel_limit = 1
+
+# --- EPG-Aware Placeholder Matching -----------------------------------------------------
+#
+# Some providers name PPV and event slots generically (PPV EVENT 04) on both the channel and
+# the stream, while the real title only appears in programme data. With this on, a channel or
+# stream whose name matches a pattern below is matched using its CURRENTLY AIRING programme
+# title instead. Matching only: no name is ever modified.
+
+epg_placeholder_matching_enabled = false
+# One regex per line, separated by \n. A name that matches none of them is matched exactly as
+# it is.
+epg_placeholder_name_patterns = "^PPV EVENT \\d+$\n^LIVE EVENT \\d+$\n^PPV \\d+ \\|?$\n^HBO \\d+$\n^MAX \\d+$\n^Triller TV \\| Event \\d+$"
+# The same [find, replace] JSON format as stream_name_regex_rules, applied to the raw
+# programme title (strips a "Next Event: X at 6:00AM on Jul 26" wrapper down to X).
+epg_title_cleanup_rules = '[["^Next Event:\\s*", ""], ["\\s+at \\d{1,2}:\\d{2}\\s*[AP]M on \\w+ \\d{1,2}$", ""]]'
+# Titles that carry no event signal. Matching one leaves the channel and stream on their
+# literal placeholder name for this pass.
+epg_skip_titles = "Signing Off,No Event Today,No Game Today"
+# The same format again, applied to the CHANNEL name before it is compared with a resolved
+# title: a name like "WWE Monday Night Raw | Monday @ 5" compares as "WWE Monday Night Raw".
+epg_channel_schedule_cleanup_rules = '[["(?i)\\s*\\|\\s*\\w+\\s*@\\s*\\d{1,2}(?::\\d{2})?\\s*[AP]?M?\\s*$", ""]]'
+# Permanently named channels (ESPN) whose current programme title may add their stream as an
+# EXTRA alternate for a channel whose name the title contains. Empty disables it.
+epg_watch_source_streams = ""
+
+# --- Sort -------------------------------------------------------------------------------
+#
+# How a channel's streams are ordered. The first entry is the one that plays, so these decide
+# failover order. Quality, audio layout and codec apply within a channel.
+
+# On: quality first, then M3U account priority. Off: account priority first.
+prioritize_quality = false
+# Comma-separated, most preferred first, case-insensitive substring match. Unlisted or
+# unknown sorts last. Blank disables it. Channel layout is ranked before codec.
+audio_channels_priority = ""
+audio_codec_priority = ""
+# When two streams tie on resolution, frame rate and audio, the higher measured bitrate goes
+# first, rounded down to this step so run-to-run variation does not reshuffle them. 0 turns
+# the tie-breaker off; a stream with no measured bitrate sorts after one that has one.
+bitrate_sort_step_kbps = 500
+# Rank last a stream that claims 720p or higher while carrying almost no video: a looping
+# slate reports a high resolution, and the throughput probe cannot catch it because a still
+# image arrives faster than realtime. Moved down, never removed.
+demote_content_starved = true
+content_bitrate_floor_kbps = 300
+# Sort by measured-throughput tier before resolution and frame rate; a stream with no fresh
+# measurement falls back to resolution and frame rate.
+enable_throughput_sorting = true
+# How many stream-list writes are in flight at once. This replaces Stream-Mapparr's Rate
+# Limiting presets, which paced one database write at a time and could not finish a large run.
+write_concurrency = 8
+
+# --- Probe ------------------------------------------------------------------------------
+#
+# What a probe run checks and how hard it may push the providers. A probe opens a real
+# connection and consumes one of your provider slots, which is why the rate is capped per
+# account and results are reused while fresh. ffprobe and ffmpeg must be in the image.
+
+# Probe a channel's backup streams as well as its first one. Off is much faster but cannot
+# show that a channel still plays on a backup.
+check_alternative_streams = true
+# Only check channels enabled in at least one profile.
+only_visible_channels = false
+# Skip a stream probed more recently than this, so a nightly run only covers what went stale
+# and a large backlog clears over several nights. 0 probes everything every run.
+probe_freshness_hours = 24
+# Connection timeout, and how long to wait for data after connecting.
+timeout = 10
+probe_timeout = 20
+# Retries when a stream looks dead before calling it dead. 0 means one attempt.
+dead_connection_retries = 3
+# Concurrent connections to ONE M3U account, never above that account's own stream limit. A
+# provider counts connections per account whatever this host does, so 1 is the safe default;
+# total parallelism grows with the number of accounts.
+probe_per_account_limit = 1
+# Cooldown after each probe before the lane takes the next one. Retry passes wait three times
+# as long.
+stream_check_delay = 2
+# Cap on probes started per minute across the whole run, on top of the per-account limit.
+probe_rate_per_minute = 6
+# Length of one throughput probe.
+probe_duration_seconds = 8
+# How long a measured throughput stays usable for sorting. Separate from the freshness window
+# above, which decides whether a stream is probed at all.
+probe_cache_ttl_minutes = 30
+# Multiplier over a stream's nominal bitrate for its claimed resolution. Below nominal × this
+# counts as insufficient and ranks last. At least 1.0.
+bitrate_safety_margin = 1.10
+
+# Content detection: one extra ffmpeg decode pass, shared by the three checks, costs one
+# provider connection rather than one each. Every check is fail-open: if ffmpeg is missing or
+# errors, the stream stays alive.
+black_screen_detection = false
+black_screen_sample_seconds = 6
+black_screen_min_black_seconds = 3
+black_screen_ffmpeg_timeout = 20
+# A live stream reports no fixed duration; one that does is serving a finite file, which
+# providers use as a dead-channel placeholder.
+placeholder_file_detection = false
+frozen_video_detection = false
+frozen_video_min_seconds = 4
+silent_audio_detection = false
+# Mean volume at or below this counts as silence. Must be negative.
+silent_audio_max_db = -70
+
+# Host suffixes ffprobe cannot validate (Streamlink): a stream on one is recorded as SKIPPED,
+# not dead, so triage leaves it alone. Use full domains.
+streamlink_hosts = "youtube.com, youtu.be, twitch.tv, kick.com"
+# The analysis flags are fixed by the probe (show_streams, show_packets, an error-level log)
+# rather than configurable: a flag set that breaks the parser would fail every stream at once.
+ffprobe_path = "/usr/local/bin/ffprobe"
+ffmpeg_path = "/usr/local/bin/ffmpeg"
+
+# --- Triage -----------------------------------------------------------------------------
+#
+# What a triage run does with what the last probe found. A rename is a channel write, and every
+# change is recorded so restore can undo it. A channel that still plays on a backup is never
+# renamed or moved, however many of its other streams failed.
+
+# {name} is the original channel name. A format that would erase the name is refused.
+dead_rename_format = "{name} [DEAD]"
+# Empty moves nothing.
+move_to_group_name = "Graveyard"
+black_screen_rename_format = "{name} [Blank]"
+move_black_screen_group = "Black Screens"
+low_framerate_rename_format = "{name} [Slow]"
+move_low_framerate_group = "Slow"
+# Formats to append to a channel that plays, comma-separated. Restore does not strip these: it
+# only undoes the tags it wrote on channels it marked as failing.
+video_format_suffixes = "UHD, FHD, HD, SD, Unknown"
