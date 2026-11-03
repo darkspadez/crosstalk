@@ -393,13 +393,17 @@ python3 scripts/parity_sweep.py --kinds normalize,callsign,location,network --li
 python3 scripts/parity_sweep.py --kinds match,score --limit 300 --pool 60
 python3 -I scripts/channel_ops_parity.py   # the cleanup selections and payloads
 
-./scripts/upstream_drift.sh     # what the plugin changed since the pin, in files we port
+./scripts/upstream_drift.sh     # what each reference changed since its pin, in files we port
 ```
 
-The Python plugin lives in `reference/` as a pinned git submodule: the parity gates compare
-against that exact commit. See [How matching works](#how-matching-works) for what is
-strict-parity and what is deliberately Rust-native, and `scripts/upstream_drift.sh` — which
-also runs on the weekly CI schedule — for when upstream has moved past that pin.
+The Python plugins live in `reference/` as pinned git submodules — EPG Janitor (the guide
+app), Stream-Mapparr and IPTV Checker (the streams app, from phase 2 on) — so the parity
+gates always compare against those exact commits. A fresh clone needs
+`git submodule update --init` to get them. See [How matching works](#how-matching-works) for
+what is strict-parity and what is deliberately Rust-native, and `scripts/upstream_drift.sh`
+— which also runs on the weekly CI schedule — for when upstream has moved past a pin; it
+reports each reference separately, against that reference's own list of ported files
+(`THIRD_PARTY_NOTICES.md`).
 
 ### Layout
 
@@ -410,6 +414,7 @@ crates/guide                the guide sub-app: scope, matching, heal, scan, clea
 crates/crosstalk-web        axum + Askama UI and JSON API
 crates/crosstalk            the binary: CLI, registry, daemon
 data/                       embedded channel databases, FCC callsigns, aliases
+reference/                  the pinned upstream plugins the parity gates compare against
 scripts/                    the parity gates and the upstream-drift report
 ```
 
@@ -417,7 +422,8 @@ A new sub-app is a crate implementing `SubApp` plus one line in `crates/crosstal
 
 ## Licence
 
-crosstalk is MIT; see [LICENSE](LICENSE). The code and data ported from EPG Janitor are
-credited, with the upstream licence text and the pinned reference commit, in
+crosstalk is MIT; see [LICENSE](LICENSE). The code and data ported from the Dispatcharr
+plugins (EPG Janitor, Stream-Mapparr and IPTV Checker) are credited, with each upstream
+licence text and pinned reference commit, in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) — both files ship in the release tarball and
 in the container image, under `/usr/share/doc/crosstalk/`.

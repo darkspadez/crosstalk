@@ -1,3 +1,9 @@
 [submodule "reference/Dispatcharr-EPG-Janitor-Plugin"]
 	path = reference/Dispatcharr-EPG-Janitor-Plugin
 	url = https://github.com/PiratesIRC/Dispatcharr-EPG-Janitor-Plugin
+[submodule "reference/Stream-Mapparr"]
+	path = reference/Stream-Mapparr
+	url = https://github.com/PiratesIRC/Stream-Mapparr
+[submodule "reference/Dispatcharr-IPTV-Checker-Plugin"]
+	path = reference/Dispatcharr-IPTV-Checker-Plugin
+	url = https://github.com/PiratesIRC/Dispatcharr-IPTV-Checker-Plugin
