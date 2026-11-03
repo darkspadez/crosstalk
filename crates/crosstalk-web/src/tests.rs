@@ -257,7 +257,7 @@ async fn a_form_cannot_turn_a_preview_action_into_an_apply() {
 
 #[tokio::test]
 async fn the_run_page_shows_status_rows_and_the_csv_link() {
-    let (state, store, _dir) = state(None);
+    let (state, store, dir) = state(None);
     let run_id = store.start_run("echo", "peek", true).expect("run");
     store
         .record_ai_decision(
@@ -284,13 +284,17 @@ async fn the_run_page_shows_status_rows_and_the_csv_link() {
             }],
         )
         .expect("rows");
+    let exports = dir.path().join("exports");
+    std::fs::create_dir_all(&exports).expect("exports");
+    let report = exports.join("echo_peek_20260101_000000_000.csv");
+    std::fs::write(&report, "# crosstalk Echo\nchannel_name\nESPN\n").expect("report");
     store
         .finish_run(
             run_id,
             crosstalk_core::store::RunStatus::Succeeded,
             Some("one channel matched"),
             &serde_json::json!({"matched": 1}),
-            Some("/tmp/does-not-exist.csv"),
+            Some(report.to_str().expect("path")),
         )
         .expect("finish");
 
@@ -309,7 +313,24 @@ async fn the_run_page_shows_status_rows_and_the_csv_link() {
     assert!(panel.contains("one channel matched"), "{panel}");
     assert!(panel.contains("Download CSV"), "{panel}");
 
-    // The report is gone, so the download says so rather than serving an empty file.
+    // The report downloads while it is there.
+    let (status, body) = get(&state, &format!("/runs/{run_id}/csv")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("ESPN"), "{body}");
+
+    // Once a clear or retention has deleted it, the panel and the run page say so instead of
+    // linking to a file that would answer 410.
+    std::fs::remove_file(&report).expect("delete the report");
+    let (status, panel) = get(&state, &format!("/runs/{run_id}/status")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!panel.contains("Download CSV"), "{panel}");
+    assert!(panel.contains("The report file is gone"), "{panel}");
+    let (status, body) = get(&state, &format!("/runs/{run_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body.contains("Download CSV"), "{body}");
+    assert!(body.contains("The report file is gone"), "{body}");
+
+    // And the download endpoint says so rather than serving an empty file.
     let (status, _body) = get(&state, &format!("/runs/{run_id}/csv")).await;
     assert_eq!(status, StatusCode::GONE);
 }
@@ -1130,4 +1151,103 @@ async fn a_csv_outside_the_exports_directory_is_not_served() {
     let (status, _headers, body) = get_full(&state, &format!("/runs/{run_id}/csv")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(!body.contains("classified"), "nothing leaks: {body}");
+}
+
+/// Backdate a file, so a test can be older than the clear-exports grace window.
+fn backdate(path: &Path, days: u64) {
+    let file = std::fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("open for time");
+    file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(days * 86_400))
+        .expect("set mtime");
+}
+
+#[tokio::test]
+async fn clearing_exports_deletes_only_the_apps_own_files() {
+    let (state, _store, dir) = state(None);
+    let exports = dir.path().join("exports");
+    std::fs::create_dir_all(&exports).expect("exports");
+    let mine = exports.join("echo_peek_20250101_000000_000.csv");
+    let recent = exports.join("echo_peek_20250102_000000_000.csv");
+    let foreign = exports.join("lineuparr_export.csv");
+    let not_csv = exports.join("echo_notes.txt");
+    for path in [&mine, &recent, &foreign, &not_csv] {
+        std::fs::write(path, "x").expect("write");
+    }
+    // Everything but the second app report is old; the second one looks like a run still open.
+    for path in [&mine, &foreign, &not_csv] {
+        backdate(path, 30);
+    }
+
+    let (status, headers) = post_raw(&state, "/exports/clear", "confirm=true", &[], true).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let location = headers
+        .get("location")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    assert_eq!(location, "/?cleared=1&kept=1&failed=0");
+
+    assert!(!mine.exists(), "the app's own old report is deleted");
+    assert!(recent.exists(), "a report a run may still hold survives");
+    assert!(foreign.exists(), "another program's file is untouched");
+    assert!(not_csv.exists(), "only .csv files are exports");
+}
+
+#[tokio::test]
+async fn clearing_exports_needs_the_server_side_confirmation() {
+    let (state, _store, dir) = state(None);
+    let exports = dir.path().join("exports");
+    std::fs::create_dir_all(&exports).expect("exports");
+    let mine = exports.join("echo_peek_20250101_000000_000.csv");
+    std::fs::write(&mine, "x").expect("write");
+    backdate(&mine, 30);
+
+    // CSRF alone is not enough: the dialog's confirm=true is part of the form.
+    let (status, _headers) = post_raw(&state, "/exports/clear", "", &[], true).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(mine.exists(), "nothing was deleted");
+}
+
+#[tokio::test]
+async fn clearing_exports_needs_the_csrf_token_and_auth() {
+    let (open, _store, _dir) = state(None);
+    let (status, _headers) = post_raw(&open, "/exports/clear", "confirm=true", &[], false).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // And a token-protected daemon refuses an unauthenticated POST before anything else.
+    let (protected, _store, _dir) = state(Some("s3cret"));
+    let (status, _headers) =
+        post_raw(&protected, "/exports/clear", "confirm=true", &[], true).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn the_dashboard_reports_what_a_clear_deleted() {
+    let (state, _store, dir) = state(None);
+    let exports = dir.path().join("exports");
+    std::fs::create_dir_all(&exports).expect("exports");
+    std::fs::write(exports.join("echo_peek_20250101_000000_000.csv"), "x").expect("write");
+
+    // The button says what is on disk before it is pressed.
+    let (status, body) = get(&state, "/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Clear exports"), "{body}");
+    assert!(body.contains("1 report file on disk"), "{body}");
+    assert!(
+        body.contains("data-confirm="),
+        "the dialog is CSP-safe: {body}"
+    );
+
+    // And the redirect's counts are what the page says afterwards.
+    let (status, body) = get(&state, "/?cleared=1&kept=2&failed=0").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Deleted 1 report file."), "{body}");
+    assert!(body.contains("Kept 2 written in the last"), "{body}");
+    assert!(!body.contains("could not be deleted"), "{body}");
+
+    let (status, body) = get(&state, "/?cleared=0&kept=0&failed=1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Deleted 0 report files."), "{body}");
+    assert!(body.contains("1 could not be deleted"), "{body}");
 }

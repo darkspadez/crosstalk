@@ -4,6 +4,7 @@
 //!   * `serve`   — run the daemon (REST API, scheduler, web UI)
 //!   * `run`     — run one sub-app action once, without the daemon
 //!   * `validate` — check configuration against Dispatcharr
+//!   * `exports clear` — delete the CSV reports the sub-apps wrote
 //!   * `simulate-streams` — offline stream-to-channel match simulation (the parity oracle)
 
 mod registry;
@@ -38,6 +39,8 @@ enum Command {
     Run(RunArgs),
     /// Validate the configuration files and each sub-app's settings.
     Validate(ConfigArgs),
+    /// Manage the CSV reports the sub-apps write.
+    Exports(ExportsArgs),
     /// Offline stream-to-channel match simulation.
     #[command(name = "simulate-streams")]
     SimulateStreams(SimulateArgs),
@@ -71,6 +74,31 @@ struct RunArgs {
 struct ConfigArgs {
     #[arg(long, default_value = "config", env = "CROSSTALK_CONFIG_DIR")]
     config: PathBuf,
+}
+
+#[derive(Args, Debug)]
+struct ExportsArgs {
+    #[command(subcommand)]
+    command: ExportsCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum ExportsCommand {
+    /// Delete the CSV reports the sub-apps wrote. Other files in the directory are untouched.
+    Clear(ExportsClearArgs),
+}
+
+#[derive(Args, Debug)]
+struct ExportsClearArgs {
+    /// Directory holding the configuration files; the exports directory comes from it.
+    #[arg(long, default_value = "config", env = "CROSSTALK_CONFIG_DIR")]
+    config: PathBuf,
+    /// Only this sub-app's reports, for example `guide`. Default: every sub-app's.
+    #[arg(long)]
+    app: Option<String>,
+    /// Confirm the deletion. Without it, the command lists what it would delete and stops.
+    #[arg(long, short = 'y')]
+    yes: bool,
 }
 
 #[derive(Args, Debug)]
@@ -159,6 +187,9 @@ fn main() -> Result<()> {
         Command::Serve(args) => serve(args),
         Command::Run(args) => run_once(args),
         Command::Validate(args) => validate(args),
+        Command::Exports(args) => match args.command {
+            ExportsCommand::Clear(args) => clear_exports(args),
+        },
     }
 }
 
@@ -376,6 +407,76 @@ fn preview_counterpart(action: &str) -> Option<&'static str> {
     }
 }
 
+/// `exports clear`: the host feature that replaced each plugin's `clear_csv_exports`.
+///
+/// Only the registered sub-apps' own files are considered (by their export prefix), so a
+/// directory shared with the plugins loses nothing that is not ours. Reports written in the
+/// last couple of minutes are kept: a daemon run may be holding one, and this command cannot
+/// ask the daemon — opening the run store would retire its in-flight runs.
+fn clear_exports(args: ExportsClearArgs) -> Result<()> {
+    let config = CrosstalkConfig::load(&args.config)?;
+    let registry = registry::builtin();
+    let all_prefixes: Vec<String> = registry.iter().map(|app| app.export_prefix()).collect();
+    // The single-app filter is ownership against the whole registry, not a lone prefix
+    // match: a nested id's files (a future `guide_extra_*` alongside `guide_*`) start with
+    // both prefixes, and belong to the longest match.
+    let wanted: Option<String> = match &args.app {
+        Some(id) => {
+            let app = registry.get(id).with_context(|| {
+                format!(
+                    "no sub-app {id:?}; known apps: {}",
+                    registry
+                        .iter()
+                        .map(|app| app.id())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
+            Some(app.export_prefix())
+        }
+        None => None,
+    };
+
+    let directory = config.exports_dir();
+    println!("exports: {}", directory.display());
+    if !args.yes {
+        // A one-shot command has no dialog to confirm in, so the flag stands in for it.
+        let listed = crosstalk_core::csv_report::app_exports(&directory, &all_prefixes);
+        let count = match &wanted {
+            Some(prefix) => listed
+                .iter()
+                .filter(|file| {
+                    crosstalk_core::csv_report::owning_prefix(&file.name, &all_prefixes)
+                        == Some(prefix.as_str())
+                })
+                .count(),
+            None => listed.len(),
+        };
+        anyhow::bail!(
+            "refusing to delete {count} report file(s) without --yes. Add --yes to proceed."
+        );
+    }
+
+    let summary = match &wanted {
+        Some(prefix) => {
+            crosstalk_core::csv_report::clear_app_exports(&directory, &all_prefixes, prefix)
+        }
+        None => crosstalk_core::csv_report::clear_exports(&directory, &all_prefixes),
+    };
+    println!("deleted: {}", summary.deleted);
+    if summary.kept_recent > 0 {
+        println!(
+            "kept: {} written in the last {} minutes, in case a run is still using them",
+            summary.kept_recent,
+            crosstalk_core::csv_report::CLEAR_GRACE.as_secs() / 60
+        );
+    }
+    if summary.failed > 0 {
+        println!("failed: {} (the log says why)", summary.failed);
+    }
+    Ok(())
+}
+
 fn validate(args: ConfigArgs) -> Result<()> {
     let config = CrosstalkConfig::load(&args.config)?;
     let registry = registry::builtin();
@@ -475,5 +576,127 @@ mod shutdown_tests {
         runner.shutdown();
         wait_for_drain(&runner, std::time::Duration::from_secs(5)).await;
         assert!(runner.start("guide", "match_preview", true).is_err());
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(args).expect("the command line parses")
+    }
+
+    fn clear_args(args: &[&str]) -> ExportsClearArgs {
+        match parse(args).command {
+            Command::Exports(ExportsArgs {
+                command: ExportsCommand::Clear(args),
+            }) => args,
+            other => panic!("expected an exports clear command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exports_clear_takes_a_config_dir_an_app_and_yes() {
+        let args = clear_args(&[
+            "crosstalk",
+            "exports",
+            "clear",
+            "--config",
+            "/etc/crosstalk",
+        ]);
+        assert_eq!(args.config, Path::new("/etc/crosstalk"));
+        assert_eq!(args.app, None);
+        assert!(!args.yes, "a deletion is never the default");
+
+        let args = clear_args(&[
+            "crosstalk",
+            "exports",
+            "clear",
+            "--config",
+            "/etc/crosstalk",
+            "--app",
+            "guide",
+            "--yes",
+        ]);
+        assert_eq!(args.app.as_deref(), Some("guide"));
+        assert!(args.yes);
+    }
+
+    #[test]
+    fn exports_clear_defaults_to_the_same_config_dir_as_run() {
+        // `run` and `serve` default to `config` and honour the environment; a destructive
+        // command that pointed somewhere else would be a trap.
+        let args = clear_args(&["crosstalk", "exports", "clear"]);
+        assert_eq!(args.config, Path::new("config"));
+    }
+
+    #[test]
+    fn exports_clear_needs_the_clear_subcommand() {
+        assert!(Cli::try_parse_from(["crosstalk", "exports"]).is_err());
+        assert!(Cli::try_parse_from(["crosstalk", "exports", "nope"]).is_err());
+    }
+
+    /// A config directory with an exports subdirectory holding a backdated report.
+    fn config_dir_with_exports() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let exports = dir.path().join("exports");
+        std::fs::create_dir_all(&exports).expect("exports");
+        let report = exports.join("guide_match_preview_20250101_000000_000.csv");
+        std::fs::write(&report, "x").expect("write");
+        let file = std::fs::File::options()
+            .write(true)
+            .open(&report)
+            .expect("open for time");
+        file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(86_400))
+            .expect("set mtime");
+        (dir, report)
+    }
+
+    #[test]
+    fn clearing_without_yes_refuses_and_deletes_nothing() {
+        let (dir, report) = config_dir_with_exports();
+        let error = clear_exports(ExportsClearArgs {
+            config: dir.path().to_path_buf(),
+            app: None,
+            yes: false,
+        })
+        .expect_err("refuses");
+        assert!(format!("{error}").contains("--yes"), "{error:#}");
+        assert!(report.exists(), "nothing was deleted");
+    }
+
+    #[test]
+    fn clearing_with_yes_deletes_only_the_registered_apps_reports() {
+        let (dir, report) = config_dir_with_exports();
+        let exports = dir.path().join("exports");
+        let foreign = exports.join("lineuparr_export.csv");
+        std::fs::write(&foreign, "x").expect("write");
+
+        clear_exports(ExportsClearArgs {
+            config: dir.path().to_path_buf(),
+            app: Some("guide".to_string()),
+            yes: true,
+        })
+        .expect("clears");
+
+        assert!(!report.exists(), "the guide's own report is deleted");
+        assert!(foreign.exists(), "another program's file is untouched");
+    }
+
+    #[test]
+    fn clearing_names_an_unknown_app() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let error = clear_exports(ExportsClearArgs {
+            config: dir.path().to_path_buf(),
+            app: Some("nope".to_string()),
+            yes: true,
+        })
+        .expect_err("fails");
+        assert!(
+            format!("{error}").contains("known apps: guide"),
+            "{error:#}"
+        );
     }
 }

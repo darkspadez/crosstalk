@@ -38,7 +38,7 @@ use crosstalk_core::jobs::{JobContext, ProgressEvent};
 use crosstalk_core::match_run::{self, CandidateProbe, ConfidenceBand, ScoreProgress, WalkRules};
 use crosstalk_core::scope::ScopedChannels;
 use crosstalk_core::store::RunRow;
-use crosstalk_core::subapp::{JobOutcome, OutcomeBuilder};
+use crosstalk_core::subapp::{JobOutcome, OutcomeBuilder, SubApp};
 use crosstalk_matching::pipeline::{CandidateIndex, Scored};
 use crosstalk_matching::MatchProfile;
 use std::collections::{HashMap, HashSet};
@@ -133,8 +133,10 @@ pub struct MatchOutcome {
 ///
 /// `dry_run` writes the report and changes nothing; otherwise the matches are written in one
 /// batch, which is also what makes Dispatcharr queue the programme parse for each changed
-/// entry.
+/// entry. `app` is the run's author, which names the report it writes.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
+    app: &dyn SubApp,
     context: &JobContext,
     settings: &GuideSettings,
     ai: Option<&crosstalk_core::ai::AiService>,
@@ -490,7 +492,15 @@ pub async fn run(
         .filter(|row| row.epg_data_id.is_some())
         .collect();
 
-    let report = write_report(context, settings, scoped_channels, &rows, &matched, dry_run)?;
+    let report = write_report(
+        app,
+        context,
+        settings,
+        scoped_channels,
+        &rows,
+        &matched,
+        dry_run,
+    )?;
 
     let mut applied = 0;
     if !dry_run {
@@ -514,7 +524,7 @@ pub async fn run(
             .map(|name| name.to_string_lossy().to_string());
         csv_report::prune_exports(
             &context.exports_dir(),
-            crate::EXPORT_PREFIX,
+            &app.export_prefix(),
             context.config().exports.retention_days,
             name.as_deref(),
         );
@@ -602,6 +612,7 @@ fn reason_for(
 }
 
 fn write_report(
+    app: &dyn SubApp,
     context: &JobContext,
     settings: &GuideSettings,
     scoped_channels: &ScopedChannels,
@@ -612,7 +623,7 @@ fn write_report(
     let exports_dir = context.exports_dir();
     let report = csv_report::Report::new(
         &exports_dir,
-        crate::EXPORT_PREFIX,
+        app,
         if dry_run {
             "match_preview"
         } else {
@@ -774,6 +785,7 @@ pub fn associations(rows: &[MatchRow]) -> Vec<(i64, i64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::GuideApp;
     use crosstalk_core::dispatcharr::{Channel, ChannelGroup, DispatcharrClient, EpgSource};
     use crosstalk_core::jobs::VecSink;
     use std::sync::atomic::AtomicUsize;
@@ -941,9 +953,18 @@ mod tests {
         let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
 
-        run(&context, &settings, None, &world, &channels, &entries, true)
-            .await
-            .expect("preview");
+        run(
+            &GuideApp::new(),
+            &context,
+            &settings,
+            None,
+            &world,
+            &channels,
+            &entries,
+            true,
+        )
+        .await
+        .expect("preview");
 
         let scoring: Vec<_> = sink
             .events()
@@ -964,9 +985,18 @@ mod tests {
         let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
 
-        let result = run(&context, &settings, None, &world, &channels, &entries, true)
-            .await
-            .expect("preview");
+        let result = run(
+            &GuideApp::new(),
+            &context,
+            &settings,
+            None,
+            &world,
+            &channels,
+            &entries,
+            true,
+        )
+        .await
+        .expect("preview");
 
         assert_eq!(result.channels, 2);
         let espn = result
@@ -991,7 +1021,14 @@ mod tests {
         assert_eq!(result.applied, 0);
         let report = result.report.expect("report written");
         let text = std::fs::read_to_string(&report).expect("read report");
-        assert!(text.contains("# crosstalk guide"));
+        // The preamble names the app that wrote it, from the app itself.
+        assert!(
+            text.starts_with(&format!(
+                "# crosstalk Guide v{} - Auto-Match Preview Report",
+                crosstalk_core::HOST_VERSION
+            )),
+            "{text}"
+        );
         assert!(text.contains("channel_name,channel_number"));
         assert!(text.contains("ESPN HD"));
     }
@@ -1003,7 +1040,14 @@ mod tests {
         let (channels, entries) = scoped(&world);
 
         let result = run(
-            &context, &settings, None, &world, &channels, &entries, false,
+            &GuideApp::new(),
+            &context,
+            &settings,
+            None,
+            &world,
+            &channels,
+            &entries,
+            false,
         )
         .await
         .expect("apply");
@@ -1017,9 +1061,18 @@ mod tests {
         let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
 
-        let result = run(&context, &settings, None, &world, &channels, &entries, true)
-            .await
-            .expect("preview");
+        let result = run(
+            &GuideApp::new(),
+            &context,
+            &settings,
+            None,
+            &world,
+            &channels,
+            &entries,
+            true,
+        )
+        .await
+        .expect("preview");
         let espn = result
             .rows
             .iter()
@@ -1037,9 +1090,18 @@ mod tests {
             ..GuideSettings::default()
         };
         let (channels, entries) = scoped(&world);
-        let result = run(&context, &settings, None, &world, &channels, &entries, true)
-            .await
-            .expect("preview");
+        let result = run(
+            &GuideApp::new(),
+            &context,
+            &settings,
+            None,
+            &world,
+            &channels,
+            &entries,
+            true,
+        )
+        .await
+        .expect("preview");
         let espn = result
             .rows
             .iter()
@@ -1139,6 +1201,7 @@ mod tests {
         let (channels, entries) = scoped(&world);
 
         let result = run(
+            &GuideApp::new(),
             &context,
             &settings,
             Some(&service),
@@ -1179,6 +1242,7 @@ mod tests {
         let (channels, entries) = scoped(&world);
 
         let result = run(
+            &GuideApp::new(),
             &context,
             &settings,
             Some(&service),
@@ -1219,6 +1283,7 @@ mod tests {
         let (channels, entries) = scoped(&world);
 
         let result = run(
+            &GuideApp::new(),
             &context,
             &settings,
             Some(&service),
@@ -1299,6 +1364,7 @@ mod tests {
             );
 
         let result = run(
+            &GuideApp::new(),
             &context,
             &settings,
             Some(&service),
@@ -1368,6 +1434,7 @@ mod tests {
             );
 
         let result = run(
+            &GuideApp::new(),
             &context,
             &settings,
             Some(&service),
@@ -1519,6 +1586,7 @@ mod tests {
         let (channels, entries) = scoped(&world);
 
         let result = run(
+            &GuideApp::new(),
             &context,
             &settings,
             Some(&service),
@@ -1551,9 +1619,18 @@ mod tests {
         let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
 
-        let result = run(&context, &settings, None, &world, &channels, &entries, true)
-            .await
-            .expect("preview");
+        let result = run(
+            &GuideApp::new(),
+            &context,
+            &settings,
+            None,
+            &world,
+            &channels,
+            &entries,
+            true,
+        )
+        .await
+        .expect("preview");
         let espn = result
             .rows
             .iter()
@@ -1713,9 +1790,18 @@ mod tests {
         context.cancel();
         let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
-        let error = run(&context, &settings, None, &world, &channels, &entries, true)
-            .await
-            .expect_err("a cancelled run aborts");
+        let error = run(
+            &GuideApp::new(),
+            &context,
+            &settings,
+            None,
+            &world,
+            &channels,
+            &entries,
+            true,
+        )
+        .await
+        .expect_err("a cancelled run aborts");
         assert!(format!("{error:#}").contains("cancelled"));
     }
     #[tokio::test]
@@ -1726,9 +1812,18 @@ mod tests {
         let (_server, world, context) = fixture_full("espn.us", "=ESPN", "=ESPN HD").await;
         let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
-        let result = run(&context, &settings, None, &world, &channels, &entries, true)
-            .await
-            .expect("preview");
+        let result = run(
+            &GuideApp::new(),
+            &context,
+            &settings,
+            None,
+            &world,
+            &channels,
+            &entries,
+            true,
+        )
+        .await
+        .expect("preview");
 
         let row = result
             .rows

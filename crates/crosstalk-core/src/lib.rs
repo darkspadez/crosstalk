@@ -19,11 +19,15 @@ pub mod store;
 pub mod subapp;
 pub mod wildcard;
 
+#[cfg(test)]
+mod test_app;
+
 pub use ai::{AiService, Answer, Decider, DecisionRequest, DecisionResponse, Question, Verdict};
 pub use config::{ConfigReport, CrosstalkConfig, SharedConfig};
 pub use csv_report::{
-    exports_to_delete, is_our_export, preamble, prune_exports, report_path, safe_cell,
-    write_report, ExportFile, Report,
+    app_exports, clear_app_exports, clear_exports, exports_to_clear, exports_to_delete,
+    grace_doomed, is_our_export, owning_prefix, preamble, prune_exports, report_path, safe_cell,
+    write_report, ClearSummary, ExportFile, Report, CLEAR_GRACE,
 };
 pub use dispatcharr::{
     Channel, DispatcharrClient, EpgEntry, EpgSource, HasPrograms, ProgramWindow, World,

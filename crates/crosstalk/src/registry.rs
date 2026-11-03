@@ -26,6 +26,26 @@ mod tests {
     }
 
     #[test]
+    fn export_prefixes_must_not_nest() {
+        // One prefix that starts another makes single-prefix matching ambiguous: every
+        // `guide_extra_*` file also matches `guide_`, so retention or a `--app guide` clear
+        // could delete the wrong app's reports. Ownership falls back to the longest match
+        // (see `csv_report::owning_prefix`), but the rule here keeps the ambiguous case from
+        // ever being registered. Add the `guide_extra` app and this fails first, on purpose.
+        let prefixes: Vec<String> = builtin().iter().map(|app| app.export_prefix()).collect();
+        for left in &prefixes {
+            for right in &prefixes {
+                if left != right {
+                    assert!(
+                        !right.starts_with(left.as_str()),
+                        "export prefix {left:?} names every {right:?} file too: ids must not nest"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn every_action_id_is_unique_within_its_app() {
         for app in builtin().iter() {
             let mut seen = std::collections::HashSet::new();

@@ -483,6 +483,33 @@ pub trait SubApp: Send + Sync {
         config_dir.join(format!("{}.toml", self.id()))
     }
 
+    /// The file-name prefix this app's CSV exports carry in the shared exports directory.
+    ///
+    /// `/data/exports` is shared with the plugins and with the other sub-apps, so the prefix is
+    /// how an app recognizes its own history: retention only prunes these files, and the host's
+    /// "clear exports" only deletes them. Derived from the id so the two can never drift apart.
+    ///
+    /// Ids must not nest: no id may start with another id plus `_` (so no `guide_extra` while
+    /// `guide` exists), because `guide_extra_….csv` would otherwise also match `guide_` and a
+    /// single-prefix decision could delete the wrong app's files. The registry test pins this; a
+    /// per-app decision against the full registry uses `owning_prefix` for the same reason.
+    fn export_prefix(&self) -> String {
+        format!("{}_", self.id())
+    }
+
+    /// The first line of a report: `# crosstalk <name> v<version> - <report>`.
+    ///
+    /// A comment, like every other preamble line, so a spreadsheet skips it and reads the
+    /// columns from the first line that does not start with a `#`. The app names itself here
+    /// for the same reason the prefix comes from the id: a caller cannot forget to update it.
+    fn report_title(&self, report: &str) -> String {
+        format!(
+            "# crosstalk {} v{} - {report}",
+            self.name(),
+            crate::HOST_VERSION
+        )
+    }
+
     /// Write settings back, preserving comments.
     fn save_settings(&self, path: &Path, values: &SettingsValues) -> Result<()>;
 
@@ -697,56 +724,21 @@ mod tests {
         assert_eq!(values.text("name"), Some("All"));
     }
 
-    /// A minimal sub-app, so the registry can be tested without depending on the guide app (which
-    /// depends on this crate, so it cannot be referenced here).
-    struct StubApp;
-
-    impl SubApp for StubApp {
-        fn id(&self) -> &'static str {
-            "stub"
-        }
-
-        fn name(&self) -> &'static str {
-            "Stub"
-        }
-
-        fn description(&self) -> &'static str {
-            "test app"
-        }
-
-        fn actions(&self) -> Vec<ActionSpec> {
-            vec![
-                ActionSpec::new("preview", "Preview", "reads", ActionKind::Read),
-                ActionSpec::new("apply", "Apply", "writes", ActionKind::Write),
-            ]
-        }
-
-        fn schema(&self) -> &SettingsSchema {
-            static SCHEMA: std::sync::OnceLock<SettingsSchema> = std::sync::OnceLock::new();
-            SCHEMA.get_or_init(SettingsSchema::default)
-        }
-
-        fn load_settings(&self, _path: &Path) -> Result<SettingsValues> {
-            Ok(SettingsValues::new())
-        }
-
-        fn save_settings(&self, _path: &Path, _values: &SettingsValues) -> Result<()> {
-            Ok(())
-        }
-
-        fn run<'a>(
-            &'a self,
-            _action: &'a str,
-            _context: &'a JobContext,
-            _dry_run: bool,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<JobOutcome>> + Send + 'a>>
-        {
-            Box::pin(async { Ok(JobOutcome::new("ok")) })
-        }
-    }
+    /// The shared minimal sub-app: the core cannot depend on a real one, which depends on it.
+    use crate::test_app::StubApp;
 
     fn stub_registry() -> Registry {
-        Registry::new(vec![Arc::new(StubApp)])
+        Registry::new(vec![Arc::new(StubApp::new())])
+    }
+
+    #[test]
+    fn an_apps_exports_are_named_after_its_id() {
+        let app = StubApp::new();
+        assert_eq!(app.export_prefix(), "stub_");
+        assert_eq!(
+            app.report_title("Preview Report"),
+            format!("# crosstalk Stub v{} - Preview Report", crate::HOST_VERSION)
+        );
     }
 
     #[test]

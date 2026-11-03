@@ -21,7 +21,7 @@ use crosstalk_core::jobs::{JobContext, ProgressEvent};
 use crosstalk_core::match_run::{self, ConfidenceBand};
 use crosstalk_core::scope::ScopedChannels;
 use crosstalk_core::store::RunRow;
-use crosstalk_core::subapp::{JobOutcome, OutcomeBuilder};
+use crosstalk_core::subapp::{JobOutcome, OutcomeBuilder, SubApp};
 use crosstalk_matching::pipeline::{CandidateIndex, Scored};
 use crosstalk_matching::MatchProfile;
 use std::collections::HashMap;
@@ -125,6 +125,7 @@ pub struct HealOutcome {
 
 /// Run scan & heal.
 pub async fn run(
+    app: &dyn SubApp,
     context: &JobContext,
     settings: &GuideSettings,
     world: &World,
@@ -433,7 +434,7 @@ pub async fn run(
     // and the error below names it (mirroring matching, which also reports before it
     // writes). The run record itself cannot link it: the runner drops the report path on
     // a failed run.
-    let report = write_report(context, settings, scanned, &rows, dry_run)?;
+    let report = write_report(app, context, settings, scanned, &rows, dry_run)?;
 
     // Step 4: write the replacements that clear the threshold.
     let mut applied = 0;
@@ -462,7 +463,7 @@ pub async fn run(
             .map(|name| name.to_string_lossy().to_string());
         csv_report::prune_exports(
             &context.exports_dir(),
-            crate::EXPORT_PREFIX,
+            &app.export_prefix(),
             context.config().exports.retention_days,
             name.as_deref(),
         );
@@ -511,6 +512,7 @@ fn reason_for(row: &HealRow, threshold: u8, allow_without_programs: bool) -> Str
 }
 
 fn write_report(
+    app: &dyn SubApp,
     context: &JobContext,
     settings: &GuideSettings,
     scanned: usize,
@@ -526,7 +528,7 @@ fn write_report(
     let exports_dir = context.exports_dir();
     let report = csv_report::Report::new(
         &exports_dir,
-        crate::EXPORT_PREFIX,
+        app,
         if dry_run {
             "heal_preview"
         } else {
@@ -637,6 +639,7 @@ pub fn outcome(result: &HealOutcome, dry_run: bool, threshold: u8) -> JobOutcome
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::GuideApp;
     use crosstalk_core::dispatcharr::{Channel, ChannelGroup, DispatcharrClient, EpgSource};
     use crosstalk_core::jobs::VecSink;
     use wiremock::matchers::{method, path, query_param};
@@ -809,9 +812,17 @@ mod tests {
         let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
 
-        let result = run(&context, &settings, &world, &channels, &entries, true)
-            .await
-            .expect("preview");
+        let result = run(
+            &GuideApp::new(),
+            &context,
+            &settings,
+            &world,
+            &channels,
+            &entries,
+            true,
+        )
+        .await
+        .expect("preview");
         assert_eq!(result.broken, 1);
         let row = &result.rows[0];
         assert_eq!(row.status, HealStatus::ReplacementPreview);
@@ -826,9 +837,17 @@ mod tests {
         let (_server, world, context) = fixture(false, true).await;
         let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
-        let result = run(&context, &settings, &world, &channels, &entries, false)
-            .await
-            .expect("apply");
+        let result = run(
+            &GuideApp::new(),
+            &context,
+            &settings,
+            &world,
+            &channels,
+            &entries,
+            false,
+        )
+        .await
+        .expect("apply");
         assert_eq!(result.rows[0].status, HealStatus::Healed);
         assert_eq!(result.applied, 1);
     }
@@ -841,9 +860,17 @@ mod tests {
             fixture_with_names("ESPN HD", "ESPN (broken)", "ESPN", false, true, false).await;
         let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
-        let error = run(&context, &settings, &world, &channels, &entries, false)
-            .await
-            .expect_err("the apply fails");
+        let error = run(
+            &GuideApp::new(),
+            &context,
+            &settings,
+            &world,
+            &channels,
+            &entries,
+            false,
+        )
+        .await
+        .expect_err("the apply fails");
         let message = format!("{error:#}");
         assert!(message.contains("recorded in"), "{message}");
 
@@ -873,9 +900,17 @@ mod tests {
             fixture_with_names("+ESPN HD", "=ESPN (broken)", "@ESPN", false, true, true).await;
         let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
-        let result = run(&context, &settings, &world, &channels, &entries, true)
-            .await
-            .expect("preview");
+        let result = run(
+            &GuideApp::new(),
+            &context,
+            &settings,
+            &world,
+            &channels,
+            &entries,
+            true,
+        )
+        .await
+        .expect("preview");
         assert_eq!(result.broken, 1);
         let row = &result.rows[0];
         assert_eq!(row.original_epg_name, "=ESPN (broken)");
@@ -904,9 +939,17 @@ mod tests {
         let (_server, world, context) = fixture(true, true).await;
         let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
-        let result = run(&context, &settings, &world, &channels, &entries, false)
-            .await
-            .expect("preview");
+        let result = run(
+            &GuideApp::new(),
+            &context,
+            &settings,
+            &world,
+            &channels,
+            &entries,
+            false,
+        )
+        .await
+        .expect("preview");
         assert_eq!(result.broken, 0);
         assert!(result.rows.is_empty());
         assert_eq!(result.applied, 0);
@@ -917,9 +960,17 @@ mod tests {
         let (_server, world, context) = fixture(false, false).await;
         let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
-        let result = run(&context, &settings, &world, &channels, &entries, false)
-            .await
-            .expect("apply");
+        let result = run(
+            &GuideApp::new(),
+            &context,
+            &settings,
+            &world,
+            &channels,
+            &entries,
+            false,
+        )
+        .await
+        .expect("apply");
         assert_eq!(result.rows[0].status, HealStatus::NoReplacementFound);
         assert_eq!(result.rows[0].new_epg_id, None);
         assert_eq!(
@@ -946,9 +997,17 @@ mod tests {
         let (channels, entries) = scoped(&world);
         assert!(settings.heal_confidence_threshold > 50);
 
-        let result = run(&context, &settings, &world, &channels, &entries, false)
-            .await
-            .expect("apply");
+        let result = run(
+            &GuideApp::new(),
+            &context,
+            &settings,
+            &world,
+            &channels,
+            &entries,
+            false,
+        )
+        .await
+        .expect("apply");
         assert_eq!(result.broken, 1);
         let row = &result.rows[0];
         assert_eq!(row.status, HealStatus::SkippedLowConfidence);
@@ -968,9 +1027,17 @@ mod tests {
 
         // A preview records the replacement too, whatever the score: only an apply
         // splits Healed from SkippedLowConfidence.
-        let preview = run(&context, &settings, &world, &channels, &entries, true)
-            .await
-            .expect("preview");
+        let preview = run(
+            &GuideApp::new(),
+            &context,
+            &settings,
+            &world,
+            &channels,
+            &entries,
+            true,
+        )
+        .await
+        .expect("preview");
         assert_eq!(preview.rows[0].status, HealStatus::ReplacementPreview);
         assert_eq!(preview.rows[0].new_epg_id, Some(8));
         assert_eq!(preview.applied, 0);
@@ -1091,9 +1158,17 @@ mod tests {
         context.cancel();
         let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
-        let error = run(&context, &settings, &world, &channels, &entries, true)
-            .await
-            .expect_err("a cancelled run aborts");
+        let error = run(
+            &GuideApp::new(),
+            &context,
+            &settings,
+            &world,
+            &channels,
+            &entries,
+            true,
+        )
+        .await
+        .expect_err("a cancelled run aborts");
         assert!(format!("{error:#}").contains("cancelled"));
     }
 }

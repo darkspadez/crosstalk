@@ -6,9 +6,10 @@
 //! the EPG reason wording, and the write itself.
 //!
 //! Only the matching actions are implemented. The Python plugin's cleanup actions (remove
-//! by regex, strip from hidden channels, add a bad-EPG suffix, clear exports) and its
-//! freshness watchdog are deliberately out of scope for this version, as is the anonymous
-//! usage counter.
+//! by regex, strip from hidden channels, add a bad-EPG suffix) and its freshness watchdog are
+//! deliberately out of scope for this version, as is the anonymous usage counter. `clear
+//! exports` is not an action here but a host feature: one button and one command delete every
+//! sub-app's own reports, so each app does not carry its own copy.
 
 pub mod heal;
 pub mod matching;
@@ -25,12 +26,6 @@ use std::sync::OnceLock;
 
 pub const APP_ID: &str = "guide";
 pub const APP_NAME: &str = "Guide";
-
-/// The file-name prefix this app's CSV exports carry inside the shared exports directory.
-///
-/// `/data/exports` is shared with other plugins and, later, with the other crosstalk sub-apps,
-/// so each app only ever considers files its own prefix names.
-pub const EXPORT_PREFIX: &str = "guide_";
 
 /// The action ids, as used in schedules and URLs.
 pub const ACTION_VALIDATE: &str = "validate";
@@ -242,6 +237,7 @@ impl GuideApp {
         let ai = crosstalk_core::ai_gate::service(context.config());
 
         let result = matching::run(
+            self,
             context,
             &settings,
             ai.as_ref(),
@@ -271,6 +267,7 @@ impl GuideApp {
         let scoped_entries = scope::scope_entries(&world, filter);
 
         let result = heal::run(
+            self,
             context,
             &settings,
             &world,
@@ -370,6 +367,20 @@ mod tests {
         // The cleanup actions and the watchdog are out of scope for this version.
         assert!(!ids.contains(&"remove_epg_by_regex"));
         assert!(!ids.contains(&"watchdog_run_check_now"));
+    }
+
+    #[test]
+    fn the_app_names_its_own_exports() {
+        // The prefix and the preamble title come from the sub-app, so the host's "clear
+        // exports" and the retention rule agree with what the runs actually wrote.
+        assert_eq!(app().export_prefix(), "guide_");
+        assert_eq!(
+            app().report_title("Auto-Match Preview Report"),
+            format!(
+                "# crosstalk Guide v{} - Auto-Match Preview Report",
+                crosstalk_core::HOST_VERSION
+            )
+        );
     }
 
     #[test]

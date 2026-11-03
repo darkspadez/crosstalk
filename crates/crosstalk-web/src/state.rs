@@ -272,6 +272,30 @@ pub fn schedules(config: &CrosstalkConfig) -> Vec<ScheduleInfo> {
     crosstalk_core::scheduler::describe(config)
 }
 
+/// The file-name prefixes every registered app's CSV exports carry.
+///
+/// Taken from the apps themselves rather than from a list kept here, so the host's "clear
+/// exports" and an app's own retention rule cannot disagree about what is ours.
+pub fn export_prefixes(registry: &Registry) -> Vec<String> {
+    registry.iter().map(|app| app.export_prefix()).collect()
+}
+
+/// The apps' own CSV exports currently in the exports directory.
+pub fn exports_on_disk(config: &CrosstalkConfig, registry: &Registry) -> usize {
+    crosstalk_core::csv_report::app_exports(&config.exports_dir(), &export_prefixes(registry)).len()
+}
+
+/// Whether the report a run recorded is still on disk.
+///
+/// Retention and the host's "clear exports" both delete reports, so a run page must ask
+/// before offering a download: the run record keeps naming a file that may be gone, and the
+/// page should say so instead of linking to a 410.
+pub fn report_available(run: &RunRecord) -> bool {
+    run.report_path
+        .as_deref()
+        .is_some_and(|path| std::path::Path::new(path).is_file())
+}
+
 /// The counts of a run, as `(key, value)` pairs, for the status panel.
 pub fn counts(run: &RunRecord) -> Vec<(String, i64)> {
     match run.counts.as_object() {

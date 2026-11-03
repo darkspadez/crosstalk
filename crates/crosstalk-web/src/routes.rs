@@ -28,6 +28,7 @@ pub fn router(state: AppState) -> Router {
         .route("/runs/:id/rows", get(run_rows))
         .route("/runs/:id/csv", get(run_csv))
         .route("/runs/:id/cancel", post(cancel_run))
+        .route("/exports/clear", post(clear_exports))
         .route("/settings", get(settings_page))
         .route("/settings/host", post(save_host_settings))
         .route("/settings/:app", post(save_app_settings))
@@ -78,6 +79,10 @@ struct DashboardTemplate {
     schedules: Vec<crosstalk_core::scheduler::ScheduleInfo>,
     runs: Vec<RunRecord>,
     warnings: Vec<String>,
+    /// What the last "clear exports" did, on the page it redirected back to.
+    notice: Option<String>,
+    /// The apps' own report files currently on disk, so the button says what it would delete.
+    export_count: usize,
 }
 
 #[derive(Template)]
@@ -109,6 +114,8 @@ struct RunTemplate {
     active: Option<crosstalk_core::runner::ActiveRun>,
     counts: Vec<(String, i64)>,
     rows: Vec<UiRow>,
+    /// Whether the CSV the run recorded is still on disk.
+    report_available: bool,
 }
 
 #[derive(Template)]
@@ -118,6 +125,7 @@ struct RunStatusTemplate {
     run: RunRecord,
     active: Option<crosstalk_core::runner::ActiveRun>,
     counts: Vec<(String, i64)>,
+    report_available: bool,
 }
 
 #[derive(Template)]
@@ -244,7 +252,10 @@ async fn logout() -> Response {
     response
 }
 
-async fn dashboard(State(state): State<AppState>) -> Response {
+async fn dashboard(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>,
+) -> Response {
     let runs = state.store.recent_runs(20).unwrap_or_default();
     let snapshot = state.snapshot();
     let warnings = snapshot.validate().warnings;
@@ -255,7 +266,89 @@ async fn dashboard(State(state): State<AppState>) -> Response {
         schedules: state::schedules(&snapshot),
         runs,
         warnings,
+        notice: clear_notice(&query),
+        export_count: state::exports_on_disk(&snapshot, &state.registry),
     }
+    .into_response()
+}
+
+/// The summary a "clear exports" redirects back to the dashboard with.
+///
+/// A count per outcome, because "deleted 12" on its own would hide the answers an operator
+/// needs: how much was kept because a run may still hold it, and whether anything refused to go.
+fn clear_notice(query: &HashMap<String, String>) -> Option<String> {
+    let count = |key: &str| {
+        query
+            .get(key)
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0)
+    };
+    if !query.contains_key("cleared") {
+        return None;
+    }
+    let (deleted, kept, failed) = (count("cleared"), count("kept"), count("failed"));
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    let mut notice = format!("Deleted {deleted} report file{}.", plural(deleted));
+    if kept > 0 {
+        notice.push_str(&format!(
+            " Kept {kept} written in the last {} minutes, in case a run is still using them.",
+            crosstalk_core::csv_report::CLEAR_GRACE.as_secs() / 60
+        ));
+    }
+    if failed > 0 {
+        notice.push_str(&format!(
+            " {failed} could not be deleted; the log says why."
+        ));
+    }
+    Some(notice)
+}
+
+/// Delete the registered apps' CSV exports. One host feature for what every plugin had its own
+/// `clear_csv_exports` action for.
+async fn clear_exports(
+    State(state): State<AppState>,
+    Form(form): Form<ClearExportsForm>,
+) -> Response {
+    // The same server-side confirmation every channel-changing action needs: the browser's
+    // dialog is convenience, not protection.
+    if form.confirm.as_deref() != Some("true") {
+        return (
+            StatusCode::BAD_REQUEST,
+            "clearing deletes files: resubmit the form with confirm=true\n",
+        )
+            .into_response();
+    }
+
+    // A run writes its report and then applies it, so a clear during a run could delete the
+    // file that run is about to link. The daemon knows its own runs exactly, so it refuses
+    // rather than guessing from timestamps; a one-shot CLI clear cannot know and keeps the
+    // most recent reports instead (see `csv_report::CLEAR_GRACE`).
+    if let Some(active) = state.runner.running().into_iter().next() {
+        return (
+            StatusCode::CONFLICT,
+            format!(
+                "a run is in progress ({} / {}): clear the exports after it finishes\n",
+                active.app, active.action
+            ),
+        )
+            .into_response();
+    }
+
+    let snapshot = state.snapshot();
+    let summary = crosstalk_core::csv_report::clear_exports(
+        &snapshot.exports_dir(),
+        &state::export_prefixes(&state.registry),
+    );
+    tracing::info!(
+        deleted = summary.deleted,
+        kept = summary.kept_recent,
+        failed = summary.failed,
+        "cleared the CSV exports"
+    );
+    Redirect::to(&format!(
+        "/?cleared={}&kept={}&failed={}",
+        summary.deleted, summary.kept_recent, summary.failed
+    ))
     .into_response()
 }
 
@@ -282,6 +375,13 @@ async fn app_page(State(state): State<AppState>, Path(app_id): Path<String>) -> 
         runs: state.store.recent_runs_for(&app_id, 15).unwrap_or_default(),
     }
     .into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct ClearExportsForm {
+    /// Server-side confirmation for a deletion, mirroring the CLI's `--yes`.
+    #[serde(default)]
+    confirm: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -353,6 +453,7 @@ async fn run_page(State(state): State<AppState>, Path(id): Path<i64>) -> Respons
                 .into_iter()
                 .find(|entry| entry.run_id == id),
             rows: state::rows(&state.store, id),
+            report_available: state::report_available(&run),
             run,
         }
         .into_response(),
@@ -372,6 +473,7 @@ async fn run_status(State(state): State<AppState>, Path(id): Path<i64>) -> Respo
     RunStatusTemplate {
         csrf_token: state.csrf_token().to_string(),
         counts: state::counts(&run),
+        report_available: state::report_available(&run),
         run,
         active,
     }

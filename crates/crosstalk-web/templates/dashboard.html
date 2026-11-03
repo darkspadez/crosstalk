@@ -3,6 +3,12 @@
 {% block content %}
 <h1>Dashboard</h1>
 
+{% if let Some(notice) = notice %}
+<section class="card">
+  <p class="ok">{{ notice }}</p>
+</section>
+{% endif %}
+
 {% if !warnings.is_empty() %}
 <section class="card warn">
   <h2>Needs attention</h2>
@@ -46,6 +52,26 @@
   </table>
   <p class="muted">Schedules fire in UTC.</p>
   {% endif %}
+</section>
+
+<section class="card">
+  <h2>Exports</h2>
+  {% if export_count == 0 %}
+  <p class="muted">No report files. Each run writes a CSV to the exports directory.</p>
+  {% else %}
+  <p class="muted">{{ export_count }} report file{% if export_count != 1 %}s{% endif %} on disk.</p>
+  {% endif %}
+  <form method="post" action="/exports/clear" class="inline"
+        data-confirm="Delete {{ export_count }} CSV report{% if export_count != 1 %}s{% endif %} the sub-apps wrote? Files from other plugins are never touched, and reports written in the last couple of minutes are kept in case a run is still using them.">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="confirm" value="true">
+    <button type="submit" class="ghost">Clear exports</button>
+  </form>
+  <p class="muted">
+    Retention under <code>[exports]</code> in <code>crosstalk.toml</code> deletes older reports
+    automatically; this deletes them now. Run records keep pointing at the file they wrote, and
+    a run page says so once it is gone.
+  </p>
 </section>
 
 <section class="card">

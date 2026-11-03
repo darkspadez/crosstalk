@@ -81,10 +81,16 @@ The UI listens on <http://localhost:8730>.
 | `crosstalk serve --config <dir>` | Run the daemon: REST API, scheduler and web UI |
 | `crosstalk validate --config <dir>` | Check the configuration files and each app's settings |
 | `crosstalk run <app> <action> [--dry-run] [--yes]` | Run one action once and exit |
+| `crosstalk exports clear [--app <id>] [--yes]` | Delete the CSV reports the sub-apps wrote (the UI's **Clear exports** button does the same) |
 | `crosstalk simulate-streams --channels <csv> --streams <m3u>` | Offline stream-to-channel simulation, for tuning without touching a live install |
 
 `crosstalk run` refuses an action that changes data unless `--yes` is passed, because a
-one-shot run has no dialog to confirm in.
+one-shot run has no dialog to confirm in. `crosstalk exports clear` works the same way: it
+prints how many reports it found and stops without `--yes`.
+
+Clearing exports only ever deletes the sub-apps' own files, named by each app's prefix
+(`guide_…`), so a directory shared with the plugins keeps theirs, and reports written in the
+last couple of minutes are kept in case a run is still using one.
 
 ## Configuration
 
