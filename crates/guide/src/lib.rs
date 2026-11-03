@@ -5,16 +5,23 @@
 //! This crate owns the operator-facing half: the actions, the settings, the EPG source filter,
 //! the EPG reason wording, and the write itself.
 //!
-//! Only the matching actions are implemented. The Python plugin's cleanup actions (remove
-//! by regex, strip from hidden channels, add a bad-EPG suffix) and its freshness watchdog are
-//! deliberately out of scope for this version, as is the anonymous usage counter. `clear
-//! exports` is not an action here but a host feature: one button and one command delete every
-//! sub-app's own reports, so each app does not carry its own copy.
+//! Two families of actions, and both are ports: the matching ones (`match_*`, `heal_*`) assign
+//! a guide, and the cleanup ones (`scan`, then `tag_missing_*`, `clear_missing_*`,
+//! `clear_hidden_*`, `clear_by_regex_*`, `clear_groups_*`) remove or mark a guide that carries
+//! no programme data. The cleanup half is a preset over `crosstalk-core`'s channel operations:
+//! it selects, it plans, and the two writes it can issue are a rename and a guide clear. The
+//! plugin's freshness watchdog is still out of scope for this version, as is its anonymous
+//! usage counter, and `clear exports` is not an action here but a host feature: one button and
+//! one command delete every sub-app's own reports, so each app does not carry its own copy.
 
+pub mod cleanup;
 pub mod heal;
 pub mod matching;
+pub mod scan;
 pub mod scope;
 pub mod settings;
+#[cfg(test)]
+mod test_support;
 
 use anyhow::{bail, Result};
 use crosstalk_core::jobs::JobContext;
@@ -29,11 +36,23 @@ pub const APP_NAME: &str = "Guide";
 
 /// The action ids, as used in schedules and URLs.
 pub const ACTION_VALIDATE: &str = "validate";
+pub const ACTION_STATUS: &str = "status";
 pub const ACTION_MATCH_PREVIEW: &str = "match_preview";
 pub const ACTION_MATCH_APPLY: &str = "match_apply";
 pub const ACTION_HEAL_PREVIEW: &str = "heal_preview";
 pub const ACTION_HEAL_APPLY: &str = "heal_apply";
-pub const ACTION_STATUS: &str = "status";
+/// The read-only scan whose rows the cleanup actions select from.
+pub const ACTION_SCAN: &str = "scan";
+pub const ACTION_TAG_MISSING_PREVIEW: &str = "tag_missing_preview";
+pub const ACTION_TAG_MISSING_APPLY: &str = "tag_missing_apply";
+pub const ACTION_CLEAR_MISSING_PREVIEW: &str = "clear_missing_preview";
+pub const ACTION_CLEAR_MISSING_APPLY: &str = "clear_missing_apply";
+pub const ACTION_CLEAR_HIDDEN_PREVIEW: &str = "clear_hidden_preview";
+pub const ACTION_CLEAR_HIDDEN_APPLY: &str = "clear_hidden_apply";
+pub const ACTION_CLEAR_BY_REGEX_PREVIEW: &str = "clear_by_regex_preview";
+pub const ACTION_CLEAR_BY_REGEX_APPLY: &str = "clear_by_regex_apply";
+pub const ACTION_CLEAR_GROUPS_PREVIEW: &str = "clear_groups_preview";
+pub const ACTION_CLEAR_GROUPS_APPLY: &str = "clear_groups_apply";
 
 /// The sub-app itself.
 #[derive(Debug, Default)]
@@ -115,6 +134,107 @@ impl SubApp for GuideApp {
                 "This replaces broken EPG assignments with working ones. An assignment that \
                  cannot be proven empty is never touched. Continue?",
             ),
+            ActionSpec::new(
+                ACTION_SCAN,
+                "Scan for Missing Program Data",
+                "Find in-scope channels whose assigned guide carries no programme data in the \
+                 check window. Read-only: the result set is stored for the cleanup actions and \
+                 written to a CSV.",
+                ActionKind::Read,
+            ),
+            ActionSpec::new(
+                ACTION_TAG_MISSING_PREVIEW,
+                "Tag Missing EPG (Dry Run)",
+                "Append the Bad EPG Suffix to the channels the last scan found, optionally \
+                 clearing their guide. Changes nothing.",
+                ActionKind::Read,
+            ),
+            ActionSpec::new(
+                ACTION_TAG_MISSING_APPLY,
+                "Tag Missing EPG (Apply)",
+                "Append the Bad EPG Suffix to the channels the last scan found, and clear their \
+                 guide when 'Also Remove EPG When Adding Suffix' is on. A channel that already \
+                 carries the suffix is left entirely alone.",
+                ActionKind::Destructive,
+            )
+            .with_confirm(
+                "This renames the channels the last scan found with missing programme data. If \
+                 Also Remove EPG When Adding Suffix is on, it REMOVES their EPG assignments as \
+                 well. Continue?",
+            ),
+            ActionSpec::new(
+                ACTION_CLEAR_MISSING_PREVIEW,
+                "Clear Missing EPG Assignments (Dry Run)",
+                "Show which of the last scan's channels would lose their guide. Changes \
+                 nothing.",
+                ActionKind::Read,
+            ),
+            ActionSpec::new(
+                ACTION_CLEAR_MISSING_APPLY,
+                "Clear Missing EPG Assignments (Apply)",
+                "Remove the EPG assignment from the channels the last scan found with missing \
+                 programme data.",
+                ActionKind::Destructive,
+            )
+            .with_confirm(
+                "This permanently removes EPG assignments from the channels the last scan found \
+                 with missing programme data. It changes no channel name. Continue?",
+            ),
+            ActionSpec::new(
+                ACTION_CLEAR_HIDDEN_PREVIEW,
+                "Clear EPG from Hidden Channels (Dry Run)",
+                "Show which channels disabled in the [scope] profiles would lose their guide. \
+                 Changes nothing.",
+                ActionKind::Read,
+            ),
+            ActionSpec::new(
+                ACTION_CLEAR_HIDDEN_APPLY,
+                "Clear EPG from Hidden Channels (Apply)",
+                "Remove the EPG assignment from every channel disabled in the [scope] profiles. \
+                 Unlike the plugin this never deletes programme data, so a visible channel \
+                 sharing the entry keeps its guide.",
+                ActionKind::Destructive,
+            )
+            .with_confirm(
+                "This removes EPG assignments from every channel hidden (disabled) in the \
+                 [scope] profiles. Programme data is never deleted. Continue?",
+            ),
+            ActionSpec::new(
+                ACTION_CLEAR_BY_REGEX_PREVIEW,
+                "Clear EPG by REGEX (Dry Run)",
+                "Show which channels would lose their guide because its NAME matches the \
+                 configured REGEX. Changes nothing.",
+                ActionKind::Read,
+            ),
+            ActionSpec::new(
+                ACTION_CLEAR_BY_REGEX_APPLY,
+                "Clear EPG by REGEX (Apply)",
+                "Remove the EPG assignment where the assigned guide's name matches the \
+                 configured REGEX, within [scope].",
+                ActionKind::Destructive,
+            )
+            .with_confirm(
+                "This permanently removes EPG assignments from channels whose guide name \
+                 matches the configured REGEX. Continue?",
+            ),
+            ActionSpec::new(
+                ACTION_CLEAR_GROUPS_PREVIEW,
+                "Clear ALL EPG in Groups (Dry Run)",
+                "Show every channel in the [scope] groups that would lose its guide. Changes \
+                 nothing.",
+                ActionKind::Read,
+            ),
+            ActionSpec::new(
+                ACTION_CLEAR_GROUPS_APPLY,
+                "Clear ALL EPG in Groups (Apply)",
+                "Remove the EPG assignment from EVERY channel in the [scope] groups. Refuses \
+                 to run with no groups set, unlike the plugin.",
+                ActionKind::Destructive,
+            )
+            .with_confirm(
+                "This permanently removes EPG assignments from EVERY channel in the [scope] \
+                 groups. This cannot be undone. Continue?",
+            ),
         ]
     }
 
@@ -180,22 +300,88 @@ impl GuideApp {
             ACTION_MATCH_APPLY => self.auto_match(context, dry_run).await,
             ACTION_HEAL_PREVIEW => self.heal(context, true).await,
             ACTION_HEAL_APPLY => self.heal(context, dry_run).await,
+            ACTION_SCAN => self.scan(context).await,
+            ACTION_TAG_MISSING_PREVIEW => {
+                self.cleanup(context, cleanup::Cleanup::TagMissing, true)
+                    .await
+            }
+            ACTION_TAG_MISSING_APPLY => {
+                self.cleanup(context, cleanup::Cleanup::TagMissing, dry_run)
+                    .await
+            }
+            ACTION_CLEAR_MISSING_PREVIEW => {
+                self.cleanup(context, cleanup::Cleanup::ClearMissing, true)
+                    .await
+            }
+            ACTION_CLEAR_MISSING_APPLY => {
+                self.cleanup(context, cleanup::Cleanup::ClearMissing, dry_run)
+                    .await
+            }
+            ACTION_CLEAR_HIDDEN_PREVIEW => {
+                self.cleanup(context, cleanup::Cleanup::ClearHidden, true)
+                    .await
+            }
+            ACTION_CLEAR_HIDDEN_APPLY => {
+                self.cleanup(context, cleanup::Cleanup::ClearHidden, dry_run)
+                    .await
+            }
+            ACTION_CLEAR_BY_REGEX_PREVIEW => {
+                self.cleanup(context, cleanup::Cleanup::ClearByRegex, true)
+                    .await
+            }
+            ACTION_CLEAR_BY_REGEX_APPLY => {
+                self.cleanup(context, cleanup::Cleanup::ClearByRegex, dry_run)
+                    .await
+            }
+            ACTION_CLEAR_GROUPS_PREVIEW => {
+                self.cleanup(context, cleanup::Cleanup::ClearGroups, true)
+                    .await
+            }
+            ACTION_CLEAR_GROUPS_APPLY => {
+                self.cleanup(context, cleanup::Cleanup::ClearGroups, dry_run)
+                    .await
+            }
             other => bail!("{APP_NAME} has no action {other:?}"),
         }
     }
 
-    /// Preview or apply auto-match: load the world, resolve the scope, then match.
-    async fn auto_match(&self, context: &JobContext, dry_run: bool) -> Result<JobOutcome> {
+    /// The scan: read-only, but it records the result set the cleanup actions select from.
+    async fn scan(&self, context: &JobContext) -> Result<JobOutcome> {
+        let settings = self.checked_settings(context)?;
+
+        let client = context.dispatcharr()?;
+        let world = client.load_world().await?;
+        let scoped_channels =
+            crosstalk_core::scope::scope_channels(&world, &context.config().scope)?;
+
+        let result = scan::run(self, context, &settings, &world, &scoped_channels).await?;
+        Ok(scan::outcome(&result))
+    }
+
+    /// One cleanup preset: preview (always a read) or apply.
+    async fn cleanup(
+        &self,
+        context: &JobContext,
+        action: cleanup::Cleanup,
+        dry_run: bool,
+    ) -> Result<JobOutcome> {
+        let settings = self.checked_settings(context)?;
+        cleanup::run(self, context, &settings, action, dry_run).await
+    }
+
+    /// This app's settings plus the shared ones a run depends on.
+    ///
+    /// The AI policy lived in this file until it moved to the host: an inverted band or an
+    /// enabled gate with no provider is still a configuration mistake, and a run must refuse it
+    /// the way it did before the move. Only the shared scope/AI errors block a run; unrelated
+    /// host problems (a missing token, Dispatcharr credentials) are the caller's concern and
+    /// are reported by `validate`.
+    fn checked_settings(&self, context: &JobContext) -> Result<settings::GuideSettings> {
         let settings = settings::load(&self.settings_path(&context.config().config_dir))?;
         let errors = settings::validate(&settings);
         if !errors.is_empty() {
             bail!("invalid settings: {}", errors.join("; "));
         }
-        // The AI policy lived in this file until it moved to the host: an inverted band or
-        // an enabled gate with no provider is still a configuration mistake, and a run must
-        // refuse it the way it did before the move. Only the shared scope/AI errors block a
-        // run; unrelated host problems (a missing token, Dispatcharr credentials) are the
-        // caller's concern and are reported by `validate`.
         let host_errors: Vec<String> = context
             .config()
             .validate()
@@ -206,6 +392,12 @@ impl GuideApp {
         if !host_errors.is_empty() {
             bail!("invalid settings: {}", host_errors.join("; "));
         }
+        Ok(settings)
+    }
+
+    /// Preview or apply auto-match: load the world, resolve the scope, then match.
+    async fn auto_match(&self, context: &JobContext, dry_run: bool) -> Result<JobOutcome> {
+        let settings = self.checked_settings(context)?;
 
         let client = context.dispatcharr()?;
         context.progress(&crosstalk_core::jobs::ProgressEvent::new(
@@ -252,11 +444,7 @@ impl GuideApp {
 
     /// Preview or apply scan-and-heal.
     async fn heal(&self, context: &JobContext, dry_run: bool) -> Result<JobOutcome> {
-        let settings = settings::load(&self.settings_path(&context.config().config_dir))?;
-        let errors = settings::validate(&settings);
-        if !errors.is_empty() {
-            bail!("invalid settings: {}", errors.join("; "));
-        }
+        let settings = self.checked_settings(context)?;
 
         let client = context.dispatcharr()?;
         let world = client.load_world().await?;
@@ -351,7 +539,7 @@ mod tests {
     }
 
     #[test]
-    fn app_declares_the_matching_actions_only() {
+    fn app_declares_every_action_in_order() {
         let ids: Vec<&str> = app().actions().iter().map(|action| action.id).collect();
         assert_eq!(
             ids,
@@ -362,11 +550,101 @@ mod tests {
                 ACTION_MATCH_APPLY,
                 ACTION_HEAL_PREVIEW,
                 ACTION_HEAL_APPLY,
+                ACTION_SCAN,
+                ACTION_TAG_MISSING_PREVIEW,
+                ACTION_TAG_MISSING_APPLY,
+                ACTION_CLEAR_MISSING_PREVIEW,
+                ACTION_CLEAR_MISSING_APPLY,
+                ACTION_CLEAR_HIDDEN_PREVIEW,
+                ACTION_CLEAR_HIDDEN_APPLY,
+                ACTION_CLEAR_BY_REGEX_PREVIEW,
+                ACTION_CLEAR_BY_REGEX_APPLY,
+                ACTION_CLEAR_GROUPS_PREVIEW,
+                ACTION_CLEAR_GROUPS_APPLY,
             ]
         );
-        // The cleanup actions and the watchdog are out of scope for this version.
-        assert!(!ids.contains(&"remove_epg_by_regex"));
+        // The watchdog is still out of scope for this version, and the plugin's CSV housekeeping
+        // is a host feature rather than an action.
         assert!(!ids.contains(&"watchdog_run_check_now"));
+        assert!(!ids.contains(&"clear_csv_exports"));
+    }
+
+    #[test]
+    fn every_writing_action_is_a_preview_apply_pair() {
+        // The naming rule for every sub-app: an action that writes is `<verb>_preview` /
+        // `<verb>_apply`, so a schedule key and an API caller can guess the pair.
+        let actions = app().actions();
+        let ids: Vec<&str> = actions.iter().map(|action| action.id).collect();
+        for id in ids.iter().copied().filter(|id| id.ends_with("_apply")) {
+            let verb = id.trim_end_matches("_apply");
+            assert!(
+                ids.contains(&format!("{verb}_preview").as_str()),
+                "{id} has no {verb}_preview"
+            );
+        }
+        for id in ids.iter().copied().filter(|id| id.ends_with("_preview")) {
+            let verb = id.trim_end_matches("_preview");
+            assert!(
+                ids.contains(&format!("{verb}_apply").as_str()),
+                "{id} has no {verb}_apply"
+            );
+            let kind = actions
+                .iter()
+                .find(|action| action.id == id)
+                .expect("action")
+                .kind;
+            assert_eq!(kind, ActionKind::Read, "a preview is a read: {id}");
+        }
+    }
+
+    #[test]
+    fn the_cleanup_actions_confirm_and_are_red() {
+        // Every cleanup apply can remove a guide assignment, which is the plugin's red, and every
+        // red confirms.
+        let actions = app().actions();
+        for id in [
+            ACTION_TAG_MISSING_APPLY,
+            ACTION_CLEAR_MISSING_APPLY,
+            ACTION_CLEAR_HIDDEN_APPLY,
+            ACTION_CLEAR_BY_REGEX_APPLY,
+            ACTION_CLEAR_GROUPS_APPLY,
+        ] {
+            let action = actions
+                .iter()
+                .find(|action| action.id == id)
+                .expect("action exists");
+            assert_eq!(action.kind, ActionKind::Destructive, "{id}");
+            assert!(action.kind.requires_confirmation(), "{id}");
+            assert!(action.confirm.is_some(), "{id} confirms");
+            assert!(action.needs_dispatcharr, "{id} talks to Dispatcharr");
+        }
+        // The scan is a read and needs no confirmation.
+        let scan = actions
+            .iter()
+            .find(|action| action.id == ACTION_SCAN)
+            .expect("scan");
+        assert_eq!(scan.kind, ActionKind::Read);
+        assert!(scan.confirm.is_none());
+        assert!(!scan.kind.touches_channels());
+    }
+
+    #[test]
+    fn tag_missing_is_red_because_it_can_clear_a_guide() {
+        // `add_bad_epg_suffix` is a rename alone, but with `remove_epg_with_suffix` on it also
+        // unassigns, so the pairing — not the current setting — decides the colour.
+        let actions = app().actions();
+        let action = actions
+            .iter()
+            .find(|action| action.id == ACTION_TAG_MISSING_APPLY)
+            .expect("action");
+        assert_eq!(action.kind, ActionKind::Destructive);
+        assert!(
+            action
+                .confirm
+                .unwrap_or_default()
+                .contains("REMOVES their EPG assignments"),
+            "the plugin's own warning is carried over"
+        );
     }
 
     #[test]
@@ -398,10 +676,17 @@ mod tests {
         assert_eq!(kind(ACTION_STATUS), ActionKind::Read);
         assert_eq!(kind(ACTION_MATCH_PREVIEW), ActionKind::Read);
         assert_eq!(kind(ACTION_HEAL_PREVIEW), ActionKind::Read);
+        assert_eq!(kind(ACTION_SCAN), ActionKind::Read);
         // Auto-match can move an assignment that already works: red.
         assert_eq!(kind(ACTION_MATCH_APPLY), ActionKind::Destructive);
         // Heal only replaces assignments it proved empty, and removes none: orange.
         assert_eq!(kind(ACTION_HEAL_APPLY), ActionKind::Write);
+        // The cleanup applies all remove an assignment: red, as in the plugin.
+        assert_eq!(kind(ACTION_TAG_MISSING_APPLY), ActionKind::Destructive);
+        assert_eq!(kind(ACTION_CLEAR_MISSING_APPLY), ActionKind::Destructive);
+        assert_eq!(kind(ACTION_CLEAR_HIDDEN_APPLY), ActionKind::Destructive);
+        assert_eq!(kind(ACTION_CLEAR_BY_REGEX_APPLY), ActionKind::Destructive);
+        assert_eq!(kind(ACTION_CLEAR_GROUPS_APPLY), ActionKind::Destructive);
     }
 
     #[test]

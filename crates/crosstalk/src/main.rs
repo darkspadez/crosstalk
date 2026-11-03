@@ -13,7 +13,6 @@ mod simulate;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use crosstalk_core::config::{CrosstalkConfig, SharedConfig};
-use crosstalk_core::jobs::JobContext;
 use crosstalk_core::runner::JobRunner;
 use crosstalk_core::store::Store;
 use std::path::PathBuf;
@@ -334,7 +333,7 @@ async fn shutdown_signal() {
 fn run_once(args: RunArgs) -> Result<()> {
     let registry = registry::builtin();
     let config = CrosstalkConfig::load(&args.config)?;
-    let (app, action) = registry
+    let (_, action) = registry
         .find_action(&args.app, &args.action)
         .with_context(|| {
             format!(
@@ -377,16 +376,33 @@ fn run_once(args: RunArgs) -> Result<()> {
         );
     }
 
-    // Only connect when the action needs Dispatcharr, so `validate` still works on a host
-    // that cannot reach it yet.
-    let context = JobContext::headless(config);
-    let context = if action.needs_dispatcharr {
-        context.connect()?
-    } else {
-        context
-    };
+    // Only the action's own id and dry-run flag matter from here; the run is recorded, so a
+    // one-shot run shows up in the history and — for `scan` — leaves the result set the cleanup
+    // actions select from. Without a store, `crosstalk run guide scan` followed by
+    // `crosstalk run guide clear_missing_apply --yes` could never work.
+    //
+    // `open_shared`, never `open`: this is a second process on the daemon's file, and a plain
+    // open would retire the daemon's live `running` rows out from under it. The store is
+    // shared (WAL + busy_timeout), but the one-run-per-app guard is per process, so a live
+    // row for this app here means the daemon (or another CLI) is mid-run: refuse rather
+    // than run the same app twice. The reserve below enforces the same rule atomically for
+    // the race this check cannot see.
+    let store = Store::open_shared(config.data_dir().join("crosstalk.db"))?;
+    let live = store.running_runs(&args.app)?;
+    if let Some(current) = live.first() {
+        anyhow::bail!(
+            "{} already has {} #{} in progress (started {}); wait for it to finish or cancel \
+             it. If no daemon is running, this row is stale from a crash and clears when the \
+             daemon next starts.",
+            args.app,
+            current.action,
+            current.id,
+            current.started_at,
+        );
+    }
+    let runner = JobRunner::new(registry, SharedConfig::new(config), store);
     let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
-    let outcome = runtime.block_on(app.run(action.id, &context, args.dry_run))?;
+    let outcome = runtime.block_on(runner.run_to_completion(&args.app, action.id, args.dry_run))?;
 
     println!("{}", outcome.summary);
     for (key, value) in &outcome.counts {
@@ -399,10 +415,18 @@ fn run_once(args: RunArgs) -> Result<()> {
 }
 
 /// The preview action that stands in for an apply action.
+///
+/// Every writing action is a `<verb>_preview` / `<verb>_apply` pair, so `--dry-run` on an apply
+/// is redirected to its preview rather than trusting the apply to honour the flag.
 fn preview_counterpart(action: &str) -> Option<&'static str> {
     match action {
         "match_apply" => Some("match_preview"),
         "heal_apply" => Some("heal_preview"),
+        "tag_missing_apply" => Some("tag_missing_preview"),
+        "clear_missing_apply" => Some("clear_missing_preview"),
+        "clear_hidden_apply" => Some("clear_hidden_preview"),
+        "clear_by_regex_apply" => Some("clear_by_regex_preview"),
+        "clear_groups_apply" => Some("clear_groups_preview"),
         _ => None,
     }
 }
@@ -698,5 +722,84 @@ mod cli_tests {
             format!("{error}").contains("known apps: guide"),
             "{error:#}"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_apply_action_has_its_preview_counterpart() {
+        // The naming rule every sub-app follows: an action that writes is `<verb>_preview` /
+        // `<verb>_apply`. `--dry-run` on an apply is redirected through this map, so a pair the
+        // map does not know would silently run the apply and ignore the flag.
+        for app in registry::builtin().iter() {
+            let ids: Vec<&str> = app.actions().iter().map(|action| action.id).collect();
+            for id in ids.iter().copied() {
+                let Some(verb) = id.strip_suffix("_apply") else {
+                    continue;
+                };
+                let expected = format!("{verb}_preview");
+                let found = preview_counterpart(id)
+                    .unwrap_or_else(|| panic!("{id} has no preview counterpart"));
+                assert_eq!(found, expected);
+                assert!(
+                    ids.contains(&found),
+                    "{found} is not an action of {}",
+                    app.id()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_scheduled_cleanup_apply_is_a_real_run_and_a_scheduled_scan_is_a_read() {
+        // The scheduler derives the dry-run flag from the action's kind, so a cleanup apply is
+        // armed as a write and the scan as a read. Nothing else has to list the new actions.
+        let runner = JobRunner::new(
+            registry::builtin(),
+            SharedConfig::new(CrosstalkConfig::default()),
+            Store::in_memory().expect("store"),
+        );
+        for action in [
+            "tag_missing_apply",
+            "clear_missing_apply",
+            "clear_hidden_apply",
+            "clear_by_regex_apply",
+            "clear_groups_apply",
+            "match_apply",
+            "heal_apply",
+        ] {
+            assert!(
+                !runner.scheduled_dry_run("guide", action),
+                "{action} must be armed as a write"
+            );
+        }
+        for action in [
+            "scan",
+            "tag_missing_preview",
+            "clear_missing_preview",
+            "clear_hidden_preview",
+            "clear_by_regex_preview",
+            "clear_groups_preview",
+        ] {
+            assert!(
+                runner.scheduled_dry_run("guide", action),
+                "{action} must be armed as a read"
+            );
+        }
+    }
+
+    #[test]
+    fn a_preview_is_not_redirected_anywhere() {
+        // Only the writing half of a pair redirects; a preview is already a read.
+        for app in registry::builtin().iter() {
+            for action in app.actions() {
+                if action.id.ends_with("_preview") {
+                    assert!(preview_counterpart(action.id).is_none(), "{}", action.id);
+                }
+            }
+        }
     }
 }

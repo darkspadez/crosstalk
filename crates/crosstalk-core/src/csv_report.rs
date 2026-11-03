@@ -101,6 +101,16 @@ fn render_setting(id: &str, kind: &crate::subapp::FieldKind, value: &FieldValue)
             format!("{} out of 100, higher is stricter", value.render())
         }
         ("check_hours", _) => format!("{} hours ahead of now", value.render()),
+        // The suffix is appended verbatim and its leading space is part of the value, so it is
+        // quoted: `ESPN  [BadEPG]` and `ESPN [BadEPG]` are different output.
+        ("bad_epg_suffix", _) => {
+            let text = value.render();
+            if text.is_empty() {
+                "(not set), so the tag actions refuse to run".to_string()
+            } else {
+                format!("{text:?}, appended verbatim")
+            }
+        }
         ("retention_days", _) => {
             let days: i64 = match value {
                 FieldValue::Number(number) => *number as i64,
@@ -458,8 +468,8 @@ fn read_exports(directory: &Path) -> Vec<ExportFile> {
 /// How long a report is protected from a "clear exports" after it was last written.
 ///
 /// The web UI refuses to clear while a run is active, which is exact for the daemon's own
-/// runs. A one-shot `crosstalk exports clear` cannot ask the daemon either: the run store must
-/// not be opened from a second process, because opening it retires every `running` row. So both
+/// runs. A one-shot `crosstalk exports clear` cannot ask the daemon either, and it avoids the
+/// run store entirely rather than opening it shared (see `Store::open_shared`). So both
 /// paths also keep the reports a run may still be holding — a report is written just before the
 /// apply, and the apply can outlast the seconds it takes the run record to say the run is over.
 /// This window is a safeguard, not a proof: the run check is what actually guarantees it.
@@ -789,6 +799,46 @@ mod tests {
         assert!(joined.contains("Allow EPG Without Program Data: Yes"));
         // A multi-line value is flattened so it cannot emit a line with no `#`.
         assert!(joined.contains("Channel Groups: A B"));
+    }
+
+    #[test]
+    fn the_bad_epg_suffix_is_quoted_because_its_spaces_are_part_of_it() {
+        let schema = SettingsSchema::new(vec![FieldSpec::new(
+            "bad_epg_suffix",
+            "_s",
+            "Bad EPG Suffix",
+            FieldKind::Text,
+            FieldValue::Text(" [BadEPG]".to_string()),
+        )]);
+        let mut values = SettingsValues::new();
+        values.insert("bad_epg_suffix", FieldValue::Text(" [BadEPG]".to_string()));
+        let lines = preamble(
+            &CrosstalkConfig::default(),
+            &StubApp::new().report_title("Tag Missing EPG Preview Report"),
+            &schema,
+            &values,
+            2,
+            &[],
+        );
+        let joined = lines.join("\n");
+        // The leading space survives the whitespace flattening, because it is shown quoted.
+        assert!(
+            joined.contains("Bad EPG Suffix: \" [BadEPG]\", appended verbatim"),
+            "{joined}"
+        );
+
+        values.insert("bad_epg_suffix", FieldValue::Text(String::new()));
+        let lines = preamble(
+            &CrosstalkConfig::default(),
+            &StubApp::new().report_title("Tag Missing EPG Preview Report"),
+            &schema,
+            &values,
+            2,
+            &[],
+        );
+        assert!(lines
+            .join("\n")
+            .contains("Bad EPG Suffix: (not set), so the tag actions refuse to run"));
     }
 
     #[test]

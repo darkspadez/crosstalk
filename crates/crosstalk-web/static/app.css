@@ -91,8 +91,11 @@ code { font-family: var(--mono); font-size: 0.88em; background: #0e1219;
 .status-failed { color: #ff8b84; }
 .status-running { color: var(--accent); }
 .status-cancelled { color: var(--muted); }
-.status-matched, .status-healed { color: #6fd7a8; }
-.status-no_match, .status-no_replacement_found { color: var(--muted); }
+.status-matched, .status-healed, .status-ok { color: #6fd7a8; }
+.status-no_match, .status-no_replacement_found, .status-skipped, .status-planned {
+  color: var(--muted);
+}
+.status-missing { color: #f0c68a; }
 
 button, .button {
   font: inherit; padding: 0.4rem 0.9rem; border-radius: 7px;

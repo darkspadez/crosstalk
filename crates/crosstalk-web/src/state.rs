@@ -133,12 +133,23 @@ pub struct UiSettings {
 /// How a run row reads in the table.
 #[derive(Debug, Clone)]
 pub struct UiRow {
+    pub channel_id: i64,
     pub channel_name: String,
+    /// The channel number as printed, empty when it has none.
+    pub channel_number: String,
     pub channel_group: String,
     pub score: i64,
     pub method: String,
+    /// The guide the run chose (a matching row), or the guide a channel operation saw.
     pub epg_name: String,
     pub epg_source: String,
+    /// The channel field a channel operation wrote (`name`, `epg_data_id`, …). Empty for a
+    /// matching row, which writes no field of its own.
+    pub field: String,
+    /// That field's value before and after, in the shape a person reads (a guide's name rather
+    /// than its id, `No EPG` rather than `none`).
+    pub before: String,
+    pub after: String,
     pub status: String,
     /// Lowercased status, for the CSS class.
     pub status_class: String,
@@ -245,19 +256,54 @@ pub fn fields(schema: &SettingsSchema, values: &SettingsValues) -> Vec<UiField> 
 }
 
 /// Build a run row for the table.
+///
+/// The row columns are generic because the run rows are: a matching row carries a score and a
+/// chosen guide, a channel-operation row carries a field and its before/after values, and the
+/// same table has to read both. `before`/`after` are rendered for a person — a guide's NAME
+/// instead of its id, `No EPG` instead of the stored `none` — because the machine values are
+/// only meaningful to a restore.
 pub fn run_row(row: &RunRow) -> UiRow {
     UiRow {
+        channel_id: row.channel_id,
         channel_name: row.channel_name.clone(),
+        channel_number: row
+            .channel_number
+            .map(|number| format!("{number}"))
+            .unwrap_or_default(),
         channel_group: row.channel_group.clone(),
         score: row.score,
         method: row.method.clone(),
         epg_name: row.epg_name.clone().unwrap_or_default(),
         epg_source: row.epg_source.clone().unwrap_or_default(),
+        field: row.field.clone(),
+        before: display_value(row, row.before_value.as_deref(), true),
+        after: display_value(row, row.after_value.as_deref(), false),
         status: row.status.clone(),
         status_class: row.status.to_lowercase(),
         reason: row.reason.clone(),
         ai_decision: row.ai_decision.clone(),
     }
+}
+
+/// One side of a channel operation, as a reader needs it.
+///
+/// `before` side of an EPG clear has the guide's name in `current_epg_name`, which is far more
+/// use than the id the store keeps for a restore. Everything else passes through as written.
+fn display_value(row: &RunRow, value: Option<&str>, before: bool) -> String {
+    let Some(value) = value else {
+        return String::new();
+    };
+    if row.field == "epg_data_id" {
+        if value == "none" {
+            return "No EPG".to_string();
+        }
+        if before {
+            if let Some(name) = row.current_epg_name.clone() {
+                return name;
+            }
+        }
+    }
+    value.to_string()
 }
 
 pub fn rows(store: &Store, run_id: i64) -> Vec<UiRow> {

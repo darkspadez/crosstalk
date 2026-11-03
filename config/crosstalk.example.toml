@@ -95,11 +95,12 @@ min_confidence = 0.5
 # about one install. An app's own filters (the guide's EPG sources, for example) stay in
 # that app's file.
 [scope]
-# Comma-separated profile names. Empty means every profile. Actions that need exactly one
-# profile use the first name given.
+# Comma-separated profile names. Empty means every profile for the scope filter. The guide's
+# 'Clear EPG from Hidden Channels' refuses to run without one, and uses every name given.
 profiles = ""
 # Only process channels in these groups. Supports * and ? wildcards. Cannot be combined
-# with ignore_groups: set one or the other.
+# with ignore_groups: set one or the other. The guide's 'Clear ALL EPG in Groups' also takes
+# its channel set from here, and refuses to run while this is empty.
 groups = ""
 # Exclude channels in these groups, applied after `groups`.
 ignore_groups = ""

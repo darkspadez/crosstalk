@@ -336,6 +336,78 @@ async fn the_run_page_shows_status_rows_and_the_csv_link() {
 }
 
 #[tokio::test]
+async fn a_channel_operation_row_shows_its_field_and_both_sides() {
+    // A channel-operation row has no score and no chosen guide; it has a field and the value on
+    // each side. The run page has to read both shapes, and a guide clear reads as the guide's
+    // NAME rather than the id the store keeps for a restore.
+    let (state, store, _dir) = state(None);
+    let run_id = store.start_run("echo", "poke", false).expect("run");
+    store
+        .append_rows(
+            run_id,
+            &[
+                crosstalk_core::store::RunRow {
+                    ordinal: 0,
+                    channel_id: 2,
+                    channel_name: "CNN [BadEPG]".to_string(),
+                    channel_group: "News".to_string(),
+                    channel_number: Some(2.0),
+                    current_epg_name: Some("CNN [US]".to_string()),
+                    field: "epg_data_id".to_string(),
+                    before_value: Some("32".to_string()),
+                    after_value: Some("none".to_string()),
+                    method: "clear_epg".to_string(),
+                    status: "ok".to_string(),
+                    reason: String::new(),
+                    ..Default::default()
+                },
+                crosstalk_core::store::RunRow {
+                    ordinal: 1,
+                    channel_id: 4,
+                    channel_name: "Télé-Québec".to_string(),
+                    channel_group: "News".to_string(),
+                    field: "name".to_string(),
+                    before_value: Some("Télé-Québec".to_string()),
+                    after_value: Some("Télé-Québec [BadEPG]".to_string()),
+                    method: "rename".to_string(),
+                    status: "planned".to_string(),
+                    reason: "already tagged with \" [BadEPG]\", so this clear_epg is skipped too"
+                        .to_string(),
+                    ..Default::default()
+                },
+                // Channel names come from Dispatcharr: a hostile one must read as text.
+                crosstalk_core::store::RunRow {
+                    ordinal: 2,
+                    channel_id: 6,
+                    channel_name: "<img src=x onerror=alert(1)>".to_string(),
+                    channel_group: "News".to_string(),
+                    method: "scan".to_string(),
+                    status: "MISSING".to_string(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .expect("rows");
+
+    let (status, body) = get(&state, &format!("/runs/{run_id}/rows")).await;
+    assert_eq!(status, StatusCode::OK);
+    // The field each row wrote, and both sides of it.
+    assert!(body.contains("epg_data_id"), "{body}");
+    assert!(body.contains("CNN [US]"), "{body}");
+    assert!(body.contains("No EPG"), "{body}");
+    assert!(body.contains("Télé-Québec [BadEPG]"), "{body}");
+    // The statuses get their own classes, so the colours are the ones the kinds promise.
+    assert!(body.contains("status-ok"), "{body}");
+    assert!(body.contains("status-planned"), "{body}");
+    assert!(body.contains("skipped too"), "{body}");
+    // A channel number is shown next to the name.
+    assert!(body.contains("#2"), "{body}");
+    // A hostile channel name is escaped, not rendered.
+    assert!(body.contains("&lt;img"), "{body}");
+    assert!(!body.contains("<img src=x"), "{body}");
+}
+
+#[tokio::test]
 async fn the_json_api_answers_with_the_same_data() {
     let (state, store, _dir) = state(None);
     store.start_run("echo", "peek", true).expect("run");

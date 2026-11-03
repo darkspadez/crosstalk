@@ -144,9 +144,28 @@ no daemon restart (a run already in progress finishes with the settings it start
 | `match_apply` | **red** | Assign guides, overwriting an existing assignment when a new match clears the threshold |
 | `heal_preview` | blue | Look for replacements for empty assignments; changes nothing |
 | `heal_apply` | **orange** | Replace empty assignments. Never removes an assignment it cannot prove is empty |
+| `scan` | blue | Find in-scope channels whose guide carries no programme data in `check_hours`. Read-only; stores its result set for the cleanup actions and writes a CSV |
+| `tag_missing_preview` | blue | Show which of the last scan's channels would get the bad-EPG suffix; changes nothing |
+| `tag_missing_apply` | **red** | Append `bad_epg_suffix` to the last scan's channels, and unassign their guide when `remove_epg_with_suffix` is on. A channel that already carries the suffix is left entirely alone |
+| `clear_missing_preview` | blue | Show which of the last scan's channels would lose their guide; changes nothing |
+| `clear_missing_apply` | **red** | Unassign the guide of the channels the last scan found with no programme data |
+| `clear_hidden_preview` | blue | Show which channels disabled in `[scope] profiles` would lose their guide; changes nothing |
+| `clear_hidden_apply` | **red** | Unassign the guide of every channel disabled in `[scope] profiles`. Never deletes programme data |
+| `clear_by_regex_preview` | blue | Show which channels would lose their guide because its name matches `epg_regex_to_remove` |
+| `clear_by_regex_apply` | **red** | Unassign the guide where its name matches the REGEX, within `[scope]` |
+| `clear_groups_preview` | blue | Show every channel in `[scope] groups` that would lose its guide |
+| `clear_groups_apply` | **red** | Unassign the guide of EVERY channel in `[scope] groups` |
 
 Button colour is the consequence, and it is the same convention the Python plugin used: blue
 reads, orange writes channel data, red can move an assignment. Orange and red always confirm.
+
+Every action that writes is a `<verb>_preview` / `<verb>_apply` pair, so `--dry-run` on the
+apply runs the preview and a schedule key names the half you mean. The cleanup actions select
+from the **last finished `scan`** rather than from a results file: there is no age limit,
+because each one re-reads every channel's current name and guide before writing, so a stale
+scan can only be out of date — never double-tagged, and never clearing a guide that was
+reassigned since. Their confirmation text is static, so the run summary, the log and the CSV
+preamble name the scan run and how many channels it found.
 
 ## AI verification
 
@@ -205,13 +224,17 @@ the probabilities and the latency.
 ```toml
 # crosstalk.toml
 [schedules]
+"guide.scan" = "0 */6 * * *"
 "guide.match_apply" = "0 4 * * *"
 "guide.heal_apply" = "0 6 * * *"
+"guide.clear_missing_apply" = "30 6 * * *"
 ```
 
 Five fields (`minute hour day month weekday`) or six (with seconds). Schedules fire in **UTC**,
 and the dashboard shows each one's next run so you can see it was understood. A schedule naming
-a preview action stays a preview.
+a preview action stays a preview. A cleanup schedule reads the last finished `scan`, so a
+`guide.scan` entry ahead of it in the day is what makes it do anything: with no finished scan it
+refuses to run and says so.
 
 ## Web UI
 
@@ -272,9 +295,11 @@ hundreds of thousands of cases in a full local run (no `--limit`); the bounded C
 cover ~4,800 normalize, ~900 per-name (callsign/location/network), and ~1,200
 match/score cases. Both gates run in CI against the plugin pinned as a submodule in
 `reference/`.
-- **Rust-native actions**: `match` and `heal` reuse the parity-checked pipeline but
-make their own product decisions. They are not ports, and row-for-row equality with the
-plugin is not claimed for them.
+- **Rust-native actions**: `match`, `heal` and the cleanup presets reuse the parity-checked
+pipeline but make their own product decisions. They are not ports, and row-for-row equality
+with the plugin is not claimed for them. `scripts/channel_ops_parity.py` compares the
+*selection* and the resulting payloads of every cleanup action against the plugin's own
+logic, which is the part where equality is claimed.
 
 Deliberate divergences from the plugin (actions only, never the pipeline):
 
@@ -296,6 +321,22 @@ reports the first programme-carrying candidate regardless of threshold.
 quote, so crosstalk CSVs differ from the plugin's for such names. The quote is a
 spreadsheet display instruction that keeps the text inert — open the CSV in a text
 editor (rather than a spreadsheet) and the quote is visible as part of the value.
+- **`clear_hidden` only unassigns**: the plugin also deleted each entry's `ProgramData` rows,
+which blanks the guide of every *visible* channel sharing that entry. crosstalk never
+deletes programme data.
+- **`clear_groups` refuses an empty `[scope] groups`**: the plugin treats the same empty
+filter as "every channel", which makes one press unassign every guide in the install.
+- **The cleanup actions select from the run store**: the plugin kept a JSON results file. The
+scan's rows are the result set, so they are queryable and cannot be overwritten by an
+unrelated run; there is no `export_results` action either, because every run already writes
+its CSV.
+- **A stale scan cannot tag or clear the wrong channel**: the plugin applied the ids stored by
+the last scan without re-reading them. crosstalk re-reads every channel, and skips a channel
+whose guide changed since the scan (with the reason in the CSV).
+- **A failed programme lookup is "unknown", never "missing"**: the plugin's check is one SQL
+query and cannot fail per channel; over REST one can. A channel the scan could not check is
+left out of the result set (counted as `unchecked` in the summary and the CSV), so the cleanup
+actions can neither tag nor clear it.
 
 ## Development
 

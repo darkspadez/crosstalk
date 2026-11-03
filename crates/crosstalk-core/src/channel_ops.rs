@@ -873,6 +873,35 @@ pub struct ReportSpec<'a> {
     pub stem: &'a str,
     /// The report's title, e.g. "Clear EPG in Groups Preview Report".
     pub title: &'a str,
+    /// Extra `Label: value` lines for the preamble. A preset uses them to say which result set
+    /// it selected from (the guide's cleanup actions name the scan run and when it ran), so a
+    /// report read weeks later explains where its channel list came from.
+    pub notes: Vec<(String, String)>,
+}
+
+impl<'a> ReportSpec<'a> {
+    pub fn new(
+        app: &'a dyn SubApp,
+        schema: &'a SettingsSchema,
+        values: &'a SettingsValues,
+        stem: &'a str,
+        title: &'a str,
+    ) -> Self {
+        Self {
+            app,
+            schema,
+            values,
+            stem,
+            title,
+            notes: Vec::new(),
+        }
+    }
+
+    /// Add a `Label: value` line to the preamble.
+    pub fn note(mut self, label: impl Into<String>, value: impl Into<String>) -> Self {
+        self.notes.push((label.into(), value.into()));
+        self
+    }
 }
 
 /// Write the plan (or what applying it did) as a CSV report.
@@ -900,6 +929,10 @@ pub fn write_ops_report(
             },
         )
         .result("Skipped", plan.skipped.len());
+    let report = spec
+        .notes
+        .iter()
+        .fold(report, |report, (label, value)| report.result(label, value));
 
     report.write(
         context.config(),
@@ -2638,13 +2671,14 @@ mod tests {
         )
         .expect("plans");
         let app = StubApp::new();
-        let spec = ReportSpec {
-            app: &app,
-            schema: &schema,
-            values: &values,
-            stem: "tag_missing_preview",
-            title: "Tag Missing EPG Preview Report",
-        };
+        let spec = ReportSpec::new(
+            &app,
+            &schema,
+            &values,
+            "tag_missing_preview",
+            "Tag Missing EPG Preview Report",
+        )
+        .note("Scan used", "an older scan");
         let path = write_ops_report(&context, &spec, &plan, None).expect("writes");
 
         let text = std::fs::read_to_string(&path).expect("read");

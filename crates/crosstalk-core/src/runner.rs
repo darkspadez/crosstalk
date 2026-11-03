@@ -158,6 +158,16 @@ impl Drop for RunSlot {
     }
 }
 
+/// Whether this failure is the store's one-live-run-per-app index refusing a second
+/// `running` row for the app (see [`crate::store::Store::open_shared`]).
+fn is_running_conflict(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<rusqlite::Error>(),
+        Some(rusqlite::Error::SqliteFailure(failure, _))
+            if failure.code == rusqlite::ErrorCode::ConstraintViolation
+    )
+}
+
 /// Runs sub-app actions.
 #[derive(Clone)]
 pub struct JobRunner {
@@ -298,7 +308,19 @@ impl JobRunner {
             );
         }
 
-        let run_id = self.store.start_run(app_id, action_id, dry_run)?;
+        // The busy map above only covers this process. `start_run` also fails when ANOTHER
+        // process (the daemon, or a second CLI) already holds a `running` row for the app
+        // — the store's partial unique index — and that failure must read as "busy", not
+        // as SQLite internals.
+        let run_id = match self.store.start_run(app_id, action_id, dry_run) {
+            Ok(run_id) => run_id,
+            Err(error) if is_running_conflict(&error) => bail!(
+                "{app_id} already has a run in progress in another process; wait for it to \
+                 finish or cancel it (a stale row from a crash clears when the daemon next \
+                 starts)"
+            ),
+            Err(error) => return Err(error),
+        };
         busy.insert(app_id.to_string(), run_id);
         drop(busy);
 
@@ -806,6 +828,25 @@ mod tests {
             .unwrap_or_default()
             .contains("deliberate failure"));
         assert!(!runner.is_busy("test"));
+    }
+
+    #[tokio::test]
+    async fn a_second_process_holding_the_app_is_refused_as_busy() {
+        // Two runners on one store stand in for the daemon and the one-shot CLI: the
+        // second sees a busy app, not SQLite internals.
+        let store = Store::in_memory().expect("store");
+        let daemon = runner(TestApp::new(Duration::from_millis(200)), store.clone());
+        let cli = runner(TestApp::new(Duration::from_millis(1)), store.clone());
+        let _run = daemon.start("test", "run", true).expect("daemon started");
+        let error = cli
+            .run_to_completion("test", "run", true)
+            .await
+            .expect_err("refused");
+        assert!(
+            format!("{error:#}").contains("already has a run in progress in another process"),
+            "{error:#}"
+        );
+        wait_until_idle(&daemon).await;
     }
 
     #[tokio::test]

@@ -137,7 +137,29 @@ impl std::fmt::Debug for Store {
 
 impl Store {
     /// Open (or create) the database at `path` and migrate it.
+    ///
+    /// For the daemon: a run left `running` by a crash or a restart can never finish, so
+    /// opening retires those rows. A SECOND process must not use this (see
+    /// [`Store::open_shared`]): retiring from the CLI would mark the daemon's live run
+    /// failed while it is still writing.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with(path, true)
+    }
+
+    /// Open the database from a second process (the one-shot CLI), without retiring.
+    ///
+    /// Same schema migration as [`Store::open`], but `running` rows are left alone: they
+    /// belong to the daemon's live runs, and only the daemon's next [`Store::open`] may
+    /// retire them. Callers must refuse to start work an already-`running` row covers (see
+    /// [`Store::running_runs`]): the in-process one-run-per-app guard cannot see across
+    /// processes, and SQLite serialises writers but does not stop two processes from
+    /// running the same app at once. (`WAL` + `busy_timeout` below are what let the two
+    /// processes share the file at all.)
+    pub fn open_shared(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with(path, false)
+    }
+
+    fn open_with(path: impl AsRef<Path>, retire_running: bool) -> Result<Self> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -148,7 +170,7 @@ impl Store {
         let store = Self {
             connection: Arc::new(Mutex::new(connection)),
         };
-        store.migrate()?;
+        store.migrate(retire_running)?;
         Ok(store)
     }
 
@@ -157,7 +179,7 @@ impl Store {
         let store = Self {
             connection: Arc::new(Mutex::new(Connection::open_in_memory()?)),
         };
-        store.migrate()?;
+        store.migrate(true)?;
         Ok(store)
     }
 
@@ -172,7 +194,10 @@ impl Store {
     }
 
     /// Create the schema. Idempotent, so it runs on every open.
-    fn migrate(&self) -> Result<()> {
+    ///
+    /// `retire_running` is true for the daemon's own open and false for a second
+    /// process's [`Store::open_shared`]: only the daemon may declare another run dead.
+    fn migrate(&self, retire_running: bool) -> Result<()> {
         self.with_connection(|connection| {
             connection.execute_batch(
                 r#"
@@ -241,12 +266,24 @@ impl Store {
                 "#,
             )?;
             // A run left `running` by a crash or a restart can never finish, and pruning
-            // skips running rows, so it would otherwise show as live forever.
-            connection.execute(
-                "UPDATE runs SET status = 'failed', \
-                 summary = COALESCE(summary, 'the daemon restarted while this run was in progress'), \
-                 finished_at = COALESCE(finished_at, ?1) WHERE status = 'running'",
-                params![chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)],
+            // skips running rows, so it would otherwise show as live forever. Only the
+            // daemon's own open retires: a second process cannot tell a live run from a
+            // stale one, and retiring a live run rewrites history under it.
+            if retire_running {
+                connection.execute(
+                    "UPDATE runs SET status = 'failed', \
+                     summary = COALESCE(summary, 'the daemon restarted while this run was in progress'), \
+                     finished_at = COALESCE(finished_at, ?1) WHERE status = 'running'",
+                    params![chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)],
+                )?;
+            }
+            // One live run per app, across processes: the in-memory busy map stops two runs
+            // in THIS process, but the CLI is another process on the same file. A partial
+            // index (no extra row when nothing is running), created after the retire above
+            // so a restarted daemon never trips on its own stale rows.
+            connection.execute_batch(
+                "CREATE UNIQUE INDEX IF NOT EXISTS runs_one_running_per_app ON runs(app) WHERE \
+                 status = 'running'",
             )?;
             add_run_row_columns(connection)?;
             rename_recorded_history(connection)?;
@@ -405,6 +442,48 @@ impl Store {
                  ORDER BY started_at DESC, id DESC LIMIT ?1",
             )?;
             let rows = statement.query_map(params![limit as i64, app], map_run)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
+    }
+
+    /// The most recent SUCCEEDED run of one action for one app.
+    ///
+    /// This is how a later action finds the result set an earlier one produced (the guide's
+    /// cleanup actions read the last `scan`), which is why it is keyed by app AND action and
+    /// requires the run to have finished cleanly: a cancelled or failed run may hold partial
+    /// rows, and a partial result set would silently skip channels the run never reached.
+    /// There is no age limit — the planning step re-reads the current state of every channel
+    /// anyway, so a stale result set is safe, only out of date.
+    pub fn last_succeeded_run(&self, app: &str, action: &str) -> Result<Option<RunRecord>> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT id, app, action, dry_run, started_at, finished_at, status, summary, \
+                 counts, report_path FROM runs WHERE app = ?1 AND action = ?2 AND status = ?3 \
+                 ORDER BY started_at DESC, id DESC LIMIT 1",
+            )?;
+            statement
+                .query_row(params![app, action, RunStatus::Succeeded.as_str()], map_run)
+                .optional()
+                .map_err(Into::into)
+        })
+    }
+
+    /// The live (`running`) runs of one app, oldest first.
+    ///
+    /// The cross-process guard: a second process (the one-shot CLI) refuses to start an
+    /// app that has one of these, because the in-process busy map cannot see it. A row
+    /// here is either the daemon's live run or a stale row from a crash, which only the
+    /// daemon's next [`Store::open`] retires — so the caller reports both cases and lets
+    /// the operator decide, rather than retiring what might be alive.
+    pub fn running_runs(&self, app: &str) -> Result<Vec<RunRecord>> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT id, app, action, dry_run, started_at, finished_at, status, summary, \
+                 counts, report_path FROM runs WHERE app = ?1 AND status = ?2 \
+                 ORDER BY started_at, id",
+            )?;
+            let rows = statement.query_map(params![app, RunStatus::Running.as_str()], map_run)?;
             rows.collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(Into::into)
         })
@@ -770,6 +849,119 @@ mod tests {
             )
             .expect("inserts into the upgraded table");
         assert_eq!(store.rows(run_id).expect("rows").len(), 1);
+    }
+
+    #[test]
+    fn the_last_succeeded_run_is_found_by_app_and_action() {
+        // The guide's cleanup actions read the result set of the last `scan` through this.
+        let store = Store::in_memory().expect("store");
+        assert!(store
+            .last_succeeded_run("guide", "scan")
+            .expect("query")
+            .is_none());
+
+        let scan = store.start_run("guide", "scan", true).expect("start");
+        store
+            .finish_run(
+                scan,
+                RunStatus::Succeeded,
+                Some("3 missing"),
+                &serde_json::json!({}),
+                None,
+            )
+            .expect("finish");
+        // A cancelled scan is not a result set: its rows are partial by definition.
+        let cancelled = store.start_run("guide", "scan", true).expect("start");
+        store
+            .finish_run(
+                cancelled,
+                RunStatus::Cancelled,
+                Some("cancelled"),
+                &serde_json::json!({}),
+                None,
+            )
+            .expect("finish");
+        // Another action's run is not a scan, however recent.
+        let other = store
+            .start_run("guide", "match_preview", true)
+            .expect("start");
+        store
+            .finish_run(
+                other,
+                RunStatus::Succeeded,
+                None,
+                &serde_json::json!({}),
+                None,
+            )
+            .expect("finish");
+
+        let found = store
+            .last_succeeded_run("guide", "scan")
+            .expect("query")
+            .expect("the succeeded scan");
+        assert_eq!(found.id, scan);
+        assert!(store
+            .last_succeeded_run("streams", "scan")
+            .expect("query")
+            .is_none());
+    }
+
+    #[test]
+    fn a_shared_open_leaves_running_rows_alone() {
+        // The one-shot CLI opens the daemon's file with this: retiring here would mark the
+        // daemon's live run failed while it is still writing.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("crosstalk.db");
+        let store = Store::open(&path).expect("open");
+        let run_id = store.start_run("guide", "scan", true).expect("start");
+
+        let shared = Store::open_shared(&path).expect("shared open");
+        let running = shared.running_runs("guide").expect("query");
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].id, run_id);
+        assert_eq!(running[0].status, RunStatus::Running);
+        assert!(shared.running_runs("streams").expect("query").is_empty());
+
+        // And the daemon's own next open still retires the stale row.
+        drop(store);
+        drop(shared);
+        let store = Store::open(&path).expect("reopen");
+        assert!(store.running_runs("guide").expect("query").is_empty());
+        assert_eq!(
+            store.run(run_id).expect("run").expect("present").status,
+            RunStatus::Failed
+        );
+    }
+
+    #[test]
+    fn a_second_live_run_for_the_same_app_is_refused() {
+        // The cross-process guard: the busy map cannot see another process, so the store
+        // itself refuses a second `running` row per app. Finished rows never conflict, and
+        // another app is unaffected.
+        let store = Store::in_memory().expect("store");
+        let _first = store.start_run("guide", "scan", true).expect("start");
+        let error = store
+            .start_run("guide", "clear_missing_apply", false)
+            .expect_err("refused");
+        assert!(
+            format!("{error:#}").contains("UNIQUE constraint failed"),
+            "{error:#}"
+        );
+        store
+            .start_run("streams", "scan", true)
+            .expect("another app may run");
+        store
+            .finish_run(
+                _first,
+                RunStatus::Succeeded,
+                None,
+                &serde_json::json!({}),
+                None,
+            )
+            .expect("finish");
+        store
+            .start_run("guide", "scan", true)
+            .expect("free again after finish");
     }
 
     #[test]

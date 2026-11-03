@@ -893,8 +893,11 @@ fn shared_fields() -> Vec<crate::subapp::FieldSpec> {
         )
         .with_placeholder("e.g. All, Favorites")
         .with_help(
-            "Comma-separated profile names. Ignored when empty. Actions that need exactly \
-             one profile use the first name given.",
+            "Comma-separated profile names. Empty means every profile for a scope filter, but \
+             the guide's 'Clear EPG from Hidden Channels' refuses to run without a name, \
+             because 'no profile' cannot mean 'the disabled channels of every profile'. It \
+             uses every name given, unions their disabled channels, and matches names \
+             exactly.",
         ),
         FieldSpec::new(
             "scope.groups",

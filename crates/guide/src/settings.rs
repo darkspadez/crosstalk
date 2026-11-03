@@ -31,6 +31,14 @@ pub struct GuideSettings {
     pub allow_epg_without_programs: bool,
     pub heal_fallback_sources: String,
     pub heal_confidence_threshold: u8,
+    /// Appended to the name of a channel the scan found without programme data.
+    /// The leading space is part of the value, exactly as in the plugin.
+    pub bad_epg_suffix: String,
+    /// Also unassign the guide when the suffix is added (`add_bad_epg_suffix` with
+    /// `remove_epg_with_suffix`).
+    pub remove_epg_with_suffix: bool,
+    /// The pattern `clear_by_regex` matches against the assigned guide's NAME.
+    pub epg_regex_to_remove: String,
 }
 
 impl Default for GuideSettings {
@@ -43,6 +51,10 @@ impl Default for GuideSettings {
             allow_epg_without_programs: false,
             heal_fallback_sources: String::new(),
             heal_confidence_threshold: 95,
+            // The plugin's shipped defaults, leading space and empty pattern included.
+            bad_epg_suffix: " [BadEPG]".to_string(),
+            remove_epg_with_suffix: false,
+            epg_regex_to_remove: String::new(),
         }
     }
 }
@@ -100,6 +112,7 @@ fn moved_settings_hint(text: &str) -> Option<String> {
 pub const SECTION_SCOPE: &str = "_section_scope";
 pub const SECTION_MATCH: &str = "_section_match";
 pub const SECTION_HEAL: &str = "_section_heal";
+pub const SECTION_CLEANUP: &str = "_section_cleanup";
 
 /// The settings form.
 pub fn schema() -> SettingsSchema {
@@ -191,6 +204,52 @@ pub fn schema() -> SettingsSchema {
             FieldValue::Number(95.0),
         )
         .with_help("Minimum score for a replacement EPG to be applied during heal."),
+        FieldSpec::section(
+            SECTION_CLEANUP,
+            "Cleanup & Maintenance",
+            "The cleanup actions work from the last scan's result set, so run `scan` first. \
+             They re-read every channel's current name and guide before writing, so an old \
+             scan cannot tag a channel twice or clear a guide that has since been reassigned. \
+             Every one refuses to run with the setting it needs left blank.",
+        ),
+        FieldSpec::new(
+            "epg_regex_to_remove",
+            SECTION_CLEANUP,
+            "EPG Name REGEX to Remove",
+            FieldKind::Text,
+            FieldValue::Text(String::new()),
+        )
+        .with_placeholder("e.g. ^XYZ_\\d+$")
+        .with_help(
+            "A regex, matched case-sensitively and unanchored against the assigned guide's \
+             NAME, not the channel's. Channels matching it get their EPG removed by 'Clear EPG \
+             by REGEX'. Python's `re` and Rust's `regex` are not identical: backreferences and \
+             lookaround are refused with an explanation rather than matching something else.",
+        ),
+        FieldSpec::new(
+            "bad_epg_suffix",
+            SECTION_CLEANUP,
+            "Bad EPG Suffix",
+            FieldKind::Text,
+            FieldValue::Text(" [BadEPG]".to_string()),
+        )
+        .with_help(
+            "Appended to the name of every channel the last scan found without programme \
+             data. The leading space is part of the suffix: without it the name reads \
+             'ESPN[BadEPG]'. A channel that already ends with the suffix is skipped entirely, \
+             so its guide survives even when 'Also Remove EPG When Adding Suffix' is on.",
+        ),
+        FieldSpec::new(
+            "remove_epg_with_suffix",
+            SECTION_CLEANUP,
+            "Also Remove EPG When Adding Suffix",
+            FieldKind::Boolean,
+            FieldValue::Boolean(false),
+        )
+        .with_help(
+            "When on, 'Add Bad EPG Suffix to Channels' also strips each tagged channel's EPG \
+             assignment in the same pass.",
+        ),
     ])
 }
 
@@ -221,6 +280,18 @@ pub fn to_values(settings: &GuideSettings) -> SettingsValues {
         "heal_confidence_threshold",
         FieldValue::Number(f64::from(settings.heal_confidence_threshold)),
     );
+    values.insert(
+        "bad_epg_suffix",
+        FieldValue::Text(settings.bad_epg_suffix.clone()),
+    );
+    values.insert(
+        "remove_epg_with_suffix",
+        FieldValue::Boolean(settings.remove_epg_with_suffix),
+    );
+    values.insert(
+        "epg_regex_to_remove",
+        FieldValue::Text(settings.epg_regex_to_remove.clone()),
+    );
     values
 }
 
@@ -231,6 +302,15 @@ pub fn apply_values(settings: &mut GuideSettings, values: &SettingsValues) -> Re
     }
     if let Some(text) = values.text("heal_fallback_sources") {
         settings.heal_fallback_sources = text.to_string();
+    }
+    if let Some(text) = values.text("bad_epg_suffix") {
+        settings.bad_epg_suffix = text.to_string();
+    }
+    if let Some(text) = values.text("epg_regex_to_remove") {
+        settings.epg_regex_to_remove = text.to_string();
+    }
+    if let Some(value) = values.bool("remove_epg_with_suffix") {
+        settings.remove_epg_with_suffix = value;
     }
     if let Some(number) = values.number("check_hours") {
         settings.check_hours = whole_number("check_hours", number, 0, 8_760)?;
@@ -340,6 +420,46 @@ mod tests {
     }
 
     #[test]
+    fn the_cleanup_defaults_are_the_plugins() {
+        // plugin.json: bad_epg_suffix default " [BadEPG]" (leading space), the removal flag
+        // off, no REGEX. The leading space is a value, not formatting.
+        let settings = GuideSettings::default();
+        assert_eq!(settings.bad_epg_suffix, " [BadEPG]");
+        assert!(!settings.remove_epg_with_suffix);
+        assert!(settings.epg_regex_to_remove.is_empty());
+        // Schema defaults agree with the struct's, or the form would show one value and save
+        // another.
+        let schema = schema();
+        assert_eq!(
+            schema.field("bad_epg_suffix").expect("field").default,
+            FieldValue::Text(" [BadEPG]".to_string())
+        );
+        assert_eq!(
+            schema
+                .field("remove_epg_with_suffix")
+                .expect("field")
+                .default,
+            FieldValue::Boolean(false)
+        );
+        assert_eq!(
+            schema.field("epg_regex_to_remove").expect("field").default,
+            FieldValue::Text(String::new())
+        );
+    }
+
+    #[test]
+    fn the_bad_epg_suffix_keeps_its_leading_space_through_a_save() {
+        // The suffix is appended verbatim, so a save that trimmed it would rename channels to
+        // `ESPN[BadEPG]`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("guide.toml");
+        let settings = GuideSettings::default();
+        save(&path, &settings).expect("save");
+        let loaded = load(&path).expect("load");
+        assert_eq!(loaded.bad_epg_suffix, " [BadEPG]");
+    }
+
+    #[test]
     fn every_editable_field_has_a_mapping() {
         // A field with no accessor in `to_values`/`apply_values` would render an empty form
         // control and silently drop the operator's edit.
@@ -350,6 +470,9 @@ mod tests {
             allow_epg_without_programs: true,
             heal_fallback_sources: "D".to_string(),
             heal_confidence_threshold: 75,
+            bad_epg_suffix: " (no guide)".to_string(),
+            remove_epg_with_suffix: true,
+            epg_regex_to_remove: "^XYZ_".to_string(),
         };
         let values = to_values(&settings);
         for field in schema().editable() {

@@ -27,3 +27,27 @@ allow_epg_without_programs = false
 # Sources heal may pick replacements from. Empty means the channel's current source only.
 heal_fallback_sources = ""
 heal_confidence_threshold = 95
+
+# --- Cleanup & Maintenance -------------------------------------------------------------
+#
+# `scan` stores its result set in the run history; the cleanup actions select from the last
+# finished scan. They re-read every channel's current name and guide before writing, so a
+# stale scan can only be out of date, never unsafe: nothing is tagged twice and a guide that
+# was reassigned since is left alone. There is no age limit for that reason.
+
+# A regex matched against the assigned guide's NAME (not the channel's), case-sensitively and
+# unanchored, for `clear_by_regex_preview` / `clear_by_regex_apply`. Empty means the action
+# refuses to run. Python's `re` and Rust's `regex` differ: backreferences and lookaround are
+# refused with an explanation rather than silently matching something else.
+epg_regex_to_remove = ""
+# Appended verbatim to the name of every channel the scan found without programme data. The
+# leading space is part of the value: without it the name reads "ESPN[BadEPG]". Empty means
+# `tag_missing_*` refuses to run, as in the plugin.
+bad_epg_suffix = " [BadEPG]"
+# Also unassign the guide in the same pass. A channel that already carries the suffix is
+# skipped entirely, so with this on it also keeps its guide.
+remove_epg_with_suffix = false
+
+# `clear_groups_*` and `clear_hidden_*` take their channel set from [scope] in crosstalk.toml:
+# `groups` (clear_groups refuses to run when it is empty, which the plugin treated as "every
+# channel") and `profiles` (clear_hidden needs the profiles whose disabled channels it clears).
