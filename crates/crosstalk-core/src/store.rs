@@ -98,6 +98,16 @@ pub struct RunRow {
     pub reason: String,
     /// What the model said, when it was asked. Empty when it was not.
     pub ai_decision: Option<String>,
+    /// The channel field a channel operation wrote (`name`, `channel_group_id`, `epg_data_id`,
+    /// `hidden_from_output`, `profile_membership:<id>`), empty for a matching row.
+    ///
+    /// `before_value`/`after_value` are the machine values of that field: an id for a group
+    /// or an EPG entry, `none` for an unassigned one, `true`/`false` for a flag. Together with
+    /// the identity columns they are what a later `restore` reverses, which is why they are
+    /// generic rather than EPG-shaped: phase 2 restores names and groups, not only guides.
+    pub field: String,
+    pub before_value: Option<String>,
+    pub after_value: Option<String>,
 }
 
 /// One AI request and its answer, kept for auditing why a row was accepted.
@@ -201,6 +211,9 @@ impl Store {
                     status           TEXT    NOT NULL DEFAULT '',
                     reason           TEXT    NOT NULL DEFAULT '',
                     ai_decision      TEXT,
+                    field            TEXT    NOT NULL DEFAULT '',
+                    before_value     TEXT,
+                    after_value      TEXT,
                     PRIMARY KEY (run_id, ordinal)
                 );
                 CREATE INDEX IF NOT EXISTS run_rows_channel ON run_rows(run_id, channel_id);
@@ -235,6 +248,7 @@ impl Store {
                  finished_at = COALESCE(finished_at, ?1) WHERE status = 'running'",
                 params![chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)],
             )?;
+            add_run_row_columns(connection)?;
             rename_recorded_history(connection)?;
             Ok(())
         })
@@ -298,8 +312,10 @@ impl Store {
                 let mut statement = transaction.prepare(
                     "INSERT OR REPLACE INTO run_rows (run_id, ordinal, channel_id, channel_name, \
                      channel_group, channel_number, current_epg_name, epg_data_id, epg_name, \
-                     epg_source, score, method, status, reason, ai_decision) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                     epg_source, score, method, status, reason, ai_decision, field, \
+                     before_value, after_value) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
+                     ?16, ?17, ?18)",
                 )?;
                 for row in rows {
                     statement.execute(params![
@@ -318,6 +334,9 @@ impl Store {
                         row.status,
                         row.reason,
                         row.ai_decision,
+                        row.field,
+                        row.before_value,
+                        row.after_value,
                     ])?;
                 }
             }
@@ -411,7 +430,8 @@ impl Store {
             let mut statement = connection.prepare(
                 "SELECT ordinal, channel_id, channel_name, channel_group, channel_number, \
                  current_epg_name, epg_data_id, epg_name, epg_source, score, method, status, \
-                 reason, ai_decision FROM run_rows WHERE run_id = ?1 ORDER BY ordinal",
+                 reason, ai_decision, field, before_value, after_value FROM run_rows \
+                 WHERE run_id = ?1 ORDER BY ordinal",
             )?;
             let rows = statement.query_map(params![run_id], |row| {
                 Ok(RunRow {
@@ -429,6 +449,9 @@ impl Store {
                     status: row.get(11)?,
                     reason: row.get(12)?,
                     ai_decision: row.get(13)?,
+                    field: row.get(14)?,
+                    before_value: row.get(15)?,
+                    after_value: row.get(16)?,
                 })
             })?;
             rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -533,6 +556,30 @@ impl Store {
     }
 }
 
+/// Add the columns channel operations record, when this database predates them.
+///
+/// `CREATE TABLE IF NOT EXISTS` leaves an existing `run_rows` alone, so a store written by an
+/// earlier build would reject the new inserts. The columns are nullable or defaulted, so an
+/// old row reads back as "no channel-operation data", which is exactly what it is.
+fn add_run_row_columns(connection: &Connection) -> Result<()> {
+    let mut statement = connection.prepare("PRAGMA table_info(run_rows)")?;
+    let existing: std::collections::HashSet<String> = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (name, definition) in [
+        ("field", "TEXT NOT NULL DEFAULT ''"),
+        ("before_value", "TEXT"),
+        ("after_value", "TEXT"),
+    ] {
+        if !existing.contains(name) {
+            connection.execute_batch(&format!(
+                "ALTER TABLE run_rows ADD COLUMN {name} {definition}"
+            ))?;
+        }
+    }
+    Ok(())
+}
+
 /// Rename the pre-rename history once: the sub-app is `guide` and its matching actions are
 /// `match_*`.
 ///
@@ -603,6 +650,9 @@ mod tests {
             status: "HEALED".to_string(),
             reason: "Excellent replacement match (100%)".to_string(),
             ai_decision: None,
+            field: String::new(),
+            before_value: None,
+            after_value: None,
         }
     }
 
@@ -643,6 +693,83 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].channel_name, "ESPN");
         assert_eq!(rows[1].score, 88);
+    }
+
+    #[test]
+    fn a_channel_operation_row_keeps_what_it_changed() {
+        // A restore reads these three columns, so they have to survive the round trip even
+        // though the matching columns are empty.
+        let store = Store::in_memory().expect("store");
+        let run_id = store
+            .start_run("guide", "clear_groups_apply", false)
+            .expect("start");
+        store
+            .append_rows(
+                run_id,
+                &[RunRow {
+                    ordinal: 0,
+                    channel_id: 7,
+                    channel_name: "ESPN".to_string(),
+                    field: "epg_data_id".to_string(),
+                    before_value: Some("31".to_string()),
+                    after_value: Some("none".to_string()),
+                    method: "clear_epg".to_string(),
+                    status: "ok".to_string(),
+                    ..RunRow::default()
+                }],
+            )
+            .expect("rows");
+
+        let rows = store.rows(run_id).expect("rows");
+        assert_eq!(rows[0].field, "epg_data_id");
+        assert_eq!(rows[0].before_value.as_deref(), Some("31"));
+        assert_eq!(rows[0].after_value.as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn a_store_written_before_the_channel_operation_columns_is_upgraded() {
+        // The columns arrived with channel operations; an existing database (cedro's) must
+        // gain them rather than fail the first insert.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("runs.db");
+        {
+            let connection = Connection::open(&path).expect("open");
+            connection
+                .execute_batch(
+                    "CREATE TABLE run_rows (run_id INTEGER NOT NULL, ordinal INTEGER NOT NULL, \
+                     channel_id INTEGER NOT NULL, channel_name TEXT NOT NULL, \
+                     channel_group TEXT NOT NULL DEFAULT '', channel_number REAL, \
+                     current_epg_name TEXT, epg_data_id INTEGER, epg_name TEXT, epg_source TEXT, \
+                     score INTEGER NOT NULL DEFAULT 0, method TEXT NOT NULL DEFAULT '', \
+                     status TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '', \
+                     ai_decision TEXT, PRIMARY KEY (run_id, ordinal));",
+                )
+                .expect("old schema");
+            // The rename migration already ran on this database (it is at DATA_VERSION),
+            // so only the column upgrade may touch it.
+            connection
+                .execute_batch("PRAGMA user_version = 1")
+                .expect("stamp version");
+        }
+
+        let store = Store::open(&path).expect("reopens");
+        let run_id = store
+            .start_run("guide", "tag_missing_apply", false)
+            .expect("start");
+        store
+            .append_rows(
+                run_id,
+                &[RunRow {
+                    ordinal: 0,
+                    channel_id: 1,
+                    field: "name".to_string(),
+                    before_value: Some("ESPN".to_string()),
+                    after_value: Some("ESPN [BadEPG]".to_string()),
+                    ..RunRow::default()
+                }],
+            )
+            .expect("inserts into the upgraded table");
+        assert_eq!(store.rows(run_id).expect("rows").len(), 1);
     }
 
     #[test]

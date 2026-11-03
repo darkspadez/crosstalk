@@ -109,6 +109,7 @@ impl MatchRow {
             },
             reason: self.reason.clone(),
             ai_decision: self.ai_decision.clone(),
+            ..RunRow::default()
         }
     }
 }

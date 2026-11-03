@@ -534,6 +534,7 @@ dependencies = [
  "dashmap",
  "figment",
  "rayon",
+ "regex",
  "reqwest",
  "rusqlite",
  "serde",

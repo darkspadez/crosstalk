@@ -125,3 +125,8 @@ jobs:
         run: |
           python3 scripts/parity_sweep.py --kinds normalize,callsign,location,network --limit 300
           python3 scripts/parity_sweep.py --kinds match,score --limit 300 --pool 60
+      # Channel operations replace the plugin's five cleanup actions, so their selection and
+      # payload logic is compared against the plugin's own code. -I keeps the harness from
+      # importing anything outside the plugin checkout (which it puts on sys.path itself).
+      - name: Channel ops vs the plugin's cleanup actions
+        run: python3 -I scripts/channel_ops_parity.py

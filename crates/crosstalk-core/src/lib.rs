@@ -7,6 +7,7 @@
 
 pub mod ai;
 pub mod ai_gate;
+pub mod channel_ops;
 pub mod config;
 pub mod csv_report;
 pub mod dispatcharr;
@@ -23,6 +24,11 @@ pub mod wildcard;
 mod test_app;
 
 pub use ai::{AiService, Answer, Decider, DecisionRequest, DecisionResponse, Question, Verdict};
+pub use channel_ops::{
+    apply, plan, plan_with_options, run_rows, write_ops_report, ApplyReport, Change, Field, Op,
+    OpKind, Plan, PlanOptions, RenameKind, ReportSpec, RowStatus, SelectedChannel, Selection, Skip,
+    Value,
+};
 pub use config::{ConfigReport, CrosstalkConfig, SharedConfig};
 pub use csv_report::{
     app_exports, clear_app_exports, clear_exports, exports_to_clear, exports_to_delete,

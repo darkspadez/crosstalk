@@ -108,6 +108,7 @@ impl HealRow {
             status: self.status.as_str().to_string(),
             reason: self.reason.clone(),
             ai_decision: None,
+            ..RunRow::default()
         }
     }
 }
