@@ -89,7 +89,8 @@ impl SubApp for GuideApp {
             ActionSpec::new(
                 ACTION_VALIDATE,
                 "Validate Settings",
-                "Check the settings for consistency. Reach Dispatcharr separately, by                  previewing a run.",
+                "Check the settings for consistency. Reach Dispatcharr separately, by \
+                 previewing a run.",
                 ActionKind::Read,
             )
             // Settings validation is local: it must work on a host that cannot reach
@@ -439,7 +440,7 @@ impl GuideApp {
 
         let client = context.dispatcharr()?;
         context.progress(&crosstalk_core::jobs::ProgressEvent::new(
-            ACTION_MATCH_PREVIEW,
+            "guide.match",
             0,
             0,
             "loading Dispatcharr data",
@@ -514,8 +515,12 @@ impl GuideApp {
         let Some(store) = context.store() else {
             return JobOutcome::new("No run history is available in this context.");
         };
-        let runs = store.recent_runs_for(APP_ID, 1).unwrap_or_default();
-        let Some(run) = runs.into_iter().next() else {
+        // This status run is recorded too, and is always the newest: report the one before it.
+        let runs = store.recent_runs_for(APP_ID, 2).unwrap_or_default();
+        let Some(run) = runs
+            .into_iter()
+            .find(|run| Some(run.id) != context.run_id())
+        else {
             return JobOutcome::new("No run has been recorded yet.");
         };
 
@@ -832,6 +837,34 @@ mod tests {
     }
 
     #[test]
+    fn the_shipped_example_configs_load_and_validate() {
+        // The release ships both files for operators to copy; a key renamed in code but not
+        // there would make the copied file refuse to load (`deny_unknown_fields`).
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config");
+        let settings = settings::load(&root.join("guide.example.toml")).expect("guide example");
+        assert!(settings::validate(&settings).is_empty());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::copy(
+            root.join("crosstalk.example.toml"),
+            dir.path().join("crosstalk.toml"),
+        )
+        .expect("copy");
+        let config = CrosstalkConfig::load_file(dir.path()).expect("host example");
+        assert!(
+            config
+                .validate()
+                .errors
+                .iter()
+                .all(|error| !error.contains("scope.")
+                    && !error.contains("ai.verify.")
+                    && !error.contains("exports.")),
+            "{:?}",
+            config.validate().errors
+        );
+    }
+
+    #[test]
     fn validate_settings_catches_a_hand_edited_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = app().settings_path(dir.path());
@@ -912,6 +945,26 @@ mod tests {
         assert!(
             format!("{error}").contains("Dispatcharr session"),
             "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_reports_the_run_before_itself() {
+        // The status run is recorded like any other, so it is always the newest row.
+        let world = test_support::world();
+        let fixture = test_support::Fixture::start(&world, &[]).await;
+        let store = crosstalk_core::store::Store::in_memory().expect("store");
+        fixture.record_scan(&store, &[]);
+        let context = fixture.context_for_run(APP_ID, ACTION_STATUS, &store);
+
+        let outcome = app()
+            .dispatch(ACTION_STATUS, &context, true)
+            .await
+            .expect("status");
+        assert!(
+            outcome.summary.starts_with("Last run: scan succeeded"),
+            "{}",
+            outcome.summary
         );
     }
 

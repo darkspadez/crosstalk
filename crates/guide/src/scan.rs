@@ -557,7 +557,7 @@ mod tests {
         // Exactly what `Selection::from_scan_rows` needs: the channels, and the guide each one
         // was on when the scan saw it.
         let selection = Selection::from_scan_rows(&scan.rows, &fixture.config.scope);
-        assert_eq!(selection.channel_ids, test_support::missing_ids());
+        assert_eq!(selection.channel_ids, Some(test_support::missing_ids()));
         assert_eq!(selection.expected_epg.get(&2), Some(&Some(CNN_US)));
     }
 

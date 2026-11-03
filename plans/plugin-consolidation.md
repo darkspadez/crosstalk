@@ -375,3 +375,46 @@ for the bridge. `clear_parse_counters` and `restart_dispatcharr` are not ported.
 
 ## Open questions
 None. Future phases get their own step lists and questions when they start.
+
+## Phase 1 review notes
+
+Findings from the end-of-phase review that later phases must build on (fixed items are in the
+"Phase 1 review fixes" commit; these are what remains true or open):
+
+- **`Selection::channel_ids` is `Option<Vec<i64>>`.** `None` = no id filter, `Some(vec![])` =
+  select nothing. Before the fix an empty scan made `clear_missing_apply` select every in-scope
+  channel. Any phase that feeds a prior run's result set (streams `triage`/`restore`, events
+  `visibility`) must go through `Some(ids)`, never an empty `Vec` meaning "all".
+- **Channel ops are uniform per selection.** Every `Op` applies the same value to every selected
+  channel. Per-channel values (streams `restore` from `run_rows` before/after, lineup `names_*`
+  canonical names, numbers, logos) have no `Op` yet, and `Change::planned` is private. Phase 2
+  needs either a per-channel op (`Op::Set { field, values: HashMap<i64, Value> }`) or a public
+  plan-from-changes constructor. `MoveGroup` cannot target "No Group", and there is no
+  `SetEpg`, `SetLogo`, `SetNumber` or stream-list field. `ChannelEdit` in the client already
+  carries all of them.
+- **`match_run::walk` picks one winner.** Stream-Mapparr attaches *every* matching stream
+  (replace/append), so streams needs a multi-select walk next to `walk`, or it can call
+  `score_names` and threshold the ranked list itself. `Candidate` and `ai_gate` are already
+  generic. No `Candidate` impl for `Stream` exists yet.
+- **Run rows are channel-shaped.** The watchdog stores source ids in `channel_id` with
+  `field = "epg_source"`, and a scan row has an empty `field`. A restore must select rows by
+  `Field::from_label(field)` (which returns `None` for both), never by `channel_id` alone.
+- **Cancel semantics.** A cleanup apply cancelled before any write is now recorded `cancelled`.
+  One cancelled after a batch landed stays `succeeded`, with the unwritten rows `failed:
+  cancelled`. The watchdog still bails on cancel without recording rows for refreshes it
+  already queued. Phase 2's resumable probe jobs should settle this once for every app.
+- **Cross-process guard.** The partial unique index stops two live runs per app across daemon
+  and CLI. A daemon *restart* while a CLI run is live still retires that run's row, so for that
+  run the guard is gone. A shared (CLI) open of a pre-index database with duplicate stale
+  `running` rows now skips the index until the daemon retires them.
+- **`status` cannot show a run in progress.** It is itself a run, so the one-run-per-app guard
+  refuses it while another guide run is live. Its description still claims otherwise. Fix it
+  with an offline/unguarded action kind when the host gains one.
+- **Programme checks cost one request per distinct EPG entry.** This affects `scan`, `match` and
+  `heal`, which is thousands of requests at cedro scale where the plugin needs one SQL query.
+  This is the first read worth moving to the optional read-only DB role.
+- **CLI `--dry-run` redirect is a hard-coded pair map** (`preview_counterpart` in
+  `crates/crosstalk/src/main.rs`). A test fails when a registered `_apply` lacks an entry, so
+  each phase adds its pairs there.
+- **v0.1.0 exports** were named `epg_janitor_*`, the plugin's own prefix, so crosstalk's
+  retention and `exports clear` never touch them. Delete them on cedro by hand once.

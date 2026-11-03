@@ -88,7 +88,7 @@ impl Cleanup {
         matches!(self, Self::TagMissing | Self::ClearMissing)
     }
 
-    /// The action id this preset runs as, for progress events and the report file name.
+    /// The schedule key this preset runs as, for progress events and the scan announcement.
     fn action_id(self, dry_run: bool) -> String {
         format!(
             "guide.{}_{}",
@@ -171,6 +171,17 @@ pub async fn run(
         context.config().exports.retention_days,
         name.as_deref(),
     );
+
+    // A cancel that stopped every write is a cancelled run, like a cancelled scan or match:
+    // the rows and the report above say what was left undone. One that landed after a batch
+    // was written stays a result, so the history never hides a write that happened.
+    if applied
+        .as_ref()
+        .is_some_and(|applied| applied.ok == 0 && applied.failed > 0)
+        && context.is_cancelled()
+    {
+        bail!("cancelled by the operator before any change was written");
+    }
 
     Ok(
         outcome(action, &plan, applied.as_ref(), dry_run, scan.as_ref())
@@ -645,6 +656,36 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_scan_that_found_nothing_selects_nothing() {
+        // A clean scan stores no rows. An empty id list must mean "none of them", never "no
+        // id filter": the latter would clear or tag every channel in scope.
+        let world = test_support::world();
+        let fixture = Fixture::start(&world, &[ESPN_HD]).await;
+
+        for action in [Cleanup::TagMissing, Cleanup::ClearMissing] {
+            let store = Store::in_memory().expect("store");
+            fixture.record_scan(&store, &[]);
+            let context = fixture.context_for_run(crate::APP_ID, action.verb(), &store);
+            let outcome = run(
+                &GuideApp::new(),
+                &context,
+                &GuideSettings {
+                    remove_epg_with_suffix: true,
+                    ..GuideSettings::default()
+                },
+                action,
+                false,
+            )
+            .await
+            .expect("apply");
+            assert_eq!(outcome.counts.get("selected"), Some(&0), "{action:?}");
+            assert_eq!(outcome.counts.get("changes"), Some(&0), "{action:?}");
+        }
+        assert!(cleared(&fixture).await.is_empty());
+        assert!(channel_edits(&fixture).await.is_empty());
+    }
+
     // ---- clear_hidden ------------------------------------------------------
 
     #[tokio::test]
@@ -875,7 +916,7 @@ mod tests {
         let run_id = context.run_id().expect("run id");
         context.cancel();
 
-        let outcome = run(
+        let error = run(
             &GuideApp::new(),
             &context,
             &GuideSettings::default(),
@@ -883,14 +924,10 @@ mod tests {
             false,
         )
         .await
-        .expect("a cancel is not an error");
-
-        assert_eq!(outcome.counts.get("written"), Some(&0));
-        assert_eq!(outcome.counts.get("failed"), Some(&2));
+        .expect_err("nothing was written, so the run is a cancelled one");
         assert!(
-            outcome.summary.contains("2 row(s) failed"),
-            "{}",
-            outcome.summary
+            format!("{error:#}").contains("cancelled by the operator"),
+            "{error:#}"
         );
         assert!(cleared(&fixture).await.is_empty());
         let rows = store.rows(run_id).expect("rows");

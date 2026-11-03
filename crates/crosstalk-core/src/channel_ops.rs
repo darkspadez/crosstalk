@@ -93,7 +93,7 @@ const PROGRESS_INTERVAL: Duration = Duration::from_secs(2);
 /// NAME (`remove_epg_by_regex`), and channels carrying a guide at all.
 ///
 /// A field left empty is no filter, so `Selection::default()` is "everything the scope
-/// allows".
+/// allows". The one exception is [`Self::channel_ids`]: an empty id LIST selects nothing.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Selection {
@@ -121,7 +121,11 @@ pub struct Selection {
     /// [`compile_pattern`] for the gaps.
     pub epg_name_regex: Option<String>,
     /// Only these channel ids, typically a previous run's result set.
-    pub channel_ids: Vec<i64>,
+    ///
+    /// `None` is no id filter; `Some` of an EMPTY list selects NOTHING. The distinction is the
+    /// safety rail: a scan that found no channel stores no rows, and reading that as "no
+    /// filter" would hand every in-scope channel to `clear_missing`.
+    pub channel_ids: Option<Vec<i64>>,
     /// Only channels that have a guide assigned (`epg_data__isnull=False`, the pre-filter of
     /// `remove_all_epg_from_groups` and `remove_epg_by_regex`).
     pub has_epg: bool,
@@ -169,14 +173,17 @@ impl Selection {
     /// to re-plan.
     pub fn from_scan_rows(rows: &[RunRow], scope: &ScopeConfig) -> Self {
         let mut selection = Self::in_scope(scope);
+        let mut ids: Vec<i64> = Vec::with_capacity(rows.len());
+        let mut seen: HashSet<i64> = HashSet::with_capacity(rows.len());
         for row in rows {
-            if !selection.channel_ids.contains(&row.channel_id) {
-                selection.channel_ids.push(row.channel_id);
+            if seen.insert(row.channel_id) {
+                ids.push(row.channel_id);
             }
             selection
                 .expected_epg
                 .insert(row.channel_id, row.epg_data_id);
         }
+        selection.channel_ids = Some(ids);
         selection
     }
 
@@ -204,8 +211,8 @@ impl Selection {
         if let Some(pattern) = &self.epg_name_regex {
             parts.push(format!("whose guide name matches {pattern:?}"));
         }
-        if !self.channel_ids.is_empty() {
-            parts.push(format!("{} named channel id(s)", self.channel_ids.len()));
+        if let Some(ids) = &self.channel_ids {
+            parts.push(format!("{} named channel id(s)", ids.len()));
         }
         if !self.expected_epg.is_empty() {
             parts.push("still on the guide the scan saw".to_string());
@@ -623,8 +630,21 @@ pub fn plan_with_options(
         ignore_groups: selection.ignore_groups.clone(),
     };
     let scoped = scope_channels(world, &scope)?;
+    // Built once: a guide lookup per channel against ~55k entries would be quadratic.
+    let entries: Entries<'_> = world
+        .entries
+        .iter()
+        .map(|entry| (entry.id, entry))
+        .collect();
     let mut skipped: Vec<Skip> = Vec::new();
-    let selected = narrow(world, &scoped, selection, regex.as_ref(), &mut skipped)?;
+    let selected = narrow(
+        world,
+        &entries,
+        &scoped,
+        selection,
+        regex.as_ref(),
+        &mut skipped,
+    )?;
 
     let mut changes: Vec<Change> = Vec::new();
     let mut selected_rows: Vec<SelectedChannel> = Vec::with_capacity(selected.len());
@@ -661,6 +681,7 @@ pub fn plan_with_options(
             }
             apply_op(
                 world,
+                &entries,
                 channel,
                 &group,
                 op,
@@ -1100,11 +1121,12 @@ impl Working {
 /// options arm it and this rename is a no-op because the suffix is already present, the
 /// suffix is stored in `guarded` and the plan loop skips every later operation.
 ///
-/// Nine parameters, like the AI gate's `ask`: one per thing an evaluation threads through,
+/// Ten parameters, like the AI gate's `ask`: one per thing an evaluation threads through,
 /// and bundling them would only move the list behind a struct literal at this one call site.
 #[allow(clippy::too_many_arguments)]
 fn apply_op(
     world: &World,
+    entries: &Entries<'_>,
     channel: &Channel,
     group: &str,
     op: &Op,
@@ -1139,7 +1161,7 @@ fn apply_op(
                     .display_number()
                     .map(|number| format!("{number}"))
                     .unwrap_or_default(),
-                epg: epg_values(world, current.epg)
+                epg: epg_values(entries, current.epg)
                     .map(|(_, name)| name)
                     .unwrap_or_else(|| "No EPG".to_string()),
                 id: channel.id.to_string(),
@@ -1306,7 +1328,7 @@ fn apply_op(
                     group,
                     kind,
                     Field::Epg,
-                    Value::Epg(epg_values(world, current.epg)),
+                    Value::Epg(epg_values(entries, current.epg)),
                     Value::Epg(None),
                 ),
             );
@@ -1332,27 +1354,28 @@ fn record(planned: &mut Vec<Change>, change: Change) {
     }
 }
 
+/// Guide entries by id, for the per-channel lookups of one plan.
+type Entries<'a> = HashMap<i64, &'a EpgEntry>;
+
 /// The group value for a group id, name included so the report needs no world.
 fn group_values(world: &World, group: Option<i64>) -> Option<(i64, String)> {
     group.map(|id| (id, world.group_name(Some(id))))
 }
 
 /// The EPG entry value for an entry id, name included for the same reason.
-fn epg_values(world: &World, entry: Option<i64>) -> Option<(i64, String)> {
+fn epg_values(entries: &Entries<'_>, entry: Option<i64>) -> Option<(i64, String)> {
     let id = entry?;
-    let name = world
-        .entries
-        .iter()
-        .find(|entry| entry.id == id)
+    let name = entries
+        .get(&id)
         .map(|entry| entry.name.clone())
         .unwrap_or_else(|| format!("EPG {id}"));
     Some((id, name))
 }
 
 /// The guide entry of a channel, if it has one and the world carries entries.
-fn entry_of<'a>(world: &'a World, channel: &Channel) -> Option<&'a EpgEntry> {
+fn entry_of<'a>(entries: &Entries<'a>, channel: &Channel) -> Option<&'a EpgEntry> {
     let id = channel.current_epg_id()?;
-    world.entries.iter().find(|entry| entry.id == id)
+    entries.get(&id).copied()
 }
 
 /// Fail early when the world was loaded without a slice the plan needs.
@@ -1454,6 +1477,7 @@ fn require_world(world: &World, selection: &Selection, ops: &[Op]) -> Result<()>
 /// The channels a selection resolves to, plus the skips worth reporting.
 fn narrow<'a>(
     world: &World,
+    entries: &Entries<'_>,
     scoped: &'a ScopedChannels,
     selection: &Selection,
     regex: Option<&Regex>,
@@ -1461,8 +1485,8 @@ fn narrow<'a>(
 ) -> Result<Vec<&'a Channel>> {
     let mut channels: Vec<&Channel> = scoped.channels.iter().collect();
 
-    if !selection.channel_ids.is_empty() {
-        let wanted: HashSet<i64> = selection.channel_ids.iter().copied().collect();
+    if let Some(ids) = &selection.channel_ids {
+        let wanted: HashSet<i64> = ids.iter().copied().collect();
         channels.retain(|channel| wanted.contains(&channel.id));
 
         // A stale result set is the case worth reporting: the operator should see that the
@@ -1474,7 +1498,7 @@ fn narrow<'a>(
             .map(|channel| (channel.id, channel))
             .collect();
         let mut reported: HashSet<i64> = HashSet::new();
-        for id in &selection.channel_ids {
+        for id in ids {
             if !reported.insert(*id) {
                 continue;
             }
@@ -1505,7 +1529,7 @@ fn narrow<'a>(
 
     if let Some(regex) = regex {
         channels.retain(|channel| {
-            entry_of(world, channel).is_some_and(|entry| regex.is_match(&entry.name))
+            entry_of(entries, channel).is_some_and(|entry| regex.is_match(&entry.name))
         });
     }
 
@@ -1515,10 +1539,10 @@ fn narrow<'a>(
             None => true,
             Some(expected) if *expected == channel.current_epg_id() => true,
             Some(expected) => {
-                let was = epg_values(world, *expected)
+                let was = epg_values(entries, *expected)
                     .map(|(_, name)| name)
                     .unwrap_or_else(|| "no guide".to_string());
-                let now = epg_values(world, channel.current_epg_id())
+                let now = epg_values(entries, channel.current_epg_id())
                     .map(|(_, name)| name)
                     .unwrap_or_else(|| "no guide".to_string());
                 stale.push(Skip::of(
@@ -1895,6 +1919,24 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_id_list_selects_nothing() {
+        // A scan that found nothing stores no rows; its selection must be empty, not "every
+        // channel in scope".
+        let world = world();
+        for selection in [
+            Selection {
+                channel_ids: Some(Vec::new()),
+                ..Selection::default()
+            },
+            Selection::from_scan_rows(&[], &scope()),
+        ] {
+            let plan = plan_ops(&world, &selection, &[Op::ClearEpg]).expect("plan");
+            assert!(plan.selected.is_empty(), "{selection:?}");
+            assert!(plan.changes.is_empty());
+        }
+    }
+
+    #[test]
     fn an_explicit_id_selection_reports_what_it_cannot_touch() {
         let mut fixture = world();
         fixture.channels.retain(|channel| channel.id != 4);
@@ -1902,7 +1944,7 @@ mod tests {
         scoped.groups = "Sports".to_string();
 
         let selection = Selection {
-            channel_ids: vec![1, 3, 20],
+            channel_ids: Some(vec![1, 3, 20]),
             ..Selection::in_scope(&scoped)
         };
         let plan = plan_ops(&fixture, &selection, &[Op::ClearEpg]).expect("plans");
@@ -2096,7 +2138,7 @@ mod tests {
         let plan = plan_with_options(
             &world(),
             &Selection {
-                channel_ids: vec![2],
+                channel_ids: Some(vec![2]),
                 ..Selection::default()
             },
             &[
@@ -2125,7 +2167,7 @@ mod tests {
         let plan = plan_ops(
             &world(),
             &Selection {
-                channel_ids: vec![1],
+                channel_ids: Some(vec![1]),
                 ..Selection::default()
             },
             &[
@@ -2151,7 +2193,7 @@ mod tests {
         let plan = plan_ops(
             &world(),
             &Selection {
-                channel_ids: vec![4],
+                channel_ids: Some(vec![4]),
                 ..Selection::default()
             },
             &[Op::Rename {
@@ -2183,7 +2225,7 @@ mod tests {
         let plan = plan_ops(
             &world(),
             &Selection {
-                channel_ids: vec![1, 3],
+                channel_ids: Some(vec![1, 3]),
                 ..Selection::default()
             },
             &[Op::MoveGroup { group_id: 20 }],
@@ -2225,7 +2267,7 @@ mod tests {
         let plan = plan_ops(
             &world(),
             &Selection {
-                channel_ids: vec![1, 3],
+                channel_ids: Some(vec![1, 3]),
                 ..Selection::default()
             },
             &[Op::SetMembership {
@@ -2250,7 +2292,7 @@ mod tests {
         let plan = plan_ops(
             &world(),
             &Selection {
-                channel_ids: vec![1],
+                channel_ids: Some(vec![1]),
                 ..Selection::default()
             },
             &[Op::SetHiddenFromOutput { hidden: true }],
@@ -2265,7 +2307,7 @@ mod tests {
         let plan = plan_ops(
             &fixture,
             &Selection {
-                channel_ids: vec![1],
+                channel_ids: Some(vec![1]),
                 ..Selection::default()
             },
             &[Op::SetHiddenFromOutput { hidden: true }],
@@ -2280,7 +2322,7 @@ mod tests {
         let plan = plan_ops(
             &world(),
             &Selection {
-                channel_ids: vec![1],
+                channel_ids: Some(vec![1]),
                 ..Selection::default()
             },
             &[Op::ClearEpg],
@@ -2302,7 +2344,7 @@ mod tests {
         let plan = plan_ops(
             &fixture,
             &Selection {
-                channel_ids: vec![1],
+                channel_ids: Some(vec![1]),
                 ..Selection::default()
             },
             &[Op::ClearEpg],
@@ -2347,7 +2389,7 @@ mod tests {
         let error = plan_ops(
             &fixture,
             &Selection {
-                channel_ids: vec![1],
+                channel_ids: Some(vec![1]),
                 ..Selection::default()
             },
             &[Op::Rename {
@@ -2436,7 +2478,7 @@ mod tests {
         let plan = plan_ops(
             &world(),
             &Selection {
-                channel_ids: vec![1, 4],
+                channel_ids: Some(vec![1, 4]),
                 ..Selection::default()
             },
             &[
@@ -2496,7 +2538,7 @@ mod tests {
         let plan = plan_ops(
             &world(),
             &Selection {
-                channel_ids: vec![1],
+                channel_ids: Some(vec![1]),
                 ..Selection::default()
             },
             &[
@@ -2576,7 +2618,7 @@ mod tests {
         let plan = plan_ops(
             &world(),
             &Selection {
-                channel_ids: vec![1, 3],
+                channel_ids: Some(vec![1, 3]),
                 ..Selection::default()
             },
             &[
@@ -2621,7 +2663,7 @@ mod tests {
         let plan = plan_ops(
             &world(),
             &Selection {
-                channel_ids: vec![1],
+                channel_ids: Some(vec![1]),
                 ..Selection::default()
             },
             &[Op::ClearEpg],
@@ -2662,7 +2704,7 @@ mod tests {
         let plan = plan_ops(
             &world(),
             &Selection {
-                channel_ids: vec![1, 2],
+                channel_ids: Some(vec![1, 2]),
                 ..Selection::default()
             },
             &[Op::Rename {

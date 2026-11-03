@@ -277,16 +277,30 @@ impl Store {
                     params![chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)],
                 )?;
             }
+            add_run_row_columns(connection)?;
+            // Before the index below: the rename turns `janitor` rows into `guide` rows, and
+            // must not be the statement that trips over it.
+            rename_recorded_history(connection)?;
             // One live run per app, across processes: the in-memory busy map stops two runs
             // in THIS process, but the CLI is another process on the same file. A partial
             // index (no extra row when nothing is running), created after the retire above
             // so a restarted daemon never trips on its own stale rows.
-            connection.execute_batch(
+            let index = connection.execute_batch(
                 "CREATE UNIQUE INDEX IF NOT EXISTS runs_one_running_per_app ON runs(app) WHERE \
                  status = 'running'",
-            )?;
-            add_run_row_columns(connection)?;
-            rename_recorded_history(connection)?;
+            );
+            match index {
+                Ok(()) => {}
+                // A database from before the index can hold two stale `running` rows for one
+                // app (a crash while the CLI and the daemon both ran it). Only the daemon may
+                // retire them, so a shared open goes without the index until then; the CLI
+                // still refuses to start over a `running` row (`running_runs`).
+                Err(error) if !retire_running => tracing::warn!(
+                    "the one-run-per-app index cannot be created until the daemon retires \
+                     stale running rows: {error}"
+                ),
+                Err(error) => return Err(error.into()),
+            }
             Ok(())
         })
     }
@@ -1261,5 +1275,79 @@ mod tests {
         let store = Store::open(&path).expect("reopen again");
         assert_eq!(store.recent_runs_for("janitor", 10).expect("runs").len(), 1);
         assert_eq!(store.recent_runs_for("guide", 10).expect("runs").len(), 4);
+    }
+
+    /// The schema exactly as v0.1.0 (`e74a3ad`) created it: no channel-operation columns, no
+    /// one-run-per-app index, `user_version` 0.
+    const V0_1_0_SCHEMA: &str = "
+        CREATE TABLE runs (id INTEGER PRIMARY KEY AUTOINCREMENT, app TEXT NOT NULL,
+            action TEXT NOT NULL, dry_run INTEGER NOT NULL, started_at TEXT NOT NULL,
+            finished_at TEXT, status TEXT NOT NULL, summary TEXT,
+            counts TEXT NOT NULL DEFAULT '{}', report_path TEXT);
+        CREATE INDEX runs_started ON runs(started_at DESC);
+        CREATE INDEX runs_app ON runs(app, started_at DESC);
+        CREATE TABLE run_rows (run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+            ordinal INTEGER NOT NULL, channel_id INTEGER NOT NULL, channel_name TEXT NOT NULL,
+            channel_group TEXT NOT NULL DEFAULT '', channel_number REAL, current_epg_name TEXT,
+            epg_data_id INTEGER, epg_name TEXT, epg_source TEXT,
+            score INTEGER NOT NULL DEFAULT 0, method TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '', ai_decision TEXT,
+            PRIMARY KEY (run_id, ordinal));
+        CREATE INDEX run_rows_channel ON run_rows(run_id, channel_id);
+        CREATE TABLE ai_decisions (run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+            row_ordinal INTEGER NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,
+            latency_ms INTEGER NOT NULL DEFAULT 0, input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0, request TEXT NOT NULL DEFAULT '{}',
+            response TEXT NOT NULL DEFAULT '{}', PRIMARY KEY (run_id, row_ordinal));
+        CREATE TABLE settings_history (id INTEGER PRIMARY KEY AUTOINCREMENT, app TEXT NOT NULL,
+            changed_at TEXT NOT NULL, settings TEXT NOT NULL);
+    ";
+
+    #[test]
+    fn a_v0_1_0_database_with_stale_running_rows_upgrades_from_either_process() {
+        // v0.1.0 had no cross-process guard, so a crash with the CLI and the daemon both on
+        // janitor can leave two `running` rows for it. The CLI opening first must still work
+        // (it cannot create the index yet), and the daemon's open must retire, rename and
+        // index in one go.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("crosstalk.db");
+        {
+            let connection = Connection::open(&path).expect("open");
+            connection
+                .execute_batch(V0_1_0_SCHEMA)
+                .expect("v0.1.0 schema");
+            for action in ["automatch_apply", "heal_apply"] {
+                connection
+                    .execute(
+                        "INSERT INTO runs (app, action, dry_run, started_at, status) \
+                         VALUES ('janitor', ?1, 0, '2026-10-30T00:00:00Z', 'running')",
+                        params![action],
+                    )
+                    .expect("stale run");
+            }
+            connection
+                .execute(
+                    "INSERT INTO run_rows (run_id, ordinal, channel_id, channel_name) \
+                     VALUES (1, 0, 7, 'ESPN')",
+                    [],
+                )
+                .expect("old row");
+        }
+
+        let shared = Store::open_shared(&path).expect("the CLI opens a v0.1.0 database");
+        // Renamed, and still running: only the daemon may retire them.
+        assert_eq!(shared.running_runs("guide").expect("running").len(), 2);
+        assert_eq!(shared.rows(1).expect("rows")[0].field, "");
+        drop(shared);
+
+        let store = Store::open(&path).expect("the daemon opens it");
+        assert!(store.running_runs("guide").expect("running").is_empty());
+        let runs = store.recent_runs_for("guide", 10).expect("runs");
+        assert!(runs.iter().any(|run| run.action == "match_apply"));
+        // The index exists now: a second live run for the app is refused.
+        store
+            .start_run("guide", "scan", true)
+            .expect("first live run");
+        assert!(store.start_run("guide", "scan", true).is_err());
     }
 }
