@@ -107,8 +107,9 @@ Two files, split by who owns the option:
   - `[ai.verify]` — when a borderline match is worth asking a model about, and how its answer
     is read. The endpoints and keys stay under `[ai.providers]` in the same file.
 - **`guide.toml`** (sub-app): what is genuinely the guide's own — the EPG sources to match,
-  the check window, the auto-match and heal confidence thresholds, and the heal fallback
-  sources.
+  the check window, the auto-match and heal confidence thresholds, the heal fallback sources,
+  the cleanup suffix and REGEX, and the watchdog's threshold, timeout, exclude list and
+  recovery logging.
 
 The split is a clean break: `guide.toml` rejects the old `channel_profile_name`,
 `selected_groups`, `ignore_groups`, `csv_retention_days` and `[ai]` keys, and the error says
@@ -155,6 +156,8 @@ no daemon restart (a run already in progress finishes with the settings it start
 | `clear_by_regex_apply` | **red** | Unassign the guide where its name matches the REGEX, within `[scope]` |
 | `clear_groups_preview` | blue | Show every channel in `[scope] groups` that would lose its guide |
 | `clear_groups_apply` | **red** | Unassign the guide of EVERY channel in `[scope] groups` |
+| `watchdog_preview` | blue | Audit every active EPG source with channels mapped to it and report which are stale — errored, or with a guide ending inside `watchdog_horizon_threshold_hours`. Queues nothing |
+| `watchdog_apply` | **orange** | Refresh each stale source on Dispatcharr, then re-read it and record whether that helped (`recovered` / `still_broken`). Never renames or unassigns a channel |
 
 Button colour is the consequence, and it is the same convention the Python plugin used: blue
 reads, orange writes channel data, red can move an assignment. Orange and red always confirm.
@@ -166,6 +169,17 @@ because each one re-reads every channel's current name and guide before writing,
 scan can only be out of date — never double-tagged, and never clearing a guide that was
 reassigned since. Their confirmation text is static, so the run summary, the log and the CSV
 preamble name the scan run and how many channels it found.
+
+The watchdog has no on/off switch and no interval setting: it is an action, so a schedule is
+its interval (`"guide.watchdog_apply" = "0 */6 * * *"`, and a schedule naming the preview half
+stays a preview). It refreshes sources **one at a time**, waiting for each, because a refresh is
+a full XMLTV fetch and parse on Dispatcharr's Celery worker; a wait that lapses is reported as
+"did not settle" rather than as a failed refresh. Staleness itself costs one request per source —
+"does programme data reach `now + threshold`?" — and only a source the run is about to refresh
+pays for more: a bisection back to 1970 answers both "carries no guide at all" (two requests, and
+such a source is never refreshed, as in the plugin) and "when exactly does it end" (~28 indexed
+counts: the cutoff probe, the 1970 probe, its re-probe inside the bracket and ~25 bisection
+steps — because the report and the recovered/still-broken rule both need the value).
 
 ## AI verification
 
@@ -224,7 +238,8 @@ the probabilities and the latency.
 ```toml
 # crosstalk.toml
 [schedules]
-"guide.scan" = "0 */6 * * *"
+"guide.watchdog_apply" = "0 */6 * * *"
+"guide.scan" = "30 */6 * * *"
 "guide.match_apply" = "0 4 * * *"
 "guide.heal_apply" = "0 6 * * *"
 "guide.clear_missing_apply" = "30 6 * * *"
@@ -337,6 +352,23 @@ whose guide changed since the scan (with the reason in the CSV).
 query and cannot fail per channel; over REST one can. A channel the scan could not check is
 left out of the result set (counted as `unchecked` in the summary and the CSV), so the cleanup
 actions can neither tag nor clear it.
+- **The watchdog is scheduled, not enabled**: the plugin's `watchdog_enabled` and
+`watchdog_check_interval_hours` are gone in favour of `[schedules]`, and the plugin's single
+button became `watchdog_preview` / `watchdog_apply`. The apply is **orange** rather than the
+plugin's green: it queues refreshes on Dispatcharr, which is a write.
+- **A queued refresh is waited for, with a timeout**: the plugin's refresh ran inline, so it had
+nothing to wait for. crosstalk polls the source for `watchdog_refresh_timeout_minutes` and
+reports a wait that lapsed as "did not settle" rather than as a failed refresh.
+- **"Has mapped channels" comes from the channel list**, not from the server-side
+`has_channels` annotation: channel → its own EPG entry → that entry's source is exactly the
+plugin's ORM query, and it costs no request.
+- **A recovery is a log line and a run row**, not a Dispatcharr System Event, which crosstalk
+has none of. `watchdog_log_on_recovery` keeps the same meaning. A re-read that fails counts as
+"no improvement" where the plugin distinguished a vanished source from a database error.
+- **The watchdog wants an administrator's API key**: the programme search only returns rows
+on guide data a channel the key's user can reach is mapped to, so a lesser key reads some
+sources short or empty — and its refresh POSTs answer 403. The run warns in the summary when
+the key is not an administrator's; the plugin, running as Django, never had a key at all.
 
 ## Development
 
@@ -359,7 +391,7 @@ strict-parity and what is deliberately Rust-native.
 ```
 crates/crosstalk-matching   pure, IO-free matcher: normalisation, similarity, callsigns, pipeline
 crates/crosstalk-core       host: config, sub-app trait, Dispatcharr client, AI, store, runner, CSV
-crates/guide                the guide sub-app: scope, matching, heal, AI gate, settings
+crates/guide                the guide sub-app: scope, matching, heal, cleanup presets, watchdog
 crates/crosstalk-web        axum + Askama UI and JSON API
 crates/crosstalk            the binary: CLI, registry, daemon
 data/                       embedded channel databases, FCC callsigns, aliases

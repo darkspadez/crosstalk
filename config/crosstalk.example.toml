@@ -142,5 +142,7 @@ run_history_days = 15
 # Schedules, as `<app>.<action>` with a cron expression. Five fields (minute hour day month
 # weekday) is what most people write, and six (with seconds) is accepted. They fire in UTC.
 # [schedules]
+# "guide.watchdog_apply" = "0 */6 * * *"
+# "guide.scan" = "30 */6 * * *"
 # "guide.match_apply" = "0 4 * * *"
 # "guide.heal_apply" = "0 6 * * *"

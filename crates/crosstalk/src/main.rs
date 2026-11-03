@@ -427,6 +427,7 @@ fn preview_counterpart(action: &str) -> Option<&'static str> {
         "clear_hidden_apply" => Some("clear_hidden_preview"),
         "clear_by_regex_apply" => Some("clear_by_regex_preview"),
         "clear_groups_apply" => Some("clear_groups_preview"),
+        "watchdog_apply" => Some("watchdog_preview"),
         _ => None,
     }
 }
@@ -768,6 +769,7 @@ mod tests {
             "clear_hidden_apply",
             "clear_by_regex_apply",
             "clear_groups_apply",
+            "watchdog_apply",
             "match_apply",
             "heal_apply",
         ] {
@@ -783,6 +785,7 @@ mod tests {
             "clear_hidden_preview",
             "clear_by_regex_preview",
             "clear_groups_preview",
+            "watchdog_preview",
         ] {
             assert!(
                 runner.scheduled_dry_run("guide", action),

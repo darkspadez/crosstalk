@@ -39,6 +39,19 @@ pub struct GuideSettings {
     pub remove_epg_with_suffix: bool,
     /// The pattern `clear_by_regex` matches against the assigned guide's NAME.
     pub epg_regex_to_remove: String,
+    /// A guide ending inside this many hours counts as stale for the watchdog. The plugin's
+    /// `watchdog_horizon_threshold_hours`.
+    pub watchdog_horizon_threshold_hours: u32,
+    /// Comma-separated EPG source ids the watchdog must never touch. The plugin's
+    /// `watchdog_exclude_source_ids`.
+    pub watchdog_exclude_source_ids: String,
+    /// Log every recovery. A failure is always logged. The plugin's
+    /// `watchdog_log_on_recovery`.
+    pub watchdog_log_on_recovery: bool,
+    /// How long the watchdog waits for a queued refresh to move a source. Crosstalk-only: the
+    /// plugin's refresh ran inline in the Celery task it was already in, so it had nothing to
+    /// wait for. `0` requests the refresh and does not wait.
+    pub watchdog_refresh_timeout_minutes: u32,
 }
 
 impl Default for GuideSettings {
@@ -55,6 +68,12 @@ impl Default for GuideSettings {
             bad_epg_suffix: " [BadEPG]".to_string(),
             remove_epg_with_suffix: false,
             epg_regex_to_remove: String::new(),
+            // The plugin's shipped defaults, minus the two the schedule replaces
+            // (`watchdog_enabled` and `watchdog_check_interval_hours`).
+            watchdog_horizon_threshold_hours: 12,
+            watchdog_exclude_source_ids: String::new(),
+            watchdog_log_on_recovery: true,
+            watchdog_refresh_timeout_minutes: 10,
         }
     }
 }
@@ -113,6 +132,7 @@ pub const SECTION_SCOPE: &str = "_section_scope";
 pub const SECTION_MATCH: &str = "_section_match";
 pub const SECTION_HEAL: &str = "_section_heal";
 pub const SECTION_CLEANUP: &str = "_section_cleanup";
+pub const SECTION_WATCHDOG: &str = "_section_watchdog";
 
 /// The settings form.
 pub fn schema() -> SettingsSchema {
@@ -250,6 +270,61 @@ pub fn schema() -> SettingsSchema {
             "When on, 'Add Bad EPG Suffix to Channels' also strips each tagged channel's EPG \
              assignment in the same pass.",
         ),
+        FieldSpec::section(
+            SECTION_WATCHDOG,
+            "EPG Freshness Watchdog",
+            "Audits every active EPG source that has channels mapped to it and refreshes the ones \
+             that are errored or whose guide is about to run dry, then records whether that \
+             helped. It never touches a channel. There is no on/off switch and no interval here: \
+             arm it with a schedule instead, e.g. \"guide.watchdog_apply\" = \"0 */6 * * *\" in \
+             crosstalk.toml, and remember a schedule naming watchdog_preview stays a preview.",
+        ),
+        FieldSpec::new(
+            "watchdog_horizon_threshold_hours",
+            SECTION_WATCHDOG,
+            "Refresh When Guide Ends Within (Hours)",
+            FieldKind::Number,
+            FieldValue::Number(12.0),
+        )
+        .with_help(
+            "If a source's newest programme ends within this many hours, refresh it now. At \
+             least 1: 0 would make every guide stale. An outcome is judged by RELATIVE \
+             improvement, so a feed that legitimately ends sooner than this is not reported \
+             broken for ever.",
+        ),
+        FieldSpec::new(
+            "watchdog_refresh_timeout_minutes",
+            SECTION_WATCHDOG,
+            "Refresh Timeout (Minutes)",
+            FieldKind::Number,
+            FieldValue::Number(10.0),
+        )
+        .with_help(
+            "How long to wait for a queued refresh to move a source before giving up on the \
+             wait. A large XMLTV fetch and parse takes minutes. 0 requests the refresh and does \
+             not wait (the row then says the refresh did not settle).",
+        ),
+        FieldSpec::new(
+            "watchdog_exclude_source_ids",
+            SECTION_WATCHDOG,
+            "Excluded EPG Source IDs",
+            FieldKind::Text,
+            FieldValue::Text(String::new()),
+        )
+        .with_placeholder("e.g. 39, 21")
+        .with_help("Comma-separated EPGSource IDs the watchdog must never touch."),
+        FieldSpec::new(
+            "watchdog_log_on_recovery",
+            SECTION_WATCHDOG,
+            "Log Every Recovery",
+            FieldKind::Boolean,
+            FieldValue::Boolean(true),
+        )
+        .with_help(
+            "Write a log line when the watchdog fixes a source. A failure is always logged, and \
+             every source gets a row in the report either way. The plugin called this 'Log a \
+             System Event On Self-Heal'; crosstalk has no Dispatcharr System Events.",
+        ),
     ])
 }
 
@@ -292,6 +367,22 @@ pub fn to_values(settings: &GuideSettings) -> SettingsValues {
         "epg_regex_to_remove",
         FieldValue::Text(settings.epg_regex_to_remove.clone()),
     );
+    values.insert(
+        "watchdog_horizon_threshold_hours",
+        FieldValue::Number(f64::from(settings.watchdog_horizon_threshold_hours)),
+    );
+    values.insert(
+        "watchdog_exclude_source_ids",
+        FieldValue::Text(settings.watchdog_exclude_source_ids.clone()),
+    );
+    values.insert(
+        "watchdog_log_on_recovery",
+        FieldValue::Boolean(settings.watchdog_log_on_recovery),
+    );
+    values.insert(
+        "watchdog_refresh_timeout_minutes",
+        FieldValue::Number(f64::from(settings.watchdog_refresh_timeout_minutes)),
+    );
     values
 }
 
@@ -309,11 +400,26 @@ pub fn apply_values(settings: &mut GuideSettings, values: &SettingsValues) -> Re
     if let Some(text) = values.text("epg_regex_to_remove") {
         settings.epg_regex_to_remove = text.to_string();
     }
+    if let Some(text) = values.text("watchdog_exclude_source_ids") {
+        settings.watchdog_exclude_source_ids = text.to_string();
+    }
     if let Some(value) = values.bool("remove_epg_with_suffix") {
         settings.remove_epg_with_suffix = value;
     }
+    if let Some(value) = values.bool("watchdog_log_on_recovery") {
+        settings.watchdog_log_on_recovery = value;
+    }
     if let Some(number) = values.number("check_hours") {
         settings.check_hours = whole_number("check_hours", number, 0, 8_760)?;
+    }
+    if let Some(number) = values.number("watchdog_horizon_threshold_hours") {
+        // Floor 1: the plugin's `_INT_FLOORS`, because 0 would make every guide stale.
+        settings.watchdog_horizon_threshold_hours =
+            whole_number("watchdog_horizon_threshold_hours", number, 1, 8_760)?;
+    }
+    if let Some(number) = values.number("watchdog_refresh_timeout_minutes") {
+        settings.watchdog_refresh_timeout_minutes =
+            whole_number("watchdog_refresh_timeout_minutes", number, 0, 1_440)?;
     }
     if let Some(number) = values.number("match_confidence_threshold") {
         settings.match_confidence_threshold = crosstalk_core::subapp::clamp_u8(number)?;
@@ -448,6 +554,52 @@ mod tests {
     }
 
     #[test]
+    fn the_watchdog_defaults_are_the_plugins_minus_the_schedule() {
+        // plugin.json: watchdog_horizon_threshold_hours 12, exclude list empty, log on recovery
+        // on. `watchdog_enabled` and `watchdog_check_interval_hours` are gone: a schedule is the
+        // interval, and a schedule naming the preview half stays a preview.
+        let settings = GuideSettings::default();
+        assert_eq!(settings.watchdog_horizon_threshold_hours, 12);
+        assert_eq!(settings.watchdog_exclude_source_ids, "");
+        assert!(settings.watchdog_log_on_recovery);
+        // Crosstalk-only: the plugin's refresh ran inline, so it waited for nothing.
+        assert_eq!(settings.watchdog_refresh_timeout_minutes, 10);
+
+        // Schema defaults agree with the struct's, or the form would show one value and save
+        // another.
+        let schema = schema();
+        for (id, default) in [
+            ("watchdog_horizon_threshold_hours", FieldValue::Number(12.0)),
+            ("watchdog_refresh_timeout_minutes", FieldValue::Number(10.0)),
+            (
+                "watchdog_exclude_source_ids",
+                FieldValue::Text(String::new()),
+            ),
+            ("watchdog_log_on_recovery", FieldValue::Boolean(true)),
+        ] {
+            assert_eq!(schema.field(id).expect("field").default, default, "{id}");
+        }
+        assert!(schema.field("watchdog_enabled").is_none());
+        assert!(schema.field("watchdog_check_interval_hours").is_none());
+    }
+
+    #[test]
+    fn the_watchdog_threshold_floors_at_one() {
+        // The plugin's `_INT_FLOORS`: 0 would make every guide stale. The form refuses it, and
+        // a hand-edited file is floored by the run rather than honoured.
+        let mut settings = GuideSettings::default();
+        let mut values = SettingsValues::new();
+        values.insert("watchdog_horizon_threshold_hours", FieldValue::Number(0.0));
+        assert!(apply_values(&mut settings, &values).is_err());
+
+        // 0 minutes is allowed: request the refresh and do not wait for it.
+        let mut values = SettingsValues::new();
+        values.insert("watchdog_refresh_timeout_minutes", FieldValue::Number(0.0));
+        apply_values(&mut settings, &values).expect("0 minutes is a valid choice");
+        assert_eq!(settings.watchdog_refresh_timeout_minutes, 0);
+    }
+
+    #[test]
     fn the_bad_epg_suffix_keeps_its_leading_space_through_a_save() {
         // The suffix is appended verbatim, so a save that trimmed it would rename channels to
         // `ESPN[BadEPG]`.
@@ -473,6 +625,10 @@ mod tests {
             bad_epg_suffix: " (no guide)".to_string(),
             remove_epg_with_suffix: true,
             epg_regex_to_remove: "^XYZ_".to_string(),
+            watchdog_horizon_threshold_hours: 24,
+            watchdog_exclude_source_ids: "39, 21".to_string(),
+            watchdog_log_on_recovery: false,
+            watchdog_refresh_timeout_minutes: 5,
         };
         let values = to_values(&settings);
         for field in schema().editable() {

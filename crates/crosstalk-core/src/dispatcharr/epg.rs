@@ -364,12 +364,19 @@ impl DispatcharrClient {
         Ok(())
     }
 
-    /// Poll a source until its refresh moves it, or `timeout` lapses.
+    /// Poll a source until its refresh settles, or `timeout` lapses.
     ///
-    /// A refresh writes two things: `status` (`fetching` → `parsing` → `success`/`error`) and,
-    /// only on success, `updated_at`. So "changed" means either field moved since `before` —
-    /// a failed refresh moves the status alone, and waiting for `updated_at` would then wait
-    /// out the whole timeout.
+    /// A refresh moves through `fetching` → `parsing` → `success`/`error`, and only the last
+    /// step is the answer: returning on the first movement would hand the caller a source
+    /// mid-flight, whose horizon has no settled value to read (upstream models this the same
+    /// way with `_NON_TERMINAL_REFRESH_STATUSES`). So this waits until the status leaves
+    /// `fetching`/`parsing` AND the state differs from `before`, or the timeout lapses.
+    ///
+    /// A refresh writes two things: `status` and, only on success, `updated_at`. So "changed"
+    /// means either field moved since `before` — a failed refresh moves the status alone, and
+    /// waiting for `updated_at` would then wait out the whole timeout. A refresh that ran and
+    /// failed back to the same status still counts as changed when a mid-flight status was
+    /// observed, so a fast error is not reported as "did not settle".
     ///
     /// `cancelled` is checked between polls, so an operator's cancel lands within one interval
     /// rather than after the refresh finishes; it returns the repo's usual "cancelled by the
@@ -383,12 +390,18 @@ impl DispatcharrClient {
         cancelled: impl Fn() -> bool,
     ) -> Result<EpgRefresh> {
         let started = std::time::Instant::now();
+        // Whether a mid-flight status was observed. A refresh that ran and failed back to
+        // the status it started from leaves no other trace, so this is what distinguishes
+        // "ran and failed" from "never ran" at the timeout.
+        let mut saw_mid_flight = false;
         loop {
             if cancelled() {
                 bail!("cancelled by the operator");
             }
             let state = self.epg_source_state(source_id).await?;
-            if state.changed_since(before) {
+            let mid_flight = matches!(state.status.as_str(), "fetching" | "parsing");
+            saw_mid_flight |= mid_flight;
+            if !mid_flight && (state.changed_since(before) || saw_mid_flight) {
                 return Ok(EpgRefresh::Changed(state));
             }
             let elapsed = started.elapsed();

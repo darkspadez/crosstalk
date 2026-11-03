@@ -6,13 +6,15 @@
 //! the EPG reason wording, and the write itself.
 //!
 //! Two families of actions, and both are ports: the matching ones (`match_*`, `heal_*`) assign
-//! a guide, and the cleanup ones (`scan`, then `tag_missing_*`, `clear_missing_*`,
-//! `clear_hidden_*`, `clear_by_regex_*`, `clear_groups_*`) remove or mark a guide that carries
-//! no programme data. The cleanup half is a preset over `crosstalk-core`'s channel operations:
+//! a guide, and the maintenance ones manage a guide that is missing or about to run dry —
+//! the cleanup presets (`scan`, then `tag_missing_*`, `clear_missing_*`, `clear_hidden_*`,
+//! `clear_by_regex_*`, `clear_groups_*`) remove or mark a guide that carries no programme data,
+//! and the watchdog (`watchdog_preview`, `watchdog_apply`) refreshes the EPG sources whose guide
+//! is about to expire. The cleanup half is a preset over `crosstalk-core`'s channel operations:
 //! it selects, it plans, and the two writes it can issue are a rename and a guide clear. The
-//! plugin's freshness watchdog is still out of scope for this version, as is its anonymous
-//! usage counter, and `clear exports` is not an action here but a host feature: one button and
-//! one command delete every sub-app's own reports, so each app does not carry its own copy.
+//! plugin's anonymous usage counter is still out of scope, and `clear exports` is not an action
+//! here but a host feature: one button and one command delete every sub-app's own reports, so
+//! each app does not carry its own copy.
 
 pub mod cleanup;
 pub mod heal;
@@ -22,6 +24,7 @@ pub mod scope;
 pub mod settings;
 #[cfg(test)]
 mod test_support;
+pub mod watchdog;
 
 use anyhow::{bail, Result};
 use crosstalk_core::jobs::JobContext;
@@ -53,6 +56,9 @@ pub const ACTION_CLEAR_BY_REGEX_PREVIEW: &str = "clear_by_regex_preview";
 pub const ACTION_CLEAR_BY_REGEX_APPLY: &str = "clear_by_regex_apply";
 pub const ACTION_CLEAR_GROUPS_PREVIEW: &str = "clear_groups_preview";
 pub const ACTION_CLEAR_GROUPS_APPLY: &str = "clear_groups_apply";
+/// The freshness watchdog: audit every active source, refresh the stale ones.
+pub const ACTION_WATCHDOG_PREVIEW: &str = "watchdog_preview";
+pub const ACTION_WATCHDOG_APPLY: &str = "watchdog_apply";
 
 /// The sub-app itself.
 #[derive(Debug, Default)]
@@ -235,6 +241,30 @@ impl SubApp for GuideApp {
                 "This permanently removes EPG assignments from EVERY channel in the [scope] \
                  groups. This cannot be undone. Continue?",
             ),
+            ActionSpec::new(
+                ACTION_WATCHDOG_PREVIEW,
+                "EPG Freshness Watchdog (Dry Run)",
+                "Audit every active EPG source that has channels mapped to it and report which \
+                 ones are stale — errored, or with a guide ending inside the threshold. Queues \
+                 nothing.",
+                ActionKind::Read,
+            ),
+            ActionSpec::new(
+                ACTION_WATCHDOG_APPLY,
+                "EPG Freshness Watchdog (Apply)",
+                "Refresh every active EPG source that is errored or whose guide ends inside the \
+                 threshold, then re-read it and record whether the refresh helped. Never \
+                 renames or unassigns a channel.",
+                // Orange: it writes guide data, and removes no channel assignment. The plugin
+                // painted this button green because it touched no channel, but it does queue
+                // refreshes on Dispatcharr, which is a write.
+                ActionKind::Write,
+            )
+            .with_confirm(
+                "This queues a refresh on Dispatcharr for every stale EPG source — an XMLTV \
+                 fetch and parse on its Celery worker — and waits for each one. It changes no \
+                 channel name and removes no EPG assignment. Continue?",
+            ),
         ]
     }
 
@@ -341,6 +371,8 @@ impl GuideApp {
                 self.cleanup(context, cleanup::Cleanup::ClearGroups, dry_run)
                     .await
             }
+            ACTION_WATCHDOG_PREVIEW => self.watchdog(context, true).await,
+            ACTION_WATCHDOG_APPLY => self.watchdog(context, dry_run).await,
             other => bail!("{APP_NAME} has no action {other:?}"),
         }
     }
@@ -367,6 +399,12 @@ impl GuideApp {
     ) -> Result<JobOutcome> {
         let settings = self.checked_settings(context)?;
         cleanup::run(self, context, &settings, action, dry_run).await
+    }
+
+    /// The freshness watchdog: preview (audit only) or apply (audit and refresh).
+    async fn watchdog(&self, context: &JobContext, dry_run: bool) -> Result<JobOutcome> {
+        let settings = self.checked_settings(context)?;
+        watchdog::run(self, context, &settings, dry_run).await
     }
 
     /// This app's settings plus the shared ones a run depends on.
@@ -561,10 +599,12 @@ mod tests {
                 ACTION_CLEAR_BY_REGEX_APPLY,
                 ACTION_CLEAR_GROUPS_PREVIEW,
                 ACTION_CLEAR_GROUPS_APPLY,
+                ACTION_WATCHDOG_PREVIEW,
+                ACTION_WATCHDOG_APPLY,
             ]
         );
-        // The watchdog is still out of scope for this version, and the plugin's CSV housekeeping
-        // is a host feature rather than an action.
+        // The plugin's own ids are never copied, and its CSV housekeeping is a host feature
+        // rather than an action.
         assert!(!ids.contains(&"watchdog_run_check_now"));
         assert!(!ids.contains(&"clear_csv_exports"));
     }
@@ -687,6 +727,38 @@ mod tests {
         assert_eq!(kind(ACTION_CLEAR_HIDDEN_APPLY), ActionKind::Destructive);
         assert_eq!(kind(ACTION_CLEAR_BY_REGEX_APPLY), ActionKind::Destructive);
         assert_eq!(kind(ACTION_CLEAR_GROUPS_APPLY), ActionKind::Destructive);
+        // The watchdog queues refreshes on Dispatcharr but touches no channel: orange, where
+        // the plugin painted its button green for the same reason.
+        assert_eq!(kind(ACTION_WATCHDOG_PREVIEW), ActionKind::Read);
+        assert_eq!(kind(ACTION_WATCHDOG_APPLY), ActionKind::Write);
+    }
+
+    #[test]
+    fn the_watchdog_apply_confirms_and_touches_no_channel() {
+        let actions = app().actions();
+        let apply = actions
+            .iter()
+            .find(|action| action.id == ACTION_WATCHDOG_APPLY)
+            .expect("action");
+        // Orange and red always confirm, so the operator sees that refreshes are queued.
+        assert_eq!(apply.kind, ActionKind::Write);
+        assert!(apply.kind.requires_confirmation());
+        assert!(apply.confirm.is_some());
+        assert!(apply.needs_dispatcharr);
+        // Orange is "writes data, removes no assignment": the watchdog queues refreshes and
+        // never touches a channel.
+        assert!(apply.kind.touches_channels());
+        assert!(apply
+            .confirm
+            .unwrap_or_default()
+            .contains("changes no channel name"));
+
+        let preview = actions
+            .iter()
+            .find(|action| action.id == ACTION_WATCHDOG_PREVIEW)
+            .expect("action");
+        assert_eq!(preview.kind, ActionKind::Read);
+        assert!(preview.confirm.is_none());
     }
 
     #[test]

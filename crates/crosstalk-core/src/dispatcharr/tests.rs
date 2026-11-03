@@ -1610,6 +1610,49 @@ async fn a_refresh_poll_reports_the_state_that_moved() {
 }
 
 #[tokio::test]
+async fn a_refresh_poll_waits_past_mid_flight_for_the_settled_state() {
+    // The regression this pins: the first movement is `fetching`, and returning it would hand
+    // the watchdog a source with no settled horizon to read — every healthy refresh would
+    // classify `still_broken`. The poll must wait for the terminal state instead.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/epg/sources/9/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": 9,
+            "status": "fetching",
+            "updated_at": null
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/epg/sources/9/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": 9,
+            "status": "success",
+            "updated_at": "2026-07-17T12:00:00Z"
+        })))
+        .mount(&server)
+        .await;
+
+    let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+    let before = EpgSourceState {
+        id: 9,
+        status: "success".to_string(),
+        updated_at: None,
+        last_message: None,
+    };
+    let outcome = client
+        .await_epg_refresh(9, &before, Duration::from_secs(30), || false)
+        .await
+        .expect("polled");
+    match outcome {
+        EpgRefresh::Changed(state) => assert_eq!(state.status, "success"),
+        other => panic!("expected the settled state, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn a_refresh_poll_gives_up_at_the_timeout() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

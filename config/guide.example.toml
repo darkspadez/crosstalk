@@ -51,3 +51,34 @@ remove_epg_with_suffix = false
 # `clear_groups_*` and `clear_hidden_*` take their channel set from [scope] in crosstalk.toml:
 # `groups` (clear_groups refuses to run when it is empty, which the plugin treated as "every
 # channel") and `profiles` (clear_hidden needs the profiles whose disabled channels it clears).
+
+# --- EPG Freshness Watchdog -------------------------------------------------------------
+#
+# Dispatcharr's own EPG refresh has no retry and no freshness awareness, so a source that
+# fails, or whose guide simply runs out, stays broken until somebody notices. The watchdog
+# audits every active source that has channels mapped to it and refreshes the ones that are
+# errored or about to run dry, then re-reads them and records whether that helped. It never
+# touches a channel.
+#
+# `watchdog_preview` reports what would be refreshed; `watchdog_apply` refreshes. There is no
+# on/off switch and no interval: arm it with a schedule in crosstalk.toml instead, e.g.
+#   [schedules]
+#   "guide.watchdog_apply" = "0 */6 * * *"
+# A schedule naming the preview half stays a preview. Use an administrator's API key: with a
+# lesser key the programme search only returns rows on guide data a reachable channel is
+# mapped to, so sources read short or empty (and refresh POSTs answer 403).
+
+# A source whose newest programme ends within this many hours is refreshed now. At least 1:
+# 0 would make every guide stale. The outcome of a refresh is judged by RELATIVE improvement
+# (the error cleared, or the horizon moved forward), so a feed that legitimately ends sooner
+# than this is not reported "still broken" for ever.
+watchdog_horizon_threshold_hours = 12
+# How long to wait for a queued refresh to move a source. A large XMLTV fetch and parse takes
+# minutes; the waits are sequential, one source at a time, so Dispatcharr's Celery worker is
+# never asked to fetch several guides at once. 0 requests the refresh and does not wait.
+watchdog_refresh_timeout_minutes = 10
+# Comma-separated EPGSource ids the watchdog must never touch, e.g. "39, 21".
+watchdog_exclude_source_ids = ""
+# Log every recovery. A failure is always logged, and every source gets a row in the report
+# either way. (The plugin wrote a Dispatcharr System Event here; crosstalk has none.)
+watchdog_log_on_recovery = true

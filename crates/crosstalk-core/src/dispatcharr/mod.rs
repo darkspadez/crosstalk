@@ -26,7 +26,7 @@
 //!     create are in the same class (a retry duplicates rows).
 //!   * the EPG import endpoint only queues a Celery task and answers 202, so a refresh is
 //!     "requested", never "done"; [`DispatcharrClient::await_epg_refresh`] polls the source's
-//!     own `status`/`updated_at` until it moves.
+//!     own `status`/`updated_at` until it settles out of `fetching`/`parsing`.
 //!
 //! Reads need a standard user; every write here is behind `IsAdmin` upstream, so a run that
 //! writes needs an administrator's key.
