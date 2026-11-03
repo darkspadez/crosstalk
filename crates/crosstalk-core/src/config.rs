@@ -338,6 +338,7 @@ impl MatchingConfig {
             ignore_regional: self.ignore_regional_tags,
             ignore_geographic: self.ignore_geographic_tags,
             ignore_misc: self.ignore_misc_tags,
+            ..crosstalk_matching::normalize::NormalizeFlags::default()
         }
     }
 
@@ -350,6 +351,7 @@ impl MatchingConfig {
             flags: self.normalize_flags(),
             databases: self.databases(),
             custom_aliases: self.custom_aliases.clone(),
+            alias_country: None,
         }
     }
 

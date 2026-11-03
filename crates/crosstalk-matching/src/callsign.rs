@@ -223,6 +223,9 @@ struct Ladder {
     end_of_name: Regex,
     /// Priority 5: any callsign-shaped word.
     any_word: Regex,
+    /// `matching_core.py`'s OTA branding context: a channel number after a denylisted
+    /// callsign (`KING 5`, `WAVE 3`, `WOOD TV8`, `WHO 13`).
+    ota_number_context: Regex,
 }
 
 fn ladder() -> &'static Ladder {
@@ -253,6 +256,7 @@ fn ladder() -> &'static Ladder {
             ),
             end_of_name: ci(r"\b([KW][A-Z]{2,4}(?:-(?:TV|CD|LP|DT|LD))?)\s*(?:\.[a-z]+)?\s*$"),
             any_word: ci(r"\b([KW][A-Z]{2,4}(?:-(?:TV|CD|LP|DT|LD))?)\b"),
+            ota_number_context: ci(r"^\s+(?:TV|DT|CD|LP|LD)?\s*\d{1,3}\b"),
         }
     })
 }
@@ -273,6 +277,21 @@ fn group1(caps: &fancy_regex::Captures<'_>, index: usize) -> Option<String> {
     caps.get(index).map(|m| m.as_str().to_uppercase())
 }
 
+/// Which callsign ladder a profile extracts with.
+///
+/// Both plugins share `matching_core.py`'s denylist and its shape tests, but EPG Janitor
+/// overrides the ladder in its own `fuzzy_matcher.py`: it adds a
+/// `CALLSIGN (NETWORK)` priority, while the shared core (which Stream-Mapparr runs
+/// unchanged) rescues a denylisted word only when an OTA channel number follows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CallsignLadder {
+    /// EPG Janitor's five-priority ladder (the plugin's override).
+    #[default]
+    EpgJanitor,
+    /// `matching_core.py`'s four-priority ladder, which Stream-Mapparr runs.
+    SharedCore,
+}
+
 /// Extract a US callsign and say how confident the position makes it.
 ///
 /// High confidence means priorities 1-4: parentheses, a parenthesised suffix, a leading
@@ -286,6 +305,15 @@ fn group1(caps: &fancy_regex::Captures<'_>, index: usize) -> Option<String> {
 pub fn extract_callsign_with_confidence(
     channel_name: &str,
     known: &KnownCallsigns,
+) -> (Option<String>, bool) {
+    extract_callsign_with_confidence_for(channel_name, known, CallsignLadder::EpgJanitor)
+}
+
+/// [`extract_callsign_with_confidence`] for an explicit ladder.
+pub fn extract_callsign_with_confidence_for(
+    channel_name: &str,
+    known: &KnownCallsigns,
+    ladder_kind: CallsignLadder,
 ) -> (Option<String>, bool) {
     let l = ladder();
     let name = l.strip_d_prefix.replace(channel_name, "").into_owned();
@@ -318,12 +346,15 @@ pub fn extract_callsign_with_confidence(
         }
     }
 
-    // Priority 3: leading `CALLSIGN (NETWORK)`, gated on the allowlist.
-    if let Ok(Some(caps)) = l.leading_network.captures(&name) {
-        let base = caps.get(2).map(|m| m.as_str().to_uppercase());
-        if base.as_deref().is_some_and(|b| known.contains(b)) {
-            if let Some(full) = group1(&caps, 1) {
-                return (Some(full), true);
+    if ladder_kind == CallsignLadder::EpgJanitor {
+        // Priority 3: leading `CALLSIGN (NETWORK)`, gated on the allowlist. EPG Janitor's
+        // own priority; the shared core has no equivalent.
+        if let Ok(Some(caps)) = l.leading_network.captures(&name) {
+            let base = caps.get(2).map(|m| m.as_str().to_uppercase());
+            if base.as_deref().is_some_and(|b| known.contains(b)) {
+                if let Some(full) = group1(&caps, 1) {
+                    return (Some(full), true);
+                }
             }
         }
     }
@@ -338,11 +369,23 @@ pub fn extract_callsign_with_confidence(
         }
     }
 
-    // Priority 5: any callsign-shaped word. Low confidence by construction.
+    // Priority 5 (the core's Priority 4): any callsign-shaped word. Low confidence by
+    // construction. The shared core additionally rescues a denylisted-but-real station
+    // here when an OTA channel number follows it (`KING 5`, `WOOD TV8`); EPG Janitor does
+    // not, which is a real difference between the two ladders.
     if let Ok(Some(caps)) = l.any_word.captures(&name) {
+        let matched = caps.get(0);
         if let Some(callsign) = group1(&caps, 1) {
             if !denied(&callsign) {
                 return (Some(callsign), false);
+            }
+            if ladder_kind == CallsignLadder::SharedCore && known.contains(&callsign) {
+                if let Some(matched) = matched {
+                    let rest = &name[matched.end()..];
+                    if let Ok(true) = ladder().ota_number_context.is_match(rest) {
+                        return (Some(callsign), false);
+                    }
+                }
             }
         }
     }
@@ -353,6 +396,15 @@ pub fn extract_callsign_with_confidence(
 /// The callsign alone, discarding the confidence flag.
 pub fn extract_callsign(channel_name: &str, known: &KnownCallsigns) -> Option<String> {
     extract_callsign_with_confidence(channel_name, known).0
+}
+
+/// [`extract_callsign`] for an explicit ladder.
+pub fn extract_callsign_for(
+    channel_name: &str,
+    known: &KnownCallsigns,
+    ladder_kind: CallsignLadder,
+) -> Option<String> {
+    extract_callsign_with_confidence_for(channel_name, known, ladder_kind).0
 }
 
 /// Remove the broadcast suffix (`-TV`, `-CD`, `-LP`, `-DT`, `-LD`) from a callsign.

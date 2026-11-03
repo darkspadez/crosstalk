@@ -16,29 +16,45 @@
 //! have programme data?). That check is IO, so it is not here: this module returns the
 //! ranked candidates and the caller walks them, which is the same order the plugin walks.
 
-use crate::alias::AliasMap;
+use crate::alias::{fold_alias_key, AliasMap};
 use crate::callsign::{
-    extract_callsign_with_confidence, extract_location, network_keyword, normalize_callsign,
-    KnownCallsigns, Location,
+    extract_callsign_with_confidence_for, extract_location, network_keyword, normalize_callsign,
+    CallsignLadder, KnownCallsigns, Location,
 };
 use crate::normalize::{NormalizeFlags, Normalizer};
 use crate::pyre::{py_split_whitespace, pythonize};
 use crate::similarity::{calculate_similarity_chars, length_scaled_threshold};
-use crate::tokens::{has_token_overlap, is_digit, process_string_for_matching, trailing_number};
+use crate::tokens::{
+    designator_tokens, has_token_overlap, is_digit, process_string_for_matching, trailing_number,
+};
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
-/// Tunables that are identical to the plugin's constants. Kept in one struct so a future
-/// opt-in behaviour change is additive rather than a rewrite.
+/// The knobs a profile sets on the one engine.
+///
+/// The threshold is a constant in both plugins. The two flags exist because the plugins
+/// disagree in ways that are not a different threshold, and each names the plugin that
+/// needs it so a future reader can tell an option from a tunable.
 #[derive(Debug, Clone, Copy)]
 pub struct MatchOptions {
-    /// `FUZZY_MATCH_THRESHOLD` in the plugin, 85. Scores below this are dropped.
+    /// `FUZZY_MATCH_THRESHOLD` in both plugins, 85. Scores below this are dropped.
     pub match_threshold: u8,
+    /// Which callsign ladder to extract with. Stream-Mapparr runs `matching_core.py`'s
+    /// four-priority ladder; EPG Janitor overrides it with a fifth priority for
+    /// `CALLSIGN (NETWORK)`.
+    pub callsign_ladder: CallsignLadder,
+    /// Stream-Mapparr folds alias keys (trimmed, case-folded) before the fallback lookup,
+    /// so a custom entry survives a capitalisation or whitespace difference. EPG Janitor's
+    /// `alias_match` looks the trimmed name up verbatim and has no folded fallback.
+    pub fold_alias_keys: bool,
 }
 
 impl Default for MatchOptions {
     fn default() -> Self {
         Self {
             match_threshold: 85,
+            callsign_ladder: CallsignLadder::EpgJanitor,
+            fold_alias_keys: false,
         }
     }
 }
@@ -192,6 +208,15 @@ impl Scored {
     }
 }
 
+/// Stream-Mapparr's best-single-match answer: its `fuzzy_match` triple.
+#[derive(Debug, Clone)]
+pub struct BestMatch {
+    /// Position in the [`CandidateIndex`].
+    pub index: usize,
+    pub score: u8,
+    pub method: MatchMethod,
+}
+
 /// The candidate side of the match, normalised once and shared read-only.
 #[derive(Debug)]
 pub struct CandidateIndex {
@@ -212,6 +237,9 @@ pub struct CandidateIndex {
     is_shift: Vec<bool>,
     /// Digit tokens of the normalized name, precomputed for the digit-token guard.
     digit_tokens: Vec<Vec<String>>,
+    /// Designator tokens of the normalized name (Stream-Mapparr's guard reads these
+    /// instead of digit-only tokens, so `f1` counts and `1` is only part of it).
+    designator_tokens: Vec<Vec<String>>,
     /// Index of the first candidate carrying this name. The plugin keys its results by
     /// NAME, so a duplicate name can only ever produce one entry; this is that key.
     first_of_name: Vec<usize>,
@@ -258,7 +286,22 @@ impl CandidateIndex {
     /// QUERY is normalised with the caller's tag set. Reproducing that asymmetry matters,
     /// because a tag such as the literal word `quality` is stripped from the query but not
     /// from the candidates.
-    pub fn build(names: &[String], normalizer: &Normalizer, known: &KnownCallsigns) -> Self {
+    pub fn build(names: &[String], matcher: &Matcher) -> Self {
+        Self::build_with(
+            names,
+            matcher.normalizer(),
+            matcher.known(),
+            matcher.options().callsign_ladder,
+        )
+    }
+
+    fn build_with(
+        names: &[String],
+        normalizer: &Normalizer,
+        known: &KnownCallsigns,
+        callsign_ladder: CallsignLadder,
+    ) -> Self {
+        let normalizer = normalizer.without_cinemax();
         let mut index = Self {
             names: names.to_vec(),
             normalized_lower: Vec::with_capacity(names.len()),
@@ -271,6 +314,7 @@ impl CandidateIndex {
             location: Vec::with_capacity(names.len()),
             is_shift: Vec::with_capacity(names.len()),
             digit_tokens: Vec::with_capacity(names.len()),
+            designator_tokens: Vec::with_capacity(names.len()),
             first_of_name: Vec::with_capacity(names.len()),
         };
         let mut seen_names: std::collections::HashMap<String, usize> =
@@ -299,7 +343,8 @@ impl CandidateIndex {
                 index.processed_chars.push(None);
             }
 
-            let (callsign, high) = extract_callsign_with_confidence(name, known);
+            let (callsign, high) =
+                extract_callsign_with_confidence_for(name, known, callsign_ladder);
             index.callsign.push(callsign);
             index.callsign_high_confidence.push(high);
             index.location.push(extract_location(name));
@@ -314,6 +359,18 @@ impl CandidateIndex {
                             .filter(|token| is_digit(token))
                             .map(str::to_string)
                             .collect()
+                    })
+                    .unwrap_or_default(),
+            );
+            index.designator_tokens.push(
+                index
+                    .normalized_lower
+                    .last()
+                    .and_then(|entry| entry.as_deref())
+                    .map(|lowered| {
+                        designator_tokens(lowered)
+                            .into_iter()
+                            .collect::<Vec<String>>()
                     })
                     .unwrap_or_default(),
             );
@@ -393,6 +450,9 @@ pub struct Matcher {
     alias_map: AliasMap,
     known: Arc<KnownCallsigns>,
     options: MatchOptions,
+    /// The case-folded alias view, built once when the profile asks for it. Empty for
+    /// EPG Janitor, whose lookup is verbatim.
+    folded_aliases: HashMap<String, Vec<String>>,
 }
 
 impl Matcher {
@@ -402,11 +462,17 @@ impl Matcher {
         known: Arc<KnownCallsigns>,
         options: MatchOptions,
     ) -> Self {
+        let folded_aliases = if options.fold_alias_keys {
+            alias_map.folded_index()
+        } else {
+            HashMap::new()
+        };
         Self {
             normalizer: Normalizer::new(flags),
             alias_map,
             known,
             options,
+            folded_aliases,
         }
     }
 
@@ -550,6 +616,323 @@ impl Matcher {
         matches
     }
 
+    /// Stage 0, Stream-Mapparr's exact-normalised alias lookup.
+    ///
+    /// Returns the candidates whose normalized form (spaced OR punctuation-stripped)
+    /// exactly equals an alias variant of the query. Pure: no fuzzy similarity, unlike
+    /// EPG Janitor's `alias_match` above, because Stream-Mapparr runs exact aliases as
+    /// its own stage and leaves the score to the fuzzy stages.
+    ///
+    /// The lookup is verbatim first (`alias_map.get(query)`), then case-folded with
+    /// surrounding whitespace stripped, which is what makes a hand-edited alias survive
+    /// `MS Now` vs `  ms now `. A candidate that normalises to one character still counts:
+    /// exact equality is not fuzzy scoring, so `Three` -> `3` can equal its alias.
+    pub fn alias_lookup(
+        &self,
+        query: &str,
+        index: &CandidateIndex,
+        user_ignored_tags: &[&str],
+    ) -> Vec<usize> {
+        let exact = self.alias_map.aliases_for_exact(query);
+        let variants: &[String] = if exact.is_empty() {
+            self.folded_aliases
+                .get(&fold_alias_key(query))
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+        } else {
+            exact
+        };
+        if variants.is_empty() || index.is_empty() {
+            return Vec::new();
+        }
+
+        // `alias_lookup` never passes `remove_cinemax`, on either side.
+        let normalizer = self.normalizer.without_cinemax();
+        let mut alias_low: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut alias_nospace: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for variant in variants {
+            let normalized = normalizer.normalize_name(variant, user_ignored_tags);
+            if normalized.is_empty() {
+                continue;
+            }
+            let lowered = lower(&normalized);
+            alias_nospace.insert(nospace(&lowered));
+            alias_low.insert(lowered);
+        }
+        if alias_low.is_empty() {
+            return Vec::new();
+        }
+
+        let mut hits = Vec::new();
+        for candidate in 0..index.len() {
+            let fallback: (String, String);
+            let (low, no_space): (&str, &str) = match index.normalized(candidate) {
+                Some(pair) => pair,
+                None => {
+                    // The index drops names shorter than two characters, which fuzzy
+                    // scoring cannot use. An alias hit is exact equality, so a name that
+                    // cleans to `3` can still equal its alias.
+                    let normalized =
+                        normalizer.normalize_name(index.name(candidate), user_ignored_tags);
+                    if normalized.is_empty() {
+                        continue;
+                    }
+                    let lowered = lower(&normalized);
+                    let stripped = nospace(&lowered);
+                    fallback = (lowered, stripped);
+                    (fallback.0.as_str(), fallback.1.as_str())
+                }
+            };
+            if alias_low.contains(low) || alias_nospace.contains(no_space) {
+                hits.push(candidate);
+            }
+        }
+        hits
+    }
+
+    /// Stream-Mapparr's `fuzzy_match`: THE winning name, its score and the stage that won.
+    ///
+    /// Three stages, in order, each returning at most one candidate:
+    ///
+    ///   1. exact after normalisation (space/punctuation insensitive), or >= 97% on the
+    ///      literal normalised strings;
+    ///   2. substring, with a 0.75 length-ratio floor;
+    ///   3. token-sort Levenshtein.
+    ///
+    /// It is not EPG Janitor's `fuzzy_match` (not ported: Janitor's pipeline calls
+    /// `match_all_streams` instead). The differences are real and reproduced here rather
+    /// than behind flags because this function exists for Stream-Mapparr's collector:
+    ///
+    ///   * the numeric guard compares DESIGNATOR tokens (`1`, `f1`, `tf1`), not digits, so
+    ///     a rejoined `F1` is seen to disagree with `UHD 1`;
+    ///   * stage 2 does not require the majority token-overlap guard, and stage 3 has
+    ///     neither that guard nor the length-scaled threshold — only the base threshold;
+    ///   * an exact hit at stage 1 returns immediately, in candidate order.
+    ///
+    /// `remove_cinemax` is accepted for signature parity with the plugin and then
+    /// ignored, exactly as the plugin ignores it: the query is normalised without it
+    /// (`plugin.py` cleans the channel name without the flag) and every cached
+    /// candidate was precomputed without it, so no stage can observe it. A query of
+    /// `Cinemax` still matches a candidate `Cinemax` here, as it does there.
+    pub fn fuzzy_match(
+        &self,
+        query: &str,
+        index: &CandidateIndex,
+        user_ignored_tags: &[&str],
+        remove_cinemax: bool,
+    ) -> Option<BestMatch> {
+        let _ = remove_cinemax;
+        if index.is_empty() {
+            return None;
+        }
+        let query_normalizer = self.normalizer.without_cinemax();
+        let normalized_query = query_normalizer.normalize_name(query, user_ignored_tags);
+        if normalized_query.is_empty() {
+            return None;
+        }
+        let query_designators = designator_tokens(&normalized_query);
+        let query_lower = lower(&normalized_query);
+        let query_nospace = nospace(&query_lower);
+        let query_lower_chars: Vec<char> = query_lower.chars().collect();
+        let threshold_ratio = f64::from(self.options.match_threshold) / 100.0;
+
+        let keeps = |candidate: usize| -> bool {
+            if query_designators.is_empty() {
+                return true;
+            }
+            match index.normalized(candidate) {
+                Some(_) => {
+                    let candidate_designators = &index.designator_tokens[candidate];
+                    !candidate_designators.is_empty()
+                        && candidate_designators
+                            .iter()
+                            .any(|token| query_designators.contains(token))
+                }
+                None => true,
+            }
+        };
+
+        // Stage 1: exact after normalisation, then 97% on the literal forms.
+        let mut best: Option<(usize, f64)> = None;
+        for candidate in 0..index.len() {
+            let Some((_, candidate_nospace)) = index.normalized(candidate) else {
+                continue;
+            };
+            if !keeps(candidate) {
+                continue;
+            }
+            if query_nospace == candidate_nospace {
+                return Some(BestMatch {
+                    index: candidate,
+                    score: 100,
+                    method: MatchMethod::Exact,
+                });
+            }
+            let Some(candidate_chars) = index.normalized_chars(candidate) else {
+                continue;
+            };
+            let ratio = calculate_similarity_chars(&query_lower_chars, candidate_chars, 0.97);
+            if ratio >= 0.97 && best.is_none_or(|(_, best_ratio)| ratio > best_ratio) {
+                best = Some((candidate, ratio));
+            }
+        }
+        if let Some((candidate, ratio)) = best {
+            return Some(BestMatch {
+                index: candidate,
+                score: (ratio * 100.0) as u8,
+                method: MatchMethod::Exact,
+            });
+        }
+
+        // Stage 2: substring, with a length-ratio floor.
+        let mut best: Option<(usize, f64)> = None;
+        for candidate in 0..index.len() {
+            let Some((candidate_lower, _)) = index.normalized(candidate) else {
+                continue;
+            };
+            if !keeps(candidate) {
+                continue;
+            }
+            if !(candidate_lower.contains(&query_lower) || query_lower.contains(candidate_lower)) {
+                continue;
+            }
+            let candidate_chars = index.normalized_chars(candidate).unwrap_or(&[]);
+            let shorter = query_lower_chars.len().min(candidate_chars.len());
+            let longer = query_lower_chars.len().max(candidate_chars.len());
+            if longer == 0 {
+                continue;
+            }
+            let length_ratio = shorter as f64 / longer as f64;
+            if length_ratio < 0.75 {
+                continue;
+            }
+            let ratio =
+                calculate_similarity_chars(&query_lower_chars, candidate_chars, threshold_ratio);
+            if best.is_none_or(|(_, best_ratio)| ratio > best_ratio) {
+                best = Some((candidate, ratio));
+            }
+        }
+        if let Some((candidate, ratio)) = best {
+            let score = (ratio * 100.0) as u8;
+            if score >= self.options.match_threshold {
+                return Some(BestMatch {
+                    index: candidate,
+                    score,
+                    method: MatchMethod::Substring,
+                });
+            }
+        }
+
+        // Stage 3: token-sort Levenshtein.
+        let processed_query = process_string_for_matching(&normalized_query);
+        let processed_query_chars: Vec<char> = processed_query.chars().collect();
+        let mut best: Option<(usize, f64)> = None;
+        for candidate in 0..index.len() {
+            if !keeps(candidate) {
+                continue;
+            }
+            if index.processed(candidate).is_none() {
+                continue;
+            }
+            let candidate_chars = index.processed_char_list(candidate).unwrap_or(&[]);
+            let ratio = calculate_similarity_chars(
+                &processed_query_chars,
+                candidate_chars,
+                threshold_ratio,
+            );
+            if best.is_none_or(|(_, best_ratio)| ratio > best_ratio) {
+                best = Some((candidate, ratio));
+            }
+        }
+        let (candidate, ratio) = best?;
+        let score = (ratio * 100.0) as u8;
+        if score >= self.options.match_threshold {
+            return Some(BestMatch {
+                index: candidate,
+                score,
+                method: MatchMethod::Fuzzy(score),
+            });
+        }
+        None
+    }
+
+    /// Stream-Mapparr's `find_best_match`: the best token-sort score alone.
+    ///
+    /// No exact or substring stage and no majority token-overlap guard — just the
+    /// normalised-and-sorted Levenshtein ratio against every candidate, with the same
+    /// designator guard. Stream-Mapparr uses it for category lookup, where a single score
+    /// is all it needs; the parity sweep uses it to pin `calculate_similarity` behaviour
+    /// on normalised strings separately from the three-stage picker.
+    /// `remove_cinemax` reaches only the uncached-candidate fallback below, mirroring
+    /// the plugin: the query is normalised without it and cached candidates were
+    /// precomputed without it, so only a name the index did not precompute (under two
+    /// characters once normalised) is normalised on the fly with the call's flag.
+    pub fn find_best_match(
+        &self,
+        query: &str,
+        index: &CandidateIndex,
+        user_ignored_tags: &[&str],
+        remove_cinemax: bool,
+    ) -> Option<(usize, u8)> {
+        if index.is_empty() {
+            return None;
+        }
+        let query_normalizer = self.normalizer.without_cinemax();
+        let normalized_query = query_normalizer.normalize_name(query, user_ignored_tags);
+        if normalized_query.is_empty() {
+            return None;
+        }
+        let query_designators = designator_tokens(&normalized_query);
+        let processed_query = process_string_for_matching(&normalized_query);
+        let threshold_ratio = f64::from(self.options.match_threshold) / 100.0;
+
+        let mut best_score = -1.0;
+        let mut best: Option<usize> = None;
+        for candidate in 0..index.len() {
+            if !query_designators.is_empty() && index.normalized(candidate).is_some() {
+                let candidate_designators = &index.designator_tokens[candidate];
+                if candidate_designators.is_empty()
+                    || !candidate_designators
+                        .iter()
+                        .any(|token| query_designators.contains(token))
+                {
+                    continue;
+                }
+            }
+            let fallback: String;
+            let processed_candidate: &str = match index.processed(candidate) {
+                Some(processed) => processed,
+                None => {
+                    let normalized = self
+                        .normalizer
+                        .with_remove_cinemax(remove_cinemax)
+                        .normalize_name(index.name(candidate), user_ignored_tags);
+                    if normalized.chars().count() < 2 {
+                        continue;
+                    }
+                    fallback = process_string_for_matching(&normalized);
+                    &fallback
+                }
+            };
+            let score = crate::similarity::calculate_similarity_cutoff(
+                &processed_query,
+                processed_candidate,
+                threshold_ratio,
+            );
+            if score > best_score {
+                best_score = score;
+                best = Some(candidate);
+            }
+        }
+        let candidate = best?;
+        let percentage = (best_score * 100.0) as i64;
+        if percentage >= i64::from(self.options.match_threshold) {
+            Some((candidate, percentage as u8))
+        } else {
+            None
+        }
+    }
+
     /// Every match, including ones below the threshold.
     ///
     /// Exists so the parity sweep can compare the whole ranking against the Python
@@ -595,7 +978,7 @@ impl Matcher {
         }
 
         let (query_callsign, query_high_confidence) =
-            extract_callsign_with_confidence(query, &self.known);
+            extract_callsign_with_confidence_for(query, &self.known, self.options.callsign_ladder);
         let query_callsign_normalized = query_callsign.as_deref().map(normalize_callsign);
         let mut callsign_anchored: std::collections::HashSet<usize> =
             std::collections::HashSet::new();
@@ -899,7 +1282,11 @@ impl Matcher {
         user_ignored_tags: &[&str],
         exclude: Option<usize>,
     ) -> Vec<Scored> {
-        let (channel_callsign, _) = extract_callsign_with_confidence(channel_name, &self.known);
+        let (channel_callsign, _) = extract_callsign_with_confidence_for(
+            channel_name,
+            &self.known,
+            self.options.callsign_ladder,
+        );
         let channel_location = extract_location(channel_name);
         let channel_network = network_keyword(channel_name);
 
@@ -1063,7 +1450,7 @@ mod tests {
 
     fn index_for(matcher: &Matcher, names: &[&str]) -> CandidateIndex {
         let owned: Vec<String> = names.iter().map(|n| n.to_string()).collect();
-        CandidateIndex::build(&owned, matcher.normalizer(), matcher.known())
+        CandidateIndex::build(&owned, matcher)
     }
 
     fn best(matcher: &Matcher, query: &str, names: &[&str]) -> Option<(usize, u8, String)> {
@@ -1281,5 +1668,119 @@ mod tests {
     fn low_scores_are_dropped() {
         let m = matcher();
         assert!(best(&m, "HBO", &["WeatherNation"]).is_none());
+    }
+
+    fn stream_mapparr() -> Matcher {
+        Matcher::for_profile(crate::profile::MatchProfile::StreamMapparr)
+    }
+
+    #[test]
+    fn stream_mapparr_best_match_reports_the_winning_stage() {
+        let m = stream_mapparr();
+        let index = index_for(&m, &["ESPN", "ESPN2", "Fox Sports 1"]);
+        let best = m.fuzzy_match("ESPN HD", &index, &[], false).expect("exact");
+        assert_eq!(index.name(best.index), "ESPN");
+        assert_eq!(best.score, 100);
+        assert_eq!(best.method, MatchMethod::Exact);
+
+        // A substring hit reports substring...
+        let index = index_for(&m, &["ESPN Deporte"]);
+        let best = m
+            .fuzzy_match("ESPN Deportes", &index, &[], false)
+            .expect("substring");
+        assert_eq!(best.method, MatchMethod::Substring);
+        // ...and a reordered name is only reachable by the token-sort stage.
+        let index = index_for(&m, &["Racing Sky Sports"]);
+        let best = m
+            .fuzzy_match("Sky Sports Racing", &index, &[], false)
+            .expect("fuzzy");
+        assert!(
+            matches!(best.method, MatchMethod::Fuzzy(_)),
+            "{:?}",
+            best.method
+        );
+
+        // No match at all.
+        let index = index_for(&m, &["WeatherNation"]);
+        assert!(m.fuzzy_match("ESPN", &index, &[], false).is_none());
+    }
+
+    #[test]
+    fn stream_mapparr_keeps_designators_whole_and_refuses_numbered_siblings() {
+        let m = stream_mapparr();
+        // The designator repair keeps `F1` as one token...
+        assert_eq!(m.normalize("Sky Sports F1 UHD", &[]), "Sky Sports F1");
+        // ...and the designator guard then refuses the sibling, which the raw similarity
+        // alone would have accepted (0.923 > 0.85).
+        let index = index_for(&m, &["Sky Sports UHD 1"]);
+        assert!(m
+            .fuzzy_match("Sky Sports F1 UHD", &index, &[], false)
+            .is_none());
+        // A real designator still matches its own stream.
+        let index = index_for(&m, &["Sky Sports F1 UHD"]);
+        assert!(m
+            .fuzzy_match("Sky Sports F1 UHD", &index, &[], false)
+            .is_some());
+    }
+
+    #[test]
+    fn stream_mapparr_alias_lookup_is_exact_and_folds_keys() {
+        let m = stream_mapparr();
+        let names = vec![
+            "MS Now".to_string(),
+            "MSNBC".to_string(),
+            "TWC".to_string(),
+            "Weather Channel".to_string(),
+        ];
+        let index = CandidateIndex::build(&names, &m);
+        let hits = m.alias_lookup("MSNBC", &index, &[]);
+        // `MSNBC` is itself a variant of its own entry, so both the canonical name and the
+        // alias hit; a fuzzy near-miss below does not.
+        assert_eq!(
+            hits.iter().map(|i| index.name(*i)).collect::<Vec<_>>(),
+            vec!["MS Now", "MSNBC"]
+        );
+        // A key differing only in case or surrounding whitespace still resolves.
+        for query in ["msnbc", "  msnbc ", "MSNBC "] {
+            assert_eq!(m.alias_lookup(query, &index, &[]), hits, "{query:?}");
+        }
+        // No fuzzy stage: a near-miss alias is not a hit.
+        assert!(m.alias_lookup("Weather Chanel", &index, &[]).is_empty());
+    }
+
+    #[test]
+    fn stream_mapparr_find_best_match_is_score_only() {
+        let m = stream_mapparr();
+        let index = index_for(&m, &["ESPN", "Fox Sports 1"]);
+        let (candidate, score) = m
+            .find_best_match("ESPN HD", &index, &[], false)
+            .expect("match");
+        assert_eq!(index.name(candidate), "ESPN");
+        assert_eq!(score, 100);
+        // Below threshold: no answer, not a low-scored one.
+        let index = index_for(&m, &["WeatherNation"]);
+        assert!(m.find_best_match("ESPN", &index, &[], false).is_none());
+    }
+
+    #[test]
+    fn stream_mapparr_cinemax_flag_never_strips_the_query() {
+        // `plugin.py` sets `remove_cinemax` from the channel name but cleans the
+        // channel itself without it; only uncached candidates can observe it. A query
+        // of `Cinemax` therefore still matches a candidate `Cinemax` either way, as
+        // the plugin's `fuzzy_match`/`find_best_match` do.
+        let m = stream_mapparr();
+        let index = index_for(&m, &["Cinemax", "MoreMax", "HBO"]);
+        for remove_cinemax in [false, true] {
+            let best = m
+                .fuzzy_match("Cinemax", &index, &[], remove_cinemax)
+                .expect("exact");
+            assert_eq!(index.name(best.index), "Cinemax");
+            assert_eq!(best.score, 100);
+            let (candidate, score) = m
+                .find_best_match("Cinemax", &index, &[], remove_cinemax)
+                .expect("match");
+            assert_eq!(index.name(candidate), "Cinemax");
+            assert_eq!(score, 100);
+        }
     }
 }

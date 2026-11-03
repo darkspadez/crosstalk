@@ -170,7 +170,7 @@ pub fn simulate(
     matcher: &Matcher,
     user_ignored_tags: &[&str],
 ) -> PerStream {
-    let index = CandidateIndex::build(stream_names, matcher.normalizer(), matcher.known());
+    let index = CandidateIndex::build(stream_names, matcher);
 
     // Score every channel in parallel (P4): matching is pure, so each channel's ranked
     // list is independent. The merge below stays serial in channel-iteration order, which
@@ -315,6 +315,7 @@ pub fn run(options: &SimulateOptions) -> Result<PathBuf> {
         Arc::new(merged),
         MatchOptions {
             match_threshold: options.threshold,
+            ..MatchOptions::default()
         },
     );
 

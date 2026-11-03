@@ -575,8 +575,7 @@ mod tests {
         let names = vec!["ESPN".to_string(), "CNN".to_string()];
         let index = Arc::new(CandidateIndex::build(
             &["ESPN HD".to_string(), "CNN".to_string()],
-            matcher.normalizer(),
-            matcher.known(),
+            &matcher,
         ));
         let scored = score_names(&names, Arc::clone(&matcher), index, &matcher.tags(), None)
             .await

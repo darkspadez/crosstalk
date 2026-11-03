@@ -156,11 +156,7 @@ pub async fn run(
         .map(|entry| entry.name.clone())
         .collect();
     let matcher = Arc::new(config.matching.matcher(MatchProfile::EpgJanitor));
-    let index = Arc::new(CandidateIndex::build(
-        &names,
-        matcher.normalizer(),
-        matcher.known(),
-    ));
+    let index = Arc::new(CandidateIndex::build(&names, &matcher));
 
     let total = scoped_channels.channels.len() as u64;
     context.progress(&ProgressEvent::new(

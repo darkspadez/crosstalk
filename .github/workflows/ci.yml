@@ -128,6 +128,15 @@ jobs:
         run: |
           python3 scripts/parity_sweep.py --kinds normalize,callsign,location,network --limit 300
           python3 scripts/parity_sweep.py --kinds match,score --limit 300 --pool 60
+      # Stream-Mapparr is the same engine under different flags, so it keeps its own sweep
+      # against its own fuzzy_matcher.py and country.py. The first run covers the
+      # adversarial corpus (zones, designators, alias folding, Unicode); the second walks
+      # real database names for the callsign ladder and zone/country detection, which is
+      # where its divergence from EPG Janitor shows. Both stay well under a minute.
+      - name: Stream-Mapparr sweep vs its own matcher
+        run: |
+          python3 -I scripts/parity_sweep_sm.py --limit 300
+          python3 -I scripts/parity_sweep_sm.py --kinds callsign,zone,country --limit 3000
       # Channel operations replace the plugin's five cleanup actions, so their selection and
       # payload logic is compared against the plugin's own code. -I keeps the harness from
       # importing anything outside the plugin checkout (which it puts on sys.path itself).

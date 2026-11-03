@@ -86,7 +86,12 @@ SOFTWARE.
     schema follows the plugin's field ids, labels and help text.
   - `Stream-Mapparr/*_channels.json` (AU, BR, CA, DE, DO, ES, FR, IN, MX, NL, NO, PE, PL, PT,
     UK, US) and `Stream-Mapparr/networks.json` → the embedded country channel databases and
-    the network-name table the matcher's country and network detection use.
+    the network-name table the matcher's country and network detection use. Only the files
+    that differ from the EPG Janitor copies are duplicated, under
+    `data/stream-mapparr/` (DO, PE, PL, PT, US and `networks.json`); the eleven shared
+    databases are read from `data/channels/`. `data/stream-mapparr/aliases.json` and
+    `country_aliases.json` are its `aliases.py` `CHANNEL_ALIASES` and `COUNTRY_ALIASES`
+    tables converted to JSON with the same entries.
 
 ### Reference pin
 

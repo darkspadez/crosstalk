@@ -166,6 +166,49 @@ pub fn char_len(s: &str) -> usize {
     s.chars().count()
 }
 
+/// True when a token is a channel DESIGNATOR: the part of a name that tells numbered
+/// siblings apart.
+///
+/// Digits alone (`1`, `12`) or a short stem with digits (`f1`, `e4`, `m6`, `tf1`). A word
+/// such as `sports` or `hd` is not one, and neither is a bare letter. This is
+/// Stream-Mapparr's rule (`is_designator_token` in its `fuzzy_matcher.py`): its numeric
+/// guard compares designators rather than digits, so `Sky Sports F1` and
+/// `Sky Sports UHD 1` are seen to disagree once the designator is rejoined whole.
+pub fn is_designator_token(token: &str) -> bool {
+    fn matches(token: &str) -> bool {
+        let bytes = token.as_bytes();
+        if bytes.is_empty() {
+            return false;
+        }
+        let (stem, digits) = if bytes.iter().all(u8::is_ascii_digit) {
+            ("", token)
+        } else {
+            let split = bytes
+                .iter()
+                .position(|b| b.is_ascii_digit())
+                .unwrap_or(bytes.len());
+            (&token[..split], &token[split..])
+        };
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+        if !stem.is_empty() && (stem.len() > 3 || !stem.bytes().all(|b| b.is_ascii_lowercase())) {
+            return false;
+        }
+        digits.len() <= 2
+    }
+    matches(&crate::pyre::py_trim(token).to_lowercase())
+}
+
+/// The designator tokens of a name, lowercased: Stream-Mapparr's
+/// `{t.lower() for t in name.split() if is_designator_token(t)}`.
+pub fn designator_tokens(name: &str) -> HashSet<String> {
+    crate::pyre::py_split_whitespace(name)
+        .filter(|token| is_designator_token(token))
+        .map(str::to_lowercase)
+        .collect()
+}
+
 /// Token-sort form used by the third fuzzy stage.
 ///
 /// NFKD-fold, drop combining marks, lowercase, split a letter-glued digit, keep
@@ -435,6 +478,33 @@ mod tests {
         assert!(!is_distinctive("live"));
         assert!(!is_distinctive("teen"));
         assert!(!is_distinctive("360"));
+    }
+
+    #[test]
+    fn designator_token_rules() {
+        for token in ["1", "12", "f1", "e4", "m6", "tf1", "F1", " f 1 ", "49"] {
+            // `" f 1 "` trims to `f 1`, which is not one token: spaces are not designators.
+            if token.contains(' ') {
+                assert!(!is_designator_token(token), "{token:?}");
+                continue;
+            }
+            assert!(is_designator_token(token), "{token:?}");
+        }
+        for token in ["sports", "hd", "f", "123", "tf123", "f1x", ""] {
+            assert!(!is_designator_token(token), "{token:?}");
+        }
+        assert_eq!(
+            designator_tokens("SKY SPORTS F 1 UHD")
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["1".to_string()]
+        );
+        assert_eq!(
+            designator_tokens("sky sports f1 uhd")
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["f1".to_string()]
+        );
     }
 
     #[test]

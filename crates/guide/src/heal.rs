@@ -251,11 +251,7 @@ pub async fn run(
         .iter()
         .map(|entry| entry.name.clone())
         .collect();
-    let index = Arc::new(CandidateIndex::build(
-        &names,
-        matcher.normalizer(),
-        matcher.known(),
-    ));
+    let index = Arc::new(CandidateIndex::build(&names, &matcher));
     let tags = matcher.tags();
 
     // Step 2a: score every broken channel off the async runtime (P3), through the shared
