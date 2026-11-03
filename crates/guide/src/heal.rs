@@ -439,10 +439,10 @@ pub async fn run(
     // Step 4: write the replacements that clear the threshold.
     let mut applied = 0;
     if !dry_run {
-        let associations: Vec<(i64, i64)> = rows
+        let associations: Vec<(i64, Option<i64>)> = rows
             .iter()
             .filter(|row| row.status == HealStatus::Healed)
-            .filter_map(|row| row.new_epg_id.map(|epg| (row.channel_id, epg)))
+            .filter_map(|row| row.new_epg_id.map(|epg| (row.channel_id, Some(epg))))
             .collect();
         if !associations.is_empty() {
             let plan = report
@@ -766,6 +766,7 @@ mod tests {
                 name: "Schedules Direct".to_string(),
                 is_active: true,
                 priority: 5,
+                ..EpgSource::default()
             }],
             entries: vec![
                 EpgEntry {

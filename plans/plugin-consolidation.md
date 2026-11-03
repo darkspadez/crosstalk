@@ -172,7 +172,8 @@ No bridge plugin is needed for phase 1:
 - hide/show: `PATCH /api/channels/profiles/{id}/channels/bulk-update/`
 - clear EPG: `POST /api/channels/channels/batch-set-epg/` with `epg_data_id: null` (the existing `batch_set_epg` client already chunks and retries)
 - refresh a source: `POST /api/epg/import/` `{id}` (Celery, async: poll the source's status)
-- source horizon for the watchdog: `/api/epg/programs/` filters on `end_time` exist; **verify** a cheap "latest end per source" query exists, otherwise use the read-only DB role
+- source horizon for the watchdog (checked): no "latest end per source" route exists (`/api/epg/programs/` is unfiltered and unpaginated; `/programs/search/` orders by start only). The client probes `/programs/search/?epg_source=&end_after=&page_size=1` (one request answers "horizon < now + N h") and bisects it to the minute when the exact horizon is wanted (~16 requests). No DB role needed.
+- hide/show (checked) is two different things: profile membership (`bulk-update`) and global `hidden_from_output` (channel field via `edit/bulk`). Channel ops expose both.
 
 ### Channel ops (new, `crosstalk-core/src/channel_ops.rs`)
 - `Selection`: groups (wildcards via `wildcard.rs`), profile-hidden, name regex, explicit ids
@@ -288,8 +289,8 @@ pieces each phase adds, and the cross-cutting rules below.
   resume) and per-app concurrency/rate limits for probing.
 - **Image:** `ffprobe` in the runtime image (alpine `ffmpeg` package; measure the size cost).
 - **Writes:** channel stream lists are writable over REST (`streams` on the channel serializer,
-  ordered), but one channel per request. Stream `stream_stats` is in the serializer; verify it
-  is writable. At ~21k channels/streams these are the first **bridge** candidates (bulk
+  ordered), but one channel per request. Stream `stream_stats` is writable over REST (checked: `PATCH /api/channels/streams/{id}/`, also
+  for provider streams), so bulk stats may not need the bridge. At ~21k channels/streams these are the first **bridge** candidates (bulk
   assign, bulk stats). Decide from a timed run, not up front.
 - **Probe semantics to keep exactly:** skipped is never dead; a channel is dead only if every
   stream failed.

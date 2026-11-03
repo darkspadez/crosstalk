@@ -133,6 +133,7 @@ mod tests {
             name: name.to_string(),
             is_active: enabled,
             priority: 10 - id,
+            ..EpgSource::default()
         }
     }
 

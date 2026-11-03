@@ -119,18 +119,21 @@ mod tests {
                     name: "Schedules Direct".to_string(),
                     is_active: true,
                     priority: 10,
+                    ..EpgSource::default()
                 },
                 EpgSource {
                     id: 101,
                     name: "XMLTV".to_string(),
                     is_active: true,
                     priority: 5,
+                    ..EpgSource::default()
                 },
                 EpgSource {
                     id: 102,
                     name: "Old Source".to_string(),
                     is_active: false,
                     priority: 20,
+                    ..EpgSource::default()
                 },
             ],
             entries: vec![

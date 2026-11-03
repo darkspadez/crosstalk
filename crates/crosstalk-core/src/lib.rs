@@ -30,7 +30,10 @@ pub use csv_report::{
     write_report, ClearSummary, ExportFile, Report, CLEAR_GRACE,
 };
 pub use dispatcharr::{
-    Channel, DispatcharrClient, EpgEntry, EpgSource, HasPrograms, ProgramWindow, World,
+    Channel, ChannelCreate, ChannelEdit, ChannelGroup, ChannelProfile, ChannelRegexRename,
+    DispatcharrClient, EpgEntry, EpgHorizon, EpgRefresh, EpgSource, EpgSourceEdit, EpgSourceState,
+    HasPrograms, Logo, M3uAccount, PluginActionInfo, PluginInfo, ProgramWindow, QueuedTask, Set,
+    Stream, StreamsToChannels, World, WorldKind, WorldKinds,
 };
 pub use jobs::{JobContext, ProgressEvent, ProgressSink};
 pub use runner::{ActiveRun, JobRunner, StartedRun};

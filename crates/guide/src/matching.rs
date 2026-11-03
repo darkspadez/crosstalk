@@ -504,9 +504,9 @@ pub async fn run(
 
     let mut applied = 0;
     if !dry_run {
-        let associations: Vec<(i64, i64)> = matched
+        let associations: Vec<(i64, Option<i64>)> = matched
             .iter()
-            .filter_map(|row| row.epg_data_id.map(|epg| (row.channel_id, epg)))
+            .filter_map(|row| row.epg_data_id.map(|epg| (row.channel_id, Some(epg))))
             .collect();
         if !associations.is_empty() {
             applied = client
@@ -905,6 +905,7 @@ mod tests {
                 name: "Schedules Direct".to_string(),
                 is_active: true,
                 priority: 5,
+                ..EpgSource::default()
             }],
             entries: vec![EpgEntry {
                 id: 7,
@@ -1548,6 +1549,7 @@ mod tests {
                 name: "Schedules Direct".to_string(),
                 is_active: true,
                 priority: 5,
+                ..EpgSource::default()
             }],
             entries: vec![
                 EpgEntry {
