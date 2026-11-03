@@ -431,6 +431,7 @@ fn preview_counterpart(action: &str) -> Option<&'static str> {
         "clear_by_regex_apply" => Some("clear_by_regex_preview"),
         "clear_groups_apply" => Some("clear_groups_preview"),
         "watchdog_apply" => Some("watchdog_preview"),
+        "sort_apply" => Some("sort_preview"),
         _ => None,
     }
 }

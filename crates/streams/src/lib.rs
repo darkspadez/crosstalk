@@ -8,11 +8,14 @@
 //!
 //!   * [`settings`] — `streams.toml`, whose field ids and defaults are the plugins' own;
 //!   * [`selection`] — the stream half of the scope: M3U accounts in priority order, stream
-//!     groups, and the regex rules that decide the name matching sees.
+//!     groups, and the regex rules that decide the name matching sees;
+//!   * [`quality`] — the one quality model: Stream-Mapparr's sort key and the throughput tiers
+//!     it reads, ported statement for statement;
+//!   * [`sort`] — `sort_preview` / `sort_apply`, which is what uses that model today.
 //!
-//! Matching, quality sorting, mirror, visibility, probe, triage and restore arrive in later
-//! steps, which is why [`StreamsApp::actions`] currently registers only `validate` and `status`:
-//! the layout is there, the halves that write are not.
+//! Matching, mirror, visibility, probe, triage and restore arrive in later steps, so
+//! [`StreamsApp::actions`] registers `validate`, `status` and the `sort` pair: the layout is
+//! there, the halves that write are not (all of them).
 //!
 //! What the two plugins did that a host does once, this app does not do at all: the dry-run
 //! switch is the preview half of a pair (or `--dry-run`), the schedules, windows and
@@ -20,8 +23,10 @@
 //! CSV retention is `[exports]`, the operation lock and progress files are the run store, and
 //! `view_*` / `export_results` are the run page and its CSV.
 
+pub mod quality;
 pub mod selection;
 pub mod settings;
+pub mod sort;
 #[cfg(test)]
 mod test_support;
 
@@ -39,6 +44,8 @@ pub const APP_NAME: &str = "Streams";
 /// The action ids, as used in schedules and URLs.
 pub const ACTION_VALIDATE: &str = "validate";
 pub const ACTION_STATUS: &str = "status";
+pub const ACTION_SORT_PREVIEW: &str = "sort_preview";
+pub const ACTION_SORT_APPLY: &str = "sort_apply";
 
 /// The sub-app itself.
 #[derive(Debug, Default)]
@@ -70,7 +77,7 @@ impl SubApp for StreamsApp {
     /// pair per verb — `match`, `sort`, `mirror`, `probe` (one action, it writes stream stats),
     /// `triage`, `restore`, `visibility` — then the read-only tools (`check_countries`,
     /// `scan_placeholders`, `test_rules`). A pair is declared together, so a preview can never
-    /// ship without its apply.
+    /// ship without its apply. `sort` is the first pair in place.
     fn actions(&self) -> Vec<ActionSpec> {
         vec![
             ActionSpec::new(
@@ -91,6 +98,27 @@ impl SubApp for StreamsApp {
             )
             // Reads the run store, not Dispatcharr.
             .offline(),
+            ActionSpec::new(
+                ACTION_SORT_PREVIEW,
+                "Sort Alternate Streams (Dry Run)",
+                "Order every in-scope channel's streams by the quality model (and by feed zone) \
+                 and write a CSV. Changes nothing.",
+                ActionKind::Read,
+            ),
+            ActionSpec::new(
+                ACTION_SORT_APPLY,
+                "Sort Alternate Streams (Apply)",
+                "Rewrite the stream order of every channel whose alternates would reorder, \
+                 first stream first.",
+                // Orange: it rewrites playback order, which is what decides failover. It never \
+                // removes a channel or a guide.
+                ActionKind::Write,
+            )
+            .with_confirm(
+                "This REPLACES the stream order of every channel whose alternates would reorder. \
+                 Zone routing keeps only the channel's own feed zone and can drop the other \
+                 zone's streams from its list. It removes no channel. Continue?",
+            ),
         ]
     }
 
@@ -149,14 +177,20 @@ impl StreamsApp {
         context: &JobContext,
         dry_run: bool,
     ) -> Result<JobOutcome> {
-        // No action here writes yet, so the flag has nothing to change; the pairs the later
-        // steps add are declared preview-first, and an apply handed a dry run has to honour it.
-        let _ = dry_run;
+        // Every pair is declared preview-first, and an apply handed a dry run honours it.
         match action {
             ACTION_VALIDATE => self.validate(context),
             ACTION_STATUS => Ok(self.status(context)),
+            ACTION_SORT_PREVIEW => self.sort(context, true).await,
+            ACTION_SORT_APPLY => self.sort(context, dry_run).await,
             other => bail!("{APP_NAME} has no action {other:?}"),
         }
+    }
+
+    /// Sort the in-scope channels' streams: preview (a read) or apply.
+    async fn sort(&self, context: &JobContext, dry_run: bool) -> Result<JobOutcome> {
+        let settings = self.checked_settings(context)?;
+        sort::run(self, context, &settings, dry_run).await
     }
 
     /// This app's settings, refusing the ones a run would trip over.
@@ -267,7 +301,15 @@ mod tests {
     #[test]
     fn app_declares_its_actions_in_order() {
         let ids: Vec<&str> = app().actions().iter().map(|action| action.id).collect();
-        assert_eq!(ids, vec![ACTION_VALIDATE, ACTION_STATUS]);
+        assert_eq!(
+            ids,
+            vec![
+                ACTION_VALIDATE,
+                ACTION_STATUS,
+                ACTION_SORT_PREVIEW,
+                ACTION_SORT_APPLY
+            ]
+        );
         // The plugin's own ids are never copied, and its housekeeping is a host feature.
         for retired in [
             "validate_settings",
@@ -282,15 +324,41 @@ mod tests {
     }
 
     #[test]
-    fn every_reading_action_is_offline_and_confirms_nothing() {
-        // Both actions work without Dispatcharr: `validate` has to run before the credentials
-        // are right, and `status` reads the run store.
+    fn every_reading_action_confirms_nothing() {
         for action in app().actions() {
-            assert_eq!(action.kind, ActionKind::Read, "{}", action.id);
-            assert!(!action.needs_dispatcharr, "{}", action.id);
-            assert!(action.confirm.is_none(), "{}", action.id);
+            if action.kind != ActionKind::Read {
+                continue;
+            }
             assert!(!action.kind.touches_channels(), "{}", action.id);
+            assert!(action.confirm.is_none(), "{}", action.id);
         }
+    }
+
+    #[test]
+    fn the_offline_actions_are_the_two_that_need_no_dispatcharr() {
+        // `validate` has to run before the credentials are right, and `status` reads the run
+        // store. `sort_preview` reads Dispatcharr, so it is a read that still needs it.
+        let offline: Vec<&str> = app()
+            .actions()
+            .into_iter()
+            .filter(|action| !action.needs_dispatcharr)
+            .map(|action| action.id)
+            .collect();
+        assert_eq!(offline, vec![ACTION_VALIDATE, ACTION_STATUS]);
+    }
+
+    #[test]
+    fn sort_apply_writes_and_is_confirmed() {
+        let action = app()
+            .actions()
+            .into_iter()
+            .find(|action| action.id == ACTION_SORT_APPLY)
+            .expect("the apply half of the pair");
+        assert_eq!(action.kind, ActionKind::Write);
+        assert!(action.needs_dispatcharr);
+        let confirm = action.confirm.expect("a write asks first");
+        assert!(confirm.contains("stream order"), "{confirm}");
+        assert!(confirm.contains("feed zone"), "{confirm}");
     }
 
     #[test]

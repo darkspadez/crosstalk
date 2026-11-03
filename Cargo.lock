@@ -588,7 +588,9 @@ name = "crosstalk-streams"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "crosstalk-core",
+ "crosstalk-matching",
  "regex",
  "serde",
  "serde_json",
@@ -596,6 +598,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]

@@ -142,6 +142,12 @@ jobs:
       # importing anything outside the plugin checkout (which it puts on sys.path itself).
       - name: Channel ops vs the plugin's cleanup actions
         run: python3 -I scripts/channel_ops_parity.py
+      # The streams sort is Stream-Mapparr's quality model, ported. The harness drives the
+      # plugin's REAL `_sort_streams_by_quality` / `_zone_routed_map` (with the Django stubs the
+      # plugin's own tests install) and compares the per-channel orders with
+      # `crates/streams/examples/sort_io`. ~10s over 840 cases, 1500 channels.
+      - name: Streams sort vs the plugin's quality model
+        run: python3 -I scripts/sort_parity.py
       # Informational, never failing: what upstream changed since each pinned reference
       # commit in the files crosstalk ports from it. Covers every reference submodule
       # (EPG Janitor, Stream-Mapparr, IPTV Checker), each with its own ported-file list.

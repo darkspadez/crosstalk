@@ -170,6 +170,37 @@ pub struct RunRow {
     pub after_value: Option<String>,
 }
 
+/// What crosstalk knows about one provider stream that Dispatcharr's `stream_stats` does not.
+///
+/// `stream_stats` is the shared truth for MEDIA facts (codecs, resolution, bitrates) because
+/// players and Dispatcharr itself read it. This table holds what only crosstalk uses: when the
+/// stream was last probed, how it turned out, and how fast the provider actually delivered it.
+/// It replaces Stream-Mapparr's throughput JSON file and IPTV Checker's loaded-channels file
+/// with one row per stream, so `probe` writes and `sort` reads the same evidence.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct StreamHealth {
+    pub stream_id: i64,
+    /// When the last probe finished, RFC 3339. `None` for a row written by a throughput probe
+    /// alone, which measures delivery without inspecting the media.
+    pub probed_at: Option<String>,
+    /// `alive`, `dead`, `skipped`, `blank`, `frozen`, `silent` or `placeholder`; empty when the
+    /// row only carries a throughput measurement.
+    pub class: String,
+    /// The probe's own failure wording (`Timeout`, `403 Forbidden`, ...).
+    pub error_type: Option<String>,
+    /// Measured delivery in Mbit/s. `None` means the probe measured nothing, which is never
+    /// "fresh" (see `crosstalk_streams::quality::is_probe_fresh`).
+    pub throughput_mbps: Option<f64>,
+    /// When that measurement was taken, RFC 3339. Separate from `probed_at` because a
+    /// throughput probe and a media probe are different runs.
+    pub throughput_at: Option<String>,
+    /// The host the probe finally reached, for diagnostics.
+    pub edge_ip: Option<String>,
+    /// How many probes in a row have failed. A stream that fails once and recovers does not
+    /// climb to "dead" without a run of failures.
+    pub consecutive_failures: i64,
+}
+
 /// One AI request and its answer, kept for auditing why a row was accepted.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AiDecision {
@@ -324,6 +355,20 @@ impl Store {
                     changed_at  TEXT NOT NULL,
                     --  is reserved in SQLite.
                     settings    TEXT NOT NULL
+                );
+
+                -- What crosstalk knows about a provider stream. Idempotent: the table is
+                -- created on every open and never altered, so a store from an earlier build
+                -- simply grows it. `stream_id` is Dispatcharr's, not a row of ours.
+                CREATE TABLE IF NOT EXISTS stream_health (
+                    stream_id            INTEGER PRIMARY KEY,
+                    probed_at            TEXT,
+                    class                TEXT    NOT NULL DEFAULT '',
+                    error_type           TEXT,
+                    throughput_mbps      REAL,
+                    throughput_at        TEXT,
+                    edge_ip              TEXT,
+                    consecutive_failures INTEGER NOT NULL DEFAULT 0
                 );
                 "#,
             )?;
@@ -689,6 +734,77 @@ impl Store {
         })
     }
 
+    /// Record one stream's probe outcome, replacing whatever was there.
+    ///
+    /// Written by `probe` once per stream and read by `sort`, so the row is the stream's whole
+    /// health in one place rather than a merge of old and new columns: a probe that measured
+    /// nothing must clear the previous measurement, or a stream that has been failing for hours
+    /// would keep sorting on the rate it had this morning.
+    pub fn upsert_stream_health(&self, health: &StreamHealth) -> Result<()> {
+        self.with_connection(|connection| {
+            connection.execute(
+                "INSERT INTO stream_health (stream_id, probed_at, class, error_type, \
+                 throughput_mbps, throughput_at, edge_ip, consecutive_failures) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                 ON CONFLICT(stream_id) DO UPDATE SET \
+                     probed_at = excluded.probed_at, \
+                     class = excluded.class, \
+                     error_type = excluded.error_type, \
+                     throughput_mbps = excluded.throughput_mbps, \
+                     throughput_at = excluded.throughput_at, \
+                     edge_ip = excluded.edge_ip, \
+                     consecutive_failures = excluded.consecutive_failures",
+                params![
+                    health.stream_id,
+                    health.probed_at,
+                    health.class,
+                    health.error_type,
+                    health.throughput_mbps,
+                    health.throughput_at,
+                    health.edge_ip,
+                    health.consecutive_failures,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// One stream's health, or `None` when it has never been probed.
+    pub fn stream_health(&self, stream_id: i64) -> Result<Option<StreamHealth>> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT stream_id, probed_at, class, error_type, throughput_mbps, \
+                     throughput_at, edge_ip, consecutive_failures FROM stream_health \
+                     WHERE stream_id = ?1",
+                    params![stream_id],
+                    map_stream_health,
+                )
+                .optional()
+                .map_err(Into::into)
+        })
+    }
+
+    /// Every stream's health, keyed by stream id.
+    ///
+    /// One query for a whole sort run: at ~50k streams this is a few megabytes, while a lookup
+    /// per stream inside the sort would be a query per stream.
+    pub fn stream_health_map(&self) -> Result<std::collections::HashMap<i64, StreamHealth>> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT stream_id, probed_at, class, error_type, throughput_mbps, \
+                 throughput_at, edge_ip, consecutive_failures FROM stream_health",
+            )?;
+            let rows = statement.query_map([], map_stream_health)?;
+            let mut out = std::collections::HashMap::new();
+            for row in rows {
+                let health = row?;
+                out.insert(health.stream_id, health);
+            }
+            Ok(out)
+        })
+    }
+
     /// Backdate a run's `started_at`, for tests that seed old history.
     #[cfg(test)]
     pub(crate) fn set_started_at_for_test(&self, run_id: i64, started_at: &str) -> Result<()> {
@@ -787,6 +903,19 @@ fn rename_recorded_history(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn map_stream_health(row: &rusqlite::Row<'_>) -> rusqlite::Result<StreamHealth> {
+    Ok(StreamHealth {
+        stream_id: row.get(0)?,
+        probed_at: row.get(1)?,
+        class: row.get(2)?,
+        error_type: row.get(3)?,
+        throughput_mbps: row.get(4)?,
+        throughput_at: row.get(5)?,
+        edge_ip: row.get(6)?,
+        consecutive_failures: row.get(7)?,
+    })
+}
+
 fn map_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
     let counts: String = row.get(8)?;
     let status: String = row.get(6)?;
@@ -807,6 +936,78 @@ fn map_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stream_health_row_is_upserted_and_replaced_whole() {
+        // `probe` writes one of these per stream and `sort` reads them all: the row is the
+        // stream's whole health, so a probe that measured nothing clears the old measurement
+        // rather than leaving a stale rate for the sort to trust.
+        let store = Store::in_memory().expect("store");
+        let alive = StreamHealth {
+            stream_id: 11,
+            probed_at: Some("2026-11-01T12:00:00+00:00".to_string()),
+            class: "alive".to_string(),
+            error_type: None,
+            throughput_mbps: Some(12.5),
+            throughput_at: Some("2026-11-01T11:59:00+00:00".to_string()),
+            edge_ip: Some("edge.example".to_string()),
+            consecutive_failures: 0,
+        };
+        store.upsert_stream_health(&alive).expect("insert");
+        assert_eq!(store.stream_health(11).expect("read"), Some(alive.clone()));
+
+        let dead = StreamHealth {
+            stream_id: 11,
+            class: "dead".to_string(),
+            error_type: Some("Timeout".to_string()),
+            throughput_mbps: None,
+            consecutive_failures: 3,
+            ..alive.clone()
+        };
+        store.upsert_stream_health(&dead).expect("update");
+        assert_eq!(store.stream_health(11).expect("read"), Some(dead));
+        assert_eq!(store.stream_health(12).expect("read"), None);
+
+        store
+            .upsert_stream_health(&StreamHealth {
+                stream_id: 12,
+                class: "skipped".to_string(),
+                ..StreamHealth::default()
+            })
+            .expect("second row");
+        let map = store.stream_health_map().expect("map");
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get(&11).map(|row| row.class.as_str()), Some("dead"));
+        assert_eq!(map.get(&12).map(|row| row.class.as_str()), Some("skipped"));
+    }
+
+    #[test]
+    fn a_store_from_before_stream_health_gains_the_table_on_open() {
+        // The table is created with `IF NOT EXISTS` on every open, so an older store grows it
+        // without a version bump and without touching the run history.
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("crosstalk.db");
+        {
+            let connection = Connection::open(&path).expect("open");
+            connection
+                .execute_batch(
+                    "CREATE TABLE runs (id INTEGER PRIMARY KEY AUTOINCREMENT, app TEXT NOT NULL, \
+                     action TEXT NOT NULL, dry_run INTEGER NOT NULL, started_at TEXT NOT NULL, \
+                     finished_at TEXT, status TEXT NOT NULL, summary TEXT, \
+                     counts TEXT NOT NULL DEFAULT '{}', report_path TEXT); \
+                     PRAGMA user_version = 1",
+                )
+                .expect("old schema");
+        }
+        let store = Store::open(&path).expect("migrate");
+        store
+            .upsert_stream_health(&StreamHealth {
+                stream_id: 1,
+                class: "alive".to_string(),
+                ..StreamHealth::default()
+            })
+            .expect("the table exists after the migration");
+    }
 
     fn sample_row(ordinal: i64, name: &str, score: i64) -> RunRow {
         RunRow {

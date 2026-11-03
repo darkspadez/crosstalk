@@ -8,8 +8,10 @@ description = "crosstalk sub-app: which streams a channel has, in what order, an
 
 [dependencies]
 crosstalk-core.workspace = true
+crosstalk-matching.workspace = true
 
 anyhow.workspace = true
+chrono.workspace = true
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -19,3 +21,4 @@ tracing.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 tokio.workspace = true
+wiremock.workspace = true

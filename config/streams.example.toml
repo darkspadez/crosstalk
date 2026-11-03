@@ -121,7 +121,10 @@ epg_watch_source_streams = ""
 # --- Sort -------------------------------------------------------------------------------
 #
 # How a channel's streams are ordered. The first entry is the one that plays, so these decide
-# failover order. Quality, audio layout and codec apply within a channel.
+# failover order. Quality, audio layout and codec apply within a channel. `streams
+# sort_preview` shows what these produce without writing anything, `streams sort_apply`
+# rewrites only the channels whose order would change, and `streams match_apply` sorts the
+# streams it assigns with the same model, so a scheduled sort cannot undo a match.
 
 # On: quality first, then M3U account priority. Off: account priority first.
 prioritize_quality = false

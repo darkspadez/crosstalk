@@ -620,6 +620,38 @@ pub fn country_has_one_timezone(name: &str) -> bool {
     country_from_name(name).is_some_and(|code| SINGLE_TIMEZONE_COUNTRIES.contains(&code))
 }
 
+/// Whether `name` can possibly carry a feed-zone marker, checked without any regex.
+///
+/// A pure speed-up with the same answer (see [`extract_zone`]): it may say yes when the
+/// patterns would say no, but it must never say no when a pattern would match. Every
+/// parenthesized marker (`(W)`, `(EAST)`, `(PT)`, `(Pacific)`) needs a `(` byte, so a name
+/// without one can only match the bare words `WEST`/`EAST`/`PACIFIC` — and a bare `PT` is
+/// never a marker. A non-ASCII name takes the precise path: Python's `(?i)` folds exotic
+/// case variants (the long `ſ` matches `s`) that a byte scan cannot see, so only a pure-ASCII
+/// name without those fragments is allowed to skip the patterns.
+fn maybe_zoned(name: &str) -> bool {
+    if name.bytes().any(|byte| byte == b'(') {
+        return true;
+    }
+    if !name.is_ascii() {
+        return true;
+    }
+    ascii_contains_folded(name.as_bytes(), b"west")
+        || ascii_contains_folded(name.as_bytes(), b"east")
+        || ascii_contains_folded(name.as_bytes(), b"pacific")
+}
+
+/// ASCII case-insensitive substring search, without allocating a lowered copy.
+fn ascii_contains_folded(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.len() >= needle.len()
+        && haystack.windows(needle.len()).any(|window| {
+            window
+                .iter()
+                .zip(needle)
+                .all(|(hay, want)| hay.to_ascii_lowercase() == *want)
+        })
+}
+
 /// Canonical feed zone for zone-aware routing: `WEST`, `EAST`, or `DEFAULT`.
 ///
 /// Recognizes parenthesized `(W)`/`(E)`/`(WEST)`/`(EAST)` and the bare words `WEST`/
@@ -629,19 +661,31 @@ pub fn country_has_one_timezone(name: &str) -> bool {
 ///
 /// In a single-time-zone country the answer is always `DEFAULT`: `BBC One West` is an
 /// English region, not a time-shifted feed.
+///
+/// The three marker patterns are tried BEFORE the single-time-zone guard, which is a pure
+/// speed-up with the same answer: with no marker at all the guard's verdict cannot change the
+/// result, and the guard is the expensive half (it scans the country tables). Before either,
+/// [`maybe_zoned`] rejects the overwhelmingly common unmarked name with a byte scan: a sort
+/// calls this once per channel and once per stream — 20k channels and 200k stream references
+/// is 220k calls — and almost every name in a lineup carries no marker at all.
 pub fn extract_zone(name: &str) -> FeedZone {
+    if !maybe_zoned(name) {
+        return FeedZone::Default;
+    }
+    let west = zone_west_re().is_match(name).unwrap_or(false)
+        || zone_pacific_re().is_match(name).unwrap_or(false);
+    let east = !west && zone_east_re().is_match(name).unwrap_or(false);
+    if !west && !east {
+        return FeedZone::Default;
+    }
     if country_has_one_timezone(name) {
         return FeedZone::Default;
     }
-    if zone_west_re().is_match(name).unwrap_or(false)
-        || zone_pacific_re().is_match(name).unwrap_or(false)
-    {
-        return FeedZone::West;
+    if west {
+        FeedZone::West
+    } else {
+        FeedZone::East
     }
-    if zone_east_re().is_match(name).unwrap_or(false) {
-        return FeedZone::East;
-    }
-    FeedZone::Default
 }
 
 #[cfg(test)]
@@ -766,6 +810,65 @@ mod tests {
         assert_eq!(extract_zone("UK: BBC One West"), FeedZone::Default);
         assert_eq!(extract_zone("UK: Sky Sports West"), FeedZone::Default);
         assert_eq!(extract_zone("US: HBO West"), FeedZone::West);
+    }
+
+    #[test]
+    fn the_zone_prefilter_never_says_no_to_a_marker() {
+        // `maybe_zoned` may over-approximate, never under-: a name it rejects must answer
+        // `DEFAULT` on the precise path too. The corpus mixes plain names, every marker
+        // spelling, place names, and non-ASCII text (where exotic case folding means only
+        // the precise path may decide).
+        let names = [
+            "ESPN",
+            "Channel 12",
+            "CNN HD",
+            "HBO",
+            "HBO East",
+            "HBO West",
+            "HBO (W)",
+            "HBO (E)",
+            "HBO (WEST)",
+            "HBO (east)",
+            "HBO Pacific",
+            "HBO (Pacific)",
+            "HBO (PT)",
+            "ESPN West HD",
+            "HBO East 4K",
+            "West Palm Beach",
+            "WEST HASTINGS, NE",
+            "WEST HARTFORD, CT",
+            "Key West",
+            "Western Movies",
+            "Easter Parade",
+            "Pacifica",
+            "W",
+            "E! Entertainment",
+            "UK: Sky Sports West",
+            "UK: BBC One West",
+            "US: HBO West",
+            "BBC One West",
+            "Café (W)",
+            "ESPN WE\u{17f}T",
+            "HBO WE\u{130}ST",
+            "München West",
+            "São Paulo East",
+            "TNT (W) \u{1c} HD",
+        ];
+        for name in names {
+            if !maybe_zoned(name) {
+                assert_eq!(
+                    extract_zone(name),
+                    FeedZone::Default,
+                    "prefilter rejected {name:?} but the precise path zones it"
+                );
+            }
+        }
+        // And the markers the prefilter accepts still resolve on the precise path.
+        assert_eq!(extract_zone("HBO West"), FeedZone::West);
+        assert_eq!(extract_zone("HBO (W)"), FeedZone::West);
+        assert_eq!(extract_zone("HBO East"), FeedZone::East);
+        assert_eq!(extract_zone("HBO Pacific"), FeedZone::West);
+        assert_eq!(extract_zone("Café (W)"), FeedZone::West);
     }
 
     #[test]
