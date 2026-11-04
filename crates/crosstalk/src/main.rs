@@ -54,10 +54,12 @@ struct ServeArgs {
 
 #[derive(Args, Debug)]
 struct RunArgs {
-    /// Sub-app id, for example `guide`.
+    /// Sub-app id, for example `guide`, or `workflow` for a named workflow.
     app: String,
-    /// Action id, for example `match_apply`.
-    action: String,
+    /// Action id, for example `match_apply`, or the workflow's name after `workflow`.
+    ///
+    /// Omitted when the first argument already names a workflow: `run workflow.<name>`.
+    action: Option<String>,
     /// Directory holding the configuration files.
     #[arg(long, default_value = "config", env = "CROSSTALK_CONFIG_DIR")]
     config: PathBuf,
@@ -251,6 +253,31 @@ fn serve(args: ServeArgs) -> Result<()> {
                 None => println!("schedule {} is not valid and will not run", entry.key),
             }
         }
+        // Workflows and hooks are configuration too, and a typo in either is silent until it
+        // runs (or never does), so start-up says what the file actually describes.
+        for workflow in crosstalk_core::workflow::describe(&snapshot) {
+            match (&workflow.error, workflow.steps.is_empty()) {
+                (Some(error), _) => println!("workflow {} will not run: {error}", workflow.name),
+                (None, true) => println!("workflow {} has no steps", workflow.name),
+                (None, false) => println!(
+                    "workflow {}: {} step(s) — {}",
+                    workflow.name,
+                    workflow.steps.len(),
+                    workflow.steps.join(" → ")
+                ),
+            }
+        }
+        for (event, targets) in crosstalk_core::hooks::describe(&snapshot.hooks) {
+            println!(
+                "hook {event} -> {} (debounced {} s)",
+                if targets.is_empty() {
+                    "nothing".to_string()
+                } else {
+                    targets.join(", ")
+                },
+                snapshot.hooks.debounce_secs
+            );
+        }
 
         // With `ConnectInfo`: without it the login limiter's `ConnectInfo<SocketAddr>`
         // extractor is always `None` and every client shares the one fallback bucket, so ten
@@ -340,15 +367,119 @@ async fn shutdown_signal() {
     println!("shutting down");
 }
 
+/// The workflow a `run` invocation names, or `None` for an ordinary action run.
+///
+/// Two spellings, one target: `run workflow nightly` (the app-and-action shape) and
+/// `run workflow.nightly` (the schedule-key shape, which is what a hook and a schedule write).
+/// A bare `run <app>` with no second argument is refused here rather than reaching the action
+/// lookup with a `None` that means nothing.
+fn cli_workflow_name(args: &RunArgs) -> Result<Option<String>> {
+    match (args.app.as_str(), args.action.as_deref()) {
+        ("workflow", Some(name)) => Ok(Some(name.to_string())),
+        ("workflow", None) => {
+            anyhow::bail!("`run workflow` needs a workflow name: crosstalk run workflow <name>")
+        }
+        (key, None) => match key.strip_prefix("workflow.") {
+            Some(name) if !name.is_empty() => Ok(Some(name.to_string())),
+            _ => anyhow::bail!(
+                "`run {key}` needs an action, for example `crosstalk run {key} <action>`, or \
+                 name a workflow: `crosstalk run workflow.<name>`"
+            ),
+        },
+        (_, Some(_)) => Ok(None),
+    }
+}
+
+/// `run workflow <name>`: one workflow, once, without the daemon.
+///
+/// The same two refusals a writing action gets — `--yes` to confirm, and the cross-process
+/// "already running" check — for the same reasons: a workflow writes and holds the `workflow`
+/// slot, which the daemon's own workflow runs also hold.
+fn run_workflow_once(args: RunArgs, name: &str) -> Result<()> {
+    let registry = registry::builtin();
+    let config = CrosstalkConfig::load(&args.config)?;
+    let workflow = crosstalk_core::workflow::Workflow::from_config(&config, name)?;
+    let writes = !crosstalk_core::workflow::scheduled_dry_run(&registry, &config, name);
+    if writes && !args.yes && !args.dry_run {
+        println!("workflow {name}: {} step(s)", workflow.steps.len());
+        for step in workflow.labels() {
+            println!("  {step}");
+        }
+        anyhow::bail!(
+            "refusing to run workflow {name:?} without --yes: it changes data. Add --yes to \
+             proceed, or --dry-run to run every writing step as its preview"
+        );
+    }
+
+    let store = Store::open_shared(config.data_dir().join("crosstalk.db"))?;
+    let live = store.running_runs(crosstalk_core::workflow::APP_ID)?;
+    if let Some(current) = live.first() {
+        anyhow::bail!(
+            "a workflow is already running: workflow.{} #{} (started {}); wait for it to \
+             finish or cancel it. If no daemon is running, this row is stale from a crash and \
+             clears when the daemon next starts.",
+            current.action,
+            current.id,
+            current.started_at,
+        );
+    }
+    let runner = JobRunner::new(registry, SharedConfig::new(config), store);
+    let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
+    let options = if args.fresh {
+        crosstalk_core::runner::RunOptions::default().fresh()
+    } else {
+        crosstalk_core::runner::RunOptions::default()
+    };
+    let outcome = runtime.block_on(crosstalk_core::workflow::run_to_completion(
+        &runner,
+        name,
+        args.dry_run,
+        options,
+    ))?;
+
+    println!("{}", outcome.summary);
+    for (key, value) in &outcome.counts {
+        println!("  {key}: {value}");
+    }
+    // The step runs, so a terminal operator can follow one to its report without the UI.
+    if let Some(record) = runner
+        .store()
+        .recent_runs_for(crosstalk_core::workflow::APP_ID, 1)?
+        .into_iter()
+        .next()
+    {
+        println!("  workflow run: #{}", record.id);
+        for step in runner.store().child_runs(record.id)? {
+            println!(
+                "    #{} {} {} — {}",
+                step.id,
+                if step.dry_run { "preview" } else { "apply" },
+                step.action,
+                step.summary.as_deref().unwrap_or(""),
+            );
+        }
+    }
+    Ok(())
+}
+
 fn run_once(args: RunArgs) -> Result<()> {
+    // `run workflow <name>` and `run workflow.<name>` are the same target; both go through the
+    // workflow executor, which records the workflow run and one run per step.
+    if let Some(name) = cli_workflow_name(&args)? {
+        return run_workflow_once(args, &name);
+    }
+    let Some(action_id) = args.action.clone() else {
+        unreachable!("cli_workflow_name refuses a bare app id");
+    };
+
     let registry = registry::builtin();
     let config = CrosstalkConfig::load(&args.config)?;
     let (_, action) = registry
-        .find_action(&args.app, &args.action)
+        .find_action(&args.app, &action_id)
         .with_context(|| {
             format!(
                 "no action {:?} in sub-app {:?}; known apps: {}",
-                args.action,
+                action_id,
                 args.app,
                 registry
                     .iter()
@@ -583,8 +714,45 @@ fn validate(args: ConfigArgs) -> Result<()> {
     }
 
     for key in registry.unknown_schedules(&config) {
-        println!("error: schedule {key:?} does not name a known <app>.<action>");
+        println!("error: schedule {key:?} does not name a known <app>.<action> or workflow.<name>");
         failed = true;
+    }
+    for (workflow, step) in registry.unknown_workflow_steps(&config) {
+        println!("error: workflow {workflow:?} step {step:?} does not name a known <app>.<action>");
+        failed = true;
+    }
+    for (event, target) in registry.unknown_hook_targets(&config) {
+        println!("error: hooks.{event} target {target:?} does not name a known action or workflow");
+        failed = true;
+    }
+    for workflow in crosstalk_core::workflow::describe(&config) {
+        match (&workflow.error, workflow.steps.is_empty()) {
+            (_, true) => println!("workflow {}: no steps", workflow.name),
+            (Some(error), _) => println!("workflow {}: {error}", workflow.name),
+            (None, _) => println!(
+                "workflow {}: {} step(s){}",
+                workflow.name,
+                workflow.steps.len(),
+                if workflow.fresh {
+                    ", each new pass starts from the beginning"
+                } else {
+                    ""
+                }
+            ),
+        }
+    }
+    for (event, targets) in crosstalk_core::hooks::describe(&config.hooks) {
+        // A hook's pacing and targets are what decides whether a refresh storm becomes one run
+        // or twenty, so `validate` says both rather than only that the table parsed.
+        println!(
+            "hook {event}: {} (debounced {} s)",
+            if targets.is_empty() {
+                "no targets".to_string()
+            } else {
+                targets.join(", ")
+            },
+            config.hooks.debounce_secs
+        );
     }
     for entry in crosstalk_core::scheduler::describe(&config) {
         // The window is what says whether the job finishes in one firing: a schedule whose
@@ -704,6 +872,120 @@ mod cli_tests {
     fn exports_clear_needs_the_clear_subcommand() {
         assert!(Cli::try_parse_from(["crosstalk", "exports"]).is_err());
         assert!(Cli::try_parse_from(["crosstalk", "exports", "nope"]).is_err());
+    }
+
+    fn run_args(args: &[&str]) -> RunArgs {
+        match parse(args).command {
+            Command::Run(args) => args,
+            other => panic!("expected a run command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_workflow_is_named_two_ways_and_an_action_one() {
+        // `run workflow nightly` and `run workflow.nightly` are the same target; the CLI keeps
+        // both spellings because the docs, the schedule keys and an operator's fingers disagree
+        // about which is natural.
+        let spaced = run_args(&["crosstalk", "run", "workflow", "nightly"]);
+        assert_eq!(
+            cli_workflow_name(&spaced).expect("parses"),
+            Some("nightly".into())
+        );
+
+        let dotted = run_args(&["crosstalk", "run", "workflow.nightly"]);
+        assert_eq!(
+            cli_workflow_name(&dotted).expect("parses"),
+            Some("nightly".into())
+        );
+
+        let action = run_args(&["crosstalk", "run", "guide", "match_preview"]);
+        assert_eq!(cli_workflow_name(&action).expect("parses"), None);
+    }
+
+    #[test]
+    fn a_bare_app_id_is_refused_with_the_shape_it_wants() {
+        let bare = run_args(&["crosstalk", "run", "workflow"]);
+        let error = cli_workflow_name(&bare).expect_err("refused");
+        assert!(format!("{error}").contains("workflow <name>"), "{error}");
+
+        let no_action = run_args(&["crosstalk", "run", "guide"]);
+        let error = cli_workflow_name(&no_action).expect_err("refused");
+        assert!(format!("{error}").contains("needs an action"), "{error}");
+    }
+
+    /// A config directory whose `crosstalk.toml` defines one workflow.
+    ///
+    /// The credentials are fake and never used: they are what makes the host configuration
+    /// valid, so an offline step such as `streams.validate` — which reports configuration
+    /// problems — has nothing to complain about.
+    fn config_dir_with(steps: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let steps = steps
+            .iter()
+            .map(|step| format!("\"{step}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        std::fs::write(
+            dir.path().join("crosstalk.toml"),
+            format!(
+                "[dispatcharr]\nbase_url = \"http://127.0.0.1:9191\"\napi_key = \"test\"\n\n\
+                 [workflows.offline]\nsteps = [{steps}]\n"
+            ),
+        )
+        .expect("write");
+        dir
+    }
+
+    #[test]
+    fn a_workflow_runs_once_from_the_cli() {
+        // Both steps are offline, so this is a real end-to-end run without a Dispatcharr.
+        let dir = config_dir_with(&["streams.validate", "streams.status"]);
+        run_workflow_once(
+            RunArgs {
+                app: "workflow".to_string(),
+                action: Some("offline".to_string()),
+                config: dir.path().to_path_buf(),
+                dry_run: false,
+                yes: true,
+                fresh: false,
+            },
+            "offline",
+        )
+        .expect("runs");
+
+        let store =
+            Store::open_shared(dir.path().join("data").join("crosstalk.db")).expect("store");
+        let record = store
+            .recent_runs_for(crosstalk_core::workflow::APP_ID, 1)
+            .expect("runs")
+            .into_iter()
+            .next()
+            .expect("a workflow run");
+        assert_eq!(record.status, crosstalk_core::store::RunStatus::Succeeded);
+        assert_eq!(store.child_runs(record.id).expect("steps").len(), 2);
+    }
+
+    #[test]
+    fn a_writing_workflow_is_refused_without_yes() {
+        // The same rule a writing action gets: a one-shot run has no dialog, so the flag stands
+        // in for it — and nothing is recorded when it is missing.
+        let dir = config_dir_with(&["streams.sort_apply"]);
+        let error = run_workflow_once(
+            RunArgs {
+                app: "workflow".to_string(),
+                action: Some("offline".to_string()),
+                config: dir.path().to_path_buf(),
+                dry_run: false,
+                yes: false,
+                fresh: false,
+            },
+            "offline",
+        )
+        .expect_err("refused");
+        assert!(format!("{error}").contains("--yes"), "{error}");
+        let store =
+            Store::open_shared(dir.path().join("data").join("crosstalk.db")).expect("store");
+        assert_eq!(store.run_count().expect("count"), 0, "nothing ran");
     }
 
     /// A config directory with an exports subdirectory holding a backdated report.

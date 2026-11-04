@@ -31,6 +31,11 @@
 //!
 //! Manual runs (`crosstalk run`, the web UI) have no deadline, so they never pause — but they
 //! still resume from a checkpoint, and `--fresh` / the "start fresh" checkbox discards one.
+//!
+//! A workflow ([`crate::workflow`]) changes nothing about these rules: every step is an ordinary
+//! run of its app, so it pauses, cancels and resumes by the same rules. What a workflow adds is
+//! that a step which PAUSED pauses the workflow too, so the next firing continues at that step
+//! instead of re-running the ones before it.
 
 use crate::config::CrosstalkConfig;
 use crate::runner::ActiveRun;

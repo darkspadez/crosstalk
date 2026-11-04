@@ -29,6 +29,11 @@ pub struct AppState {
     csrf_token: String,
     /// Per-IP sign-in failure counting for POST /login.
     login_limiter: Arc<crate::auth::LoginLimiter>,
+    /// The Dispatcharr Connect webhook's debouncer and trigger.
+    hooks: Arc<crosstalk_core::hooks::Hooks>,
+    /// Per-IP delivery counting for the webhook route, on the same sliding-window counter the
+    /// login page uses.
+    hook_limiter: Arc<crate::auth::LoginLimiter>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -45,6 +50,7 @@ impl std::fmt::Debug for AppState {
 
 impl AppState {
     pub fn new(registry: Registry, config: SharedConfig, runner: JobRunner, store: Store) -> Self {
+        let hooks = crosstalk_core::hooks::Hooks::new(runner.clone());
         Self {
             registry: Arc::new(registry),
             config,
@@ -53,6 +59,13 @@ impl AppState {
             scheduler: None,
             csrf_token: crate::csrf::generate_token(),
             login_limiter: Arc::new(crate::auth::LoginLimiter::default()),
+            hooks,
+            // The bound is read from the live configuration per delivery, so this limiter only
+            // owns the count: its own maximum is deliberately wide open.
+            hook_limiter: Arc::new(crate::auth::LoginLimiter::new(
+                u32::MAX,
+                std::time::Duration::from_secs(60),
+            )),
         }
     }
 
@@ -81,6 +94,16 @@ impl AppState {
     /// The sign-in failure limiter POST /login checks.
     pub fn login_limiter(&self) -> &crate::auth::LoginLimiter {
         &self.login_limiter
+    }
+
+    /// The webhook route's debouncer and trigger.
+    pub fn hooks(&self) -> &Arc<crosstalk_core::hooks::Hooks> {
+        &self.hooks
+    }
+
+    /// The per-address delivery limiter the webhook route checks.
+    pub fn hook_limiter(&self) -> &crate::auth::LoginLimiter {
+        &self.hook_limiter
     }
 }
 
@@ -111,6 +134,123 @@ pub struct UiAction {
     /// Whether it writes, and so is worth offering "start fresh" for.
     pub writing: bool,
     pub disabled: bool,
+}
+
+/// One workflow, as the dashboard lists it.
+#[derive(Debug, Clone)]
+pub struct UiWorkflow {
+    pub name: String,
+    /// The steps, ` → `-joined.
+    pub steps: String,
+    /// How many steps the entry has, for the Run button's confirmation text.
+    pub step_count: usize,
+    /// Whether a new pass discards each step's saved progress.
+    pub fresh: bool,
+    /// Why the entry cannot run, when it cannot. The dashboard shows this instead of a button.
+    pub error: Option<String>,
+    /// A one-line summary of the last run of this workflow.
+    pub last_run: Option<String>,
+    /// Whether this workflow's slot is taken right now.
+    pub busy: bool,
+    /// Whether a run of it would change nothing, which decides whether the form confirms.
+    pub dry_run: bool,
+}
+
+/// The `[hooks]` table, as the dashboard shows it (read-only).
+#[derive(Debug, Clone, Default)]
+pub struct UiHooks {
+    /// Event name to targets, in name order.
+    pub events: Vec<(String, Vec<String>)>,
+    /// The debounce window in words.
+    pub debounce: String,
+    /// The route Dispatcharr posts to.
+    pub route: String,
+}
+
+/// Build the dashboard's workflow list.
+///
+/// Read from the live config, the registry and the store only: a workflow is configuration, so
+/// there is nothing to create here — the "web display" for workflows is this list plus the Run
+/// button and the last result.
+pub fn workflows(runner: &JobRunner, config: &CrosstalkConfig, store: &Store) -> Vec<UiWorkflow> {
+    let busy = runner.is_busy(crosstalk_core::workflow::APP_ID);
+    crosstalk_core::workflow::describe(config)
+        .into_iter()
+        .map(|info| {
+            // The last run of THIS workflow, not of any workflow.
+            let last_run = store
+                .recent_runs_for(crosstalk_core::workflow::APP_ID, 50)
+                .ok()
+                .and_then(|runs| runs.into_iter().find(|run| run.action == info.name))
+                .map(|run| describe_last_run(&run));
+            UiWorkflow {
+                name: info.name.clone(),
+                steps: info.steps.join(" → "),
+                step_count: info.steps.len(),
+                fresh: info.fresh,
+                error: info.error,
+                last_run,
+                busy,
+                // The same rule the Run handler applies, from the same place: a workflow of
+                // read-only steps needs no confirmation because it writes nothing.
+                dry_run: crosstalk_core::workflow::scheduled_dry_run(
+                    runner.registry(),
+                    config,
+                    &info.name,
+                ),
+            }
+        })
+        .collect()
+}
+
+/// One line about a finished run, worded like the app list's.
+fn describe_last_run(run: &RunRecord) -> String {
+    let paused = if run.status.is_paused() {
+        " — resumes at its next window"
+    } else {
+        ""
+    };
+    let summary = run
+        .summary
+        .as_deref()
+        .map(|summary| format!(": {summary}"))
+        .unwrap_or_default();
+    format!(
+        "{} {} ({}){paused}{summary}",
+        run.action,
+        run.status.as_str(),
+        run.started_at
+    )
+}
+
+/// Build the dashboard's hooks display.
+pub fn hooks(config: &CrosstalkConfig) -> UiHooks {
+    let debounce = config.hooks.debounce_secs;
+    UiHooks {
+        events: crosstalk_core::hooks::describe(&config.hooks),
+        debounce: if debounce <= 0.0 {
+            "runs on the first delivery".to_string()
+        } else if debounce.fract() == 0.0 {
+            format!("{debounce:.0} s")
+        } else {
+            format!("{debounce} s")
+        },
+        route: crosstalk_core::hooks::ROUTE.to_string(),
+    }
+}
+
+/// The step runs of a workflow run, in order. Empty for an ordinary run.
+pub fn steps_of(store: &Store, run: &RunRecord) -> Vec<RunRecord> {
+    if run.app != crosstalk_core::workflow::APP_ID {
+        return Vec::new();
+    }
+    store.child_runs(run.id).unwrap_or_default()
+}
+
+/// The workflow run a step belongs to, when it belongs to one.
+pub fn parent_of(store: &Store, run: &RunRecord) -> Option<RunRecord> {
+    let parent = run.parent_run_id?;
+    store.run(parent).ok().flatten()
 }
 
 /// One setting field, ready to render.
@@ -615,6 +755,7 @@ mod tests {
             summary: None,
             counts: serde_json::json!({"matched": 3, "skipped": 0}),
             report_path: None,
+            parent_run_id: None,
         };
         assert_eq!(counts(&run), vec![("matched".to_string(), 3)]);
     }

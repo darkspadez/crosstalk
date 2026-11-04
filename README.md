@@ -122,6 +122,7 @@ The UI listens on <http://localhost:8730>.
 | `crosstalk serve --config <dir>` | Run the daemon: REST API, scheduler and web UI |
 | `crosstalk validate --config <dir>` | Check the configuration files and each app's settings |
 | `crosstalk run <app> <action> [--dry-run] [--yes] [--fresh]` | Run one action once and exit (`streams probe --dry-run` measures everything and writes no stream stats) |
+| `crosstalk run workflow <name> [--dry-run] [--yes] [--fresh]` | Run one workflow once and exit (`run workflow.<name>` works too); `--dry-run` runs every writing step as its preview |
 | `crosstalk exports clear [--app <id>] [--yes]` | Delete the CSV reports the sub-apps wrote (the UI's **Clear exports** button does the same) |
 | `crosstalk simulate-streams --channels <csv> --streams <m3u>` | Offline stream-to-channel simulation, for tuning without touching a live install |
 
@@ -354,9 +355,100 @@ Every run explains itself in the history: `cancelled` runs keep the rows, the co
 they produced, and each unwritten row says it was not applied, so a half-done apply is never
 recorded as a success.
 
+## Workflows
+
+A workflow is a named sequence of actions the host runs in order, because the plugins that
+preceded crosstalk called into each other: Stream-Mapparr's own "probe then sort" sequence, or
+its hand-off after IPTV Checker's scan.
+
+```toml
+# crosstalk.toml
+[workflows.nightly]
+steps = ["streams.probe", "streams.sort_apply"]
+# A new pass starts every step's backlog from the beginning. Off by default, which resumes.
+fresh = false
+
+[schedules]
+# A workflow is scheduled like an action, under its own name space.
+"workflow.nightly" = { cron = "0 23 * * *", window = "4h" }
+```
+
+Each step is an ordinary run: its own app's one-run-per-app slot, its own run page, its own
+CSV, its own checkpoint. The workflow itself is one more run record (app `workflow`, action =
+the name) and every step run points at it, so the workflow's run page lists the steps it ran.
+Steps run one at a time and the sequence **stops at the first step that fails or is cancelled**.
+A step that pauses at its window's end pauses the workflow; the next firing resumes *that* step,
+with the step's own checkpoint picking up its backlog, and continues from there. Cancelling the
+workflow cancels the step it is inside. The window's deadline reaches every step, so a workflow
+inside a four-hour window never runs past it. One workflow runs at a time.
+
+Run one by hand with `crosstalk run workflow nightly` (or `crosstalk run workflow.nightly`),
+from the dashboard's **Workflows** card, or from a hook.
+
+## Dispatcharr events
+
+Dispatcharr's Connect integration can post to crosstalk when something happens — an M3U account
+finished refreshing, an EPG source did — and each event can trigger an action or a workflow:
+
+```toml
+# crosstalk.toml
+[hooks]
+debounce_secs = 60
+rate_per_minute = 60
+m3u_refresh = ["streams.match_apply"]
+epg_refresh = ["workflow.nightly"]
+```
+
+Setting it up, in Dispatcharr's own UI:
+
+1. **Settings → Connect → Add Connection**, type **Webhook**.
+2. URL: `http://<crosstalk host>:9191/hooks/dispatcharr` — add `?event=m3u_refresh` (or the
+   event you are subscribing) if you do not use a payload template, because Dispatcharr's own
+   payload carries no event name. The URL is *exact*: keep the path, and note the port is
+   `server.port`.
+3. Header: `Authorization: Bearer <server.token>`. The route accepts **only** this: a session
+   cookie is refused (a browser session must not be able to trigger an apply by visiting a
+   URL), and a daemon with no `server.token` refuses every delivery rather than accept
+   unauthenticated work.
+4. Add `Content-Type: application/json` and a per-event **payload template** such as
+   `{"event": "m3u_refresh", "account": "{{ account_name }}"}` if you want a JSON body; without
+   one Dispatcharr posts the event's details form-encoded (`account_name=…&streams_created=…`),
+   which crosstalk reads too.
+5. Subscribe the events: `m3u_refresh`, `epg_refresh`, and any others you configured.
+
+How a delivery is handled:
+
+- **Auth**: `Authorization: Bearer <server.token>`, never a cookie; the route is exempt from
+  CSRF only for that reason. Deliveries are rate limited per address
+  (`hooks.rate_per_minute` over a minute, `429` with `Retry-After`).
+- **Which event**: an `?event=` query parameter, then an `event` or `type` field in the body,
+  then — because Dispatcharr's default payload names none — the payload's own keys
+  (`account_name`/`total_processed` is `m3u_refresh`, `source_name`/`programs` is
+  `epg_refresh`), and only for an event the configuration names.
+- **Debounce**: several M3U accounts finishing together is one logical "the playlists changed",
+  so every delivery of the same event restarts a `debounce_secs` timer and the run happens once
+  after the burst settles.
+- **Busy target**: if the target app (or the workflow slot) is busy, exactly **one** follow-up
+  run is queued for when it frees — Stream-Mapparr's dirty-flag behaviour, so a late account is
+  not dropped and a busy app is not started twenty times.
+- **Answer**: `202` immediately, because Connect waits ten seconds and a match can take minutes;
+  the work runs in the background. An event the configuration does not name is logged and
+  answered `202` too — "I do not act on this" is not a delivery failure.
+
+```bash
+curl -X POST http://127.0.0.1:9191/hooks/dispatcharr \
+  -H "Authorization: Bearer $CROSSTALK_SERVER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"event": "m3u_refresh", "account_name": "test"}'
+```
+
 ## Web UI
 
-- Dashboard: apps, schedules with their window and next run, recent runs.
+- Dashboard: apps, workflows with their steps, last run and a **Run** button, the hook table and
+  the Dispatcharr setup, schedules with their window and next run, recent runs.
+- Workflow run page: the steps it ran, each linking to its own run page; a step's page links
+  back to the workflow.
+
 - App page: actions with their colours, a confirmation for the ones that write, a **start
   fresh** checkbox on the writing ones, the run in progress with a cancel button. A read-only
   `status` stays clickable while a run is live and reports that run's progress.

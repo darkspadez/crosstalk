@@ -22,7 +22,7 @@
 
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::{header, Method, StatusCode};
+use axum::http::{Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
@@ -153,27 +153,6 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-/// The Bearer token of a script request, when the Authorization header carries one.
-///
-/// Only the header counts, never the cookie: the login cookie is sent automatically and a
-/// cross-site page could ride it, while `Authorization` needs an explicit, preflighted
-/// header a forged form cannot set.
-fn bearer_token(request: &Request) -> Option<&str> {
-    let value = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())?;
-    let token = value
-        .strip_prefix("Bearer ")
-        .or_else(|| value.strip_prefix("bearer "))?;
-    let token = token.trim();
-    if token.is_empty() {
-        None
-    } else {
-        Some(token)
-    }
-}
-
 /// Reject POSTs without the daemon's CSRF token.
 ///
 /// Runs outside the auth check, so a forged cross-site POST fails closed with 403 even when
@@ -196,12 +175,23 @@ pub async fn check(
         return next.run(request).await;
     }
 
+    // The Dispatcharr webhook: bearer-only, and it says so itself (`auth::require` refuses the
+    // session cookie there). A cross-site form cannot set an Authorization header, so a request
+    // that reaches that route authenticated cannot be a forged browser POST — and a request that
+    // does not is refused with a 401 before the handler runs.
+    if request.uri().path() == crosstalk_core::hooks::ROUTE {
+        return next.run(request).await;
+    }
+
     // A script presenting the configured server token cannot be a forged browser form:
     // cross-site pages cannot set the Authorization header. Only when a token is
     // configured, and only on an exact constant-time match.
+    // Only the header counts, never the cookie: the login cookie is sent automatically and a
+    // cross-site page could ride it, while `Authorization` needs an explicit, preflighted header
+    // a forged form cannot set.
     if let Some(expected) = state.token() {
-        if let Some(presented) = bearer_token(&request) {
-            if crate::auth::tokens_match(&expected, presented) {
+        if let Some(presented) = crate::auth::bearer_token(&request) {
+            if crate::auth::tokens_match(&expected, &presented) {
                 return next.run(request).await;
             }
         }

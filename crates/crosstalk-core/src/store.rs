@@ -90,6 +90,13 @@ pub struct RunRecord {
     /// Machine-readable counts, as JSON.
     pub counts: serde_json::Value,
     pub report_path: Option<String>,
+    /// The workflow run this run is a step of, when it is one.
+    ///
+    /// A workflow run is an ordinary row in this table (app `workflow`, action = the workflow's
+    /// name), and each step is an ordinary row of its own app; this is the link between them, so
+    /// the workflow's run page can list its steps without a second table and without guessing
+    /// from timestamps which runs belong together.
+    pub parent_run_id: Option<i64>,
 }
 
 /// What a run row is about.
@@ -321,7 +328,11 @@ impl Store {
                     status       TEXT    NOT NULL,
                     summary      TEXT,
                     counts       TEXT    NOT NULL DEFAULT '{}',
-                    report_path  TEXT
+                    report_path  TEXT,
+                    -- The workflow run a step run belongs to (NULL for a run started on its
+                    -- own). No foreign key: a parent can be pruned before its steps and the
+                    -- child must survive as history either way.
+                    parent_run_id INTEGER
                 );
                 CREATE INDEX IF NOT EXISTS runs_started ON runs(started_at DESC);
                 CREATE INDEX IF NOT EXISTS runs_app ON runs(app, started_at DESC);
@@ -468,7 +479,7 @@ impl Store {
     /// row for the same app. A read-only status-like action starts with
     /// [`Store::start_unguarded_run`] instead.
     pub fn start_run(&self, app: &str, action: &str, dry_run: bool) -> Result<i64> {
-        self.insert_run(app, action, dry_run, false)
+        self.insert_run(app, action, dry_run, false, None)
     }
 
     /// Start a run that does not take the app's one-live-run slot.
@@ -479,15 +490,28 @@ impl Store {
     /// follow it to a run page like any other, and two unguarded runs may overlap because
     /// neither writes anything the other reads.
     pub fn start_unguarded_run(&self, app: &str, action: &str, dry_run: bool) -> Result<i64> {
-        self.insert_run(app, action, dry_run, true)
+        self.insert_run(app, action, dry_run, true, None)
     }
 
-    fn insert_run(&self, app: &str, action: &str, dry_run: bool, unguarded: bool) -> Result<i64> {
+    /// Insert one run row: the one place the column list and the slot flags live, so a new column
+    /// cannot be forgotten by one of the callers.
+    ///
+    /// `parent_run_id` is the workflow run a step belongs to (see [`crate::workflow`]); the
+    /// runner passes it from [`crate::runner::RunOptions::parent_run`], which is how a step run
+    /// stays an ordinary run of its own app with an ordinary slot rule.
+    pub(crate) fn insert_run(
+        &self,
+        app: &str,
+        action: &str,
+        dry_run: bool,
+        unguarded: bool,
+        parent_run_id: Option<i64>,
+    ) -> Result<i64> {
         let started = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         self.with_connection(|connection| {
             connection.execute(
-                "INSERT INTO runs (app, action, dry_run, started_at, status, counts, unguarded) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, '{}', ?6)",
+                "INSERT INTO runs (app, action, dry_run, started_at, status, counts, unguarded, \
+                 parent_run_id) VALUES (?1, ?2, ?3, ?4, ?5, '{}', ?6, ?7)",
                 params![
                     app,
                     action,
@@ -495,6 +519,7 @@ impl Store {
                     started,
                     RunStatus::Running.as_str(),
                     i64::from(unguarded),
+                    parent_run_id,
                 ],
             )?;
             Ok(connection.last_insert_rowid())
@@ -615,10 +640,9 @@ impl Store {
     /// The most recent runs, newest first.
     pub fn recent_runs(&self, limit: usize) -> Result<Vec<RunRecord>> {
         self.with_connection(|connection| {
-            let mut statement = connection.prepare(
-                "SELECT id, app, action, dry_run, started_at, finished_at, status, summary, \
-                 counts, report_path FROM runs ORDER BY started_at DESC, id DESC LIMIT ?1",
-            )?;
+            let mut statement = connection.prepare(&format!(
+                "SELECT {RUN_COLUMNS} FROM runs ORDER BY started_at DESC, id DESC LIMIT ?1"
+            ))?;
             let rows = statement.query_map(params![limit as i64], map_run)?;
             rows.collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(Into::into)
@@ -628,12 +652,23 @@ impl Store {
     /// Runs for one app, newest first.
     pub fn recent_runs_for(&self, app: &str, limit: usize) -> Result<Vec<RunRecord>> {
         self.with_connection(|connection| {
-            let mut statement = connection.prepare(
-                "SELECT id, app, action, dry_run, started_at, finished_at, status, summary, \
-                 counts, report_path FROM runs WHERE app = ?2 \
-                 ORDER BY started_at DESC, id DESC LIMIT ?1",
-            )?;
+            let mut statement = connection.prepare(&format!(
+                "SELECT {RUN_COLUMNS} FROM runs WHERE app = ?2 \
+                 ORDER BY started_at DESC, id DESC LIMIT ?1"
+            ))?;
             let rows = statement.query_map(params![limit as i64, app], map_run)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
+    }
+
+    /// The runs that were steps of one workflow run, in the order they ran.
+    pub fn child_runs(&self, parent_run_id: i64) -> Result<Vec<RunRecord>> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(&format!(
+                "SELECT {RUN_COLUMNS} FROM runs WHERE parent_run_id = ?1 ORDER BY started_at, id"
+            ))?;
+            let rows = statement.query_map(params![parent_run_id], map_run)?;
             rows.collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(Into::into)
         })
@@ -649,11 +684,10 @@ impl Store {
     /// anyway, so a stale result set is safe, only out of date.
     pub fn last_succeeded_run(&self, app: &str, action: &str) -> Result<Option<RunRecord>> {
         self.with_connection(|connection| {
-            let mut statement = connection.prepare(
-                "SELECT id, app, action, dry_run, started_at, finished_at, status, summary, \
-                 counts, report_path FROM runs WHERE app = ?1 AND action = ?2 AND status = ?3 \
-                 ORDER BY started_at DESC, id DESC LIMIT 1",
-            )?;
+            let mut statement = connection.prepare(&format!(
+                "SELECT {RUN_COLUMNS} FROM runs WHERE app = ?1 AND action = ?2 AND status = ?3 \
+                 ORDER BY started_at DESC, id DESC LIMIT 1"
+            ))?;
             statement
                 .query_row(params![app, action, RunStatus::Succeeded.as_str()], map_run)
                 .optional()
@@ -673,11 +707,10 @@ impl Store {
     /// reporting them as "already running" would refuse work nothing is blocking.
     pub fn running_runs(&self, app: &str) -> Result<Vec<RunRecord>> {
         self.with_connection(|connection| {
-            let mut statement = connection.prepare(
-                "SELECT id, app, action, dry_run, started_at, finished_at, status, summary, \
-                 counts, report_path FROM runs WHERE app = ?1 AND status = ?2 AND unguarded = 0 \
-                 ORDER BY started_at, id",
-            )?;
+            let mut statement = connection.prepare(&format!(
+                "SELECT {RUN_COLUMNS} FROM runs WHERE app = ?1 AND status = ?2 AND unguarded = 0 \
+                 ORDER BY started_at, id"
+            ))?;
             let rows = statement.query_map(params![app, RunStatus::Running.as_str()], map_run)?;
             rows.collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(Into::into)
@@ -687,10 +720,8 @@ impl Store {
     /// One run by id.
     pub fn run(&self, run_id: i64) -> Result<Option<RunRecord>> {
         self.with_connection(|connection| {
-            let mut statement = connection.prepare(
-                "SELECT id, app, action, dry_run, started_at, finished_at, status, summary, \
-                 counts, report_path FROM runs WHERE id = ?1",
-            )?;
+            let mut statement =
+                connection.prepare(&format!("SELECT {RUN_COLUMNS} FROM runs WHERE id = ?1"))?;
             statement
                 .query_row(params![run_id], map_run)
                 .optional()
@@ -1096,16 +1127,17 @@ fn add_run_columns(connection: &Connection) -> Result<()> {
     let existing: std::collections::HashSet<String> = statement
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<rusqlite::Result<_>>()?;
-    if !existing.contains("unguarded") {
-        // A daemon and a CLI opening together can both see the column missing: the second
-        // `ALTER TABLE` then fails with "duplicate column name", which means the work is
-        // done rather than that something went wrong.
-        if let Err(error) = connection
-            .execute_batch("ALTER TABLE runs ADD COLUMN unguarded INTEGER NOT NULL DEFAULT 0")
-        {
-            if !is_duplicate_column(&error) {
-                return Err(anyhow::anyhow!(error));
-            }
+    for (name, definition) in [
+        ("unguarded", "INTEGER NOT NULL DEFAULT 0"),
+        // The workflow link. Nullable, so every row written before it existed reads back as a
+        // run that was started on its own, which is what it was.
+        ("parent_run_id", "INTEGER"),
+    ] {
+        if !existing.contains(name) {
+            // A daemon and a CLI opening together can both see the column missing: the second
+            // `ALTER TABLE` then fails with "duplicate column name", which means the work is
+            // done rather than that something went wrong.
+            add_column(connection, "runs", name, definition)?;
         }
     }
     Ok(())
@@ -1197,6 +1229,15 @@ fn map_stream_health(row: &rusqlite::Row<'_>) -> rusqlite::Result<StreamHealth> 
     })
 }
 
+/// The `runs` columns a [`RunRecord`] is built from, in the order [`map_run`] reads them.
+///
+/// One list rather than five copies: every query that returns a run record has to select the
+/// same columns, and a column added to the table but missed in one query would make that query
+/// fail at runtime instead of at compile time.
+const RUN_COLUMNS: &str = "id, app, action, dry_run, started_at, finished_at, status, summary, \
+     counts, report_path, parent_run_id";
+
+/// One `runs` row, from the columns [`RUN_COLUMNS`] selects.
 fn map_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
     let counts: String = row.get(8)?;
     let status: String = row.get(6)?;
@@ -1211,6 +1252,7 @@ fn map_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
         summary: row.get(7)?,
         counts: serde_json::from_str(&counts).unwrap_or_default(),
         report_path: row.get(9)?,
+        parent_run_id: row.get(10)?,
     })
 }
 
@@ -1518,6 +1560,18 @@ mod tests {
         // The history survives, and the new column defaults to "guarded".
         assert_eq!(store.run_count().expect("count"), 1);
         assert!(store.running_runs("guide").expect("running").is_empty());
+        // A row written before the workflow link reads back as a run started on its own,
+        // which is what it was: the added column is NULL and no step list claims it.
+        let history = store.recent_runs(10).expect("history");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].parent_run_id, None);
+        assert!(
+            store
+                .child_runs(history[0].id)
+                .expect("children")
+                .is_empty(),
+            "an old run has no steps"
+        );
         store
             .save_checkpoint("streams", "probe", &serde_json::json!({"done": 1}))
             .expect("the table exists after the migration");
@@ -1943,6 +1997,72 @@ mod tests {
             .field_history("streams", &[], &["name"], 10)
             .expect("history")
             .is_empty());
+    }
+
+    #[test]
+    fn a_step_run_is_linked_to_the_workflow_run_it_belongs_to() {
+        // A workflow run is an ordinary row in this table, and every step points at it: that is
+        // how the workflow's run page lists what it ran, without a second table and without
+        // guessing from timestamps.
+        let store = Store::in_memory().expect("store");
+        let workflow = store
+            .start_run("workflow", "nightly", false)
+            .expect("start");
+        let probe = store
+            .insert_run("streams", "probe", false, false, Some(workflow))
+            .expect("probe");
+        // Steps run one at a time, so the first has finished before the second starts — which is
+        // also what keeps the one-live-run-per-app index out of the way for a workflow that lists
+        // the same app twice.
+        store
+            .finish_run(
+                probe,
+                RunStatus::Succeeded,
+                Some("done"),
+                &serde_json::json!({}),
+                None,
+            )
+            .expect("finish");
+        let sort = store
+            .insert_run("streams", "sort_apply", false, false, Some(workflow))
+            .expect("sort");
+        // An ordinary run, started on its own, has no parent.
+        store
+            .finish_run(
+                sort,
+                RunStatus::Succeeded,
+                Some("done"),
+                &serde_json::json!({}),
+                None,
+            )
+            .expect("finish");
+        let manual = store.start_run("streams", "probe", false).expect("manual");
+
+        let steps = store.child_runs(workflow).expect("steps");
+        assert_eq!(
+            steps.iter().map(|run| run.id).collect::<Vec<_>>(),
+            vec![probe, sort],
+            "in the order they ran"
+        );
+        assert!(steps.iter().all(|run| run.parent_run_id == Some(workflow)));
+        assert_eq!(
+            store
+                .run(manual)
+                .expect("run")
+                .expect("present")
+                .parent_run_id,
+            None
+        );
+        assert_eq!(
+            store
+                .run(workflow)
+                .expect("run")
+                .expect("present")
+                .parent_run_id,
+            None,
+            "a workflow is nobody's step"
+        );
+        assert!(store.child_runs(manual).expect("children").is_empty());
     }
 
     #[test]

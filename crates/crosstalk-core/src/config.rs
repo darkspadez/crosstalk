@@ -556,6 +556,162 @@ impl Serialize for ScheduleEntry {
     }
 }
 
+/// One `[workflows.<name>]` entry: a named sequence of actions the host runs in order.
+///
+/// ```toml
+/// [workflows.nightly]
+/// steps = ["streams.probe", "streams.sort_apply"]
+/// ```
+///
+/// A step is an `<app>.<action>` like a schedule key, and a step may NOT be another workflow:
+/// the sequence is a flat list, so there is no recursion to guard against at run time. Steps run
+/// through the same [`crate::runner::JobRunner`] a manual or scheduled action does, which is why
+/// the scheduler's dry-run rule holds for them too: a `Read` step is a dry run and a writing
+/// step really writes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowConfig {
+    /// The steps, in order.
+    pub steps: Vec<String>,
+    /// Start each step's backlog from the beginning when this workflow begins a new pass.
+    ///
+    /// Off by default, which is the resume-friendly choice: a `probe` that paused at its window's
+    /// end continues where it stopped, then the next step runs. On, every step of a new pass
+    /// discards its saved progress — what an operator wants after widening the scope. A pass that
+    /// RESUMES a paused workflow never discards anything, whatever this says.
+    #[serde(default)]
+    pub fresh: bool,
+}
+
+/// The `[hooks]` table: what Dispatcharr Connect events trigger, and how deliveries are paced.
+///
+/// ```toml
+/// [hooks]
+/// debounce_secs = 60
+/// rate_per_minute = 60
+/// m3u_refresh = ["streams.match_apply"]
+/// epg_refresh = ["workflow.nightly"]
+/// ```
+///
+/// The event names are open-ended (`m3u_refresh`, `epg_refresh`, `m3u_error`, … — whatever the
+/// operator subscribes to in Dispatcharr), so they are the table's unknown keys rather than a
+/// fixed list. A target is an `<app>.<action>` or a `workflow.<name>`, validated at load like a
+/// schedule key.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HooksConfig {
+    /// How long one event must be quiet before its targets run.
+    ///
+    /// Several M3U accounts finishing a refresh within a few seconds is one logical refresh, not
+    /// six matches: the timer restarts on every delivery of the same event and the run happens
+    /// once, after the burst settles. Zero means "run on the first delivery".
+    pub debounce_secs: f64,
+    /// Deliveries served per client address per minute, for the HTTP route.
+    ///
+    /// A hook delivery starts real work, so an unauthenticated flood (or a Connect integration
+    /// configured twice) must not start a run per request. Zero disables the limit.
+    pub rate_per_minute: u32,
+    /// Event name to what it triggers, in the order the hook fires them.
+    pub events: BTreeMap<String, Vec<String>>,
+}
+
+impl Default for HooksConfig {
+    fn default() -> Self {
+        Self {
+            // The burst window several M3U accounts need to finish: long enough to collapse a
+            // refresh of a dozen accounts, short enough that a nightly match still runs promptly.
+            debounce_secs: 60.0,
+            rate_per_minute: 60,
+            events: BTreeMap::new(),
+        }
+    }
+}
+
+impl HooksConfig {
+    /// The debounce window as a duration.
+    pub fn debounce(&self) -> std::time::Duration {
+        let millis = if self.debounce_secs.is_finite() && self.debounce_secs > 0.0 {
+            // Saturating rather than casting blindly: a config can say 1e20.
+            (self.debounce_secs * 1000.0).min(u64::MAX as f64) as u64
+        } else {
+            0
+        };
+        std::time::Duration::from_millis(millis)
+    }
+
+    /// The targets one event name triggers, if it is configured.
+    pub fn targets(&self, event: &str) -> &[String] {
+        self.events.get(event).map(Vec::as_slice).unwrap_or(&[])
+    }
+}
+
+/// Deserialize `[hooks]` as a table whose known keys are the pacing settings and whose other
+/// keys are event names.
+///
+/// Hand-written rather than a `#[serde(flatten)]` map: flattening would feed `debounce_secs` to
+/// the event map as well (serde's flatten sees every key), so the scalar settings would fail to
+/// parse as a list of targets. Writing the visitor also names the offending key on a type error.
+impl<'de> Deserialize<'de> for HooksConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{MapAccess, Visitor};
+
+        struct HooksVisitor;
+
+        impl<'de> Visitor<'de> for HooksVisitor {
+            type Value = HooksConfig;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(
+                    "a table of debounce_secs, rate_per_minute and event name -> [targets]",
+                )
+            }
+
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut config = HooksConfig::default();
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "debounce_secs" => config.debounce_secs = map.next_value()?,
+                        "rate_per_minute" => config.rate_per_minute = map.next_value()?,
+                        _ => {
+                            let targets: Vec<String> = map.next_value().map_err(|error| {
+                                serde::de::Error::custom(format!(
+                                    "hooks.{key}: expected a list of targets: {error}"
+                                ))
+                            })?;
+                            config.events.insert(key, targets);
+                        }
+                    }
+                }
+                Ok(config)
+            }
+        }
+
+        deserializer.deserialize_map(HooksVisitor)
+    }
+}
+
+impl Serialize for HooksConfig {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        let mut map = serializer.serialize_map(Some(2 + self.events.len()))?;
+        map.serialize_entry("debounce_secs", &self.debounce_secs)?;
+        map.serialize_entry("rate_per_minute", &self.rate_per_minute)?;
+        for (event, targets) in &self.events {
+            map.serialize_entry(event, targets)?;
+        }
+        map.end()
+    }
+}
+
 /// Filesystem and thread-pool settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -614,8 +770,13 @@ pub struct CrosstalkConfig {
     pub exports: ExportsConfig,
     pub jobs: JobsConfig,
     /// Cron expressions per `<app>.<action>`, for example `guide.match_apply = "0 4 * * *"`,
-    /// or a table that adds a window: `{ cron = "0 23 * * *", window = "4h" }`.
+    /// or a table that adds a window: `{ cron = "0 23 * * *", window = "4h" }`. A workflow is
+    /// scheduled the same way, as `workflow.<name>`.
     pub schedules: BTreeMap<String, ScheduleEntry>,
+    /// Named step sequences: `[workflows.nightly] steps = ["streams.probe", ...]`.
+    pub workflows: BTreeMap<String, WorkflowConfig>,
+    /// What Dispatcharr Connect events trigger: `[hooks] m3u_refresh = ["streams.match_apply"]`.
+    pub hooks: HooksConfig,
     /// Directory the configuration was loaded from. Not part of the file.
     #[serde(skip)]
     pub config_dir: PathBuf,
@@ -693,7 +854,7 @@ impl CrosstalkConfig {
         let overlay: toml::Table = Figment::from(Env::prefixed(env_prefix).split("__"))
             .extract()
             .map_err(|error| anyhow::anyhow!("invalid environment override: {error}"))?;
-        const SECTIONS: [&str; 8] = [
+        const SECTIONS: [&str; 10] = [
             "server",
             "dispatcharr",
             "ai",
@@ -702,6 +863,8 @@ impl CrosstalkConfig {
             "exports",
             "jobs",
             "schedules",
+            "workflows",
+            "hooks",
         ];
         let overlay: toml::Table = overlay
             .into_iter()
@@ -899,6 +1062,16 @@ impl CrosstalkConfig {
                     "schedules.{key} must be <app>.<action>, e.g. guide.match_apply"
                 ));
             }
+            // A workflow is scheduled under its own name space. Naming one that does not exist
+            // would arm nothing, which is exactly the typo this catches: the scheduler skips
+            // it and `crosstalk validate` says why.
+            if let Some(name) = key.strip_prefix("workflow.") {
+                if !self.workflows.contains_key(name) {
+                    report
+                        .errors
+                        .push(format!("schedules.{key} names no [workflows.{name}] entry"));
+                }
+            }
             // Parsed, not merely counted: a five-field expression with a misspelled weekday
             // would otherwise validate and then never fire.
             if let Err(error) = crate::scheduler::parse_schedule(entry.cron_expression()) {
@@ -908,6 +1081,55 @@ impl CrosstalkConfig {
             // otherwise arm a schedule whose runs never pause, or never end.
             if let Err(error) = entry.window() {
                 report.errors.push(format!("schedules.{key}: {error:#}"));
+            }
+        }
+
+        // Workflows: every step must be a step and not another workflow. The registered-action
+        // check needs the registry, so it lives in `Registry::unknown_workflow_steps`; what can
+        // be checked here is the shape, which is what a step naming a workflow gets wrong.
+        for (name, workflow) in &self.workflows {
+            if workflow.steps.is_empty() {
+                report.errors.push(format!("workflows.{name} has no steps"));
+            }
+            for step in &workflow.steps {
+                if step.starts_with("workflow.") {
+                    report.errors.push(format!(
+                        "workflows.{name}: {step} is a workflow, and a workflow step must be an \
+                         <app>.<action>: workflows do not nest"
+                    ));
+                } else if !step.contains('.') {
+                    report.errors.push(format!(
+                        "workflows.{name}: {step} must be <app>.<action>, e.g. streams.probe"
+                    ));
+                }
+            }
+        }
+
+        // Hooks: the route turns every delivery into real work, so a nonsense pacing value or a
+        // target that is not an <app>.<action> / workflow.<name> is an error rather than a
+        // surprise at 03:00.
+        if !self.hooks.debounce_secs.is_finite() || self.hooks.debounce_secs < 0.0 {
+            report.errors.push(format!(
+                "hooks.debounce_secs must be a number of seconds (0 runs on the first \
+                 delivery), got {}",
+                self.hooks.debounce_secs
+            ));
+        }
+        for (event, targets) in &self.hooks.events {
+            if targets.is_empty() {
+                report.warnings.push(format!(
+                    "hooks.{event} lists no targets: the event is delivered and ignored"
+                ));
+            }
+            for target in targets {
+                let is_workflow = target
+                    .strip_prefix("workflow.")
+                    .is_some_and(|name| self.workflows.contains_key(name));
+                if !is_workflow && !target.contains('.') {
+                    report.errors.push(format!(
+                        "hooks.{event}: {target} must be <app>.<action> or workflow.<name>"
+                    ));
+                }
             }
         }
 
@@ -2236,6 +2458,276 @@ base_url = "https://api.typesafe.ai/v1"
         let error = CrosstalkConfig::load_file(dir.path()).expect_err("rejects");
         let text = format!("{error:#}");
         assert!(text.contains("windoww"), "{text}");
+    }
+
+    #[test]
+    fn a_workflow_is_steps_and_an_optional_fresh_flag() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            r#"
+[workflows.nightly]
+steps = ["streams.probe", "streams.sort_apply"]
+
+[workflows.rebuild]
+steps = ["streams.match_apply"]
+fresh = true
+
+[schedules]
+"workflow.nightly" = { cron = "0 23 * * *", window = "4h" }
+"#,
+        );
+        let config = CrosstalkConfig::load_file(dir.path()).expect("load");
+        assert_eq!(
+            config.workflows["nightly"].steps,
+            vec![
+                "streams.probe".to_string(),
+                "streams.sort_apply".to_string()
+            ]
+        );
+        assert!(!config.workflows["nightly"].fresh, "off by default");
+        assert!(config.workflows["rebuild"].fresh);
+        // A workflow is scheduled like an action, under its own name space, and the schedule
+        // entry names an existing workflow, so nothing here is an error.
+        assert!(config.schedules.contains_key("workflow.nightly"));
+        assert!(
+            config
+                .validate()
+                .errors
+                .iter()
+                .all(|error| error.contains("credentials")),
+            "{:?}",
+            config.validate().errors
+        );
+    }
+
+    #[test]
+    fn a_workflow_step_cannot_be_a_workflow() {
+        // A step naming a workflow would be a cycle (or at least a sequence inside a sequence),
+        // and this port has neither: a flat list of actions is the whole feature.
+        let mut config = CrosstalkConfig::default();
+        config.workflows.insert(
+            "nightly".to_string(),
+            WorkflowConfig {
+                steps: vec!["workflow.other".to_string()],
+                fresh: false,
+            },
+        );
+        config.workflows.insert(
+            "other".to_string(),
+            WorkflowConfig {
+                steps: vec!["workflow.nightly".to_string()],
+                fresh: false,
+            },
+        );
+        let errors = config.validate().errors;
+        assert!(
+            errors.iter().any(|error| error.contains("do not nest")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_or_malformed_workflow_is_a_validation_error() {
+        let mut config = CrosstalkConfig::default();
+        config.workflows.insert(
+            "empty".to_string(),
+            WorkflowConfig {
+                steps: Vec::new(),
+                fresh: false,
+            },
+        );
+        config.workflows.insert(
+            "shapeless".to_string(),
+            WorkflowConfig {
+                steps: vec!["probe".to_string()],
+                fresh: false,
+            },
+        );
+        let errors = config.validate().errors;
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("workflows.empty has no steps")),
+            "{errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("workflows.shapeless: probe must be <app>.<action>")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_schedule_naming_a_missing_workflow_is_an_error() {
+        let mut config = CrosstalkConfig::default();
+        config.schedules.insert(
+            "workflow.nightly".to_string(),
+            ScheduleEntry::cron("0 23 * * *"),
+        );
+        let errors = config.validate().errors;
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("names no [workflows.nightly] entry")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn hooks_are_pacing_settings_plus_one_key_per_event() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            r#"
+[workflows.nightly]
+steps = ["streams.probe"]
+
+[hooks]
+debounce_secs = 30
+rate_per_minute = 12
+m3u_refresh = ["streams.match_apply"]
+epg_refresh = ["workflow.nightly", "streams.sort_apply"]
+"#,
+        );
+        let config = CrosstalkConfig::load_file(dir.path()).expect("load");
+        assert_eq!(config.hooks.debounce_secs, 30.0);
+        assert_eq!(config.hooks.rate_per_minute, 12);
+        assert_eq!(
+            config.hooks.targets("epg_refresh"),
+            [
+                "workflow.nightly".to_string(),
+                "streams.sort_apply".to_string()
+            ]
+        );
+        // An event the file does not name has no targets; unknown event names are the normal
+        // case, so none of this is an error.
+        assert!(config.hooks.targets("channel_start").is_empty());
+        assert_eq!(config.hooks.debounce(), std::time::Duration::from_secs(30));
+        assert!(
+            config
+                .validate()
+                .errors
+                .iter()
+                .all(|error| error.contains("credentials")),
+            "{:?}",
+            config.validate().errors
+        );
+    }
+
+    #[test]
+    fn a_malformed_hook_target_or_pacing_is_a_validation_error() {
+        let mut config = CrosstalkConfig::default();
+        config.hooks.debounce_secs = -1.0;
+        config
+            .hooks
+            .events
+            .insert("m3u_refresh".to_string(), vec!["typo".to_string()]);
+        config
+            .hooks
+            .events
+            .insert("epg_refresh".to_string(), Vec::new());
+        let errors = config.validate().errors;
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("hooks.debounce_secs")),
+            "{errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("hooks.m3u_refresh: typo must be <app>.<action>")),
+            "{errors:?}"
+        );
+        // An event with no targets is a warning: the delivery is accepted and ignored.
+        assert!(
+            config
+                .validate()
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("hooks.epg_refresh lists no targets")),
+            "{:?}",
+            config.validate().warnings
+        );
+    }
+
+    #[test]
+    fn hooks_and_workflows_survive_a_save_with_comments() {
+        // The web UI's host save rewrites the file through `toml_edit`: the event keys must come
+        // back as event keys (not under `[hooks.events]`), and the workflow steps as steps.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("crosstalk.toml");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            r#"# operator note
+[workflows.nightly]
+steps = ["streams.probe", "streams.sort_apply"]
+
+[hooks]
+m3u_refresh = ["streams.match_apply"]
+"#,
+        );
+        let config = CrosstalkConfig::load_file(dir.path()).expect("load");
+        config.save(&path).expect("save");
+        let text = std::fs::read_to_string(&path).expect("read back");
+        assert!(text.contains("# operator note"), "comments survive: {text}");
+        assert!(!text.contains("[hooks.events]"), "events stay flat: {text}");
+
+        let reloaded = CrosstalkConfig::load_file(dir.path()).expect("reload");
+        assert_eq!(
+            reloaded.workflows["nightly"].steps,
+            vec![
+                "streams.probe".to_string(),
+                "streams.sort_apply".to_string()
+            ]
+        );
+        assert_eq!(
+            reloaded.hooks.targets("m3u_refresh"),
+            ["streams.match_apply".to_string()]
+        );
+        assert!(reloaded.hooks.debounce_secs > 0.0, "the default survives");
+    }
+
+    #[test]
+    fn a_malformed_hook_value_names_the_event() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            "[hooks]\nm3u_refresh = \"streams.match_apply\"\n",
+        );
+        let error = CrosstalkConfig::load_file(dir.path()).expect_err("rejects");
+        assert!(format!("{error:#}").contains("m3u_refresh"), "{error:#}");
+    }
+
+    #[test]
+    fn environment_overrides_reach_hooks_and_workflows() {
+        // The README promises every value is overridable as CROSSTALK_<SECTION>__<KEY>: the
+        // new top-level tables are sections too, so the filter must let them through.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            "[workflows.nightly]\nsteps = [\"streams.probe\"]\n",
+        );
+        std::env::set_var("CROSSTALK_TESTHOOKS_HOOKS__RATE_PER_MINUTE", "12");
+        std::env::set_var("CROSSTALK_TESTHOOKS_WORKFLOWS__NIGHTLY__FRESH", "true");
+        let config =
+            CrosstalkConfig::load_prefixed(dir.path(), "CROSSTALK_TESTHOOKS_").expect("load");
+        std::env::remove_var("CROSSTALK_TESTHOOKS_HOOKS__RATE_PER_MINUTE");
+        std::env::remove_var("CROSSTALK_TESTHOOKS_WORKFLOWS__NIGHTLY__FRESH");
+        assert_eq!(config.hooks.rate_per_minute, 12);
+        assert!(config.workflows["nightly"].fresh);
+        assert_eq!(
+            config.env_overrides, 1,
+            "overrides applied, so save still refuses"
+        );
+        assert!(config.save(dir.path().join("crosstalk.toml")).is_err());
     }
 
     #[test]

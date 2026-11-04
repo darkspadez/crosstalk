@@ -18,12 +18,15 @@
 //!     the next firing resumes it instead of an operator thinking work was lost or finished
 //!     (see [`crate::jobs`] for the whole rule);
 //!   * a panic in an action frees the app and records the failure, so one bad run cannot lock
-//!     the daemon out of ever running that app again.
+//!     the daemon out of ever running that app again;
+//!   * a workflow ([`crate::workflow`]) is one more run: it holds the reserved `workflow` slot
+//!     (so two workflows never interleave), it is cancellable by its run id like any action, and
+//!     its steps are ordinary runs of their own apps that point back at it.
 
 use crate::config::{CrosstalkConfig, SharedConfig};
 use crate::jobs::{JobContext, ProgressEvent, ProgressSink};
 use crate::store::{RunStatus, Store};
-use crate::subapp::{ActionKind, ActionSpec, JobOutcome, OutcomeStatus, Registry};
+use crate::subapp::{ActionKind, JobOutcome, OutcomeStatus, Registry};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
@@ -51,6 +54,11 @@ pub struct RunOptions {
     pub deadline: Option<DateTime<Utc>>,
     /// Ignore and discard saved progress.
     pub fresh: bool,
+    /// The workflow run this run is a step of, when a workflow started it.
+    ///
+    /// Recorded on the run row (`parent_run_id`) so the workflow's run page can list its steps.
+    /// Nothing else reads it: a step is an ordinary run in every other respect.
+    pub parent_run: Option<i64>,
 }
 
 impl RunOptions {
@@ -63,6 +71,12 @@ impl RunOptions {
     /// Start the backlog from the beginning, discarding any saved progress.
     pub fn fresh(mut self) -> Self {
         self.fresh = true;
+        self
+    }
+
+    /// Record this run as a step of the given workflow run.
+    pub fn with_parent(mut self, parent_run_id: i64) -> Self {
+        self.parent_run = Some(parent_run_id);
         self
     }
 }
@@ -219,6 +233,9 @@ fn recorded_outcome(
                 // The action decided it was cancelled itself, which is what a job that stops on
                 // request after a write returns.
                 OutcomeStatus::Cancelled => RunStatus::Cancelled,
+                // A run that says it failed is recorded failed, counts and all: the action's own
+                // answer is the truth about why it stopped, exactly as it is for a pause.
+                OutcomeStatus::Failed => RunStatus::Failed,
                 // A cancel that arrived too late for the action to act on still means the
                 // operator asked it to stop: record that, and keep everything it produced.
                 OutcomeStatus::Succeeded if cancelled => RunStatus::Cancelled,
@@ -378,7 +395,8 @@ impl JobRunner {
     fn reserve(
         &self,
         app_id: &str,
-        spec: &ActionSpec,
+        action_id: &str,
+        unguarded: bool,
         dry_run: bool,
         options: &RunOptions,
     ) -> Result<(i64, Arc<AtomicBool>)> {
@@ -386,14 +404,16 @@ impl JobRunner {
             bail!("the daemon is shutting down; not starting new runs");
         }
 
-        if spec.unguarded {
+        if unguarded {
             // No slot, and no busy entry: the whole point is that this may run beside another
-            // run of the same app.
-            let run_id = self.store.start_unguarded_run(app_id, spec.id, dry_run)?;
+            // run of the same app. The workflow link is kept: a `status` step is still a step.
+            let run_id =
+                self.store
+                    .insert_run(app_id, action_id, dry_run, true, options.parent_run)?;
             if options.fresh {
-                self.store.clear_checkpoint(app_id, spec.id)?;
+                self.store.clear_checkpoint(app_id, action_id)?;
             }
-            return Ok((run_id, self.track(run_id, app_id, spec.id, dry_run)));
+            return Ok((run_id, self.track(run_id, app_id, action_id, dry_run)));
         }
 
         let mut busy = self.busy.lock().expect("busy lock");
@@ -408,7 +428,10 @@ impl JobRunner {
         // process (the daemon, or a second CLI) already holds a `running` row for the app
         // — the store's partial unique index — and that failure must read as "busy", not
         // as SQLite internals.
-        let run_id = match self.store.start_run(app_id, spec.id, dry_run) {
+        let started = self
+            .store
+            .insert_run(app_id, action_id, dry_run, false, options.parent_run);
+        let run_id = match started {
             Ok(run_id) => run_id,
             Err(error) if is_running_conflict(&error) => bail!(
                 "{app_id} already has a run in progress in another process; wait for it to \
@@ -422,9 +445,9 @@ impl JobRunner {
 
         if options.fresh {
             // Before the action reads anything: a fresh start must not find last night's place.
-            self.store.clear_checkpoint(app_id, spec.id)?;
+            self.store.clear_checkpoint(app_id, action_id)?;
         }
-        Ok((run_id, self.track(run_id, app_id, spec.id, dry_run)))
+        Ok((run_id, self.track(run_id, app_id, action_id, dry_run)))
     }
 
     /// Register a started run's cancel flag and its active-run entry.
@@ -472,7 +495,8 @@ impl JobRunner {
             .find_action(app_id, action_id)
             .with_context(|| format!("no action {action_id:?} in sub-app {app_id:?}"))?;
 
-        let (run_id, cancel_flag) = self.reserve(app_id, &spec, dry_run, &options)?;
+        let (run_id, cancel_flag) =
+            self.reserve(app_id, spec.id, spec.unguarded, dry_run, &options)?;
 
         let runner = self.clone();
         let app = Arc::clone(app);
@@ -576,7 +600,8 @@ impl JobRunner {
             .find_action(app_id, action_id)
             .with_context(|| format!("no action {action_id:?} in sub-app {app_id:?}"))?;
 
-        let (run_id, cancel_flag) = self.reserve(app_id, &spec, dry_run, &options)?;
+        let (run_id, cancel_flag) =
+            self.reserve(app_id, spec.id, spec.unguarded, dry_run, &options)?;
         let slot = RunSlot {
             run_id,
             app: app_id.to_string(),
@@ -686,6 +711,132 @@ impl JobRunner {
         self.registry
             .find_action(app_id, action_id)
             .map(|(_, action)| action.kind)
+    }
+
+    /// Whether a run started by this runner is still in flight.
+    ///
+    /// The workflow executor watches its steps with this: a step is an ordinary spawned run, so
+    /// "did it finish yet" is the live table, not a join handle the runner never exposes.
+    /// A run from ANOTHER process is not listed here — but a workflow never starts one, so the
+    /// answer is exact for the caller that matters.
+    pub fn is_run_active(&self, run_id: i64) -> bool {
+        self.active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&run_id)
+    }
+
+    /// Wait for a run to finish, asking it to stop whenever `cancel` is set.
+    ///
+    /// Used by the workflow executor: the workflow's own cancel flag reaches its running step
+    /// this way, so cancelling a workflow cancels the step it is inside rather than waiting for
+    /// it to finish first. Polling rather than a channel because the run may also be cancelled
+    /// from the UI under its own run id, and that path sets the same flag the runner already
+    /// holds.
+    pub async fn wait_for_run(&self, run_id: i64, cancel: &AtomicBool) {
+        while self.is_run_active(run_id) {
+            if cancel.load(Ordering::SeqCst) {
+                self.cancel(run_id);
+            }
+            tokio::time::sleep(RUN_POLL).await;
+        }
+    }
+
+    /// Take the host's `workflow` slot and register the new run's cancel flag, live entry and
+    /// progress sink.
+    ///
+    /// The workflow executor ([`crate::workflow`]) owns the step loop; this is the bookkeeping
+    /// that makes a workflow a run like any other: one at a time (they would contend for the
+    /// same apps anyway), cancellable by its run id from the UI or the API, and visible in the
+    /// live table while it works.
+    pub fn reserve_workflow(
+        &self,
+        name: &str,
+        dry_run: bool,
+        options: &RunOptions,
+    ) -> Result<WorkflowSlot> {
+        let (run_id, cancel) =
+            self.reserve(crate::workflow::APP_ID, name, false, dry_run, options)?;
+        let sink = Arc::new(BroadcastSink {
+            sender: self.sender.clone(),
+            active: Arc::clone(&self.active),
+            run_id,
+        });
+        Ok(WorkflowSlot {
+            run_id,
+            name: name.to_string(),
+            cancel,
+            sink,
+            slot: Some(RunSlot {
+                run_id,
+                app: crate::workflow::APP_ID.to_string(),
+                store: self.store.clone(),
+                active: Arc::clone(&self.active),
+                busy: Arc::clone(&self.busy),
+                finish: Arc::clone(&self.finish),
+                finished: false,
+            }),
+            runner: self.clone(),
+        })
+    }
+}
+
+/// How often [`JobRunner::wait_for_run`] re-reads the live run table.
+///
+/// Short enough that cancelling a workflow stops its step promptly, long enough that a four-hour
+/// probe costs a few hundred thousand lock acquisitions rather than millions.
+const RUN_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// A started workflow's host-side bookkeeping (see [`JobRunner::reserve_workflow`]).
+///
+/// Dropping one without [`WorkflowSlot::finish`] records the run as failed, exactly as an
+/// action's slot does: a workflow whose task was torn down must not leave a `running` row
+/// behind claiming it is still working.
+pub struct WorkflowSlot {
+    run_id: i64,
+    /// The workflow's name, for the progress events and the drop guard's failure message.
+    name: String,
+    cancel: Arc<AtomicBool>,
+    sink: Arc<BroadcastSink>,
+    /// `None` once the outcome is recorded, so the drop guard cannot record a second one.
+    slot: Option<RunSlot>,
+    runner: JobRunner,
+}
+
+impl WorkflowSlot {
+    /// The workflow run's id, for the step runs' parent link and the redirect after a start.
+    pub fn run_id(&self) -> i64 {
+        self.run_id
+    }
+
+    /// The workflow's own cancel flag, shared with the runner's table.
+    pub fn cancel_flag(&self) -> &AtomicBool {
+        self.cancel.as_ref()
+    }
+
+    /// Whether an operator (or a shutdown) asked this workflow to stop.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::SeqCst)
+    }
+
+    /// Report progress: which step is running, out of how many.
+    pub fn progress(&self, event: &ProgressEvent) {
+        self.sink.publish(event);
+    }
+
+    /// Record the outcome and free the `workflow` slot, then prune history like any other run.
+    pub fn finish(mut self, outcome: &Result<JobOutcome>) {
+        let cancelled = self.is_cancelled();
+        let (status, summary, counts, report) = recorded_outcome(outcome, cancelled);
+        if let Some(slot) = self.slot.take() {
+            slot.finish(status, summary.as_deref(), &counts, report.as_deref());
+        }
+        self.runner.prune_history();
+
+        let mut event = ProgressEvent::new(&self.name, 0, 0, status.as_str());
+        event.done = true;
+        event.summary = summary;
+        self.sink.publish(&event);
     }
 }
 

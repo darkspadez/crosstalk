@@ -420,6 +420,13 @@ pub enum OutcomeStatus {
     Paused,
     /// The action stopped because the run was cancelled.
     Cancelled,
+    /// The action ran, did some of its work and stopped on an error it did not recover from.
+    ///
+    /// Distinct from returning `Err`: an `Err` means the run produced no usable outcome at all
+    /// (see [`crate::runner`]), so the record keeps no counts. A composite run (a workflow) that
+    /// stops at a failed step has counts — what its earlier steps did — and a summary naming the
+    /// step, and this is how it says both.
+    Failed,
 }
 
 /// How one action finished, for the run record and the toast.
@@ -461,6 +468,17 @@ impl JobOutcome {
         self
     }
 
+    /// A run that did some of its work and stopped on an unrecovered error.
+    ///
+    /// The counts and the summary are kept: a workflow that failed at its third step still says
+    /// what the first two did.
+    pub fn failed(summary: impl Into<String>) -> Self {
+        Self {
+            status: OutcomeStatus::Failed,
+            ..Self::new(summary)
+        }
+    }
+
     pub fn with_status(mut self, status: OutcomeStatus) -> Self {
         self.status = status;
         self
@@ -472,6 +490,10 @@ impl JobOutcome {
 
     pub fn is_cancelled(&self) -> bool {
         self.status == OutcomeStatus::Cancelled
+    }
+
+    pub fn is_failed(&self) -> bool {
+        self.status == OutcomeStatus::Failed
     }
 
     pub fn with_count(mut self, key: impl Into<String>, value: i64) -> Self {
@@ -517,6 +539,12 @@ impl OutcomeBuilder {
     /// This run was cancelled; keep everything it did.
     pub fn cancelled(mut self) -> Self {
         self.status = OutcomeStatus::Cancelled;
+        self
+    }
+
+    /// This run stopped on an error, keeping the counts of what it did do.
+    pub fn failed(mut self) -> Self {
+        self.status = OutcomeStatus::Failed;
         self
     }
 
@@ -644,6 +672,14 @@ impl Registry {
         // would be unreachable from the UI, the CLI and the scheduler.
         let mut seen = std::collections::HashSet::new();
         for app in &apps {
+            // `workflow` is the host's own app id: it is what `workflow.<name>` means in a
+            // schedule key, a hook target and a run row, so a sub-app registered under it
+            // would make every one of those ambiguous.
+            assert!(
+                app.id() != crate::target::WORKFLOW_APP,
+                "the app id {:?} is reserved for workflows",
+                app.id()
+            );
             assert!(
                 seen.insert(app.id()),
                 "two sub-apps share the id {:?}",
@@ -684,17 +720,53 @@ impl Registry {
         Some((app, spec))
     }
 
-    /// Resolve the schedule keys against the registered apps, reporting any that name an
-    /// action which does not exist. A typo in a schedule would otherwise just never run.
+    /// Resolve the schedule keys against the registered apps and the configured workflows,
+    /// reporting any that name something which does not exist. A typo in a schedule would
+    /// otherwise just never run.
+    ///
+    /// A key is a [`crate::target::Target`]: `<app>.<action>`, or `workflow.<name>` for a step
+    /// sequence, which is how a workflow gets scheduled.
     pub fn unknown_schedules(&self, config: &CrosstalkConfig) -> Vec<String> {
         let mut unknown = Vec::new();
         for key in config.schedules.keys() {
-            let Some((app, action)) = key.split_once('.') else {
-                unknown.push(key.clone());
-                continue;
-            };
-            if self.find_action(app, action).is_none() {
-                unknown.push(key.clone());
+            match crate::target::Target::parse(key) {
+                Ok(target) if target.exists(self, config) => {}
+                _ => unknown.push(key.clone()),
+            }
+        }
+        unknown
+    }
+
+    /// Workflow steps that name no registered action, as `(workflow, step)` pairs.
+    ///
+    /// A step naming a workflow is caught earlier, by the configuration's own shape rules (a
+    /// workflow never nests), so what is left here is a typo or a step for an app this build
+    /// does not link in.
+    pub fn unknown_workflow_steps(&self, config: &CrosstalkConfig) -> Vec<(String, String)> {
+        let mut unknown = Vec::new();
+        for (name, workflow) in &config.workflows {
+            for step in &workflow.steps {
+                if crate::workflow::Step::parse(step)
+                    .map(|step| self.find_action(&step.app, &step.action).is_none())
+                    .unwrap_or(true)
+                {
+                    unknown.push((name.clone(), step.clone()));
+                }
+            }
+        }
+        unknown
+    }
+
+    /// Hook targets that name no registered action and no configured workflow, as
+    /// `(event, target)` pairs.
+    pub fn unknown_hook_targets(&self, config: &CrosstalkConfig) -> Vec<(String, String)> {
+        let mut unknown = Vec::new();
+        for (event, targets) in &config.hooks.events {
+            for target in targets {
+                match crate::target::Target::parse(target) {
+                    Ok(parsed) if parsed.exists(self, config) => {}
+                    _ => unknown.push((event.clone(), target.clone())),
+                }
             }
         }
         unknown
@@ -861,6 +933,67 @@ mod tests {
         assert_eq!(action.kind, ActionKind::Write);
         assert!(registry.find_action("stub", "nope").is_none());
         assert!(registry.find_action("nope", "nope").is_none());
+    }
+
+    #[test]
+    fn registry_reports_unknown_workflow_steps_and_hook_targets() {
+        // Validation has the registry, the configuration alone does not: a step or a hook target
+        // naming an action this build does not register is the typo only this method can see.
+        let registry = stub_registry();
+        let mut config = CrosstalkConfig::default();
+        config.workflows.insert(
+            "nightly".to_string(),
+            crate::config::WorkflowConfig {
+                steps: vec!["stub.apply".to_string(), "stub.nope".to_string()],
+                fresh: false,
+            },
+        );
+        config.workflows.insert(
+            "nested".to_string(),
+            crate::config::WorkflowConfig {
+                steps: vec!["workflow.other".to_string()],
+                fresh: false,
+            },
+        );
+        config.hooks.events.insert(
+            "m3u_refresh".to_string(),
+            vec!["stub.preview".to_string(), "stub.nope".to_string()],
+        );
+        config.hooks.events.insert(
+            "epg_refresh".to_string(),
+            vec![
+                "workflow.nightly".to_string(),
+                "workflow.missing".to_string(),
+            ],
+        );
+        config.schedules.insert(
+            "workflow.nightly".to_string(),
+            crate::config::ScheduleEntry::cron("0 4 * * *"),
+        );
+        config.schedules.insert(
+            "workflow.missing".to_string(),
+            crate::config::ScheduleEntry::cron("0 4 * * *"),
+        );
+
+        assert_eq!(
+            registry.unknown_workflow_steps(&config),
+            vec![
+                ("nested".to_string(), "workflow.other".to_string()),
+                ("nightly".to_string(), "stub.nope".to_string()),
+            ]
+        );
+        assert_eq!(
+            registry.unknown_hook_targets(&config),
+            vec![
+                ("epg_refresh".to_string(), "workflow.missing".to_string()),
+                ("m3u_refresh".to_string(), "stub.nope".to_string()),
+            ]
+        );
+        // A configured workflow is a valid schedule key; a missing one is not.
+        assert_eq!(
+            registry.unknown_schedules(&config),
+            vec!["workflow.missing".to_string()]
+        );
     }
 
     #[test]

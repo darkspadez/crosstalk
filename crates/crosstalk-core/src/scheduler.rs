@@ -15,6 +15,7 @@
 
 use crate::config::CrosstalkConfig;
 use crate::runner::{JobRunner, RunOptions};
+use crate::target::Target;
 use crate::window::Window;
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
@@ -70,6 +71,14 @@ pub fn parse_schedule(expression: &str) -> Result<Cron> {
 fn split_key(key: &str) -> Result<(&str, &str)> {
     key.split_once('.')
         .with_context(|| format!("schedule {key:?} must be written <app>.<action>"))
+}
+
+/// The target a schedule key names: an action, or `workflow.<name>`.
+///
+/// Only the shape is checked here; whether it names anything is
+/// [`Target::exists`], which needs the registry and the configuration.
+fn key_target(key: &str) -> Result<Target> {
+    Target::parse(key).with_context(|| format!("schedule {key:?}"))
 }
 
 /// The schedules the configuration describes, with their next run times.
@@ -212,12 +221,15 @@ async fn arm_jobs(
 ) -> Vec<uuid::Uuid> {
     let mut armed = Vec::new();
     for (key, entry) in &config.schedules {
-        let Ok((app, action)) = split_key(key) else {
+        let Ok(target) = key_target(key) else {
             tracing::warn!("schedule {key:?} is not <app>.<action>; ignoring it");
             continue;
         };
-        if runner.registry().find_action(app, action).is_none() {
-            tracing::warn!("schedule {key:?} names an unknown action; ignoring it");
+        // An entry naming nothing is skipped rather than failing the daemon: a typo in one
+        // schedule must not stop the others, and `crosstalk validate` reports it as an error.
+        // A workflow is a target like an action — `workflow.<name>` — so both arm the same way.
+        if !target.exists(runner.registry(), config) {
+            tracing::warn!("schedule {key:?} names an unknown action or workflow; ignoring it");
             continue;
         }
 
@@ -245,30 +257,32 @@ async fn arm_jobs(
         }
 
         let job_runner = runner.clone();
-        let app = app.to_string();
-        let action = action.to_string();
-        let dry_run = runner.scheduled_dry_run(&app, &action);
+        let dry_run = target.dry_run(runner.registry(), config);
+        let fired = target.key();
         let job = match Job::new_async(normalized.as_str(), move |_uuid, _lock| {
             let runner = job_runner.clone();
-            let app = app.clone();
-            let action = action.clone();
+            let target = target.clone();
+            let fired = fired.clone();
             Box::pin(async move {
                 // The window is measured from THIS firing, not from the daemon's start: a
                 // schedule that fires every six hours and runs for four leaves two hours of
                 // headroom for the work it could not finish.
                 let options = RunOptions::default()
                     .with_deadline(window.map(|window| window.deadline_from(Utc::now())));
-                // The flag comes from the action's own kind, so a schedule naming a
-                // preview stays a preview instead of writing because a schedule said so.
-                match runner.start_with(&app, &action, dry_run, options) {
+                // The flag comes from the target's own kind, so a schedule naming a preview
+                // stays a preview instead of writing because a schedule said so — and a
+                // workflow of writing steps really writes.
+                match target.start(&runner, dry_run, options) {
                     Ok(started) => tracing::info!(
-                        app,
-                        action,
+                        target = fired.as_str(),
                         run_id = started.run_id,
                         "scheduled run started"
                     ),
                     Err(error) => {
-                        tracing::warn!(app, action, "scheduled run not started: {error:#}")
+                        tracing::warn!(
+                            target = fired.as_str(),
+                            "scheduled run not started: {error:#}"
+                        )
                     }
                 }
             })
@@ -521,6 +535,143 @@ mod tests {
         );
         let mut scheduler = Scheduler::start(runner, &config).await.expect("arms");
         assert_eq!(scheduler.jobs_count(), 0, "a bad window is not armed");
+        scheduler.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_workflow_is_scheduled_under_its_own_name_space() {
+        // `"workflow.<name>"` is a schedule key like any `<app>.<action>`, and the dry-run flag
+        // comes from the steps' own kinds: a workflow of reading steps is armed as a read, one
+        // with a writing step as a write.
+        struct App;
+        impl crate::subapp::SubApp for App {
+            fn id(&self) -> &'static str {
+                "streams"
+            }
+            fn name(&self) -> &'static str {
+                "Streams"
+            }
+            fn description(&self) -> &'static str {
+                "test"
+            }
+            fn actions(&self) -> Vec<crate::subapp::ActionSpec> {
+                vec![
+                    crate::subapp::ActionSpec::new(
+                        "probe",
+                        "Probe",
+                        "runs",
+                        crate::subapp::ActionKind::Read,
+                    )
+                    .offline(),
+                    crate::subapp::ActionSpec::new(
+                        "sort_apply",
+                        "Sort",
+                        "writes",
+                        crate::subapp::ActionKind::Write,
+                    )
+                    .offline(),
+                ]
+            }
+            fn schema(&self) -> &crate::subapp::SettingsSchema {
+                static SCHEMA: std::sync::OnceLock<crate::subapp::SettingsSchema> =
+                    std::sync::OnceLock::new();
+                SCHEMA.get_or_init(crate::subapp::SettingsSchema::default)
+            }
+            fn load_settings(
+                &self,
+                _path: &std::path::Path,
+            ) -> anyhow::Result<crate::subapp::SettingsValues> {
+                Ok(crate::subapp::SettingsValues::new())
+            }
+            fn save_settings(
+                &self,
+                _path: &std::path::Path,
+                _values: &crate::subapp::SettingsValues,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn run<'a>(
+                &'a self,
+                _action: &'a str,
+                _context: &crate::jobs::JobContext,
+                _dry_run: bool,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = anyhow::Result<crate::subapp::JobOutcome>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move { Ok(crate::subapp::JobOutcome::new("finished")) })
+            }
+        }
+
+        let registry = crate::subapp::Registry::new(vec![Arc::new(App)]);
+        let mut config = CrosstalkConfig::default();
+        config.workflows.insert(
+            "nightly".to_string(),
+            crate::config::WorkflowConfig {
+                steps: vec!["streams.probe".to_string()],
+                fresh: false,
+            },
+        );
+        config.workflows.insert(
+            "fixing".to_string(),
+            crate::config::WorkflowConfig {
+                steps: vec![
+                    "streams.probe".to_string(),
+                    "streams.sort_apply".to_string(),
+                ],
+                fresh: false,
+            },
+        );
+        config.schedules.insert(
+            "workflow.nightly".to_string(),
+            ScheduleEntry::cron("0 23 * * *"),
+        );
+        config.schedules.insert(
+            "workflow.fixing".to_string(),
+            ScheduleEntry::cron("0 3 * * *"),
+        );
+        // A key naming a workflow that does not exist arms nothing.
+        config.schedules.insert(
+            "workflow.nope".to_string(),
+            ScheduleEntry::cron("0 5 * * *"),
+        );
+
+        let store = crate::store::Store::in_memory().expect("store");
+        let runner = JobRunner::new(
+            registry,
+            crate::config::SharedConfig::new(config.clone()),
+            store,
+        );
+        let mut scheduler = Scheduler::start(runner.clone(), &config)
+            .await
+            .expect("arms");
+        assert_eq!(scheduler.jobs_count(), 2, "both real workflows arm");
+
+        // The dashboard lists them, app half `workflow`, with a next run.
+        let described = describe(&config);
+        let nightly = described
+            .iter()
+            .find(|entry| entry.key == "workflow.nightly")
+            .expect("listed");
+        assert_eq!(nightly.app, "workflow");
+        assert_eq!(nightly.action, "nightly");
+        assert!(nightly.next_run.is_some());
+
+        // The dry-run flag follows the steps: all-read is a read, one write is a write.
+        assert!(runner.registry().find_action("streams", "probe").is_some());
+        assert!(crate::workflow::scheduled_dry_run(
+            runner.registry(),
+            &config,
+            "nightly"
+        ));
+        assert!(!crate::workflow::scheduled_dry_run(
+            runner.registry(),
+            &config,
+            "fixing"
+        ));
         scheduler.shutdown().await;
     }
 
