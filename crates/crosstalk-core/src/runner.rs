@@ -4,21 +4,28 @@
 //! apply with programme checks takes minutes — so the HTTP layer starts it and returns, and
 //! the operator watches it through the progress stream or on the run page.
 //!
-//! Three rules come from the plugin's own behaviour and are enforced here rather than left to
+//! The rules come from the plugin's own behaviour and are enforced here rather than left to
 //! each app:
 //!
-//!   * one run per app at a time, checked and reserved under ONE lock, because two
-//!     auto-matches writing the same channels would race;
+//!   * one GUARDED run per app at a time, checked and reserved under ONE lock, because two
+//!     auto-matches writing the same channels would race. A read-only status-like action is
+//!     declared unguarded (`ActionSpec::unguarded`) and takes no slot: it is still recorded, so
+//!     its answer lands on a run page, but it can run while another run of its app is live — that
+//!     is exactly when an operator wants to see the blocking run's progress;
 //!   * a cancelled run actually tells the action to stop, and is recorded as cancelled rather
-//!     than as a success;
+//!     than as a success — keeping the counts, the report and the rows it produced;
+//!   * a run that stops at its schedule window's end is recorded paused, distinct from both, so
+//!     the next firing resumes it instead of an operator thinking work was lost or finished
+//!     (see [`crate::jobs`] for the whole rule);
 //!   * a panic in an action frees the app and records the failure, so one bad run cannot lock
 //!     the daemon out of ever running that app again.
 
 use crate::config::{CrosstalkConfig, SharedConfig};
 use crate::jobs::{JobContext, ProgressEvent, ProgressSink};
 use crate::store::{RunStatus, Store};
-use crate::subapp::{ActionKind, Registry};
+use crate::subapp::{ActionKind, ActionSpec, JobOutcome, OutcomeStatus, Registry};
 use anyhow::{bail, Context, Result};
+use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -31,6 +38,33 @@ pub struct StartedRun {
     pub app: String,
     pub action: String,
     pub dry_run: bool,
+}
+
+/// What a caller may change about how a run starts.
+///
+/// The defaults are a manual run: no deadline (so the action never pauses) and a resume from
+/// whatever checkpoint the action left last time. A schedule adds the window's deadline; an
+/// operator who wants the backlog from the beginning adds `fresh`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunOptions {
+    /// The instant the run must stop and checkpoint: a schedule window's end.
+    pub deadline: Option<DateTime<Utc>>,
+    /// Ignore and discard saved progress.
+    pub fresh: bool,
+}
+
+impl RunOptions {
+    /// Bound the run by a window's end.
+    pub fn with_deadline(mut self, deadline: Option<DateTime<Utc>>) -> Self {
+        self.deadline = deadline;
+        self
+    }
+
+    /// Start the backlog from the beginning, discarding any saved progress.
+    pub fn fresh(mut self) -> Self {
+        self.fresh = true;
+        self
+    }
 }
 
 /// A snapshot of what is running, for the status page.
@@ -168,6 +202,55 @@ fn is_running_conflict(error: &anyhow::Error) -> bool {
     )
 }
 
+/// How a finished action maps onto a recorded run: the one place every app's stopping rules are
+/// applied (the rules themselves are documented in [`crate::jobs`]).
+///
+/// The counts, the summary and the report survive a cancel, so nothing that landed is hidden:
+/// phase 1 recorded a cancelled run with the empty counts an `Err` carries, which made a
+/// half-written apply read as "nothing happened".
+fn recorded_outcome(
+    outcome: &Result<JobOutcome>,
+    cancelled: bool,
+) -> (RunStatus, Option<String>, serde_json::Value, Option<String>) {
+    match outcome {
+        Ok(outcome) => {
+            let status = match outcome.status {
+                OutcomeStatus::Paused => RunStatus::Paused,
+                // The action decided it was cancelled itself, which is what a job that stops on
+                // request after a write returns.
+                OutcomeStatus::Cancelled => RunStatus::Cancelled,
+                // A cancel that arrived too late for the action to act on still means the
+                // operator asked it to stop: record that, and keep everything it produced.
+                OutcomeStatus::Succeeded if cancelled => RunStatus::Cancelled,
+                OutcomeStatus::Succeeded => RunStatus::Succeeded,
+            };
+            (
+                status,
+                Some(outcome.summary.clone()),
+                serde_json::to_value(&outcome.counts).unwrap_or_default(),
+                outcome
+                    .report_path
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
+            )
+        }
+        // A cancel is not a failure: the action stopped where the operator asked it to, and its
+        // own message says where. Nothing landed, so there is nothing to count.
+        Err(error) if cancelled => (
+            RunStatus::Cancelled,
+            Some(format!("{error:#}")),
+            serde_json::json!({}),
+            None,
+        ),
+        Err(error) => (
+            RunStatus::Failed,
+            Some(format!("{error:#}")),
+            serde_json::json!({}),
+            None,
+        ),
+    }
+}
+
 /// Runs sub-app actions.
 #[derive(Clone)]
 pub struct JobRunner {
@@ -289,15 +372,28 @@ impl JobRunner {
     /// Reserve the app's slot and create the run, or explain why not.
     ///
     /// The check and the reservation happen under one lock: checking first and inserting later
-    /// lets two simultaneous requests both through.
+    /// lets two simultaneous requests both through. An unguarded action (a read-only status
+    /// query) takes no slot at all, and is recorded as an unguarded run so the store's partial
+    /// unique index — which covers guarded rows only — does not refuse it.
     fn reserve(
         &self,
         app_id: &str,
-        action_id: &str,
+        spec: &ActionSpec,
         dry_run: bool,
+        options: &RunOptions,
     ) -> Result<(i64, Arc<AtomicBool>)> {
         if self.is_shutting_down() {
             bail!("the daemon is shutting down; not starting new runs");
+        }
+
+        if spec.unguarded {
+            // No slot, and no busy entry: the whole point is that this may run beside another
+            // run of the same app.
+            let run_id = self.store.start_unguarded_run(app_id, spec.id, dry_run)?;
+            if options.fresh {
+                self.store.clear_checkpoint(app_id, spec.id)?;
+            }
+            return Ok((run_id, self.track(run_id, app_id, spec.id, dry_run)));
         }
 
         let mut busy = self.busy.lock().expect("busy lock");
@@ -312,7 +408,7 @@ impl JobRunner {
         // process (the daemon, or a second CLI) already holds a `running` row for the app
         // — the store's partial unique index — and that failure must read as "busy", not
         // as SQLite internals.
-        let run_id = match self.store.start_run(app_id, action_id, dry_run) {
+        let run_id = match self.store.start_run(app_id, spec.id, dry_run) {
             Ok(run_id) => run_id,
             Err(error) if is_running_conflict(&error) => bail!(
                 "{app_id} already has a run in progress in another process; wait for it to \
@@ -324,6 +420,15 @@ impl JobRunner {
         busy.insert(app_id.to_string(), run_id);
         drop(busy);
 
+        if options.fresh {
+            // Before the action reads anything: a fresh start must not find last night's place.
+            self.store.clear_checkpoint(app_id, spec.id)?;
+        }
+        Ok((run_id, self.track(run_id, app_id, spec.id, dry_run)))
+    }
+
+    /// Register a started run's cancel flag and its active-run entry.
+    fn track(&self, run_id: i64, app_id: &str, action_id: &str, dry_run: bool) -> Arc<AtomicBool> {
         let flag = Arc::new(AtomicBool::new(false));
         self.finish
             .lock()
@@ -342,7 +447,12 @@ impl JobRunner {
                 cancelling: false,
             },
         );
-        Ok((run_id, flag))
+        flag
+    }
+
+    /// Start a run with the default options: no deadline, resume from a checkpoint.
+    pub fn start(&self, app_id: &str, action_id: &str, dry_run: bool) -> Result<StartedRun> {
+        self.start_with(app_id, action_id, dry_run, RunOptions::default())
     }
 
     /// Start a run and return immediately.
@@ -350,13 +460,19 @@ impl JobRunner {
     /// The task owns everything it needs, so a dropped HTTP connection does not cancel the
     /// work: an apply that has begun should finish, which is what an operator expects after
     /// closing the tab.
-    pub fn start(&self, app_id: &str, action_id: &str, dry_run: bool) -> Result<StartedRun> {
-        let (app, _action) = self
+    pub fn start_with(
+        &self,
+        app_id: &str,
+        action_id: &str,
+        dry_run: bool,
+        options: RunOptions,
+    ) -> Result<StartedRun> {
+        let (app, spec) = self
             .registry
             .find_action(app_id, action_id)
             .with_context(|| format!("no action {action_id:?} in sub-app {app_id:?}"))?;
 
-        let (run_id, cancel_flag) = self.reserve(app_id, action_id, dry_run)?;
+        let (run_id, cancel_flag) = self.reserve(app_id, &spec, dry_run, &options)?;
 
         let runner = self.clone();
         let app = Arc::clone(app);
@@ -379,23 +495,17 @@ impl JobRunner {
                 active: Arc::clone(&runner.active),
                 run_id,
             });
-            // Snapshot at run start: a settings save while this run is in flight changes
-            // the next run, never this one's context.
-            let snapshot = Arc::new(runner.config.snapshot());
-            let context = JobContext::new(snapshot, sink.clone()).for_run(
+            let context = runner.context_for(
+                &started_app,
+                &started_action,
                 run_id,
-                runner.store.clone(),
                 Arc::clone(&cancel_flag),
+                sink.clone(),
+                &options,
             );
             // Open the Dispatcharr session once per run, here rather than inside each sub-app, so
             // every action shares one client, one concurrency cap and one token.
-            let needs_dispatcharr = app
-                .actions()
-                .iter()
-                .find(|entry| entry.id == started_action)
-                .map(|entry| entry.needs_dispatcharr)
-                .unwrap_or(true);
-            let context = if needs_dispatcharr {
+            let context = if spec.needs_dispatcharr {
                 match context.connect() {
                     Ok(context) => context,
                     Err(error) => {
@@ -419,32 +529,7 @@ impl JobRunner {
 
             let outcome = app.run(&started_action, &context, dry_run).await;
             let cancelled = cancel_flag.load(Ordering::SeqCst);
-
-            let (status, summary, counts, report) = match (&outcome, cancelled) {
-                // Cancelled only counts when the action actually stopped: if it returned Ok the
-                // work is done, and recording it as cancelled would hide a write that happened.
-                (Err(_), true) => (
-                    RunStatus::Cancelled,
-                    Some("cancelled".to_string()),
-                    serde_json::json!({}),
-                    None,
-                ),
-                (Ok(outcome), _) => (
-                    RunStatus::Succeeded,
-                    Some(outcome.summary.clone()),
-                    serde_json::to_value(&outcome.counts).unwrap_or_default(),
-                    outcome
-                        .report_path
-                        .as_ref()
-                        .map(|path| path.display().to_string()),
-                ),
-                (Err(error), false) => (
-                    RunStatus::Failed,
-                    Some(format!("{error:#}")),
-                    serde_json::json!({}),
-                    None,
-                ),
-            };
+            let (status, summary, counts, report) = recorded_outcome(&outcome, cancelled);
 
             slot.finish(status, summary.as_deref(), &counts, report.as_deref());
             runner.prune_history();
@@ -463,22 +548,35 @@ impl JobRunner {
         })
     }
 
-    /// Run an action to completion, for the one-shot CLI and tests.
-    ///
-    /// Takes the same reservation as [`JobRunner::start`], so a one-shot run and a scheduled
-    /// one cannot write the same channels at once.
+    /// Run an action to completion with the default options.
     pub async fn run_to_completion(
         &self,
         app_id: &str,
         action_id: &str,
         dry_run: bool,
-    ) -> Result<crate::subapp::JobOutcome> {
-        let (app, _action) = self
+    ) -> Result<JobOutcome> {
+        self.run_to_completion_with(app_id, action_id, dry_run, RunOptions::default())
+            .await
+    }
+
+    /// Run an action to completion, for the one-shot CLI and tests.
+    ///
+    /// Takes the same reservation as [`JobRunner::start`], so a one-shot run and a scheduled
+    /// one cannot write the same channels at once — unless the action is unguarded, which takes
+    /// no slot for the same reason it does not in the daemon.
+    pub async fn run_to_completion_with(
+        &self,
+        app_id: &str,
+        action_id: &str,
+        dry_run: bool,
+        options: RunOptions,
+    ) -> Result<JobOutcome> {
+        let (app, spec) = self
             .registry
             .find_action(app_id, action_id)
             .with_context(|| format!("no action {action_id:?} in sub-app {app_id:?}"))?;
 
-        let (run_id, cancel_flag) = self.reserve(app_id, action_id, dry_run)?;
+        let (run_id, cancel_flag) = self.reserve(app_id, &spec, dry_run, &options)?;
         let slot = RunSlot {
             run_id,
             app: app_id.to_string(),
@@ -494,20 +592,15 @@ impl JobRunner {
             active: Arc::clone(&self.active),
             run_id,
         });
-        // Same snapshot rule as `start`: the run keeps the config it started with.
-        let snapshot = Arc::new(self.config.snapshot());
-        let context = JobContext::new(snapshot, sink).for_run(
+        let context = self.context_for(
+            app_id,
+            action_id,
             run_id,
-            self.store.clone(),
             Arc::clone(&cancel_flag),
+            sink,
+            &options,
         );
-        let needs_dispatcharr = app
-            .actions()
-            .iter()
-            .find(|entry| entry.id == action_id)
-            .map(|entry| entry.needs_dispatcharr)
-            .unwrap_or(true);
-        let context = if needs_dispatcharr {
+        let context = if spec.needs_dispatcharr {
             match context.connect() {
                 Ok(context) => context,
                 Err(error) => {
@@ -527,34 +620,32 @@ impl JobRunner {
 
         let outcome = app.run(action_id, &context, dry_run).await;
         let cancelled = cancel_flag.load(Ordering::SeqCst);
-
-        match &outcome {
-            // Same rule as `start`: only an action that actually stopped is cancelled.
-            Err(_) if cancelled => slot.finish(
-                RunStatus::Cancelled,
-                Some("cancelled"),
-                &serde_json::json!({}),
-                None,
-            ),
-            Ok(outcome) => slot.finish(
-                RunStatus::Succeeded,
-                Some(&outcome.summary),
-                &serde_json::to_value(&outcome.counts).unwrap_or_default(),
-                outcome
-                    .report_path
-                    .as_ref()
-                    .map(|path| path.display().to_string())
-                    .as_deref(),
-            ),
-            Err(error) => slot.finish(
-                RunStatus::Failed,
-                Some(&format!("{error:#}")),
-                &serde_json::json!({}),
-                None,
-            ),
-        }
+        // The record is written from a copy, so the caller still gets the action's own answer.
+        let (status, summary, counts, report) = recorded_outcome(&outcome, cancelled);
+        slot.finish(status, summary.as_deref(), &counts, report.as_deref());
         self.prune_history();
         outcome
+    }
+
+    /// The context one run gets.
+    ///
+    /// Snapshot at run start: a settings save while this run is in flight changes the next run,
+    /// never this one. The same builder for the spawned and the blocking path, so a scheduled
+    /// run and a one-shot run see the same deadline, checkpoint and live-run table.
+    fn context_for(
+        &self,
+        app_id: &str,
+        action_id: &str,
+        run_id: i64,
+        cancel_flag: Arc<AtomicBool>,
+        sink: Arc<dyn ProgressSink>,
+        options: &RunOptions,
+    ) -> JobContext {
+        let snapshot = Arc::new(self.config.snapshot());
+        JobContext::new(snapshot, sink)
+            .for_run(app_id, action_id, run_id, self.store.clone(), cancel_flag)
+            .with_deadline(options.deadline)
+            .with_live_runs(Arc::clone(&self.active))
     }
 
     /// Delete run history older than the configured retention.
@@ -947,7 +1038,13 @@ mod tests {
             Arc::new(CrosstalkConfig::default()),
             Arc::new(VecSink::new()),
         )
-        .for_run(run_id, store.clone(), Arc::new(AtomicBool::new(false)));
+        .for_run(
+            "test",
+            "run",
+            run_id,
+            store.clone(),
+            Arc::new(AtomicBool::new(false)),
+        );
         assert_eq!(context.run_id(), Some(run_id));
         context
             .record_rows(&[crate::store::RunRow {
@@ -958,6 +1055,271 @@ mod tests {
             }])
             .expect("rows");
         assert_eq!(store.rows(run_id).expect("rows").len(), 1);
+    }
+
+    /// A runner over the resumable test app, on a real clock: pausing depends on real elapsed
+    /// time, so the deadline tests below use short work units rather than a paused clock.
+    fn resumable_runner(store: Store) -> JobRunner {
+        JobRunner::new(
+            Registry::new(vec![Arc::new(crate::test_app::ResumableApp::new())]),
+            SharedConfig::new(CrosstalkConfig::default()),
+            store,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_windowed_run_pauses_at_its_deadline_and_the_next_run_resumes() {
+        use crate::store::RunRow;
+        use crate::test_app::{RESUMABLE_PER_UNIT, RESUMABLE_UNITS};
+
+        let store = Store::in_memory().expect("store");
+        let runner = resumable_runner(store.clone());
+
+        // A deadline a few units in: the run pauses with a partial backlog.
+        let deadline = Utc::now() + chrono::Duration::milliseconds(45);
+        let first = runner
+            .run_to_completion_with(
+                "resumable",
+                "run",
+                false,
+                RunOptions::default().with_deadline(Some(deadline)),
+            )
+            .await
+            .expect("a paused run is not an error: it did what its window allowed");
+
+        assert!(first.is_paused(), "{}", first.summary);
+        let done = first.counts["done"];
+        assert!(
+            done > 0 && done < RESUMABLE_UNITS,
+            "paused between units, got {done} of {RESUMABLE_UNITS}"
+        );
+
+        let runs = store.recent_runs_for("resumable", 1).expect("runs");
+        assert_eq!(runs[0].status, RunStatus::Paused);
+        assert_eq!(
+            runs[0].counts["done"], done,
+            "the partial count is recorded"
+        );
+        assert_eq!(
+            store.rows(runs[0].id).expect("rows").len() as i64,
+            done,
+            "the rows that landed are recorded"
+        );
+        assert!(
+            store
+                .rows(runs[0].id)
+                .expect("rows")
+                .iter()
+                .any(|row: &RunRow| row.status == "done"),
+            "each finished unit left its row"
+        );
+        assert_eq!(
+            store.load_checkpoint("resumable", "run").expect("read"),
+            Some(serde_json::json!({ "done": done })),
+            "the checkpoint is what the next window resumes from"
+        );
+
+        // The next firing resumes: the total is the whole backlog, not another partial.
+        let second = runner
+            .run_to_completion_with(
+                "resumable",
+                "run",
+                false,
+                RunOptions::default()
+                    .with_deadline(Some(Utc::now() + chrono::Duration::seconds(30))),
+            )
+            .await
+            .expect("resumed");
+        assert!(!second.is_paused(), "{}", second.summary);
+        assert_eq!(second.counts.get("resumed"), Some(&1), "{}", second.summary);
+        assert_eq!(second.counts["done"], RESUMABLE_UNITS);
+        let runs = store.recent_runs_for("resumable", 1).expect("runs");
+        assert_eq!(runs[0].status, RunStatus::Succeeded);
+        assert_eq!(
+            store.load_checkpoint("resumable", "run").expect("read"),
+            None,
+            "a finished backlog clears its checkpoint"
+        );
+        let _ = RESUMABLE_PER_UNIT;
+    }
+
+    #[tokio::test]
+    async fn a_manual_run_has_no_deadline_and_never_pauses() {
+        let store = Store::in_memory().expect("store");
+        let runner = resumable_runner(store);
+        let outcome = runner
+            .run_to_completion("resumable", "run", false)
+            .await
+            .expect("finishes");
+        assert!(!outcome.is_paused());
+        assert_eq!(outcome.counts["done"], crate::test_app::RESUMABLE_UNITS);
+    }
+
+    #[tokio::test]
+    async fn a_fresh_run_discards_a_saved_checkpoint() {
+        let store = Store::in_memory().expect("store");
+        let runner = resumable_runner(store.clone());
+        let paused = runner
+            .run_to_completion_with(
+                "resumable",
+                "run",
+                false,
+                RunOptions::default().with_deadline(Some(Utc::now())),
+            )
+            .await
+            .expect("pauses immediately");
+        assert!(paused.is_paused());
+        assert_eq!(paused.counts["done"], 0, "the deadline had already passed");
+
+        // Leave progress behind, then ask for a fresh start.
+        store
+            .save_checkpoint("resumable", "run", &serde_json::json!({"done": 7}))
+            .expect("seed");
+        let fresh = runner
+            .run_to_completion_with("resumable", "run", false, RunOptions::default().fresh())
+            .await
+            .expect("finishes");
+        assert_eq!(
+            fresh.counts["done"],
+            crate::test_app::RESUMABLE_UNITS,
+            "a fresh run works the whole backlog instead of resuming at 7: {}",
+            fresh.summary
+        );
+        assert!(
+            !fresh.counts.contains_key("resumed"),
+            "fresh means no resume: {}",
+            fresh.summary
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_mid_apply_is_recorded_cancelled_with_what_landed() {
+        use crate::test_app::RESUMABLE_PER_UNIT;
+
+        let store = Store::in_memory().expect("store");
+        let runner = resumable_runner(store.clone());
+        let started = runner.start("resumable", "run", false).expect("started");
+        // Long enough for a few units, short enough that the backlog is not finished.
+        tokio::time::sleep(RESUMABLE_PER_UNIT * 3).await;
+        assert!(runner.cancel(started.run_id));
+        wait_until_app_idle(&runner, "resumable").await;
+
+        let run = store.run(started.run_id).expect("run").expect("present");
+        assert_eq!(
+            run.status,
+            RunStatus::Cancelled,
+            "a cancelled run is never recorded as a success: {:?}",
+            run.summary
+        );
+        let done = store.rows(run.id).expect("rows").len() as i64;
+        assert!(done > 0, "the units that landed left their rows");
+        assert!(
+            run.summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("cancelled"),
+            "the summary says where it stopped: {:?}",
+            run.summary
+        );
+        // Cancelling keeps the place, so the next window continues rather than starting over.
+        assert!(
+            store
+                .load_checkpoint("resumable", "run")
+                .expect("read")
+                .is_some(),
+            "a cancel keeps the checkpoint"
+        );
+    }
+
+    #[test]
+    fn a_finished_action_during_a_cancel_is_recorded_cancelled_with_its_counts() {
+        // The cancel arrived too late for the action to act on: the operator still asked it to
+        // stop, so the run says cancelled — and the counts and summary it produced survive, so
+        // the history does not hide what landed (the phase-1 behaviour did).
+        let outcome: Result<JobOutcome> = Ok(JobOutcome::new("Sorted 5 channel(s)")
+            .with_count("written", 5)
+            .with_count("failed", 0));
+        let (status, summary, counts, _) = recorded_outcome(&outcome, true);
+        assert_eq!(status, RunStatus::Cancelled);
+        assert_eq!(summary.as_deref(), Some("Sorted 5 channel(s)"));
+        assert_eq!(counts["written"], 5);
+
+        // The same outcome without a cancel is a success.
+        assert_eq!(recorded_outcome(&outcome, false).0, RunStatus::Succeeded);
+    }
+
+    #[test]
+    fn a_paused_outcome_is_recorded_paused_and_an_explicit_cancel_as_cancelled() {
+        let paused: Result<JobOutcome> =
+            Ok(JobOutcome::paused("paused after 120 of 900").with_count("done", 120));
+        let (status, summary, counts, _) = recorded_outcome(&paused, false);
+        assert_eq!(status, RunStatus::Paused);
+        assert_eq!(summary.as_deref(), Some("paused after 120 of 900"));
+        assert_eq!(counts["done"], 120);
+        // A paused run is not "cancelled" just because a flag was also set: the action's own
+        // answer is the truth about why it stopped.
+        assert_eq!(recorded_outcome(&paused, true).0, RunStatus::Paused);
+
+        let cancelled: Result<JobOutcome> =
+            Ok(JobOutcome::new("stopped").with_status(OutcomeStatus::Cancelled));
+        assert_eq!(recorded_outcome(&cancelled, false).0, RunStatus::Cancelled);
+    }
+
+    #[test]
+    fn an_error_during_a_cancel_is_cancelled_not_failed_and_names_where_it_stopped() {
+        let failed: Result<JobOutcome> =
+            Err(anyhow::anyhow!("cancelled by the operator at unit 4"));
+        let (status, summary, _counts, _) = recorded_outcome(&failed, true);
+        assert_eq!(status, RunStatus::Cancelled);
+        assert!(summary.unwrap_or_default().contains("unit 4"));
+
+        // Without a cancel the same error is a failure, unchanged.
+        assert_eq!(recorded_outcome(&failed, false).0, RunStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn an_unguarded_action_runs_beside_a_live_run_and_takes_no_slot() {
+        use crate::test_app::RESUMABLE_PER_UNIT;
+
+        let store = Store::in_memory().expect("store");
+        let runner = resumable_runner(store.clone());
+        let live = runner.start("resumable", "run", false).expect("started");
+        assert!(runner.is_busy("resumable"));
+
+        // The status-like action is the one that must not be refused: it is what tells an
+        // operator what the blocking run is doing.
+        let status = runner
+            .run_to_completion("resumable", "status", true)
+            .await
+            .expect("an unguarded action runs while another does");
+        assert_eq!(status.summary, "ok");
+        // It is recorded, so its answer has a run page of its own…
+        let records = store.recent_runs_for("resumable", 10).expect("runs");
+        assert!(
+            records.iter().any(|run| run.action == "status"),
+            "the unguarded run is recorded"
+        );
+        // …and it holds no slot, so it is not reported as "already running".
+        let running = store.running_runs("resumable").expect("running");
+        assert_eq!(running.len(), 1);
+        assert_eq!(
+            running[0].id, live.run_id,
+            "only the guarded run holds the app"
+        );
+
+        wait_until_app_idle(&runner, "resumable").await;
+        let _ = RESUMABLE_PER_UNIT;
+    }
+
+    /// Wait until this app has nothing in flight.
+    async fn wait_until_app_idle(runner: &JobRunner, app: &str) {
+        for _ in 0..400 {
+            if !runner.is_busy(app) && runner.running().is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the runner never went idle for {app}");
     }
 
     #[test]

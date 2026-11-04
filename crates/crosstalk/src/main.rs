@@ -67,6 +67,13 @@ struct RunArgs {
     /// Confirm an action that changes data. Without it, such an action is refused.
     #[arg(long, short = 'y')]
     yes: bool,
+    /// Ignore and discard the progress a paused run saved, and start the backlog over.
+    ///
+    /// The default is to resume: a windowed job checkspoints where it stopped, so the next run
+    /// continues. This is how an operator says "no, start from the beginning" — after changing
+    /// the scope, for instance.
+    #[arg(long)]
+    fresh: bool,
 }
 
 #[derive(Args, Debug)]
@@ -405,9 +412,24 @@ fn run_once(args: RunArgs) -> Result<()> {
     }
     let runner = JobRunner::new(registry, SharedConfig::new(config), store);
     let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
-    let outcome = runtime.block_on(runner.run_to_completion(&args.app, action.id, args.dry_run))?;
+    let options = if args.fresh {
+        crosstalk_core::runner::RunOptions::default().fresh()
+    } else {
+        crosstalk_core::runner::RunOptions::default()
+    };
+    let outcome = runtime.block_on(runner.run_to_completion_with(
+        &args.app,
+        action.id,
+        args.dry_run,
+        options,
+    ))?;
 
     println!("{}", outcome.summary);
+    if outcome.is_paused() {
+        // A one-shot run has no deadline, so this cannot happen today; say so loudly rather
+        // than reporting a partial run as a finished one if that ever changes.
+        println!("  paused: this run stopped at its window's end and will resume");
+    }
     for (key, value) in &outcome.counts {
         println!("  {key}: {value}");
     }
@@ -557,6 +579,15 @@ fn validate(args: ConfigArgs) -> Result<()> {
     for key in registry.unknown_schedules(&config) {
         println!("error: schedule {key:?} does not name a known <app>.<action>");
         failed = true;
+    }
+    for entry in crosstalk_core::scheduler::describe(&config) {
+        // The window is what says whether the job finishes in one firing: a schedule whose
+        // window is shorter than its work pauses every time and continues, which is a very
+        // different thing from one that runs to the end.
+        match &entry.window {
+            Some(window) => println!("schedule {}: window {window}", entry.key),
+            None => println!("schedule {}: no window (runs to the end)", entry.key),
+        }
     }
 
     for app in registry.iter() {

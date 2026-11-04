@@ -21,6 +21,11 @@ use std::sync::{Arc, Mutex};
 const DATA_VERSION: i64 = 1;
 
 /// How a run ended.
+///
+/// `Paused` is its own outcome because it means something no other status does: the run stopped
+/// cleanly at its window's deadline, saved its progress, and will continue on the next firing.
+/// Recording it as cancelled would make an operator think work was lost; recording it as
+/// succeeded would claim a job was finished when it was not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
@@ -28,6 +33,7 @@ pub enum RunStatus {
     Succeeded,
     Failed,
     Cancelled,
+    Paused,
 }
 
 impl std::fmt::Display for RunStatus {
@@ -43,6 +49,7 @@ impl RunStatus {
             RunStatus::Succeeded => "succeeded",
             RunStatus::Failed => "failed",
             RunStatus::Cancelled => "cancelled",
+            RunStatus::Paused => "paused",
         }
     }
 
@@ -51,11 +58,19 @@ impl RunStatus {
         matches!(self, RunStatus::Running)
     }
 
+    /// Whether the run stopped at its window's deadline and will resume on the next firing.
+    /// Public because the templates ask: a paused run reads as "paused, resumes at the next
+    /// window" rather than as an unfinished or failed one.
+    pub fn is_paused(&self) -> bool {
+        matches!(self, RunStatus::Paused)
+    }
+
     fn parse(text: &str) -> Self {
         match text {
             "succeeded" => RunStatus::Succeeded,
             "failed" => RunStatus::Failed,
             "cancelled" => RunStatus::Cancelled,
+            "paused" => RunStatus::Paused,
             _ => RunStatus::Running,
         }
     }
@@ -357,6 +372,18 @@ impl Store {
                     settings    TEXT NOT NULL
                 );
 
+                -- Where a long job keeps its place between schedule windows. Keyed by the action
+                -- rather than by the run: the whole point is that tonight's run is a different
+                -- run from last night's and still continues it. `stream_health` and this table
+                -- are the two pieces of state a sub-app owns that outlive a run.
+                CREATE TABLE IF NOT EXISTS job_checkpoints (
+                    app        TEXT NOT NULL,
+                    action     TEXT NOT NULL,
+                    state      TEXT NOT NULL DEFAULT '{}',
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (app, action)
+                );
+
                 -- What crosstalk knows about a provider stream. Idempotent: the table is
                 -- created on every open and never altered, so a store from an earlier build
                 -- simply grows it. `stream_id` is Dispatcharr's, not a row of ours.
@@ -385,17 +412,40 @@ impl Store {
                 )?;
             }
             add_run_row_columns(connection)?;
+            add_run_columns(connection)?;
             // Before the index below: the rename turns `janitor` rows into `guide` rows, and
             // must not be the statement that trips over it.
             rename_recorded_history(connection)?;
-            // One live run per app, across processes: the in-memory busy map stops two runs
-            // in THIS process, but the CLI is another process on the same file. A partial
+            // One live GUARDED run per app, across processes: the in-memory busy map stops two
+            // runs in THIS process, but the CLI is another process on the same file. A partial
             // index (no extra row when nothing is running), created after the retire above
             // so a restarted daemon never trips on its own stale rows.
-            let index = connection.execute_batch(
-                "CREATE UNIQUE INDEX IF NOT EXISTS runs_one_running_per_app ON runs(app) WHERE \
-                 status = 'running'",
-            );
+            //
+            // `unguarded` is what lets a read-only status action run while another run of the
+            // app is live: it is still recorded, so its output lands on a run page like every
+            // other action's, but it takes no slot. An index built before that column existed
+            // has to be replaced — `IF NOT EXISTS` would keep the old definition — and the
+            // replacement only happens ONCE: dropping and re-creating it on every open would
+            // leave a moment with no guard at all, which is long enough for two processes
+            // opening together to insert competing `running` rows. The swap runs in one
+            // transaction under the write lock (`busy_timeout`), so a daemon and a CLI opening
+            // together serialize: the second sees the new definition and does nothing, and
+            // `IF EXISTS` keeps a DROP that lost the race from failing.
+            let index = (|| -> Result<()> {
+                if index_definition(connection, "runs_one_running_per_app")?
+                    .is_some_and(|sql| sql.contains("unguarded"))
+                {
+                    return Ok(());
+                }
+                let transaction = connection.unchecked_transaction()?;
+                transaction.execute_batch(
+                    "DROP INDEX IF EXISTS runs_one_running_per_app; \
+                     CREATE UNIQUE INDEX IF NOT EXISTS runs_one_running_per_app ON \
+                     runs(app) WHERE status = 'running' AND unguarded = 0",
+                )?;
+                transaction.commit()?;
+                Ok(())
+            })();
             match index {
                 Ok(()) => {}
                 // A database from before the index can hold two stale `running` rows for one
@@ -406,25 +456,45 @@ impl Store {
                     "the one-run-per-app index cannot be created until the daemon retires \
                      stale running rows: {error}"
                 ),
-                Err(error) => return Err(error.into()),
+                Err(error) => return Err(error),
             }
             Ok(())
         })
     }
 
     /// Start a run and return its id.
+    ///
+    /// Takes the app's one-live-run slot: the partial unique index refuses a second `running`
+    /// row for the same app. A read-only status-like action starts with
+    /// [`Store::start_unguarded_run`] instead.
     pub fn start_run(&self, app: &str, action: &str, dry_run: bool) -> Result<i64> {
+        self.insert_run(app, action, dry_run, false)
+    }
+
+    /// Start a run that does not take the app's one-live-run slot.
+    ///
+    /// For an action that only reads the run store (`status`, the dashboard's own questions):
+    /// refusing it while a run is live would mean the operator cannot see the run that is
+    /// blocking them, which is exactly when they need to. It is still recorded, so a caller can
+    /// follow it to a run page like any other, and two unguarded runs may overlap because
+    /// neither writes anything the other reads.
+    pub fn start_unguarded_run(&self, app: &str, action: &str, dry_run: bool) -> Result<i64> {
+        self.insert_run(app, action, dry_run, true)
+    }
+
+    fn insert_run(&self, app: &str, action: &str, dry_run: bool, unguarded: bool) -> Result<i64> {
         let started = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         self.with_connection(|connection| {
             connection.execute(
-                "INSERT INTO runs (app, action, dry_run, started_at, status, counts) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, '{}')",
+                "INSERT INTO runs (app, action, dry_run, started_at, status, counts, unguarded) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, '{}', ?6)",
                 params![
                     app,
                     action,
                     i64::from(dry_run),
                     started,
-                    RunStatus::Running.as_str()
+                    RunStatus::Running.as_str(),
+                    i64::from(unguarded),
                 ],
             )?;
             Ok(connection.last_insert_rowid())
@@ -591,18 +661,21 @@ impl Store {
         })
     }
 
-    /// The live (`running`) runs of one app, oldest first.
+    /// The live (`running`) GUARDED runs of one app, oldest first.
     ///
     /// The cross-process guard: a second process (the one-shot CLI) refuses to start an
     /// app that has one of these, because the in-process busy map cannot see it. A row
     /// here is either the daemon's live run or a stale row from a crash, which only the
     /// daemon's next [`Store::open`] retires — so the caller reports both cases and lets
     /// the operator decide, rather than retiring what might be alive.
+    ///
+    /// Unguarded rows (a `status` query in flight) are excluded: they hold no slot, so
+    /// reporting them as "already running" would refuse work nothing is blocking.
     pub fn running_runs(&self, app: &str) -> Result<Vec<RunRecord>> {
         self.with_connection(|connection| {
             let mut statement = connection.prepare(
                 "SELECT id, app, action, dry_run, started_at, finished_at, status, summary, \
-                 counts, report_path FROM runs WHERE app = ?1 AND status = ?2 \
+                 counts, report_path FROM runs WHERE app = ?1 AND status = ?2 AND unguarded = 0 \
                  ORDER BY started_at, id",
             )?;
             let rows = statement.query_map(params![app, RunStatus::Running.as_str()], map_run)?;
@@ -704,6 +777,10 @@ impl Store {
 
     /// Delete finished runs older than `keep_days`, keeping the most recent `keep_minimum`
     /// per app. Returns how many runs were removed.
+    ///
+    /// Unguarded runs (a `status` query in flight, then finished) are history of a question,
+    /// not of work: they are pruned by age alone and never count toward the minimum, so an
+    /// operator who polls `status` cannot evict the real runs the minimum is there to keep.
     pub fn prune(&self, keep_days: u32, keep_minimum: usize) -> Result<usize> {
         if keep_days == 0 {
             return Ok(0);
@@ -712,13 +789,14 @@ impl Store {
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         self.with_connection(|connection| {
             let removed = connection.execute(
-                "DELETE FROM runs WHERE status != 'running' AND started_at < ?1 AND id NOT IN ( \
+                "DELETE FROM runs WHERE status != 'running' AND started_at < ?1 AND ( \
+                     unguarded != 0 OR id NOT IN ( \
                      SELECT id FROM ( \
                          SELECT id, ROW_NUMBER() OVER (PARTITION BY app \
                              ORDER BY started_at DESC, id DESC) AS position \
-                         FROM runs WHERE status != 'running' \
+                         FROM runs WHERE status != 'running' AND unguarded = 0 \
                      ) WHERE position <= ?2 \
-                 )",
+                 )) ",
                 params![cutoff, keep_minimum as i64],
             )?;
             Ok(removed)
@@ -731,6 +809,88 @@ impl Store {
             connection
                 .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
                 .map_err(Into::into)
+        })
+    }
+
+    /// Save a job's progress, replacing whatever was there.
+    ///
+    /// Keyed by app and action rather than by run: the next firing of the same schedule is a
+    /// different run and must still find it. The state is the action's own JSON — the store
+    /// never looks inside, because only the action knows what "where I got to" means.
+    pub fn save_checkpoint(
+        &self,
+        app: &str,
+        action: &str,
+        state: &serde_json::Value,
+    ) -> Result<()> {
+        let updated = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let state = serde_json::to_string(state)?;
+        self.with_connection(|connection| {
+            connection.execute(
+                "INSERT INTO job_checkpoints (app, action, state, updated_at) VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(app, action) DO UPDATE SET state = excluded.state, \
+                 updated_at = excluded.updated_at",
+                params![app, action, state, updated],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// A job's saved progress, or `None` when it has none.
+    ///
+    /// A state that no longer parses is dropped rather than failing the run: a checkpoint is an
+    /// optimisation over starting again, never a reason not to run.
+    pub fn load_checkpoint(&self, app: &str, action: &str) -> Result<Option<serde_json::Value>> {
+        let state: Option<String> = self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT state FROM job_checkpoints WHERE app = ?1 AND action = ?2",
+                    params![app, action],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(Into::into)
+        })?;
+        Ok(match state {
+            Some(text) => match serde_json::from_str(&text) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    tracing::warn!(
+                        "discarding the {app}.{action} checkpoint: its state does not parse: \
+                         {error}"
+                    );
+                    None
+                }
+            },
+            None => None,
+        })
+    }
+
+    /// When a job's progress was last saved, for the run page and the status action.
+    pub fn checkpoint_updated_at(&self, app: &str, action: &str) -> Result<Option<String>> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT updated_at FROM job_checkpoints WHERE app = ?1 AND action = ?2",
+                    params![app, action],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(Into::into)
+        })
+    }
+
+    /// Discard a job's saved progress. `true` when there was some.
+    ///
+    /// Called when a resumed job finishes its whole backlog, and when an operator asks for a
+    /// fresh start (`crosstalk run --fresh`, the "start fresh" checkbox).
+    pub fn clear_checkpoint(&self, app: &str, action: &str) -> Result<bool> {
+        self.with_connection(|connection| {
+            let removed = connection.execute(
+                "DELETE FROM job_checkpoints WHERE app = ?1 AND action = ?2",
+                params![app, action],
+            )?;
+            Ok(removed > 0)
         })
     }
 
@@ -830,6 +990,71 @@ impl Store {
     }
 }
 
+/// The SQL of a named index, or `None` when it does not exist.
+///
+/// Used to tell an index built by an older release from this build's: the definition is the
+/// only durable record of which columns an index covers.
+fn index_definition(connection: &Connection, name: &str) -> Result<Option<String>> {
+    connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+            params![name],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map(Option::flatten)
+        .map_err(Into::into)
+}
+
+/// Whether this SQLite error is a lost `ADD COLUMN` race: two processes opening together
+/// both saw the column missing, and the second's `ALTER TABLE` landed after the first's.
+fn is_duplicate_column(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(_, Some(message))
+            if message.contains("duplicate column name")
+    )
+}
+
+/// Add one column when it is missing, tolerating a concurrent migrator that added it first.
+fn add_column(connection: &Connection, table: &str, name: &str, definition: &str) -> Result<()> {
+    if let Err(error) = connection.execute_batch(&format!(
+        "ALTER TABLE {table} ADD COLUMN {name} {definition}"
+    )) {
+        if is_duplicate_column(&error) {
+            return Ok(());
+        }
+        return Err(anyhow::anyhow!("adding {table}.{name}: {error:#}"));
+    }
+    Ok(())
+}
+
+/// Add the columns the run table gained after the first release.
+///
+/// `unguarded` marks a run that holds no slot: a read-only status-like action that must be
+/// allowed to run while another run of the same app is live. The DEFAULT is the backfill — every
+/// row written before this column existed was a guarded run — so the partial index can be built
+/// on top of it without a pass over history.
+fn add_run_columns(connection: &Connection) -> Result<()> {
+    let mut statement = connection.prepare("PRAGMA table_info(runs)")?;
+    let existing: std::collections::HashSet<String> = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<_>>()?;
+    if !existing.contains("unguarded") {
+        // A daemon and a CLI opening together can both see the column missing: the second
+        // `ALTER TABLE` then fails with "duplicate column name", which means the work is
+        // done rather than that something went wrong.
+        if let Err(error) = connection
+            .execute_batch("ALTER TABLE runs ADD COLUMN unguarded INTEGER NOT NULL DEFAULT 0")
+        {
+            if !is_duplicate_column(&error) {
+                return Err(anyhow::anyhow!(error));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Add the columns channel operations and the run-row subject record, when this database
 /// predates them.
 ///
@@ -851,9 +1076,9 @@ fn add_run_row_columns(connection: &Connection) -> Result<()> {
         ("subject", "TEXT NOT NULL DEFAULT 'channel'"),
     ] {
         if !existing.contains(name) {
-            connection.execute_batch(&format!(
-                "ALTER TABLE run_rows ADD COLUMN {name} {definition}"
-            ))?;
+            // Same lost-race tolerance as `add_run_columns`: two processes migrating together
+            // must not fail the second open.
+            add_column(connection, "run_rows", name, definition)?;
         }
     }
     // Watchdog rows predate the column: they carry an EPG SOURCE id in `channel_id` and mark
@@ -979,6 +1204,238 @@ mod tests {
         assert_eq!(map.len(), 2);
         assert_eq!(map.get(&11).map(|row| row.class.as_str()), Some("dead"));
         assert_eq!(map.get(&12).map(|row| row.class.as_str()), Some("skipped"));
+    }
+
+    #[test]
+    fn a_checkpoint_is_saved_read_and_cleared_by_app_and_action() {
+        // The next window is a different run of the same action, so the place it got to is
+        // keyed by app+action and outlives the run: this is what replaces IPTV Checker's
+        // pending_resume.json.
+        let store = Store::in_memory().expect("store");
+        assert_eq!(
+            store.load_checkpoint("streams", "probe").expect("read"),
+            None
+        );
+
+        store
+            .save_checkpoint(
+                "streams",
+                "probe",
+                &serde_json::json!({"remaining": [4, 5, 6], "done": 2}),
+            )
+            .expect("save");
+        assert_eq!(
+            store.load_checkpoint("streams", "probe").expect("read"),
+            Some(serde_json::json!({"remaining": [4, 5, 6], "done": 2}))
+        );
+        assert!(store
+            .checkpoint_updated_at("streams", "probe")
+            .expect("updated")
+            .is_some());
+        // Another action of the same app has its own place.
+        assert_eq!(
+            store
+                .load_checkpoint("streams", "sort_apply")
+                .expect("read"),
+            None
+        );
+
+        // A second save replaces the first rather than piling up.
+        store
+            .save_checkpoint("streams", "probe", &serde_json::json!({"remaining": [6]}))
+            .expect("save again");
+        assert_eq!(
+            store.load_checkpoint("streams", "probe").expect("read"),
+            Some(serde_json::json!({"remaining": [6]}))
+        );
+
+        assert!(store.clear_checkpoint("streams", "probe").expect("clear"));
+        assert_eq!(
+            store.load_checkpoint("streams", "probe").expect("read"),
+            None
+        );
+        assert!(
+            !store.clear_checkpoint("streams", "probe").expect("clear"),
+            "clearing nothing is not an error"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_checkpoint_reads_as_none_instead_of_failing_the_run() {
+        // A checkpoint is an optimisation over starting again, never a reason not to run.
+        let store = Store::in_memory().expect("store");
+        store
+            .with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO job_checkpoints (app, action, state, updated_at) \
+                     VALUES ('streams', 'probe', 'not json', '2026-11-01T00:00:00+00:00')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .expect("seed");
+        assert_eq!(
+            store.load_checkpoint("streams", "probe").expect("read"),
+            None
+        );
+    }
+
+    #[test]
+    fn paused_is_its_own_status_and_reads_back() {
+        // It must not be confused with running (which holds the slot), cancelled (work dropped)
+        // or succeeded (job done): a paused run is one that will continue.
+        let store = Store::in_memory().expect("store");
+        let run_id = store.start_run("streams", "probe", false).expect("start");
+        store
+            .finish_run(
+                run_id,
+                RunStatus::Paused,
+                Some("paused at the window's end"),
+                &serde_json::json!({"probed": 120}),
+                None,
+            )
+            .expect("finish");
+        let run = store.run(run_id).expect("run").expect("present");
+        assert_eq!(run.status, RunStatus::Paused);
+        assert_eq!(run.status.as_str(), "paused");
+        assert!(run.status.is_paused());
+        assert!(!run.status.is_running());
+        // A paused run does not hold the app's slot: the next firing must be able to start.
+        assert!(store.running_runs("streams").expect("running").is_empty());
+        assert_eq!(store.run_count().expect("count"), 1);
+    }
+
+    #[test]
+    fn a_paused_run_is_not_a_successful_run_for_a_later_action() {
+        // `last_succeeded_run` is how a later action finds "the result set the last run
+        // produced": a paused or cancelled run's rows are partial, so they must not qualify.
+        let store = Store::in_memory().expect("store");
+        let run_id = store.start_run("guide", "scan", true).expect("start");
+        store
+            .finish_run(
+                run_id,
+                RunStatus::Paused,
+                None,
+                &serde_json::json!({}),
+                None,
+            )
+            .expect("finish");
+        assert!(store
+            .last_succeeded_run("guide", "scan")
+            .expect("query")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unguarded_run_takes_no_slot_and_is_not_reported_as_running() {
+        // The status action used to be refused while another run of its app was live, which is
+        // exactly when an operator asks what is going on. It is still recorded, so its answer
+        // lands on a run page.
+        let store = Store::in_memory().expect("store");
+        let guarded = store
+            .start_run("guide", "match_apply", false)
+            .expect("guarded");
+        let unguarded = store
+            .start_unguarded_run("guide", "status", true)
+            .expect("an unguarded run may start beside a live one");
+
+        assert_eq!(
+            store.running_runs("guide").expect("running").len(),
+            1,
+            "the cross-process guard sees the guarded run only"
+        );
+        assert_eq!(store.running_runs("guide").expect("running")[0].id, guarded);
+        // And the slot is still held for a second guarded run, as the index requires.
+        assert!(store.start_run("guide", "match_apply", false).is_err());
+
+        store
+            .finish_run(
+                unguarded,
+                RunStatus::Succeeded,
+                Some("ok"),
+                &serde_json::json!({}),
+                None,
+            )
+            .expect("finish");
+        assert_eq!(
+            store.run(unguarded).expect("run").expect("present").status,
+            RunStatus::Succeeded
+        );
+    }
+
+    #[test]
+    fn the_guard_index_is_rebuilt_once_and_then_left_alone() {
+        // The index gained a column, so an older database's definition has to be replaced —
+        // exactly once. Rebuilding it on every open would leave a moment with no guard, which is
+        // long enough for two processes opening together to insert competing `running` rows.
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("crosstalk.db");
+        {
+            let connection = Connection::open(&path).expect("open");
+            connection
+                .execute_batch(
+                    "CREATE TABLE runs (id INTEGER PRIMARY KEY AUTOINCREMENT, app TEXT NOT NULL, \
+                     action TEXT NOT NULL, dry_run INTEGER NOT NULL, started_at TEXT NOT NULL, \
+                     finished_at TEXT, status TEXT NOT NULL, summary TEXT, \
+                     counts TEXT NOT NULL DEFAULT '{}', report_path TEXT); \
+                     CREATE UNIQUE INDEX runs_one_running_per_app ON runs(app) \
+                     WHERE status = 'running';",
+                )
+                .expect("old schema");
+        }
+        let store = Store::open(&path).expect("migrate");
+        let definition = store
+            .with_connection(|connection| index_definition(connection, "runs_one_running_per_app"))
+            .expect("read the index")
+            .expect("the index exists");
+        assert!(definition.contains("unguarded"), "{definition}");
+
+        // Reopening keeps the same definition and still accepts work.
+        drop(store);
+        let store = Store::open(&path).expect("migrate again");
+        assert!(store.start_run("guide", "scan", true).is_ok());
+        assert!(
+            store.start_run("guide", "scan", true).is_err(),
+            "the guard still holds"
+        );
+    }
+
+    #[test]
+    fn a_store_from_before_unguarded_and_checkpoints_gains_both_on_open() {
+        // The upgrade path: a database written by the release before this one has no
+        // `unguarded` column, no `job_checkpoints` table and an index without the column. The
+        // migration must add all three without touching the history.
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("crosstalk.db");
+        {
+            let connection = Connection::open(&path).expect("open");
+            connection
+                .execute_batch(
+                    "CREATE TABLE runs (id INTEGER PRIMARY KEY AUTOINCREMENT, app TEXT NOT NULL, \
+                     action TEXT NOT NULL, dry_run INTEGER NOT NULL, started_at TEXT NOT NULL, \
+                     finished_at TEXT, status TEXT NOT NULL, summary TEXT, \
+                     counts TEXT NOT NULL DEFAULT '{}', report_path TEXT); \
+                     CREATE UNIQUE INDEX runs_one_running_per_app ON runs(app) \
+                     WHERE status = 'running'; \
+                     INSERT INTO runs (app, action, dry_run, started_at, status) \
+                     VALUES ('guide', 'scan', 1, '2026-11-01T00:00:00+00:00', 'succeeded'); \
+                     PRAGMA user_version = 1",
+                )
+                .expect("old schema");
+        }
+        let store = Store::open(&path).expect("migrate");
+        // The history survives, and the new column defaults to "guarded".
+        assert_eq!(store.run_count().expect("count"), 1);
+        assert!(store.running_runs("guide").expect("running").is_empty());
+        store
+            .save_checkpoint("streams", "probe", &serde_json::json!({"done": 1}))
+            .expect("the table exists after the migration");
+        // The re-created index has the new definition: an unguarded run may start beside a
+        // guarded one, which the old index would have refused.
+        let _guarded = store.start_run("streams", "probe", false).expect("guarded");
+        store
+            .start_unguarded_run("streams", "status", true)
+            .expect("the index excludes unguarded rows");
     }
 
     #[test]

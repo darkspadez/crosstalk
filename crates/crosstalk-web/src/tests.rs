@@ -33,7 +33,15 @@ impl SubApp for EchoApp {
     fn actions(&self) -> Vec<ActionSpec> {
         vec![
             ActionSpec::new("peek", "Peek", "reads", ActionKind::Read),
+            // A read-only status query: it must stay clickable while another run holds the app,
+            // which is exactly when an operator wants it (the phase-1 review's finding).
+            ActionSpec::new("status", "Status", "reads the store", ActionKind::Read)
+                .offline()
+                .unguarded(),
             ActionSpec::new("poke", "Poke", "writes", ActionKind::Write)
+                .with_confirm("This writes data. Continue?"),
+            // Slow enough for a test to see the app busy.
+            ActionSpec::new("slow", "Slow", "takes a moment", ActionKind::Write)
                 .with_confirm("This writes data. Continue?"),
         ]
     }
@@ -59,6 +67,10 @@ impl SubApp for EchoApp {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<JobOutcome>> + Send + 'a>>
     {
         Box::pin(async move {
+            if _action == "slow" {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                return Ok(JobOutcome::new("slowly done"));
+            }
             context.record_rows(&[crosstalk_core::store::RunRow {
                 ordinal: 0,
                 channel_id: 1,
@@ -253,6 +265,162 @@ async fn a_form_cannot_turn_a_preview_action_into_an_apply() {
     }
     let runs = store.recent_runs(1).expect("runs");
     assert!(runs[0].dry_run);
+}
+
+#[tokio::test]
+async fn a_status_action_stays_clickable_while_another_run_holds_the_app() {
+    let (state, _store, _dir) = state(None);
+    let started = state.runner.start("echo", "slow", false).expect("started");
+    assert!(state.runner.is_busy("echo"));
+
+    let (status, body) = get(&state, "/apps/echo").await;
+    assert_eq!(status, StatusCode::OK);
+    // The apply is disabled while the app is busy…
+    assert!(body.contains("a run is in progress"), "{body}");
+    // …but the unguarded status action is offered, because the guard does not apply to it.
+    assert!(
+        body.contains(r#"action="/apps/echo/actions/status""#),
+        "the status action is still clickable: {body}"
+    );
+    state.runner.cancel(started.run_id);
+}
+
+#[tokio::test]
+async fn a_status_run_is_recorded_without_blocking_the_app() {
+    let (state, store, _dir) = state(None);
+    // Start the status action while a long run holds the app: it must not be refused.
+    let live = state.runner.start("echo", "slow", false).expect("started");
+    let status = post_form(&state, "/apps/echo/actions/status", "dry_run=true").await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "an unguarded action is not refused as busy"
+    );
+    for _ in 0..100 {
+        if store
+            .recent_runs_for("echo", 10)
+            .expect("runs")
+            .iter()
+            .any(|run| run.action == "status" && !run.status.is_running())
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    state.runner.cancel(live.run_id);
+}
+
+#[tokio::test]
+async fn the_start_fresh_checkbox_discards_saved_progress() {
+    let (state, store, _dir) = state(None);
+    store
+        .save_checkpoint("echo", "poke", &serde_json::json!({"done": 7}))
+        .expect("seed a checkpoint");
+
+    // Without the checkbox the checkpoint is left alone, so the run resumes.
+    let no_fresh = post_form(
+        &state,
+        "/apps/echo/actions/poke",
+        "dry_run=false&confirm=true",
+    )
+    .await;
+    assert_eq!(no_fresh, StatusCode::SEE_OTHER);
+    for _ in 0..100 {
+        if store.run_count().expect("count") > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    for _ in 0..100 {
+        if !state.runner.is_busy("echo") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        store
+            .load_checkpoint("echo", "poke")
+            .expect("read")
+            .is_some(),
+        "a normal run resumes rather than discarding"
+    );
+
+    // With it, the saved progress is gone before the action reads anything.
+    let fresh = post_form(
+        &state,
+        "/apps/echo/actions/poke",
+        "dry_run=false&confirm=true&fresh=true",
+    )
+    .await;
+    assert_eq!(fresh, StatusCode::SEE_OTHER);
+    for _ in 0..100 {
+        if store
+            .load_checkpoint("echo", "poke")
+            .expect("read")
+            .is_none()
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(store.load_checkpoint("echo", "poke").expect("read"), None);
+}
+
+#[tokio::test]
+async fn a_paused_run_page_says_it_will_resume() {
+    let (state, store, _dir) = state(None);
+    let run_id = store.start_run("echo", "poke", false).expect("start");
+    store
+        .finish_run(
+            run_id,
+            crosstalk_core::store::RunStatus::Paused,
+            Some("paused after 120 of 900 stream(s)"),
+            &serde_json::json!({"done": 120}),
+            None,
+        )
+        .expect("finish");
+
+    let (status, body) = get(&state, &format!("/runs/{run_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("status-paused"), "{body}");
+    assert!(
+        body.contains("Paused at its window's end"),
+        "a paused run explains itself: {body}"
+    );
+    assert!(
+        body.contains("resumes from that checkpoint"),
+        "and says it continues: {body}"
+    );
+
+    // The dashboard says the same in one line, so an operator browsing apps sees which ones
+    // have a backlog waiting for the next window.
+    let (status, body) = get(&state, "/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("resumes at its next window"),
+        "the dashboard names the paused backlog: {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_dashboard_lists_a_schedule_window() {
+    let (state, _store, _dir) = state(None);
+    // The window is what tells an operator that a four-hour job will not run to the end in one
+    // firing; the dashboard shows it beside the expression.
+    let mut config = CrosstalkConfig::load_file(state.config.config_dir()).expect("config");
+    config.schedules.insert(
+        "echo.poke".to_string(),
+        crosstalk_core::config::ScheduleEntry::Windowed(crosstalk_core::config::ScheduleTable {
+            cron: "0 23 * * *".to_string(),
+            window: Some("4h".to_string()),
+            until: None,
+            timezone: None,
+        }),
+    );
+    state.config.replace(config);
+    let (status, body) = get(&state, "/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("4h from start"), "{body}");
 }
 
 #[tokio::test]

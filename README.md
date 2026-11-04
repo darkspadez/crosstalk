@@ -104,7 +104,7 @@ The UI listens on <http://localhost:8730>.
 |---|---|
 | `crosstalk serve --config <dir>` | Run the daemon: REST API, scheduler and web UI |
 | `crosstalk validate --config <dir>` | Check the configuration files and each app's settings |
-| `crosstalk run <app> <action> [--dry-run] [--yes]` | Run one action once and exit |
+| `crosstalk run <app> <action> [--dry-run] [--yes] [--fresh]` | Run one action once and exit |
 | `crosstalk exports clear [--app <id>] [--yes]` | Delete the CSV reports the sub-apps wrote (the UI's **Clear exports** button does the same) |
 | `crosstalk simulate-streams --channels <csv> --streams <m3u>` | Offline stream-to-channel simulation, for tuning without touching a live install |
 
@@ -300,11 +300,45 @@ a preview action stays a preview. A cleanup schedule reads the last finished `sc
 `guide.scan` entry ahead of it in the day is what makes it do anything: with no finished scan it
 refuses to run and says so.
 
+### Windows and resumable jobs
+
+A job that cannot finish in one slot — a probe over 50k streams against provider connection
+limits — runs inside a **window**. An entry becomes a table instead of a bare expression:
+
+```toml
+[schedules]
+"guide.match_apply" = "0 4 * * *"
+# Four hours from each firing: stops at 03:00, resumes at 23:00 the next night.
+"streams.probe" = { cron = "0 23 * * *", window = "4h" }
+# Until 06:00, wrapping past midnight when it has already passed; read in its own zone.
+"streams.probe_weekend" = { cron = "0 22 * * 5", until = "06:00", timezone = "America/New_York" }
+```
+
+`window` and `until` are exclusive; `until` defaults to UTC, like the expression, and a time
+that has already passed means tomorrow (so a 23:00 start until 06:00 is eight hours, not minus
+seventeen). A time the clocks skip ends at the first instant that exists.
+
+A windowed run checks the clock between work units. When the window closes it saves its place
+and stops with the run recorded **paused** — distinct from `succeeded` (the job finished) and
+from `cancelled` (someone stopped it). The next firing of the same action loads the checkpoint
+and continues, so a backlog drains over several nights. The dashboard shows each schedule's
+window and the run page says what a paused run will do.
+
+Checkpoints survive a cancel too: cancelling at 03:00 because the host is needed lets tomorrow
+continue where today stopped. To start a backlog over — after changing the scope, say — ask for
+a fresh start: `crosstalk run streams probe --fresh`, or the **start fresh** checkbox on the app
+page. Settings are re-read on every run, so a change takes effect at the next window.
+
+Every run explains itself in the history: `cancelled` runs keep the rows, the counts and the CSV
+they produced, and each unwritten row says it was not applied, so a half-done apply is never
+recorded as a success.
+
 ## Web UI
 
-- Dashboard: apps, schedules and their next run, recent runs.
-- App page: actions with their colours, a confirmation for the ones that write, the run in
-  progress with a cancel button.
+- Dashboard: apps, schedules with their window and next run, recent runs.
+- App page: actions with their colours, a confirmation for the ones that write, a **start
+  fresh** checkbox on the writing ones, the run in progress with a cancel button. A read-only
+  `status` stays clickable while a run is live and reports that run's progress.
 - Run page: live status, the full result table with the reason for every row, the AI decision
   where there was one, and the CSV download.
 - Settings: every option with the help text the form shows, written back to the TOML files.

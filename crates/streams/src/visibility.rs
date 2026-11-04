@@ -400,14 +400,6 @@ pub async fn run(
         name.as_deref(),
     );
 
-    if applied
-        .as_ref()
-        .is_some_and(|applied| applied.ok == 0 && applied.failed > 0)
-        && context.is_cancelled()
-    {
-        bail!("cancelled by the operator before any change was written");
-    }
-
     let changed = op_plan.changes.len();
     let mut builder = OutcomeBuilder::new(if dry_run {
         format!(
@@ -452,6 +444,11 @@ pub async fn run(
              disabled",
             outcome.groups_without_winner
         ));
+    }
+    // The cancel rule (see crosstalk_core::jobs): whatever landed stays recorded, and the run
+    // says it was cancelled rather than claiming the profile is in its final state.
+    if let Some(note) = channel_ops::cancelled_note(context, &op_plan, applied.as_ref()) {
+        builder = builder.cancelled().note(note);
     }
     Ok(builder.report(Some(report)).build())
 }
@@ -620,6 +617,47 @@ mod tests {
         // All four "Kids" channels are enabled in the host profile, and only ESPN [HD] and CNN
         // survive: the rest move to disabled.
         assert_eq!(outcome.enabled_before, 4);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_apply_is_recorded_cancelled_and_keeps_what_it_did() {
+        let world = visibility_world();
+        let mut server = ServerFixture::start(&world).await;
+        server.config.scope.profiles = "All".to_string();
+        let store = server.store();
+        let context = server.context_for_run(ACTION_VISIBILITY_APPLY, &store, false);
+        let run_id = context.run_id().expect("run id");
+        context.cancel();
+
+        let outcome = StreamsApp::new()
+            .dispatch(ACTION_VISIBILITY_APPLY, &context, false)
+            .await
+            .expect("a cancelled run still reports what it did");
+        assert!(outcome.is_cancelled(), "{}", outcome.summary);
+        assert!(
+            outcome.summary.contains("cancelled by the operator"),
+            "{}",
+            outcome.summary
+        );
+        assert_eq!(outcome.counts.get("written"), Some(&0));
+        assert_eq!(
+            server
+                .request_count("PATCH", "/api/channels/profiles/4/channels/bulk-update/")
+                .await,
+            0,
+            "nothing is written"
+        );
+        // Each planned row says it was not applied; the `skipped` rows (already enabled) are
+        // not failures and keep their own reason.
+        let rows = store.rows(run_id).expect("rows");
+        let planned: Vec<_> = rows.iter().filter(|row| row.status != "skipped").collect();
+        assert!(!planned.is_empty(), "{rows:?}");
+        assert!(
+            planned
+                .iter()
+                .all(|row| row.status == "failed" && row.reason.contains("cancelled")),
+            "{rows:?}"
+        );
     }
 
     #[tokio::test]

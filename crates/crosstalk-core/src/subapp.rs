@@ -68,6 +68,14 @@ pub struct ActionSpec {
     pub confirm: Option<&'static str>,
     /// Whether running it needs a reachable Dispatcharr.
     pub needs_dispatcharr: bool,
+    /// Whether the action may run while another run of its app is live.
+    ///
+    /// Only for an action that reads the run store and touches nothing else — `status` is the
+    /// one case today. Refusing it while a run is live is exactly backwards: the run that holds
+    /// the slot is the one the operator wants to see, and its progress is the answer. An
+    /// unguarded run is still recorded (so its answer lands on a run page), but it takes no slot
+    /// and is not counted as "already running" by the cross-process guard.
+    pub unguarded: bool,
 }
 
 impl ActionSpec {
@@ -84,12 +92,30 @@ impl ActionSpec {
             kind,
             confirm: None,
             needs_dispatcharr: true,
+            unguarded: false,
         }
     }
 
     /// Mark an action that works entirely offline, so it does not demand credentials.
     pub fn offline(mut self) -> Self {
         self.needs_dispatcharr = false;
+        self
+    }
+
+    /// Mark a read-only action that may run beside another run of its app (see
+    /// [`ActionSpec::unguarded`]).
+    ///
+    /// Only a `Read` action qualifies: it writes nothing another run could race. This is a
+    /// hard panic in every build, not a `debug_assert`: a write action marked unguarded
+    /// would silently race another run of its app, and the registry re-checks it too.
+    pub fn unguarded(mut self) -> Self {
+        assert_eq!(
+            self.kind,
+            ActionKind::Read,
+            "only a read-only action may bypass the one-run-per-app guard: {}",
+            self.id
+        );
+        self.unguarded = true;
         self
     }
 
@@ -380,6 +406,22 @@ pub fn clamp_unit(value: f64) -> Result<f64> {
     Ok(value)
 }
 
+/// How one action finished, beyond the summary and the counts.
+///
+/// The host turns this into the recorded [`crate::store::RunStatus`], so a sub-app never decides
+/// what its own stopping means in the history — the rules are the host's and documented in
+/// [`crate::jobs`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OutcomeStatus {
+    /// The action did the whole job it was asked for.
+    #[default]
+    Succeeded,
+    /// The action stopped at its window's deadline with progress saved to resume.
+    Paused,
+    /// The action stopped because the run was cancelled.
+    Cancelled,
+}
+
 /// How one action finished, for the run record and the toast.
 #[derive(Debug, Clone)]
 pub struct JobOutcome {
@@ -388,6 +430,8 @@ pub struct JobOutcome {
     pub counts: BTreeMap<String, i64>,
     /// CSV written by the action, if any.
     pub report_path: Option<PathBuf>,
+    /// Whether this was a whole job, a pause at the window's deadline, or a cancel.
+    pub status: OutcomeStatus,
 }
 
 impl JobOutcome {
@@ -396,7 +440,38 @@ impl JobOutcome {
             summary: summary.into(),
             counts: BTreeMap::new(),
             report_path: None,
+            status: OutcomeStatus::Succeeded,
         }
+    }
+
+    /// A run that stopped at its window's deadline with its progress saved.
+    ///
+    /// The action must have checkpointed before returning this, or the next window starts from
+    /// the beginning with a `paused` row claiming otherwise.
+    pub fn paused(summary: impl Into<String>) -> Self {
+        Self {
+            status: OutcomeStatus::Paused,
+            ..Self::new(summary)
+        }
+    }
+
+    /// Mark this outcome cancelled, keeping its counts, report and summary.
+    pub fn with_cancelled(mut self) -> Self {
+        self.status = OutcomeStatus::Cancelled;
+        self
+    }
+
+    pub fn with_status(mut self, status: OutcomeStatus) -> Self {
+        self.status = status;
+        self
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.status == OutcomeStatus::Paused
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.status == OutcomeStatus::Cancelled
     }
 
     pub fn with_count(mut self, key: impl Into<String>, value: i64) -> Self {
@@ -420,6 +495,7 @@ pub struct OutcomeBuilder {
     summary: String,
     counts: BTreeMap<String, i64>,
     report: Option<PathBuf>,
+    status: OutcomeStatus,
 }
 
 impl OutcomeBuilder {
@@ -428,7 +504,25 @@ impl OutcomeBuilder {
             summary: summary.into(),
             counts: BTreeMap::new(),
             report: None,
+            status: OutcomeStatus::Succeeded,
         }
+    }
+
+    /// This run stopped at its window's deadline and will resume.
+    pub fn paused(mut self) -> Self {
+        self.status = OutcomeStatus::Paused;
+        self
+    }
+
+    /// This run was cancelled; keep everything it did.
+    pub fn cancelled(mut self) -> Self {
+        self.status = OutcomeStatus::Cancelled;
+        self
+    }
+
+    pub fn status(mut self, status: OutcomeStatus) -> Self {
+        self.status = status;
+        self
     }
 
     /// Append `, {note}` to the summary: a clause such as `3 below threshold`.
@@ -454,6 +548,7 @@ impl OutcomeBuilder {
             summary: self.summary,
             counts: self.counts,
             report_path: self.report,
+            status: self.status,
         }
     }
 }
@@ -554,6 +649,18 @@ impl Registry {
                 "two sub-apps share the id {:?}",
                 app.id()
             );
+            // A hard check, not a `debug_assert`: the builder already panics, but an app
+            // could set the flag by struct literal in the same crate, and an unguarded write
+            // action would race another run of its app with no guard to stop it.
+            for action in app.actions() {
+                assert!(
+                    !action.unguarded || action.kind == ActionKind::Read,
+                    "action {}.{} is unguarded but not read-only: only a read-only action \
+                     may bypass the one-run-per-app guard",
+                    app.id(),
+                    action.id
+                );
+            }
         }
         Self { apps }
     }
@@ -761,9 +868,10 @@ mod tests {
         let registry = stub_registry();
         let mut config = CrosstalkConfig::default();
         for key in ["stub.apply", "stub.nope", "typo"] {
-            config
-                .schedules
-                .insert(key.to_string(), "0 4 * * *".to_string());
+            config.schedules.insert(
+                key.to_string(),
+                crate::config::ScheduleEntry::cron("0 4 * * *"),
+            );
         }
         let unknown = registry.unknown_schedules(&config);
         assert_eq!(unknown, vec!["stub.nope".to_string(), "typo".to_string()]);

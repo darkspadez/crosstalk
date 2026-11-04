@@ -63,7 +63,7 @@ use crate::epg::{EpgRun, EpgSettings, EpgTitles};
 use crate::quality::{self, QualityKey, QualityModel, StreamView, ThroughputSource};
 use crate::selection::{self, StreamPool};
 use crate::settings::StreamsSettings;
-use anyhow::{bail, Result};
+use anyhow::Result;
 use crosstalk_core::channel_ops::{
     self, ApplyReport, Field, Op, Plan, ReportSpec, Selection, SetValue,
 };
@@ -3029,14 +3029,6 @@ pub async fn run(
         name.as_deref(),
     );
 
-    if applied
-        .as_ref()
-        .is_some_and(|applied| applied.ok == 0 && applied.failed > 0)
-        && context.is_cancelled()
-    {
-        bail!("cancelled by the operator before any change was written");
-    }
-
     let changed = outcome.write_count();
     // The plugin's own completion wording (plugin.py:9080-9100), including its "nothing new
     // to add" case, which reads as a failure otherwise: with Overwrite off, a second run over
@@ -3089,6 +3081,11 @@ pub async fn run(
             .count("ota_no_callsign", ota.no_callsign as i64)
             .count("ota_not_in_database", ota.not_in_database as i64)
             .count("ota_no_streams", ota.no_streams as i64);
+    }
+    // The cancel rule (see crosstalk_core::jobs): the streams that landed stay recorded and the
+    // run says it was cancelled rather than claiming a complete match.
+    if let Some(note) = channel_ops::cancelled_note(context, &op_plan, applied.as_ref()) {
+        builder = builder.cancelled().note(note);
     }
     Ok(builder.report(Some(report)).build())
 }
@@ -4107,6 +4104,57 @@ mod tests {
             assert!(report.contains(column), "{column} missing: {report}");
         }
         assert!(report.contains("ESPN 4K [Main]"), "{report}");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_apply_is_recorded_cancelled_and_keeps_what_it_did() {
+        let world = World {
+            channels: vec![
+                channel(1, "ESPN", vec![12], 1),
+                channel(2, "CNN", vec![20], 2),
+            ],
+            streams: vec![
+                stream(10, "ESPN HD", Some(1), Some(TVE)),
+                stream(11, "ESPN 4K", Some(1), Some(TVE)),
+                stream(12, "ESPN", Some(2), Some(TVE)),
+                stream(20, "CNN", Some(1), Some(TVE)),
+            ],
+            m3u_accounts: accounts(),
+            groups: groups(),
+            ..World::default()
+        };
+        let fixture = ServerFixture::start(&world).await;
+        let store = fixture.store();
+        let context = fixture.context_for_run(crate::ACTION_MATCH_APPLY, &store, false);
+        let run_id = context.run_id().expect("run");
+        context.cancel();
+
+        let outcome = run(
+            &crate::StreamsApp::new(),
+            &context,
+            &StreamsSettings::default(),
+            false,
+        )
+        .await
+        .expect("a cancelled run still reports what it did");
+        assert!(outcome.is_cancelled(), "{}", outcome.summary);
+        assert!(
+            outcome.summary.contains("cancelled by the operator"),
+            "{}",
+            outcome.summary
+        );
+        assert_eq!(outcome.counts.get("written"), Some(&0));
+        assert!(fixture
+            .bodies("PATCH", "/api/channels/channels/edit/bulk/")
+            .await
+            .is_empty());
+        let rows = store.rows(run_id).expect("rows");
+        assert!(!rows.is_empty());
+        assert!(
+            rows.iter()
+                .all(|row| row.status == "failed" && row.reason.contains("cancelled")),
+            "{rows:?}"
+        );
     }
 
     #[tokio::test]

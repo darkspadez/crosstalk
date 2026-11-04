@@ -395,6 +395,167 @@ impl MatchingConfig {
     }
 }
 
+/// One `[schedules]` entry.
+///
+/// A plain cron expression is all most entries need. An entry that carries a window runs for a
+/// bounded stretch and checkpoints its progress, so a job too big for one night continues where
+/// it stopped ([`crate::window`]):
+///
+/// ```toml
+/// [schedules]
+/// "guide.match_apply" = "0 4 * * *"
+/// "streams.probe" = { cron = "0 23 * * *", window = "4h" }
+/// "streams.probe_far" = { cron = "0 1 * * *", until = "06:00", timezone = "America/New_York" }
+/// ```
+///
+/// The cron expression stays UTC, which is what the scheduler fires on; only `until` is read in
+/// `timezone`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScheduleEntry {
+    /// `"guide.match_apply" = "0 4 * * *"`.
+    Cron(String),
+    /// `{ cron = "...", window = "4h" }`.
+    Windowed(ScheduleTable),
+}
+
+/// The table form of a [`ScheduleEntry`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScheduleTable {
+    /// The cron expression: five or six fields, UTC.
+    pub cron: String,
+    /// How long one firing may run, for example `"4h"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<String>,
+    /// The wall-clock time of day the run must stop at, for example `"06:00"`. Wraps past
+    /// midnight when it has already passed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<String>,
+    /// The zone `until` is read in. Omitted means UTC, like the cron expression.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+}
+
+impl ScheduleEntry {
+    /// A plain cron entry. The shorthand every caller that only wants an expression uses.
+    pub fn cron(expression: impl Into<String>) -> Self {
+        Self::Cron(expression.into())
+    }
+
+    /// The cron expression, whichever shape the entry has.
+    pub fn cron_expression(&self) -> &str {
+        match self {
+            Self::Cron(expression) => expression,
+            Self::Windowed(table) => &table.cron,
+        }
+    }
+
+    /// The window this entry arms, or `None` for a plain cron entry.
+    ///
+    /// `Err` is a window an operator mistyped; [`CrosstalkConfig::validate`] reports it before
+    /// the daemon arms anything.
+    pub fn window(&self) -> Result<Option<crate::window::Window>> {
+        match self {
+            Self::Cron(_) => Ok(None),
+            Self::Windowed(table) => crate::window::Window::parse(
+                table.window.as_deref(),
+                table.until.as_deref(),
+                table.timezone.as_deref(),
+            ),
+        }
+    }
+
+    /// Whether the entry runs inside a window at all.
+    pub fn is_windowed(&self) -> bool {
+        matches!(self, Self::Windowed(table) if table.window.is_some() || table.until.is_some())
+    }
+
+    /// The window in words, for the dashboard and the run report. `None` when there is none.
+    pub fn window_description(&self) -> Option<String> {
+        self.window().ok().flatten().map(|window| window.describe())
+    }
+}
+
+impl From<&str> for ScheduleEntry {
+    fn from(expression: &str) -> Self {
+        Self::Cron(expression.to_string())
+    }
+}
+
+impl From<String> for ScheduleEntry {
+    fn from(expression: String) -> Self {
+        Self::Cron(expression)
+    }
+}
+
+impl std::fmt::Display for ScheduleEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.cron_expression())?;
+        if let Some(window) = self.window_description() {
+            write!(f, " ({window})")?;
+        }
+        Ok(())
+    }
+}
+
+/// Deserialize a schedule entry as either a string or a table.
+///
+/// Hand-written rather than `#[serde(untagged)]` so a typo inside the table names the field it
+/// did not understand instead of "data did not match any variant".
+impl<'de> Deserialize<'de> for ScheduleEntry {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{self, MapAccess, Visitor};
+
+        struct EntryVisitor;
+
+        impl<'de> Visitor<'de> for EntryVisitor {
+            type Value = ScheduleEntry;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(
+                    "a cron expression string, or a table with cron, window, until and timezone",
+                )
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> std::result::Result<Self::Value, E> {
+                Ok(ScheduleEntry::Cron(value.to_string()))
+            }
+
+            fn visit_string<E: de::Error>(
+                self,
+                value: String,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(ScheduleEntry::Cron(value))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let table = ScheduleTable::deserialize(de::value::MapAccessDeserializer::new(map))?;
+                Ok(ScheduleEntry::Windowed(table))
+            }
+        }
+
+        deserializer.deserialize_any(EntryVisitor)
+    }
+}
+
+impl Serialize for ScheduleEntry {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Cron(expression) => serializer.serialize_str(expression),
+            Self::Windowed(table) => table.serialize(serializer),
+        }
+    }
+}
+
 /// Filesystem and thread-pool settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -452,8 +613,9 @@ pub struct CrosstalkConfig {
     pub scope: ScopeConfig,
     pub exports: ExportsConfig,
     pub jobs: JobsConfig,
-    /// Cron expressions per `<app>.<action>`, for example `guide.match_apply = "0 4 * * *"`.
-    pub schedules: BTreeMap<String, String>,
+    /// Cron expressions per `<app>.<action>`, for example `guide.match_apply = "0 4 * * *"`,
+    /// or a table that adds a window: `{ cron = "0 23 * * *", window = "4h" }`.
+    pub schedules: BTreeMap<String, ScheduleEntry>,
     /// Directory the configuration was loaded from. Not part of the file.
     #[serde(skip)]
     pub config_dir: PathBuf,
@@ -731,7 +893,7 @@ impl CrosstalkConfig {
                 .push("ai.verify.enabled is on but ai.verify.model is empty".to_string());
         }
 
-        for (key, cron) in &self.schedules {
+        for (key, entry) in &self.schedules {
             if !key.contains('.') {
                 report.errors.push(format!(
                     "schedules.{key} must be <app>.<action>, e.g. guide.match_apply"
@@ -739,7 +901,12 @@ impl CrosstalkConfig {
             }
             // Parsed, not merely counted: a five-field expression with a misspelled weekday
             // would otherwise validate and then never fire.
-            if let Err(error) = crate::scheduler::parse_schedule(cron) {
+            if let Err(error) = crate::scheduler::parse_schedule(entry.cron_expression()) {
+                report.errors.push(format!("schedules.{key}: {error:#}"));
+            }
+            // A window is parsed here for the same reason: "4" or a misspelled zone would
+            // otherwise arm a schedule whose runs never pause, or never end.
+            if let Err(error) = entry.window() {
                 report.errors.push(format!("schedules.{key}: {error:#}"));
             }
         }
@@ -1619,7 +1786,7 @@ enabled_databases = ["US", "UK"]
             config
                 .schedules
                 .get("guide.match_apply")
-                .map(String::as_str),
+                .map(ScheduleEntry::cron_expression),
             Some("0 4 * * *")
         );
     }
@@ -1812,7 +1979,7 @@ enabled_databases = ["US", "UK"]
         );
         config
             .schedules
-            .insert("guide".to_string(), "every day".to_string());
+            .insert("guide".to_string(), ScheduleEntry::cron("every day"));
         let report = config.validate();
         assert!(report
             .errors
@@ -1930,6 +2097,145 @@ base_url = "https://api.typesafe.ai/v1"
         assert!(reloaded.ai.providers.is_empty());
         assert!(reloaded.matching.custom_aliases.is_empty());
         assert!(reloaded.schedules.is_empty());
+    }
+
+    #[test]
+    fn a_schedule_entry_is_a_cron_string_or_a_table_with_a_window() {
+        // Two shapes, one key space: the short form stays what it was, so every existing
+        // crosstalk.toml keeps working.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            r#"
+[schedules]
+"guide.match_apply" = "0 4 * * *"
+"streams.probe" = { cron = "0 23 * * *", window = "4h" }
+"streams.probe_early" = { cron = "0 1 * * *", until = "06:00" }
+"streams.probe_ny" = { cron = "0 1 * * *", until = "06:00", timezone = "America/New_York" }
+"#,
+        );
+        let config = CrosstalkConfig::load_file(dir.path()).expect("load");
+
+        let plain = &config.schedules["guide.match_apply"];
+        assert_eq!(plain.cron_expression(), "0 4 * * *");
+        assert!(!plain.is_windowed());
+        assert_eq!(plain.window().expect("window"), None);
+
+        let probe = &config.schedules["streams.probe"];
+        assert!(probe.is_windowed());
+        assert_eq!(probe.cron_expression(), "0 23 * * *");
+        let window = probe.window().expect("window").expect("a duration window");
+        assert_eq!(
+            window.describe(),
+            "4h from start",
+            "the dashboard and reports name the window in words"
+        );
+
+        let early = &config.schedules["streams.probe_early"];
+        assert_eq!(
+            early.window_description().as_deref(),
+            Some("until 06:00 (UTC)"),
+            "`until` defaults to UTC, like the cron expression"
+        );
+        let ny = &config.schedules["streams.probe_ny"];
+        assert_eq!(
+            ny.window_description().as_deref(),
+            Some("until 06:00 (America/New_York)")
+        );
+        // The file has no Dispatcharr credentials, which is the only complaint: the schedule
+        // entries themselves must all read.
+        assert!(
+            config
+                .validate()
+                .errors
+                .iter()
+                .all(|error| error.contains("credentials")),
+            "{:?}",
+            config.validate().errors
+        );
+    }
+
+    #[test]
+    fn a_bad_window_is_a_validation_error_that_names_the_entry() {
+        // A window that does not parse would arm a run that never pauses: refuse it at load
+        // time rather than let a "4" mean four seconds.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            r#"
+[schedules]
+"streams.probe" = { cron = "0 23 * * *", window = "4" }
+"streams.sort" = { cron = "0 23 * * *", window = "4h", until = "06:00" }
+"streams.mirror" = { cron = "0 23 * * *", until = "06:00", timezone = "Mars/Olympus" }
+"streams.visibility" = { cron = "not a cron", window = "4h" }
+"#,
+        );
+        let config = CrosstalkConfig::load_file(dir.path()).expect("load");
+        let errors = config.validate().errors;
+        for (entry, expected) in [
+            ("schedules.streams.probe", "duration"),
+            ("schedules.streams.sort", "not both"),
+            ("schedules.streams.mirror", "not an IANA time zone"),
+            ("schedules.streams.visibility", "cron expression"),
+        ] {
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.starts_with(entry) && error.contains(expected)),
+                "{entry} should report {expected:?}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_windowed_schedule_survives_a_save_with_comments() {
+        // The web UI's host save rewrites the file through `toml_edit`: a table-valued schedule
+        // entry must come back as a table, or saving an unrelated setting would silently turn
+        // every windowed run into an unbounded one.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("crosstalk.toml");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            r#"# operator note
+[schedules]
+"guide.match_apply" = "0 4 * * *"
+"streams.probe" = { cron = "0 23 * * *", window = "4h" }
+"#,
+        );
+        let config = CrosstalkConfig::load_file(dir.path()).expect("load");
+        config.save(&path).expect("save");
+        let text = std::fs::read_to_string(&path).expect("read back");
+        assert!(text.contains("# operator note"), "comments survive: {text}");
+
+        let reloaded = CrosstalkConfig::load_file(dir.path()).expect("reload");
+        assert_eq!(
+            reloaded.schedules["streams.probe"]
+                .window_description()
+                .as_deref(),
+            Some("4h from start")
+        );
+        assert_eq!(
+            reloaded.schedules["guide.match_apply"].cron_expression(),
+            "0 4 * * *"
+        );
+    }
+
+    #[test]
+    fn a_misspelled_key_inside_a_schedule_table_names_the_field() {
+        // `untagged` would say "data did not match any variant", which tells an operator
+        // nothing about the typo they made.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            "[schedules]\n\"streams.probe\" = { cron = \"0 1 * * *\", windoww = \"4h\" }\n",
+        );
+        let error = CrosstalkConfig::load_file(dir.path()).expect_err("rejects");
+        let text = format!("{error:#}");
+        assert!(text.contains("windoww"), "{text}");
     }
 
     #[test]

@@ -392,6 +392,11 @@ struct StartForm {
     /// The UI's confirm dialog submits it; a forged POST without it is rejected.
     #[serde(default)]
     confirm: Option<String>,
+    /// "Start fresh": ignore and discard the progress a paused run saved. Unchecked is the
+    /// default because resuming is the point of a windowed job; the checkbox is how an
+    /// operator asks for the backlog from the beginning.
+    #[serde(default)]
+    fresh: Option<String>,
 }
 
 async fn start_action(
@@ -418,7 +423,16 @@ async fn start_action(
     let dry_run = !action.kind.touches_channels()
         || form.dry_run.as_deref().is_some_and(|value| value == "true");
 
-    match state.runner.start(&app_id, &action_id, dry_run) {
+    let options = crosstalk_core::runner::RunOptions::default();
+    let options = if form.fresh.as_deref().is_some_and(|value| value == "true") {
+        options.fresh()
+    } else {
+        options
+    };
+    match state
+        .runner
+        .start_with(&app_id, &action_id, dry_run, options)
+    {
         Ok(started) => Redirect::to(&format!("/runs/{}", started.run_id)).into_response(),
         Err(error) => (
             StatusCode::CONFLICT,

@@ -109,6 +109,11 @@ pub struct ScanOutcome {
     pub unchecked: usize,
     /// How far ahead programmes were looked for.
     pub check_hours: u32,
+    /// Whether a cancel stopped the scan. The rows above are the channels it managed to judge:
+    /// they are written and reported, because a partial audit that says it is partial is worth
+    /// more than nothing at all — and the result set is selected by "the last SUCCEEDED scan",
+    /// so a cancelled one can never be used by a cleanup action.
+    pub cancelled: bool,
 }
 
 /// What a later action needs from the last scan.
@@ -217,9 +222,13 @@ pub async fn run(
     let concurrency = context.config().dispatcharr.concurrency.max(1);
     let mut answered: Vec<Option<HasPrograms>> = checks.iter().map(|_| None).collect();
     let mut failed: Vec<bool> = checks.iter().map(|_| false).collect();
+    let mut cancelled = false;
     for batch_start in (0..checks.len()).step_by(BATCH_CHANNELS) {
         if context.is_cancelled() {
-            bail!("cancelled by the operator");
+            // Stop asking, keep the answers: the rows below are the channels this run could
+            // judge, and `unchecked` says how many it could not.
+            cancelled = true;
+            break;
         }
         let batch_end = (batch_start + BATCH_CHANNELS).min(checks.len());
         {
@@ -263,7 +272,8 @@ pub async fn run(
             "checking programme data",
         ));
         if context.is_cancelled() {
-            bail!("cancelled by the operator");
+            cancelled = true;
+            break;
         }
     }
 
@@ -285,7 +295,14 @@ pub async fn run(
         let has = match &checks[ordinal] {
             Check::Unassigned => continue,
             Check::Empty => HasPrograms::No,
-            Check::Ask(..) => answered[ordinal].expect("every asked channel was answered"),
+            Check::Ask(..) => match answered[ordinal] {
+                Some(answer) => answer,
+                // A cancelled run never asked this one: unknown, like a failed lookup.
+                None => {
+                    unchecked += 1;
+                    continue;
+                }
+            },
         };
         if has == HasPrograms::Yes {
             continue;
@@ -333,6 +350,7 @@ pub async fn run(
         checked,
         unchecked,
         check_hours,
+        cancelled,
     })
 }
 
@@ -420,6 +438,16 @@ pub fn outcome(result: &ScanOutcome) -> JobOutcome {
         .count("missing_data", missing as i64)
         .count("unchecked", result.unchecked as i64)
         .report(result.report.clone());
+    if result.cancelled {
+        // The cancel rule (see `crosstalk_core::jobs`): the channels judged so far are in the
+        // report and the rows, the rest are `unchecked`, and the run is never recorded as a
+        // successful scan — which is what stops a cleanup action selecting from it.
+        outcome = outcome.cancelled().note(format!(
+            "cancelled by the operator: {} channel(s) were not checked, so this result set is \
+             partial and no cleanup action will use it",
+            result.unchecked
+        ));
+    }
     if result.unchecked > 0 {
         outcome = outcome.note(format!(
             "{} channel(s) could not be checked (programme lookup failed) and are left out \
@@ -596,6 +624,7 @@ mod tests {
             checked: 3,
             unchecked: 0,
             check_hours: 12,
+            cancelled: false,
         };
         assert!(outcome(&clean).summary.contains("all 3 channel(s)"));
         let empty = ScanOutcome::default();
@@ -657,13 +686,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_cancelled_scan_reports_the_cancel() {
+    async fn a_cancelled_scan_reports_the_cancel_and_records_what_it_judged() {
+        // Not an error: the rows it managed to judge are recorded, everything it did not reach
+        // is counted as unchecked, and the outcome says cancelled so no cleanup action can
+        // select from a partial result set.
         let (fixture, world) = fixture().await;
-        let context = fixture.context();
+        let store = Store::in_memory().expect("store");
+        let context = fixture.context_for_run(crate::APP_ID, crate::ACTION_SCAN, &store);
         context.cancel();
-        let error = scan(&fixture, &context, &world)
+        let result = scan(&fixture, &context, &world)
             .await
-            .expect_err("cancelled");
-        assert!(format!("{error:#}").contains("cancelled"), "{error:#}");
+            .expect("a cancelled scan still reports");
+        assert!(result.cancelled);
+        assert!(
+            result.rows.is_empty(),
+            "nothing was asked, so nothing is judged"
+        );
+        assert_eq!(
+            result.unchecked, result.checked,
+            "every channel is unchecked"
+        );
+
+        let outcome = outcome(&result);
+        assert!(outcome.is_cancelled());
+        assert!(
+            outcome.summary.contains("cancelled by the operator"),
+            "{}",
+            outcome.summary
+        );
+        assert_eq!(outcome.counts["unchecked"], result.checked as i64);
     }
 }

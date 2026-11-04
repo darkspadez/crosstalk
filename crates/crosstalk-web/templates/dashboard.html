@@ -39,18 +39,22 @@
   <p class="muted">No schedules. Add one under <code>[schedules]</code> in <code>crosstalk.toml</code>.</p>
   {% else %}
   <table>
-    <thead><tr><th>Schedule</th><th>Cron</th><th>Next run</th></tr></thead>
+    <thead><tr><th>Schedule</th><th>Cron</th><th>Window</th><th>Next run</th></tr></thead>
     <tbody>
       {% for entry in schedules %}
       <tr>
         <td><code>{{ entry.key }}</code></td>
         <td><code>{{ entry.cron }}</code></td>
+        <td>{% if let Some(window) = entry.window %}{{ window }}{% else %}<span class="muted">unbounded</span>{% endif %}</td>
         <td>{% if let Some(next) = entry.next_run %}{{ next }}{% else %}<span class="muted">not a valid expression</span>{% endif %}</td>
       </tr>
       {% endfor %}
     </tbody>
   </table>
-  <p class="muted">Schedules fire in UTC.</p>
+  <p class="muted">
+    Schedules fire in UTC. A windowed schedule stops its run at the window's end, records it
+    <span class="status status-paused">paused</span>, and resumes it on the next firing.
+  </p>
   {% endif %}
 </section>
 

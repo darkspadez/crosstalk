@@ -99,11 +99,15 @@ impl SubApp for GuideApp {
             ActionSpec::new(
                 ACTION_STATUS,
                 "Status / Last Results",
-                "Show what the last run did, and whether a run is in progress.",
+                "Show what the last run did, and what is running now — including its progress \
+                 when this daemon started it.",
                 ActionKind::Read,
             )
             // Reads the run store, not Dispatcharr.
-            .offline(),
+            .offline()
+            // Unguarded: refusing it while another run is live is backwards, because that run
+            // is what the operator is asking about.
+            .unguarded(),
             ActionSpec::new(
                 ACTION_MATCH_PREVIEW,
                 "Preview Auto-Match (Dry Run)",
@@ -478,7 +482,14 @@ impl GuideApp {
             dry_run,
         )
         .await?;
-        Ok(matching::outcome(&result, dry_run))
+        // The cancel rule (see `crosstalk_core::jobs`): a cancel that landed after the
+        // assignments were written keeps them recorded and marks the run cancelled. A cancel
+        // during planning bails before writing, which the runner records cancelled too.
+        let mut outcome = matching::outcome(&result, dry_run);
+        if context.is_cancelled() {
+            outcome = outcome.with_cancelled();
+        }
+        Ok(outcome)
     }
 
     /// Preview or apply scan-and-heal.
@@ -503,46 +514,20 @@ impl GuideApp {
             dry_run,
         )
         .await?;
-        Ok(heal::outcome(
-            &result,
-            dry_run,
-            settings.heal_confidence_threshold,
-        ))
+        // Same rule as auto-match: whatever healed stays recorded, and the run says cancelled.
+        let mut outcome = heal::outcome(&result, dry_run, settings.heal_confidence_threshold);
+        if context.is_cancelled() {
+            outcome = outcome.with_cancelled();
+        }
+        Ok(outcome)
     }
 
     /// What the last runs did, from the store rather than from a live session.
+    ///
+    /// Shared with the streams app: one wording for one question, and one place that knows the
+    /// `status` run must exclude itself and that a live run's progress is the interesting part.
     fn status(&self, context: &JobContext) -> JobOutcome {
-        let Some(store) = context.store() else {
-            return JobOutcome::new("No run history is available in this context.");
-        };
-        // This status run is recorded too, and is always the newest: report the one before it.
-        let runs = store.recent_runs_for(APP_ID, 2).unwrap_or_default();
-        let Some(run) = runs
-            .into_iter()
-            .find(|run| Some(run.id) != context.run_id())
-        else {
-            return JobOutcome::new("No run has been recorded yet.");
-        };
-
-        let mut outcome = JobOutcome::new(format!(
-            "Last run: {} {} ({}) started {}",
-            run.action,
-            run.status,
-            if run.dry_run { "preview" } else { "apply" },
-            run.started_at
-        ));
-        if let Some(summary) = run.summary {
-            outcome = JobOutcome::new(format!("{} — {summary}", outcome.summary));
-        }
-        for (key, value) in store
-            .rows(run.id)
-            .map(|rows| rows.len())
-            .map(|count| ("rows", count as i64))
-            .into_iter()
-        {
-            outcome = outcome.with_count(key, value);
-        }
-        outcome
+        crosstalk_core::status::describe(self, context)
     }
 
     fn validate(&self, context: &JobContext) -> Result<JobOutcome> {
@@ -640,6 +625,25 @@ mod tests {
                 .kind;
             assert_eq!(kind, ActionKind::Read, "a preview is a read: {id}");
         }
+    }
+
+    #[test]
+    fn status_is_the_one_unguarded_action() {
+        // It reads the run store and nothing else, so it may run while another run of this app
+        // is live — which is exactly when an operator asks it. Everything else takes the slot.
+        let actions = app().actions();
+        let status = actions
+            .iter()
+            .find(|action| action.id == ACTION_STATUS)
+            .expect("status");
+        assert_eq!(status.kind, ActionKind::Read);
+        assert!(!status.needs_dispatcharr);
+        assert!(status.unguarded);
+        assert_eq!(
+            actions.iter().filter(|action| action.unguarded).count(),
+            1,
+            "only status bypasses the one-run-per-app guard"
+        );
     }
 
     #[test]
@@ -966,6 +970,49 @@ mod tests {
             "{}",
             outcome.summary
         );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_apply_is_recorded_cancelled_not_succeeded() {
+        // End to end through the host: this is the rule from `crosstalk_core::jobs`, and the
+        // guide app must not be the one app that reports a stop as a success. Phase 1 kept a
+        // partially-written apply a success, which hid a write that had happened.
+        use crosstalk_core::config::SharedConfig;
+        use crosstalk_core::runner::JobRunner;
+        use crosstalk_core::store::{RunStatus, Store};
+        use crosstalk_core::subapp::Registry;
+        use std::sync::Arc;
+
+        let world = test_support::world();
+        let fixture = test_support::Fixture::start(&world, &[test_support::ESPN_HD]).await;
+        let store = Store::in_memory().expect("store");
+        let runner = JobRunner::new(
+            Registry::new(vec![Arc::new(GuideApp::new())]),
+            SharedConfig::new(fixture.config.clone()),
+            store.clone(),
+        );
+
+        for action in [ACTION_MATCH_APPLY, ACTION_HEAL_APPLY] {
+            let started = runner.start(APP_ID, action, false).expect("started");
+            assert!(runner.cancel(started.run_id), "the run is in flight");
+            for _ in 0..200 {
+                if !runner.is_busy(APP_ID) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let run = store.run(started.run_id).expect("run").expect("present");
+            assert_eq!(
+                run.status,
+                RunStatus::Cancelled,
+                "{action}: {:?}",
+                run.summary
+            );
+            assert!(
+                run.summary.is_some(),
+                "{action}: the run says where it stopped"
+            );
+        }
     }
 
     #[tokio::test]

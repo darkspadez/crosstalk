@@ -49,7 +49,7 @@
 use crate::quality::{self, QualityModel, StreamView, ThroughputSource};
 use crate::selection::AccountSelection;
 use crate::settings::StreamsSettings;
-use anyhow::{bail, Result};
+use anyhow::Result;
 use chrono::Utc;
 use crosstalk_core::channel_ops::{self, Field, Op, Plan, ReportSpec, Selection, SetValue};
 use crosstalk_core::config::ScopeConfig;
@@ -562,14 +562,6 @@ pub async fn run(
         name.as_deref(),
     );
 
-    if applied
-        .as_ref()
-        .is_some_and(|applied| applied.ok == 0 && applied.failed > 0)
-        && context.is_cancelled()
-    {
-        bail!("cancelled by the operator before any change was written");
-    }
-
     let changed = result.changed_count();
     let mut builder = OutcomeBuilder::new(if dry_run {
         format!("Dry run complete. Would sort {changed} channel(s) with multiple streams.")
@@ -597,6 +589,11 @@ pub async fn run(
              rewritten order",
             result.missing_streams
         ));
+    }
+    // The cancel rule (see crosstalk_core::jobs): whatever landed stays recorded, and the run
+    // says it was cancelled rather than claiming a whole sort.
+    if let Some(note) = channel_ops::cancelled_note(context, &plan, applied.as_ref()) {
+        builder = builder.cancelled().note(note);
     }
     Ok(builder.report(Some(report)).build())
 }
@@ -1047,6 +1044,49 @@ mod tests {
         // readable without a second lookup.
         assert!(report.contains("ESPN 4K, ESPN HD, ESPN SD"), "{report}");
         assert!(report.contains("Sort key"), "{report}");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_apply_is_recorded_cancelled_and_keeps_what_it_did() {
+        // The cancel rule (see crosstalk_core::jobs): a cancelled run keeps its counts, its
+        // report and its rows, and is never recorded as a success — phase 1 recorded a
+        // half-written apply as succeeded, which is what this replaces.
+        let world = scoped_world();
+        let fixture = ServerFixture::start(&world).await;
+        let store = fixture.store();
+        let context = fixture.context_for_run(ACTION_SORT_APPLY, &store, false);
+        let run_id = context.run_id().expect("run id");
+        context.cancel();
+
+        let outcome = StreamsApp::new()
+            .run(ACTION_SORT_APPLY, &context, false)
+            .await
+            .expect("a cancelled run still reports what it did");
+        assert!(outcome.is_cancelled(), "{}", outcome.summary);
+        assert!(
+            outcome.summary.contains("cancelled by the operator"),
+            "{}",
+            outcome.summary
+        );
+        assert_eq!(outcome.counts.get("written"), Some(&0));
+        assert!(
+            outcome.report_path.is_some(),
+            "the report is what says which rows were left unwritten"
+        );
+        assert!(fixture
+            .bodies("PATCH", "/api/channels/channels/edit/bulk/")
+            .await
+            .is_empty());
+        let rows = store.rows(run_id).expect("rows");
+        assert!(
+            !rows.is_empty(),
+            "the planned rows are the record of the cancel"
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row.status == "failed" && row.reason.contains("cancelled")),
+            "{rows:?}"
+        );
     }
 
     #[tokio::test]

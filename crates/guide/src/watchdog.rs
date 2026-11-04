@@ -79,7 +79,7 @@
 //!     `still_broken` and the reason carries the error.
 
 use crate::settings::GuideSettings;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use crosstalk_core::csv_report;
 use crosstalk_core::dispatcharr::{DispatcharrClient, EpgEntry, EpgHorizon, EpgSourceState, World};
@@ -337,6 +337,10 @@ pub enum Action {
     WouldRefresh,
     /// A refresh was requested and waited for.
     Refreshed(Refresh),
+    /// A refresh was requested, and the run was cancelled before it settled. The queue entry
+    /// stays on Dispatcharr, so the row records it rather than pretending nothing happened —
+    /// this is the "record rows for refreshes already queued" rule from the phase-1 review.
+    Queued,
     /// The refresh request itself failed. Classification is skipped, as in the plugin.
     RefreshFailed(String),
 }
@@ -349,6 +353,9 @@ impl Action {
             Self::Refreshed(Refresh::Settled) => "refreshed".to_string(),
             Self::Refreshed(Refresh::Timeout) => {
                 "refresh requested, did not settle within the timeout".to_string()
+            }
+            Self::Queued => {
+                "refresh queued, then the run was cancelled before it settled".to_string()
             }
             Self::RefreshFailed(error) => format!("refresh failed: {error}"),
         }
@@ -376,6 +383,7 @@ impl Row {
             (Some(outcome), _) => outcome.as_str(),
             (None, Action::RefreshFailed(_)) => "refresh_failed",
             (None, Action::WouldRefresh) => "would_refresh",
+            (None, Action::Queued) => "queued",
             (None, _) => "fresh",
         }
     }
@@ -415,6 +423,9 @@ pub struct Summary {
     pub would_refresh: Vec<i64>,
     /// One row per candidate, in the order they were audited.
     pub rows: Vec<Row>,
+    /// Whether a cancel stopped the audit. The rows above are still written: a refresh that was
+    /// already queued on Dispatcharr happened, and a run page that omitted it would hide it.
+    pub cancelled: bool,
 }
 
 /// The I/O one check performs, injected so the loop is unit-testable without a server.
@@ -459,9 +470,21 @@ pub async fn run_check<IO: WatchdogIo + ?Sized>(
     let cutoff = now + chrono::Duration::hours(i64::from(settings.horizon_threshold_hours));
     let mut summary = Summary::default();
 
-    for before in io.candidates(cutoff, &exclude).await? {
+    let candidates = io.candidates(cutoff, &exclude).await?;
+    // A cancel during THAT read: the audit has nothing to add, and the caller still needs to
+    // know the run was cancelled rather than that nothing was mapped.
+    if io.cancelled() {
+        summary.cancelled = true;
+    }
+    for before in candidates {
+        if summary.cancelled {
+            break;
+        }
         if io.cancelled() {
-            bail!("cancelled by the operator");
+            // Not a bail: the rows already decided are the audit this run produced, and the
+            // caller records them before saying the run was cancelled.
+            summary.cancelled = true;
+            break;
         }
         summary.checked += 1;
 
@@ -499,10 +522,23 @@ pub async fn run_check<IO: WatchdogIo + ?Sized>(
         let refresh = match io.refresh(before.id).await {
             Ok(refresh) => refresh,
             Err(error) => {
-                // A cancel is an abort, not a result: it must not be mistaken for a source
-                // that failed to refresh.
+                // A cancel is not a refresh failure. The POST above already reached Dispatcharr
+                // (the settle wait is what observes the cancel), so the queue entry exists and
+                // the row says so; then the run stops.
                 if io.cancelled() {
-                    bail!("cancelled by the operator");
+                    summary.cancelled = true;
+                    summary.rows.push(Row {
+                        source_id: before.id,
+                        name: before.name.clone(),
+                        status_before: before.status.clone(),
+                        status_after: None,
+                        horizon_before: before.reach,
+                        horizon_after: None,
+                        stale: true,
+                        action: Action::Queued,
+                        outcome: None,
+                    });
+                    break;
                 }
                 tracing::error!("guide watchdog refresh({}) failed: {error:#}", before.id);
                 summary.failed.push(before.id);
@@ -706,7 +742,10 @@ impl WatchdogIo for Session<'_> {
         let mut states = Vec::with_capacity(chosen.len());
         for (index, mut state) in chosen.into_iter().enumerate() {
             if self.context.is_cancelled() {
-                bail!("cancelled by the operator");
+                // Hand back what has been read so far; `run_check` sees the flag, marks the run
+                // cancelled and stops. Bailing here would throw away the audit of every source
+                // already checked.
+                break;
             }
             self.context.progress(&ProgressEvent::new(
                 PROGRESS_ACTION,
@@ -1026,10 +1065,10 @@ pub fn outcome(summary: &Summary, dry_run: bool, settings: &WatchdogSettings) ->
         .count("still_broken", summary.still_broken.len() as i64)
         .count("failed", summary.failed.len() as i64)
     };
-    if summary.checked == 0 {
+    if summary.checked == 0 && !summary.cancelled {
         // Not an error, but it is worth saying out loud: nothing is being watched. Either every
         // source is inactive or a dummy one, nothing is mapped to one, or the exclude list
-        // covers them all.
+        // covers them all. A cancelled run has its own note instead.
         builder = builder.note(
             "no active, non-dummy EPG source has channels mapped to it (or they are all \
              excluded), so nothing was audited",
@@ -1040,6 +1079,16 @@ pub fn outcome(summary: &Summary, dry_run: bool, settings: &WatchdogSettings) ->
             "{} refresh request(s) failed and were not classified",
             summary.failed.len()
         ));
+    }
+    if summary.cancelled {
+        // The cancel rule (see `crosstalk_core::jobs`): the audit and the queued refreshes are
+        // recorded, and the run says it was cancelled instead of reporting a whole sweep.
+        builder = builder.note(format!(
+            "cancelled by the operator after auditing {} source(s); refreshes already queued \
+             on Dispatcharr are recorded here and keep running there",
+            summary.checked
+        ));
+        builder = builder.cancelled();
     }
     let default = WatchdogSettings::default().horizon_threshold_hours;
     if settings.horizon_threshold_hours != default {
@@ -1054,6 +1103,7 @@ pub fn outcome(summary: &Summary, dry_run: bool, settings: &WatchdogSettings) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::bail;
     use chrono::{Duration as ChronoDuration, TimeZone};
     use std::sync::Mutex;
 
@@ -1249,7 +1299,11 @@ mod tests {
         fails: BTreeSet<i64>,
         refreshed: Mutex<Vec<i64>>,
         logs: Mutex<Vec<(Outcome, i64)>>,
-        cancelled: bool,
+        /// Set before the run, or by the refresh that observes a cancel mid-flight.
+        cancelled: std::sync::atomic::AtomicBool,
+        /// Sources whose refresh is "queued, then the operator cancelled while it settled":
+        /// the trait's `refresh` then returns the cancel error, as `await_epg_refresh` does.
+        cancel_in_refresh: BTreeSet<i64>,
     }
 
     impl Fake {
@@ -1267,6 +1321,11 @@ mod tests {
 
         fn rereads(mut self, after: SourceState) -> Self {
             self.after.insert(after.id, after);
+            self
+        }
+
+        fn cancelling_refresh(mut self, id: i64) -> Self {
+            self.cancel_in_refresh.insert(id);
             self
         }
 
@@ -1295,6 +1354,14 @@ mod tests {
         }
 
         async fn refresh(&self, source_id: i64) -> Result<Refresh> {
+            if self.cancel_in_refresh.contains(&source_id) {
+                // The POST reached Dispatcharr before the cancel was observed, which is what
+                // the real client does: queue, then wait, then notice.
+                self.refreshed.lock().unwrap().push(source_id);
+                self.cancelled
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                bail!("cancelled by the operator");
+            }
             if self.fails.contains(&source_id) {
                 bail!("connect failed");
             }
@@ -1319,7 +1386,7 @@ mod tests {
         }
 
         fn cancelled(&self) -> bool {
-            self.cancelled
+            self.cancelled.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
@@ -1474,14 +1541,42 @@ mod tests {
     async fn a_cancel_stops_the_check_before_the_next_source() {
         let broken = src(22, "error", Reach::Unknown);
         let fake = Fake {
-            cancelled: true,
+            cancelled: std::sync::atomic::AtomicBool::new(true),
             ..Fake::new(vec![broken])
         };
-        let error = run_fake(&fake, &WatchdogSettings::default(), Mode::Apply)
+        // Not an error any more: the summary says cancelled and the caller records it, so the
+        // run page shows a cancelled run instead of a failed one.
+        let summary = run_fake(&fake, &WatchdogSettings::default(), Mode::Apply)
             .await
-            .expect_err("cancelled");
-        assert!(format!("{error:#}").contains("cancelled by the operator"));
+            .expect("a cancelled check still reports");
+        assert!(summary.cancelled);
         assert!(fake.refreshed().is_empty());
+        assert!(summary.rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_cancel_during_a_refresh_records_the_source_that_was_already_queued() {
+        // The phase-1 review's exact finding: the watchdog bailed on cancel and lost the rows
+        // for refreshes it had already queued on Dispatcharr. The queue entry keeps running
+        // there, so the audit has to say so.
+        let broken = src(22, "error", Reach::Unknown);
+        let healthy = src(7, "success", Reach::At(now() + ChronoDuration::days(3)));
+        let fake = Fake::new(vec![broken, healthy]).cancelling_refresh(22);
+
+        let summary = run_fake(&fake, &WatchdogSettings::default(), Mode::Apply)
+            .await
+            .expect("a cancelled check still reports");
+        assert_eq!(fake.refreshed(), vec![22], "the refresh was queued");
+        assert!(summary.cancelled);
+        assert_eq!(summary.checked, 1, "the audit stopped at the cancel");
+        assert_eq!(summary.rows.len(), 1);
+        assert_eq!(summary.rows[0].source_id, 22);
+        assert_eq!(summary.rows[0].status(), "queued");
+        assert!(summary.refreshed.is_empty(), "it never settled");
+        assert!(
+            !summary.rows.iter().any(|row| row.source_id == 7),
+            "the next source is not audited"
+        );
     }
 
     // ---- the glue against a mock Dispatcharr ------------------------------
@@ -1778,7 +1873,13 @@ mod tests {
                     .with_dispatcharr(
                         DispatcharrClient::new(&self.config.dispatcharr).expect("client"),
                     )
-                    .for_run(run_id, store.clone(), Arc::new(AtomicBool::new(false)))
+                    .for_run(
+                        crate::APP_ID,
+                        action,
+                        run_id,
+                        store.clone(),
+                        Arc::new(AtomicBool::new(false)),
+                    )
             }
 
             /// How many requests of one method reached one path.
@@ -2306,12 +2407,14 @@ mod tests {
             let context = harness.context_for_run(&store, crate::ACTION_WATCHDOG_APPLY, false);
             context.cancel();
 
-            let error = run(&app(), &context, &GuideSettings::default(), false)
+            let outcome = run(&app(), &context, &GuideSettings::default(), false)
                 .await
-                .expect_err("cancelled");
+                .expect("a cancelled run still reports what it did");
+            assert!(outcome.is_cancelled(), "{}", outcome.summary);
             assert!(
-                format!("{error:#}").contains("cancelled by the operator"),
-                "{error:#}"
+                outcome.summary.contains("cancelled by the operator"),
+                "{}",
+                outcome.summary
             );
             assert!(harness.refreshes().await.is_empty());
         }

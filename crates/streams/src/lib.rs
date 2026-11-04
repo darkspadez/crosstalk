@@ -121,11 +121,15 @@ impl SubApp for StreamsApp {
             ActionSpec::new(
                 ACTION_STATUS,
                 "Status / Last Results",
-                "Show what the last run did, and whether a run is in progress.",
+                "Show what the last run did, and what is running now — including its progress \
+                 when this daemon started it.",
                 ActionKind::Read,
             )
             // Reads the run store, not Dispatcharr.
-            .offline(),
+            .offline()
+            // Unguarded: a probe can run for hours, and refusing `status` meanwhile would hide
+            // exactly the run the operator wants to see.
+            .unguarded(),
             ActionSpec::new(
                 ACTION_MATCH_PREVIEW,
                 "Match & Assign Streams (Dry Run)",
@@ -377,33 +381,11 @@ impl StreamsApp {
     }
 
     /// What the last runs did, from the store rather than from a live session.
+    ///
+    /// Shared with the guide app: one wording for one question, and one place that knows the
+    /// `status` run must exclude itself and that a live run's progress is the interesting part.
     fn status(&self, context: &JobContext) -> JobOutcome {
-        let Some(store) = context.store() else {
-            return JobOutcome::new("No run history is available in this context.");
-        };
-        // This status run is recorded too, and is always the newest: report the one before it.
-        let runs = store.recent_runs_for(APP_ID, 2).unwrap_or_default();
-        let Some(run) = runs
-            .into_iter()
-            .find(|run| Some(run.id) != context.run_id())
-        else {
-            return JobOutcome::new("No run has been recorded yet.");
-        };
-
-        let mut outcome = JobOutcome::new(format!(
-            "Last run: {} {} ({}) started {}",
-            run.action,
-            run.status,
-            if run.dry_run { "preview" } else { "apply" },
-            run.started_at
-        ));
-        if let Some(summary) = run.summary {
-            outcome = JobOutcome::new(format!("{} — {summary}", outcome.summary));
-        }
-        if let Ok(rows) = store.rows(run.id) {
-            outcome = outcome.with_count("rows", rows.len() as i64);
-        }
-        outcome
+        crosstalk_core::status::describe(self, context)
     }
 
     fn validate(&self, context: &JobContext) -> Result<JobOutcome> {
@@ -513,6 +495,25 @@ mod tests {
             .map(|action| action.id)
             .collect();
         assert_eq!(offline, vec![ACTION_VALIDATE, ACTION_STATUS]);
+    }
+
+    #[test]
+    fn status_is_the_one_unguarded_action() {
+        // A probe can run for hours; refusing `status` meanwhile would hide the very run the
+        // operator is asking about.
+        let actions = app().actions();
+        let status = actions
+            .iter()
+            .find(|action| action.id == ACTION_STATUS)
+            .expect("status");
+        assert_eq!(status.kind, ActionKind::Read);
+        assert!(!status.needs_dispatcharr);
+        assert!(status.unguarded);
+        assert_eq!(
+            actions.iter().filter(|action| action.unguarded).count(),
+            1,
+            "only status bypasses the one-run-per-app guard"
+        );
     }
 
     #[test]
@@ -699,6 +700,8 @@ mod tests {
             )
             .expect("finish");
         let context = fixture.context().for_run(
+            APP_ID,
+            ACTION_STATUS,
             store
                 .start_run(APP_ID, ACTION_STATUS, true)
                 .expect("status run"),

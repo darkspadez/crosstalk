@@ -444,7 +444,13 @@ impl ServerFixture {
             .expect("start run");
         JobContext::new(Arc::new(self.config.clone()), Arc::new(VecSink::new()))
             .with_dispatcharr(self.client())
-            .for_run(run_id, store.clone(), Arc::new(AtomicBool::new(false)))
+            .for_run(
+                crate::APP_ID,
+                action,
+                run_id,
+                store.clone(),
+                Arc::new(AtomicBool::new(false)),
+            )
     }
 
     /// How many requests were received for one path and method.

@@ -75,7 +75,7 @@
 //!     preamble, so the file is the same information in the shape every other export has.
 
 use crate::settings::StreamsSettings;
-use anyhow::{bail, Result};
+use anyhow::Result;
 use crosstalk_core::channel_ops::{self, Field, Op, Plan, Selection, SetValue};
 use crosstalk_core::config::ScopeConfig;
 use crosstalk_core::csv_report::{self, Report};
@@ -683,14 +683,6 @@ pub async fn run(
         name.as_deref(),
     );
 
-    if applied
-        .as_ref()
-        .is_some_and(|applied| applied.ok == 0 && applied.failed > 0)
-        && context.is_cancelled()
-    {
-        bail!("cancelled by the operator before any change was written");
-    }
-
     let added = outcome.added_count();
     let gained = outcome.planned_channels();
     // A dry run counts the plan (the plugin's dry-run message counts what it WOULD add,
@@ -745,6 +737,11 @@ pub async fn run(
              channel holding one is left alone, as the plugin's re-read leaves it",
             outcome.missing_streams
         ));
+    }
+    // The cancel rule (see crosstalk_core::jobs): whatever landed stays recorded, and the run
+    // says it was cancelled rather than claiming every channel gained its mirror.
+    if let Some(note) = channel_ops::cancelled_note(context, &op_plan, applied.as_ref()) {
+        builder = builder.cancelled().note(note);
     }
     Ok(builder.report(Some(report)).build())
 }
@@ -1270,6 +1267,42 @@ mod tests {
         let outcome = plan(&world, &scoped()).expect("plan");
         assert_eq!(outcome.stats.no_mirror_found, 1);
         assert!(outcome.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_apply_is_recorded_cancelled_and_keeps_what_it_did() {
+        let world = mirror_world();
+        let server = ServerFixture::start(&world).await;
+        let store = server.store();
+        let context = server.context_for_run(ACTION_MIRROR_APPLY, &store, false);
+        let run_id = context.run_id().expect("run id");
+        context.cancel();
+
+        let outcome = StreamsApp::new()
+            .dispatch(ACTION_MIRROR_APPLY, &context, false)
+            .await
+            .expect("a cancelled run still reports what it did");
+        assert!(outcome.is_cancelled(), "{}", outcome.summary);
+        assert!(
+            outcome.summary.contains("cancelled by the operator"),
+            "{}",
+            outcome.summary
+        );
+        assert_eq!(outcome.counts.get("written"), Some(&0));
+        assert_eq!(
+            server
+                .request_count("PATCH", "/api/channels/channels/edit/bulk/")
+                .await,
+            0,
+            "nothing is written"
+        );
+        let rows = store.rows(run_id).expect("rows");
+        assert!(!rows.is_empty());
+        assert!(
+            rows.iter()
+                .all(|row| row.status == "failed" && row.reason.contains("cancelled")),
+            "{rows:?}"
+        );
     }
 
     #[tokio::test]

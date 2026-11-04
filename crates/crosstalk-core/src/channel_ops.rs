@@ -1343,6 +1343,38 @@ pub fn write_ops_report(
     )
 }
 
+/// What a channel-operations action says when the run was cancelled: `None` when it was not.
+///
+/// The rule itself lives in [`crate::jobs`] — a cancelled run keeps its counts, its report and
+/// the rows that landed, and is never recorded as a success — so what is left to each action is
+/// the wording. One wording, because four actions (the guide's cleanup presets and the streams
+/// app's `sort`, `mirror` and `visibility`) all end the same way, and an operator comparing two
+/// run pages should not have to work out why they read differently.
+pub fn cancelled_note(
+    context: &crate::jobs::JobContext,
+    plan: &Plan,
+    applied: Option<&ApplyReport>,
+) -> Option<String> {
+    if !context.is_cancelled() {
+        return None;
+    }
+    let total = plan.changes.len();
+    match applied {
+        None => Some("cancelled by the operator; this preview wrote nothing".to_string()),
+        Some(applied) if applied.ok == 0 => Some(
+            "cancelled by the operator before any change was written; every row says why it \
+             was not applied"
+                .to_string(),
+        ),
+        Some(applied) => Some(format!(
+            "cancelled by the operator after {} of {total} change(s) landed; the other {} were \
+             not written",
+            applied.ok,
+            total.saturating_sub(applied.ok)
+        )),
+    }
+}
+
 /// The plan's rows in the store's shape, for `JobContext::record_rows`.
 ///
 /// `field`/`before_value`/`after_value` are the generic slots a later `restore` reads: the
@@ -3720,6 +3752,58 @@ mod tests {
             server.received_requests().await.unwrap_or_default().len(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_run_says_exactly_how_much_landed() {
+        // The wording four actions share: a preview, a run that wrote nothing, and a run that
+        // landed some of its rows. Each names what the operator is looking at, because the
+        // run's status says "cancelled" and the rows say which half.
+        let server = MockServer::start().await;
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        let plan = plan_ops(
+            &world(),
+            &Selection::default(),
+            &[Op::Set {
+                field: Field::HiddenFromOutput,
+                values: [
+                    (1, SetValue::Flag(true)),
+                    (3, SetValue::Flag(true)),
+                    (4, SetValue::Flag(true)),
+                ]
+                .into_iter()
+                .collect(),
+            }],
+        )
+        .expect("plans");
+        assert_eq!(plan.changes.len(), 3);
+
+        // Not cancelled: nothing to say.
+        let live = JobContext::for_tests(crate::config::CrosstalkConfig::default());
+        assert_eq!(cancelled_note(&live, &plan, None), None);
+
+        // A preview that was cancelled wrote nothing by definition.
+        let cancelled = JobContext::for_tests(crate::config::CrosstalkConfig::default());
+        cancelled.cancel();
+        let note = cancelled_note(&cancelled, &plan, None).expect("a cancelled preview says so");
+        assert!(note.contains("preview wrote nothing"), "{note}");
+
+        // A run cancelled before its first write.
+        let report = apply(&client, &plan, &cancelled, "guide.clear_groups_apply").await;
+        assert_eq!(report.ok, 0);
+        let note = cancelled_note(&cancelled, &plan, Some(&report)).expect("a note");
+        assert!(note.contains("before any change was written"), "{note}");
+
+        // A run cancelled after a batch landed names both halves — which is the case phase 1
+        // recorded as a success and so hid.
+        let partial = crate::channel_ops::ApplyReport {
+            ok: 1,
+            failed: 2,
+            ..report
+        };
+        let note = cancelled_note(&cancelled, &plan, Some(&partial)).expect("a note");
+        assert!(note.contains("after 1 of 3 change(s) landed"), "{note}");
+        assert!(note.contains("the other 2 were not written"), "{note}");
     }
 
     #[tokio::test]

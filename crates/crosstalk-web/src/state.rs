@@ -105,6 +105,11 @@ pub struct UiAction {
     pub confirm: Option<String>,
     /// Whether this action can change channel data, which decides the dry-run flag.
     pub kind_touches_channels: bool,
+    /// Whether it takes no one-run-per-app slot: a read-only status query stays clickable while
+    /// another run is live, which is exactly when an operator wants it.
+    pub unguarded: bool,
+    /// Whether it writes, and so is worth offering "start fresh" for.
+    pub writing: bool,
     pub disabled: bool,
 }
 
@@ -169,8 +174,15 @@ pub fn apps(registry: &Registry, store: &Store) -> Vec<UiApp> {
                 .ok()
                 .and_then(|runs| runs.into_iter().next())
                 .map(|run| {
+                    // A paused run says what it will do next: "paused" alone reads like a
+                    // problem, when it means the backlog continues at the next window.
+                    let paused = if run.status.is_paused() {
+                        " — resumes at its next window"
+                    } else {
+                        ""
+                    };
                     format!(
-                        "{} {} ({})",
+                        "{} {} ({}){paused}",
                         run.action,
                         run.status.as_str(),
                         run.started_at
@@ -200,7 +212,11 @@ pub fn actions(registry: &Registry, runner: &JobRunner, app_id: &str) -> Vec<UiA
                 css: action.kind.css_class().to_string(),
                 confirm: action.confirm.map(str::to_string),
                 kind_touches_channels: action.kind.touches_channels(),
-                disabled: busy,
+                unguarded: action.unguarded,
+                writing: action.kind.touches_channels(),
+                // An unguarded action is never disabled by another run: the guard does not
+                // apply to it.
+                disabled: busy && !action.unguarded,
             })
             .collect(),
         None => Vec::new(),

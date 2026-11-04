@@ -1356,6 +1356,8 @@ mod tests {
                     .clone(),
             )
             .for_run(
+                crate::APP_ID,
+                "match_preview",
                 run_id,
                 store.clone(),
                 Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1426,6 +1428,8 @@ mod tests {
                     .clone(),
             )
             .for_run(
+                crate::APP_ID,
+                "match_preview",
                 run_id,
                 store.clone(),
                 Arc::new(std::sync::atomic::AtomicBool::new(false)),

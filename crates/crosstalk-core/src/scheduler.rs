@@ -7,11 +7,17 @@
 //!
 //! Cron expressions are written the way people write them — five fields, minute first. The
 //! scheduler underneath wants seconds first, so the translation happens in one place
-//! ([`normalize_cron`]) and is covered by tests.
+//! ([`normalize_cron`]) and is covered by tests. Every expression fires in UTC, and an entry's
+//! optional window ([`crate::window`]) turns the firing into a deadline the run checks between
+//! work units. A fired windowed run that reaches its deadline pauses, and the next firing of the
+//! same entry resumes from the checkpoint — so a job too large for one night finishes over
+//! several, which is what `IPTV Checker`'s resume file did.
 
 use crate::config::CrosstalkConfig;
-use crate::runner::JobRunner;
+use crate::runner::{JobRunner, RunOptions};
+use crate::window::Window;
 use anyhow::{bail, Context, Result};
+use chrono::Utc;
 use croner::Cron;
 use tokio_cron_scheduler::{Job, JobScheduler};
 
@@ -24,6 +30,9 @@ pub struct ScheduleInfo {
     pub action: String,
     /// The expression as written.
     pub cron: String,
+    /// The window in words (`"4h from start"`, `"until 06:00 (UTC)"`), when the entry has one.
+    /// A windowed run that reaches its deadline pauses and the next firing resumes it.
+    pub window: Option<String>,
     /// The next time it will fire, when the expression parses.
     pub next_run: Option<String>,
 }
@@ -69,13 +78,15 @@ fn split_key(key: &str) -> Result<(&str, &str)> {
 /// happen even before the daemon arms anything.
 pub fn describe(config: &CrosstalkConfig) -> Vec<ScheduleInfo> {
     let mut described = Vec::new();
-    for (key, expression) in &config.schedules {
+    for (key, entry) in &config.schedules {
+        let cron = entry.cron_expression().to_string();
         let Ok((app, action)) = split_key(key) else {
             described.push(ScheduleInfo {
                 key: key.clone(),
                 app: String::new(),
                 action: String::new(),
-                cron: expression.clone(),
+                cron,
+                window: entry.window_description(),
                 next_run: None,
             });
             continue;
@@ -84,8 +95,9 @@ pub fn describe(config: &CrosstalkConfig) -> Vec<ScheduleInfo> {
             key: key.clone(),
             app: app.to_string(),
             action: action.to_string(),
-            cron: expression.clone(),
-            next_run: next_run(expression),
+            next_run: next_run(entry.cron_expression()),
+            cron,
+            window: entry.window_description(),
         });
     }
     described
@@ -199,7 +211,7 @@ async fn arm_jobs(
     config: &CrosstalkConfig,
 ) -> Vec<uuid::Uuid> {
     let mut armed = Vec::new();
-    for (key, expression) in &config.schedules {
+    for (key, entry) in &config.schedules {
         let Ok((app, action)) = split_key(key) else {
             tracing::warn!("schedule {key:?} is not <app>.<action>; ignoring it");
             continue;
@@ -209,14 +221,23 @@ async fn arm_jobs(
             continue;
         }
 
-        let normalized = match normalize_cron(expression) {
+        let normalized = match normalize_cron(entry.cron_expression()) {
             Ok(normalized) => normalized,
             Err(error) => {
                 tracing::warn!("schedule {key:?}: {error:#}; ignoring it");
                 continue;
             }
         };
-        if let Err(error) = parse_schedule(expression) {
+        // A window that does not parse would silently arm an unbounded run, so it is a skip
+        // like a bad expression: the entry does nothing until the operator fixes it.
+        let window: Option<Window> = match entry.window() {
+            Ok(window) => window,
+            Err(error) => {
+                tracing::warn!("schedule {key:?}: {error:#}; ignoring it");
+                continue;
+            }
+        };
+        if let Err(error) = parse_schedule(entry.cron_expression()) {
             // Skipping rather than failing: a typo in one schedule must not stop the
             // daemon or the other schedules. `crosstalk validate` reports it as an error.
             tracing::warn!("schedule {key:?}: {error:#}; ignoring it");
@@ -232,9 +253,14 @@ async fn arm_jobs(
             let app = app.clone();
             let action = action.clone();
             Box::pin(async move {
+                // The window is measured from THIS firing, not from the daemon's start: a
+                // schedule that fires every six hours and runs for four leaves two hours of
+                // headroom for the work it could not finish.
+                let options = RunOptions::default()
+                    .with_deadline(window.map(|window| window.deadline_from(Utc::now())));
                 // The flag comes from the action's own kind, so a schedule naming a
                 // preview stays a preview instead of writing because a schedule said so.
-                match runner.start(&app, &action, dry_run) {
+                match runner.start_with(&app, &action, dry_run, options) {
                     Ok(started) => tracing::info!(
                         app,
                         action,
@@ -267,6 +293,7 @@ async fn arm_jobs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ScheduleEntry;
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
@@ -274,7 +301,7 @@ mod tests {
         let mut config = CrosstalkConfig::default();
         let mut map = BTreeMap::new();
         for (key, expression) in schedules {
-            map.insert((*key).to_string(), (*expression).to_string());
+            map.insert((*key).to_string(), ScheduleEntry::cron(*expression));
         }
         config.schedules = map;
         config
@@ -345,6 +372,156 @@ mod tests {
         assert_eq!(described.len(), 2);
         assert!(described.iter().all(|entry| entry.next_run.is_none()));
         assert!(described.iter().any(|entry| entry.app.is_empty()));
+    }
+
+    #[test]
+    fn describe_reports_a_window_in_words_beside_the_next_run() {
+        // The dashboard answers "will this finish before it fires again?" — which needs the
+        // window, not only the expression.
+        let mut config = CrosstalkConfig::default();
+        config.schedules.insert(
+            "streams.probe".to_string(),
+            ScheduleEntry::Windowed(crate::config::ScheduleTable {
+                cron: "0 23 * * *".to_string(),
+                window: Some("4h".to_string()),
+                until: None,
+                timezone: None,
+            }),
+        );
+        config.schedules.insert(
+            "guide.match_apply".to_string(),
+            ScheduleEntry::cron("0 4 * * *"),
+        );
+
+        let described = describe(&config);
+        let probe = described
+            .iter()
+            .find(|entry| entry.key == "streams.probe")
+            .expect("listed");
+        assert_eq!(probe.cron, "0 23 * * *");
+        assert_eq!(probe.window.as_deref(), Some("4h from start"));
+        assert!(probe.next_run.is_some(), "the expression still fires");
+
+        let plain = described
+            .iter()
+            .find(|entry| entry.key == "guide.match_apply")
+            .expect("listed");
+        assert_eq!(plain.window, None);
+    }
+
+    #[tokio::test]
+    async fn a_windowed_entry_arms_and_a_bad_window_does_not() {
+        // A window that does not parse must not arm a run that never pauses: the entry is
+        // skipped with a warning, like a bad expression.
+        struct App;
+        impl crate::subapp::SubApp for App {
+            fn id(&self) -> &'static str {
+                "streams"
+            }
+            fn name(&self) -> &'static str {
+                "Streams"
+            }
+            fn description(&self) -> &'static str {
+                "test"
+            }
+            fn actions(&self) -> Vec<crate::subapp::ActionSpec> {
+                vec![crate::subapp::ActionSpec::new(
+                    "probe",
+                    "Probe",
+                    "runs",
+                    crate::subapp::ActionKind::Read,
+                )
+                .offline()]
+            }
+            fn schema(&self) -> &crate::subapp::SettingsSchema {
+                static SCHEMA: std::sync::OnceLock<crate::subapp::SettingsSchema> =
+                    std::sync::OnceLock::new();
+                SCHEMA.get_or_init(crate::subapp::SettingsSchema::default)
+            }
+            fn load_settings(
+                &self,
+                _path: &std::path::Path,
+            ) -> anyhow::Result<crate::subapp::SettingsValues> {
+                Ok(crate::subapp::SettingsValues::new())
+            }
+            fn save_settings(
+                &self,
+                _path: &std::path::Path,
+                _values: &crate::subapp::SettingsValues,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn run<'a>(
+                &'a self,
+                _action: &'a str,
+                _context: &crate::jobs::JobContext,
+                _dry_run: bool,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = anyhow::Result<crate::subapp::JobOutcome>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move { Ok(crate::subapp::JobOutcome::new("finished")) })
+            }
+        }
+
+        let mut config = CrosstalkConfig::default();
+        config.schedules.insert(
+            "streams.probe".to_string(),
+            ScheduleEntry::Windowed(crate::config::ScheduleTable {
+                cron: "0 23 * * *".to_string(),
+                window: Some("4h".to_string()),
+                until: None,
+                timezone: None,
+            }),
+        );
+        config.schedules.insert(
+            "streams.aardvark".to_string(),
+            ScheduleEntry::Windowed(crate::config::ScheduleTable {
+                cron: "0 23 * * *".to_string(),
+                window: Some("4".to_string()),
+                until: None,
+                timezone: None,
+            }),
+        );
+
+        let store = crate::store::Store::in_memory().expect("store");
+        let runner = JobRunner::new(
+            crate::subapp::Registry::new(vec![Arc::new(App)]),
+            crate::config::SharedConfig::new(config.clone()),
+            store,
+        );
+        let mut scheduler = Scheduler::start(runner, &config).await.expect("arms");
+        assert_eq!(
+            scheduler.jobs_count(),
+            1,
+            "the windowed entry arms; the mistyped window names an unknown action anyway"
+        );
+        scheduler.shutdown().await;
+
+        // The mistyped window on a REAL action is what the skip is for.
+        let mut config = CrosstalkConfig::default();
+        config.schedules.insert(
+            "streams.probe".to_string(),
+            ScheduleEntry::Windowed(crate::config::ScheduleTable {
+                cron: "0 23 * * *".to_string(),
+                window: Some("4".to_string()),
+                until: None,
+                timezone: None,
+            }),
+        );
+        assert!(!config.validate().errors.is_empty(), "validate reports it");
+        let store = crate::store::Store::in_memory().expect("store");
+        let runner = JobRunner::new(
+            crate::subapp::Registry::new(vec![Arc::new(App)]),
+            crate::config::SharedConfig::new(config.clone()),
+            store,
+        );
+        let mut scheduler = Scheduler::start(runner, &config).await.expect("arms");
+        assert_eq!(scheduler.jobs_count(), 0, "a bad window is not armed");
+        scheduler.shutdown().await;
     }
 
     #[tokio::test]

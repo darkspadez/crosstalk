@@ -142,6 +142,10 @@ run_history_days = 15
 # Schedules, as `<app>.<action>` with a cron expression. Five fields (minute hour day month
 # weekday) is what most people write, and six (with seconds) is accepted. They fire in UTC.
 # [schedules]
+# A plain expression is a run with no deadline. A table adds a window: the run stops at the
+# window's end, is recorded "paused", and the next firing resumes from its checkpoint.
+#   "streams.probe" = { cron = "0 23 * * *", window = "4h" }
+#   "streams.probe_weekend" = { cron = "0 22 * * 5", until = "06:00", timezone = "America/New_York" }
 # "guide.watchdog_apply" = "0 */6 * * *"
 # "guide.scan" = "30 */6 * * *"
 # "guide.match_apply" = "0 4 * * *"
