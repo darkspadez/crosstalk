@@ -372,7 +372,11 @@ fn run_once(args: RunArgs) -> Result<()> {
         action
     };
 
-    if action.kind.requires_confirmation() && !args.yes {
+    // `--dry-run` stands in for `--yes`: a dry run changes nothing, which is exactly what the
+    // refusal's own wording offers ("or --dry-run to change nothing"). It matters for the one
+    // writing action that is not a pair — `streams.probe`, whose `--dry-run` records health and
+    // writes no stream stats — because there is no preview action to redirect it to.
+    if action.kind.requires_confirmation() && !args.yes && !args.dry_run {
         // A one-shot run has no dialog to confirm in, so the flag has to stand in for it.
         println!(
             "{}\n{}",
@@ -829,6 +833,20 @@ mod tests {
                 "{action} must be armed as a read"
             );
         }
+    }
+
+    #[test]
+    fn a_dry_run_never_needs_yes() {
+        // The refusal's own wording offers `--dry-run` as the alternative, and for the one
+        // writing action that is not a preview/apply pair (`streams.probe`) it is the only way
+        // to run it from the CLI without `--yes`: a dry run records health and writes nothing.
+        let registry = registry::builtin();
+        let (_, probe) = registry
+            .find_action("streams", "probe")
+            .expect("streams.probe is an action");
+        assert!(probe.kind.requires_confirmation(), "it writes stream stats");
+        // The redirect map has no entry for it, so the action itself receives the flag.
+        assert!(preview_counterpart(probe.id).is_none());
     }
 
     #[test]

@@ -218,6 +218,13 @@ pub struct StreamsSettings {
     /// Only check channels enabled in at least one profile. IPTV Checker's
     /// `only_visible_channels`.
     pub only_visible_channels: bool,
+    /// Probe streams attached to no channel as well as the channels' own.
+    ///
+    /// Crosstalk-only: IPTV Checker could only ever check what `load_groups` had loaded, so an
+    /// orphan stream (a provider's new arrival, or one a failed match dropped) was invisible to
+    /// it. Off by default because those streams cost provider connections and change no
+    /// channel's playback.
+    pub probe_unattached_streams: bool,
     /// Skip a stream probed within this many hours; 0 probes everything every run.
     ///
     /// Crosstalk-only: the plugin kept a JSON progress file per window and probed whatever it
@@ -238,7 +245,11 @@ pub struct StreamsSettings {
     pub probe_per_account_limit: u32,
     /// Cooldown after each probe. IPTV Checker's `stream_check_delay`.
     pub stream_check_delay: u32,
-    /// Cap on probes started per minute in one run. Stream-Mapparr's `probe_rate_per_minute`.
+    /// Cap on throughput downloads started per minute in one run. Stream-Mapparr's
+    /// `probe_rate_per_minute`, which throttled only its throughput downloads — never the
+    /// stream checks, which IPTV Checker paced with its workers, its per-stream delay and its
+    /// 429 backoff instead. Same here: the ffprobe checks are paced per account (connections
+    /// plus `stream_check_delay`) and this cap gates the second-connection downloads only.
     pub probe_rate_per_minute: u32,
     /// Length of one throughput probe. Stream-Mapparr's `probe_duration_seconds`.
     pub probe_duration_seconds: u32,
@@ -328,6 +339,7 @@ impl Default for StreamsSettings {
 
             check_alternative_streams: true,
             only_visible_channels: false,
+            probe_unattached_streams: false,
             probe_freshness_hours: 24,
             timeout: 10,
             probe_timeout: 20,
@@ -348,8 +360,8 @@ impl Default for StreamsSettings {
             silent_audio_detection: false,
             silent_audio_max_db: -70,
             streamlink_hosts: "youtube.com, youtu.be, twitch.tv, kick.com".to_string(),
-            ffprobe_path: "/usr/local/bin/ffprobe".to_string(),
-            ffmpeg_path: "/usr/local/bin/ffmpeg".to_string(),
+            ffprobe_path: "/usr/bin/ffprobe".to_string(),
+            ffmpeg_path: "/usr/bin/ffmpeg".to_string(),
 
             dead_rename_format: "{name} [DEAD]".to_string(),
             move_to_group_name: "Graveyard".to_string(),
@@ -1051,6 +1063,18 @@ pub fn schema() -> SettingsSchema {
              profile are skipped, which is how hidden and archived channels stay out of a run.",
         ),
         FieldSpec::new(
+            "probe_unattached_streams",
+            SECTION_PROBE,
+            "Include Unattached Streams",
+            FieldKind::Boolean,
+            FieldValue::Boolean(false),
+        )
+        .with_help(
+            "Probe streams that are attached to no channel as well, so a provider's new \
+             arrival is checked before a match gives it a channel. Off by default: those \
+             streams cost connections and change no channel's playback.",
+        ),
+        FieldSpec::new(
             "probe_freshness_hours",
             SECTION_PROBE,
             "Skip Streams Probed Within (Hours)",
@@ -1120,13 +1144,16 @@ pub fn schema() -> SettingsSchema {
         FieldSpec::new(
             "probe_rate_per_minute",
             SECTION_PROBE,
-            "Probe Rate (probes / minute)",
+            "Throughput Probe Rate (downloads / minute)",
             FieldKind::Number,
             FieldValue::Number(6.0),
         )
         .with_help(
-            "Cap on probes started per minute across the whole run, on top of the per-account \
-             limit.",
+            "Cap on throughput downloads started per minute across the whole run. The ffprobe \
+             checks are NOT capped by this: they are paced per account by the connection limit \
+             and the cooldown above, as in IPTV Checker (which had no per-minute cap at all). \
+             Only the second-connection throughput downloads count against this, as in \
+             Stream-Mapparr's probe_throughput.",
         ),
         FieldSpec::new(
             "probe_duration_seconds",
@@ -1288,11 +1315,13 @@ pub fn schema() -> SettingsSchema {
             SECTION_PROBE,
             "FFprobe Path",
             FieldKind::Text,
-            FieldValue::Text("/usr/local/bin/ffprobe".to_string()),
+            FieldValue::Text("/usr/bin/ffprobe".to_string()),
         )
-        .with_placeholder("/usr/local/bin/ffprobe")
+        .with_placeholder("/usr/bin/ffprobe")
         .with_help(
-            "Full path to the ffprobe executable. The analysis flags are fixed by the probe \
+            "Full path to the ffprobe executable. The default is where the image installs it \
+             (Alpine's ffmpeg package); a bare-metal install usually has it in /usr/bin or, on \
+             Homebrew, /opt/homebrew/bin. The analysis flags are fixed by the probe \
              (show_streams, show_packets, an error-level log) rather than configurable, \
              because a flag set that breaks the parser would fail every stream at once.",
         ),
@@ -1301,12 +1330,13 @@ pub fn schema() -> SettingsSchema {
             SECTION_PROBE,
             "FFmpeg Path",
             FieldKind::Text,
-            FieldValue::Text("/usr/local/bin/ffmpeg".to_string()),
+            FieldValue::Text("/usr/bin/ffmpeg".to_string()),
         )
-        .with_placeholder("/usr/local/bin/ffmpeg")
+        .with_placeholder("/usr/bin/ffmpeg")
         .with_help(
             "Full path to the ffmpeg executable, used for the one content-detection decode \
-             pass. Unused when every content check is off.",
+             pass and by nothing else. Unused when every content check is off. The default is \
+             where the image installs it.",
         ),
         FieldSpec::section(
             SECTION_TRIAGE,
@@ -1464,6 +1494,10 @@ pub fn to_values(settings: &StreamsSettings) -> SettingsValues {
             settings.check_alternative_streams,
         ),
         ("only_visible_channels", settings.only_visible_channels),
+        (
+            "probe_unattached_streams",
+            settings.probe_unattached_streams,
+        ),
         ("black_screen_detection", settings.black_screen_detection),
         (
             "placeholder_file_detection",
@@ -1683,6 +1717,9 @@ pub fn apply_values(settings: &mut StreamsSettings, values: &SettingsValues) -> 
     }
     if let Some(value) = values.bool("only_visible_channels") {
         settings.only_visible_channels = value;
+    }
+    if let Some(value) = values.bool("probe_unattached_streams") {
+        settings.probe_unattached_streams = value;
     }
     if let Some(value) = values.bool("black_screen_detection") {
         settings.black_screen_detection = value;
@@ -2008,6 +2045,7 @@ mod tests {
             write_concurrency: 4,
             check_alternative_streams: false,
             only_visible_channels: true,
+            probe_unattached_streams: true,
             probe_freshness_hours: 0,
             timeout: 5,
             probe_timeout: 15,
@@ -2121,6 +2159,7 @@ mod tests {
         assert_eq!(settings.stream_check_delay, 2);
         assert!(settings.check_alternative_streams);
         assert!(!settings.only_visible_channels);
+        assert!(!settings.probe_unattached_streams);
         assert!(!settings.black_screen_detection);
         assert_eq!(settings.black_screen_sample_seconds, 6);
         assert_eq!(settings.black_screen_min_black_seconds, 3);
@@ -2134,8 +2173,8 @@ mod tests {
             settings.streamlink_hosts,
             "youtube.com, youtu.be, twitch.tv, kick.com"
         );
-        assert_eq!(settings.ffprobe_path, "/usr/local/bin/ffprobe");
-        assert_eq!(settings.ffmpeg_path, "/usr/local/bin/ffmpeg");
+        assert_eq!(settings.ffprobe_path, "/usr/bin/ffprobe");
+        assert_eq!(settings.ffmpeg_path, "/usr/bin/ffmpeg");
         assert_eq!(settings.dead_rename_format, "{name} [DEAD]");
         assert_eq!(settings.move_to_group_name, "Graveyard");
         assert_eq!(settings.black_screen_rename_format, "{name} [Blank]");

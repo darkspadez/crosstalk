@@ -22,13 +22,17 @@
 //!     account's server group;
 //!   * [`visibility`] — `visibility_preview` / `visibility_apply`: Stream-Mapparr's Manage
 //!     Channel Visibility, which leaves one enabled channel per name group in a profile;
+//!   * [`probe`] — `probe`, IPTV Checker's stream check (and Stream-Mapparr's throughput
+//!     measurement) as one action: it ffprobes every stream that is due, records what it found
+//!     in the store's `stream_health` and in Dispatcharr's `stream_stats`, and leaves the
+//!     per-channel verdicts triage reads;
 //!   * [`tools`] — `check_countries`, `scan_placeholders` and `test_rules`, the three
 //!     read-only tools (with [`placeholder_scan`], the numbered-family grouping behind the
 //!     second).
 //!
-//! Probe, triage and restore arrive in later steps, so [`StreamsApp::actions`] registers
-//! `validate`, `status`, the `match`, `sort`, `mirror` and `visibility` pairs and the three
-//! tools: the layout is there, the rest is not.
+//! Triage and restore arrive in later steps, so [`StreamsApp::actions`] registers `validate`,
+//! `status`, the `match`, `sort`, `mirror` and `visibility` pairs, `probe` and the three tools:
+//! the layout is there, the rest is not.
 //!
 //! What the two plugins did that a host does once, this app does not do at all: the dry-run
 //! switch is the preview half of a pair (or `--dry-run`), the schedules, windows and
@@ -40,6 +44,7 @@ pub mod epg;
 pub mod matching;
 pub mod mirror;
 pub mod placeholder_scan;
+pub mod probe;
 pub mod quality;
 pub mod selection;
 pub mod settings;
@@ -69,6 +74,7 @@ pub const ACTION_SORT_PREVIEW: &str = "sort_preview";
 pub const ACTION_SORT_APPLY: &str = "sort_apply";
 pub const ACTION_MIRROR_PREVIEW: &str = "mirror_preview";
 pub const ACTION_MIRROR_APPLY: &str = "mirror_apply";
+pub const ACTION_PROBE: &str = "probe";
 pub const ACTION_VISIBILITY_PREVIEW: &str = "visibility_preview";
 pub const ACTION_VISIBILITY_APPLY: &str = "visibility_apply";
 pub const ACTION_CHECK_COUNTRIES: &str = "check_countries";
@@ -201,6 +207,23 @@ impl SubApp for StreamsApp {
                  previous order is recorded in this run's rows. Continue?",
             ),
             ActionSpec::new(
+                ACTION_PROBE,
+                "Probe Streams",
+                "Probe every stream that is due: ffprobe it, optionally decode it once for a \
+                 black, frozen or silent picture, measure its delivery, and record what was \
+                 found in the stream's stats and crosstalk's health table.",
+                // Orange: it writes ProviderStream stats, which players read. It removes no
+                // channel and no assignment.
+                ActionKind::Write,
+            )
+            .with_confirm(
+                "This opens a real connection to your providers for every stream that is due, \
+                 one connection per M3U account at a time, and writes the results into each \
+                 stream's stats (players read them: a dead stream's stats are cleared) and into \
+                 crosstalk's health table. Nothing is assigned, renamed or removed. A run that \
+                 outlives its window pauses and continues next time. Continue?",
+            ),
+            ActionSpec::new(
                 ACTION_VISIBILITY_PREVIEW,
                 "Manage Channel Visibility (Dry Run)",
                 "Work out which channel of each name group stays enabled in the profile \
@@ -314,6 +337,7 @@ impl StreamsApp {
             ACTION_SORT_APPLY => self.sort(context, dry_run).await,
             ACTION_MIRROR_PREVIEW => self.mirror(context, true).await,
             ACTION_MIRROR_APPLY => self.mirror(context, dry_run).await,
+            ACTION_PROBE => self.probe(context, dry_run).await,
             ACTION_VISIBILITY_PREVIEW => self.visibility(context, true).await,
             ACTION_VISIBILITY_APPLY => self.visibility(context, dry_run).await,
             ACTION_CHECK_COUNTRIES => {
@@ -348,6 +372,12 @@ impl StreamsApp {
     async fn mirror(&self, context: &JobContext, dry_run: bool) -> Result<JobOutcome> {
         let settings = self.checked_settings(context)?;
         mirror::run(self, context, &settings, dry_run).await
+    }
+
+    /// Probe the in-scope streams: one action, with `dry_run` skipping the Dispatcharr write.
+    async fn probe(&self, context: &JobContext, dry_run: bool) -> Result<JobOutcome> {
+        let settings = self.checked_settings(context)?;
+        probe::run(self, context, &settings, dry_run).await
     }
 
     /// Manage a profile's channel visibility: preview (a read) or apply.
@@ -453,6 +483,7 @@ mod tests {
                 ACTION_SORT_APPLY,
                 ACTION_MIRROR_PREVIEW,
                 ACTION_MIRROR_APPLY,
+                ACTION_PROBE,
                 ACTION_VISIBILITY_PREVIEW,
                 ACTION_VISIBILITY_APPLY,
                 ACTION_CHECK_COUNTRIES,

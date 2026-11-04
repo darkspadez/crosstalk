@@ -94,6 +94,23 @@ versioned tags plus `latest` from tagged releases (`v*`), and `edge` from every 
 to `main`. Each release also attaches static Linux binaries (amd64/arm64) with a
 `SHA256SUMS` file on the GitHub Releases page.
 
+The image carries **ffmpeg** (which includes ffprobe), because `streams.probe` runs the
+real tools: IPTV Checker's stream check is two subprocesses per stream, not an HTTP
+request. Alpine installs them in `/usr/bin`, which is what `streams.toml` defaults to
+(`ffprobe_path`, `ffmpeg_path`); change those two settings to point at a Homebrew or
+`/usr/local/bin` install. Measured on arm64 (`docker build`, then `docker images` and
+`docker history`):
+
+| Image | `docker images` | ffmpeg layer |
+|---|---|---|
+| without ffmpeg | 50.7 MB | — |
+| with ffmpeg (this image) | 210 MB | 113 MB |
+
+So the probe costs about **113 MB** of image, almost all of it Alpine's codec libraries
+(`libavcodec` alone is 13 MB, and the encoders it pulls in — x265, aom, SVT-AV1 — are
+another 20 MB). Removing ffmpeg is not an option for a probe that must run where
+Dispatcharr runs; the alternative would be a second image, which the plan rejected.
+
 The UI listens on <http://localhost:8730>.
 
 > **Back up your Dispatcharr database first.** An apply rewrites guide assignments on channels.
@@ -104,7 +121,7 @@ The UI listens on <http://localhost:8730>.
 |---|---|
 | `crosstalk serve --config <dir>` | Run the daemon: REST API, scheduler and web UI |
 | `crosstalk validate --config <dir>` | Check the configuration files and each app's settings |
-| `crosstalk run <app> <action> [--dry-run] [--yes] [--fresh]` | Run one action once and exit |
+| `crosstalk run <app> <action> [--dry-run] [--yes] [--fresh]` | Run one action once and exit (`streams probe --dry-run` measures everything and writes no stream stats) |
 | `crosstalk exports clear [--app <id>] [--yes]` | Delete the CSV reports the sub-apps wrote (the UI's **Clear exports** button does the same) |
 | `crosstalk simulate-streams --channels <csv> --streams <m3u>` | Offline stream-to-channel simulation, for tuning without touching a live install |
 
@@ -176,10 +193,12 @@ no daemon restart (a run already in progress finishes with the settings it start
 ## Actions
 
 Every action below belongs to the `guide` app (`crosstalk run guide <action>`). The `streams`
-app declares its own list in `crates/streams/src/lib.rs` and currently exposes `validate`,
-`status`, the `match_*`, `sort_*`, `mirror_*` and `visibility_*` pairs and the three
-read-only tools `check_countries`, `scan_placeholders` and `test_rules`; its `probe`,
-`triage_*` and `restore_*` pairs arrive with the rest of phase 2. The tools write a CSV and a summary and
+app declares its own list in `crates/streams/src/lib.rs`: `validate`, `status`, the `match_*`,
+`sort_*`, `mirror_*` and `visibility_*` pairs, `probe` and the three read-only tools
+`check_countries`, `scan_placeholders` and `test_rules` (its `triage_*` and `restore_*` pairs
+arrive with the rest of phase 2). `probe` is the one writing action that is not a pair — it
+writes stream stats, not channel data, so its "preview" is `--dry-run`: the whole probe runs,
+`stream_health`, the run rows and the CSV are written, and no stream stat is. The tools write a CSV and a summary and
 change nothing: `check_countries` compares each stream's group-country label with its guide-id
 suffix, `scan_placeholders` lists the numbered name families the placeholder patterns miss and
 the regex to paste for each, and `test_rules` shows what the stream-name regex rules would do to
@@ -211,8 +230,10 @@ are ignored — sample changes included.
 Button colour is the consequence, and it is the same convention the Python plugin used: blue
 reads, orange writes data but removes no assignment, red can move an assignment. Orange and red always confirm.
 
-Every action that writes is a `<verb>_preview` / `<verb>_apply` pair, so `--dry-run` on the
-apply runs the preview and a schedule key names the half you mean. The cleanup actions select
+Every action that writes channel data is a `<verb>_preview` / `<verb>_apply` pair, so
+`--dry-run` on the apply runs the preview and a schedule key names the half you mean. The one
+exception is `streams.probe`, which writes stream stats rather than channel data and has no
+separate preview action; `--dry-run` runs the whole probe and skips only the Dispatcharr write. The cleanup actions select
 from the **last finished `scan`** rather than from a results file: there is no age limit,
 because each one re-reads every channel's current name and guide before writing, so a stale
 scan can only be out of date — never double-tagged, and never clearing a guide that was
@@ -416,6 +437,17 @@ the `streams.match` rows are differences from Stream-Mapparr.
 | `streams.visibility_apply` writes the first named profile that exists | Stream-Mapparr's `profile_name` list resolves to `profile_ids[0]` for the write while every named profile widens the channel set; crosstalk does exactly that. With a single profile the action only ever disables. |
 | `streams.visibility_apply` creates the membership row a winner is missing | The plugin's two `update(enabled=...)` statements touch existing rows only, so a channel with no row in the profile stays hidden even as the winner. The membership write goes through `PATCH .../bulk-update/`, which creates a missing row, so a rowless winner becomes visible. Rowless losers agree either way and are never written. In practice every channel has a row in every profile; the parity harness covers the sparse shape with the divergence counted. |
 | `streams.visibility_*` reads Dispatcharr live, not the last load snapshot | The plugin reads its `processed_data` file and refuses to run without it. A channel created since the last load takes part here. |
+| `streams.probe` is one action with `--dry-run`, not a pair | It writes stream stats and crosstalk's health table, never a channel's data, so "what would change" is a number the run only learns by measuring. `--dry-run` runs the whole probe, records health, the CSV and the per-channel verdicts, and writes no stream stats. |
+| `streams.probe` skips a stream probed within `probe_freshness_hours` | The plugin's idea of progress was a JSON resume file per window and its results file; it had no notion of "this stream was fine an hour ago", so every window re-probed everything except what the resume file named. crosstalk reads the store's `stream_health` instead, which also makes an interrupted run resume for free. |
+| `streams.probe` retries per stream, not in global passes | Same retryable error types and the same count, spaced `stream_check_delay × 3` apart, but a retry happens beside the stream that failed instead of after re-walking the whole queue. At 50k streams the plugin's pass-based loop re-queued the failures for a second full sweep. |
+| `streams.probe` probes each stream once, however many channels carry it | The plugin's loaded-channels file repeated a stream once per channel, so a stream on four channels cost four probes and left four result rows. |
+| `streams.probe` refuses to run without ffprobe | A missing binary made the plugin classify every stream `Other`/Dead and clear every `stream_stats` row — the worst possible outcome of a probe. crosstalk checks the two paths before the first stream and refuses the run, naming the setting. |
+| `streams.probe` leaves an unchanged `stream_stats` alone | Same end state; a nightly run over 50k streams should not be 50k PATCHes. The run counts what it wrote and what it left. |
+| `streams.probe` records a cancelled probe as neither a verdict nor a count | A killed invocation (cancel, shutdown) is excluded from the run's records, as the plugin excluded its `Cancelled` rows — but it also writes no health row, so the stream stays due for the next run instead of looking dead. |
+| `streams.probe` measures throughput when `enable_throughput_sorting` is on | Stream-Mapparr's separate `probe_throughput` action, folded in: same 8 s download, same 64 KiB-in-under-a-second guard, same "a failed measurement is never fresh". It costs a second connection per stream, so turning the sort's throughput tier off turns the download off too. |
+| `streams.probe` writes a fixed CSV column set | The plugin emitted dynamic `ffprobe_*` columns per run. crosstalk keeps its base twelve columns and adds the evidence as fixed ones (`container_duration_seconds`, `calculated_bitrate_kbps`, `packet_count`, `mean_volume_db`, `throughput_mbps`, `edge_ip`), so two runs' reports diff. |
+| `streams.probe`'s per-channel verdicts are run rows, not a results file | `triage` reads the `probe_verdict` and `probe_format` rows of the last probe run. The plugin read `results.json` and refused to act without it. |
+| A finite container duration is the only placeholder fingerprint | The plugin's `placeholder_file_detection` needs ffprobe to report a container duration, and a live MPEG-TS never does — so the fingerprint only fires on a container that carries one (HLS, MP4), which is what its measured placeholder was. The evidence is recorded for every stream either way. |
 | `streams.match_preview` drops the plugin's threshold-analysis advice rows | Preview also re-ran the pipeline at 5-point thresholds and collected by exact match against the winning stream name; the plugin itself notes that path disagrees with the real matcher. Those rows were advice, never a write. |
 | With `filter_dead_streams` on, match also excludes store probe verdicts | The plugin only reads `stream_stats` (empty, 0 width/height, `0x0`); crosstalk reproduces that test exactly and additionally skips streams the probe recorded as `dead` in the store — the same verdict, kept where a rerun can see it. |
 | EPG placeholder titles come from one batched read | The plugin queries the programme table per EPG record and memoizes per pass (~8600 queries in one pass before the cache existed). crosstalk resolves the record ids a run can actually reach — a placeholder name on a channel, a placeholder or watched name on a stream — and reads them in one chunked `POST /epg/current-programs/`. The cleanup rules, skip titles, "Next Event" gate and watch containment are the plugin's own. |

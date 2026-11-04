@@ -48,6 +48,7 @@ mod tests {
                 "sort_apply",
                 "mirror_preview",
                 "mirror_apply",
+                "probe",
                 "visibility_preview",
                 "visibility_apply",
                 "check_countries",

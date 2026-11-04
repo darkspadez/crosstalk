@@ -171,6 +171,13 @@ jobs:
       # `crates/streams/examples/mirror_io`.
       - name: Streams mirror fill vs the plugin's own action
         run: python3 -I scripts/mirror_parity.py
+      # The probe is IPTV Checker's stream check, ported. The harness replays outputs recorded
+      # from the REAL ffprobe/ffmpeg (crates/streams/tests/fixtures/probe/corpus.json, made by
+      # scripts/probe_fixtures.py) through the plugin's own `check_stream`, `_analyze_stream_content`
+      # and `_channels_where`, and compares the command lines, the parse, the classification, the
+      # stats merge and the per-channel verdicts with `crates/streams/examples/probe_io`.
+      - name: Streams probe vs the plugin's stream check
+        run: python3 -I scripts/probe_parity.py
       # Channel visibility is Stream-Mapparr's Manage Channel Visibility, ported: it drives the
       # plugin's REAL `manage_channel_visibility_action` (with `ChannelProfileMembership` faked
       # as a table) plus the shared `_build_channel_groups`, and compares the resulting

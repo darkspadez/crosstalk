@@ -23,7 +23,14 @@ FROM alpine:3.20 AS runtime
 ARG PUID=1000
 ARG PGID=1000
 
-RUN addgroup -g "${PGID}" -S crosstalk \
+# ffmpeg (which includes ffprobe) is what `streams.probe` runs: IPTV Checker's stream check is
+# two real subprocesses, not an HTTP request, and the plan puts them in the image so probing
+# needs nothing on the host. Alpine installs them in /usr/bin, which is why
+# `config/streams.example.toml` defaults `ffprobe_path` / `ffmpeg_path` there (IPTV Checker's
+# own default, /usr/local/bin, is where its own Dockerfile put a static build).
+# One layer, and the apk index is dropped in the same RUN so it costs no image space.
+RUN apk add --no-cache ffmpeg \
+    && addgroup -g "${PGID}" -S crosstalk \
     && adduser -u "${PUID}" -S -G crosstalk crosstalk \
     && mkdir -p /config \
     && chown "${PUID}:${PGID}" /config

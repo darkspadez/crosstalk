@@ -11,7 +11,8 @@
 
 use crosstalk_core::config::CrosstalkConfig;
 use crosstalk_core::dispatcharr::{
-    Channel, ChannelGroup, CurrentProgram, DispatcharrClient, M3uAccount, Stream, World,
+    Channel, ChannelGroup, ChannelProfile, CurrentProgram, DispatcharrClient, M3uAccount, Stream,
+    World,
 };
 use crosstalk_core::jobs::{JobContext, VecSink};
 use crosstalk_core::store::Store;
@@ -253,6 +254,127 @@ pub fn sort_world() -> World {
     }
 }
 
+/// The probe fixture's channels.
+pub const PROBE_CHANNEL: i64 = 1;
+/// A second in-scope channel, carrying one stream from the other account.
+pub const PROBE_CHANNEL_TWO: i64 = 2;
+/// A channel disabled in every profile: `only_visible_channels` drops it.
+pub const PROBE_CHANNEL_HIDDEN: i64 = 3;
+/// The profile every channel except [`PROBE_CHANNEL_HIDDEN`] is enabled in.
+pub const PROBE_PROFILE: i64 = 70;
+
+/// `ESPN One`: on the first account, an mpegts feed.
+pub const PROBE_FEED_ONE: i64 = 101;
+/// `ESPN Two`: on the first account, an HLS feed.
+pub const PROBE_FEED_TWO: i64 = 102;
+/// `ESPN Three`: on the second account.
+pub const PROBE_FEED_THREE: i64 = 103;
+/// Attached to no channel at all.
+pub const PROBE_FEED_ORPHAN: i64 = 104;
+/// Attached to the hidden channel only.
+pub const PROBE_FEED_HIDDEN: i64 = 105;
+
+/// The URL of each probe fixture stream, which is what the fake tools key on.
+pub const PROBE_URL_ONE: &str = "http://provider-a.test/live/one.ts";
+pub const PROBE_URL_TWO: &str = "http://provider-a.test/live/two.m3u8";
+pub const PROBE_URL_THREE: &str = "http://provider-b.test/live/three.ts";
+pub const PROBE_URL_ORPHAN: &str = "http://provider-b.test/live/orphan.ts";
+pub const PROBE_URL_HIDDEN: &str = "http://provider-a.test/live/hidden.ts";
+
+/// A world for the probe: three in-scope channels, one hidden channel, one orphan stream.
+pub fn probe_world() -> World {
+    let stream = |id: i64, name: &str, account: i64, url: &str, group: Option<i64>| Stream {
+        id,
+        name: name.to_string(),
+        m3u_account: Some(account),
+        channel_group: group,
+        url: Some(url.to_string()),
+        ..Stream::default()
+    };
+    World {
+        channels: vec![
+            Channel {
+                id: PROBE_CHANNEL,
+                name: "ESPN".to_string(),
+                channel_number: Some(serde_json::json!(1)),
+                channel_group_id: Some(TVE),
+                streams: vec![PROBE_FEED_ONE, PROBE_FEED_TWO, PROBE_FEED_THREE],
+                ..Channel::default()
+            },
+            Channel {
+                id: PROBE_CHANNEL_TWO,
+                name: "ESPN2".to_string(),
+                channel_number: Some(serde_json::json!(2)),
+                channel_group_id: Some(TVE),
+                streams: vec![PROBE_FEED_THREE],
+                ..Channel::default()
+            },
+            Channel {
+                id: PROBE_CHANNEL_HIDDEN,
+                name: "Archived".to_string(),
+                channel_number: Some(serde_json::json!(3)),
+                channel_group_id: Some(CABLE),
+                streams: vec![PROBE_FEED_HIDDEN],
+                ..Channel::default()
+            },
+        ],
+        profiles: vec![ChannelProfile {
+            id: PROBE_PROFILE,
+            name: "Active".to_string(),
+            channels: vec![PROBE_CHANNEL, PROBE_CHANNEL_TWO],
+        }],
+        streams: vec![
+            stream(
+                PROBE_FEED_ONE,
+                "ESPN One",
+                PROVIDER_A,
+                PROBE_URL_ONE,
+                Some(TVE),
+            ),
+            stream(
+                PROBE_FEED_TWO,
+                "ESPN Two",
+                PROVIDER_A,
+                PROBE_URL_TWO,
+                Some(TVE),
+            ),
+            stream(
+                PROBE_FEED_THREE,
+                "ESPN Three",
+                PROVIDER_B,
+                PROBE_URL_THREE,
+                Some(TVE),
+            ),
+            stream(
+                PROBE_FEED_ORPHAN,
+                "ESPN Orphan",
+                PROVIDER_B,
+                PROBE_URL_ORPHAN,
+                Some(CABLE),
+            ),
+            stream(
+                PROBE_FEED_HIDDEN,
+                "Archived Feed",
+                PROVIDER_A,
+                PROBE_URL_HIDDEN,
+                Some(CABLE),
+            ),
+        ],
+        groups: vec![
+            ChannelGroup {
+                id: TVE,
+                name: "TVE".to_string(),
+            },
+            ChannelGroup {
+                id: CABLE,
+                name: "Cable".to_string(),
+            },
+        ],
+        m3u_accounts: accounts(),
+        ..World::default()
+    }
+}
+
 /// A configuration directory a run can read its `streams.toml` from.
 pub struct Fixture {
     pub dir: tempfile::TempDir,
@@ -390,6 +512,12 @@ impl ServerFixture {
             } else {
                 ResponseTemplate::new(timezone_status).set_body_string("no settings for you")
             })
+            .mount(&server)
+            .await;
+        // The probe's one write: `PATCH /channels/streams/{id}/` with `stream_stats`.
+        Mock::given(method("PATCH"))
+            .and(path_regex(r"^/api/channels/streams/\d+/$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": 0})))
             .mount(&server)
             .await;
         Mock::given(method("PATCH"))
