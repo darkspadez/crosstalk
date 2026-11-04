@@ -184,6 +184,16 @@ jobs:
       # membership per channel with `crates/streams/examples/visibility_io`.
       - name: Streams visibility vs the plugin's own action
         run: python3 -I scripts/visibility_parity.py
+      # Triage and restore are IPTV Checker's seven post-actions and its Restore Recovered
+      # Channels, ported. The harness runs the plugin's REAL rename/move/suffix actions in its
+      # own scheduled order (with the channel table faked as a dict and the real
+      # `_capture_original_state` writing a state file), then its `restore_channels_action` with
+      # that state file built from the same recorded changes, and compares every channel's final
+      # name and group with `crates/streams/examples/triage_io`. Two shapes are counted rather
+      # than failed — the plugin's repeated tag and a quality tag it strips that crosstalk never
+      # recorded — and both are documented divergences.
+      - name: Streams triage and restore vs the plugin's own actions
+        run: python3 -I scripts/triage_parity.py
       # Informational, never failing: what upstream changed since each pinned reference
       # commit in the files crosstalk ports from it. Covers every reference submodule
       # (EPG Janitor, Stream-Mapparr, IPTV Checker), each with its own ported-file list.

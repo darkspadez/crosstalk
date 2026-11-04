@@ -232,8 +232,26 @@ ffmpeg_path = "/usr/bin/ffmpeg"
 # What a triage run does with what the last probe found. A rename is a channel write, and every
 # change is recorded so restore can undo it. A channel that still plays on a backup is never
 # renamed or moved, however many of its other streams failed.
+#
+# The seven switches below are IPTV Checker's own post-action toggles, and like the plugin's they
+# all ship OFF: a run does only what it is told to. `streams.triage_apply` with nothing switched
+# on refuses rather than reporting a no-op. The scheduled shape is a workflow (step 12) —
+#
+#   # [workflows.heal]
+#   # steps = ["streams.probe", "streams.restore_apply", "streams.triage_apply"]
+#
+# which is the plugin's "post-actions after a scheduled check", in the plugin's own order:
+# restore first, then the marks. `streams.restore_apply` on its own also works.
+rename_dead_channels = false
+rename_blank_channels = false
+rename_low_framerate_channels = false
+add_video_format_suffix = false
+move_dead_channels = false
+move_blank_channels = false
+move_low_framerate_channels = false
 
-# {name} is the original channel name. A format that would erase the name is refused.
+# {name} is the original channel name. A format that would erase the name is refused, and so is
+# one without {name} while its class is switched on.
 dead_rename_format = "{name} [DEAD]"
 # Empty moves nothing.
 move_to_group_name = "Graveyard"
@@ -241,6 +259,8 @@ black_screen_rename_format = "{name} [Blank]"
 move_black_screen_group = "Black Screens"
 low_framerate_rename_format = "{name} [Slow]"
 move_low_framerate_group = "Slow"
-# Formats to append to a channel that plays, comma-separated. Restore does not strip these: it
-# only undoes the tags it wrote on channels it marked as failing.
+# Formats to append to a channel that plays, comma-separated. A format not listed is left alone,
+# and the whole [UHD]/[FHD]/[HD]/[SD]/[Unknown] set is always recognised as the tag to REPLACE, so
+# narrowing this list never stacks a second tag. Restore does not undo these: it undoes the marks
+# it wrote on channels it found failing, and the plugin's own restore leaves the suffix alone too.
 video_format_suffixes = "UHD, FHD, HD, SD, Unknown"

@@ -460,6 +460,8 @@ fn preview_counterpart(action: &str) -> Option<&'static str> {
         "sort_apply" => Some("sort_preview"),
         "mirror_apply" => Some("mirror_preview"),
         "visibility_apply" => Some("visibility_preview"),
+        "triage_apply" => Some("triage_preview"),
+        "restore_apply" => Some("restore_preview"),
         _ => None,
     }
 }

@@ -520,6 +520,25 @@ impl ServerFixture {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": 0})))
             .mount(&server)
             .await;
+        // The channel-group create triage's moves use when the destination group does not
+        // exist yet: upstream answers the group, `get_or_create`-style.
+        Mock::given(method("POST"))
+            .and(path("/api/channels/groups/"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value =
+                    serde_json::from_slice(&request.body).unwrap_or_default();
+                let name = body
+                    .get("name")
+                    .and_then(|name| name.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "id": 700,
+                    "name": name,
+                }))
+            })
+            .mount(&server)
+            .await;
         Mock::given(method("PATCH"))
             .and(path("/api/channels/channels/edit/bulk/"))
             .respond_with(

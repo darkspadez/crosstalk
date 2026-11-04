@@ -74,7 +74,7 @@
 //!   * run rows: one per probed stream (`subject: Stream`), and the per-channel verdicts triage
 //!     reads ([`VERDICT_FIELD`], [`FORMAT_FIELD`]). The verdicts live in run rows rather than a
 //!     table of their own because the run row already carries a `field`, a `before` and an
-//!     `after`, and step 11's rule is "select run rows by field, never by channel id alone";
+//!     `after`, and triage's rule is "select run rows by field, never by channel id alone";
 //!   * one CSV, with IPTV Checker's columns plus its `ffprobe_*` evidence as fixed columns.
 //!
 //! # Divergences, each deliberate
@@ -116,7 +116,7 @@ use crosstalk_core::dispatcharr::{
 };
 use crosstalk_core::jobs::{JobContext, PacedProgress, ProgressEvent};
 use crosstalk_core::limiter::{Limiter, LimiterConfig};
-use crosstalk_core::store::{RunRow, Store, StreamHealth, Subject};
+use crosstalk_core::store::{RunRow, RunStatus, Store, StreamHealth, Subject};
 use crosstalk_core::subapp::{JobOutcome, OutcomeBuilder, SubApp};
 use ffprobe::{ExtraFacts, MediaFacts, Parsed};
 use serde_json::{json, Map, Value};
@@ -138,7 +138,8 @@ pub const STREAM_FIELD: &str = "probe";
 /// The run-row field a per-CHANNEL verdict is recorded under: `dead`, `blank`,
 /// `low_frame_rate`, `alive`, `skipped` or `inconclusive`.
 ///
-/// `triage` (step 11) reads exactly this field from the last probe run. The plugin's own three
+/// `triage` reads exactly this field from the last probe run, and `restore` reads what triage
+/// wrote. The plugin's own three
 /// predicates are preserved in the values: `dead` is every stream Dead and none a black screen
 /// (`_is_dead_nonblack`, 3319), `blank` is every stream Dead because it is a black screen
 /// (`_is_black_screen`, 3323), `low_frame_rate` is every ALIVE stream below
@@ -1072,9 +1073,10 @@ impl ChannelVerdict {
 /// The channel verdict for its probed streams, from IPTV Checker's own predicates.
 ///
 /// Order matters and is the plugin's: "every stream failed" is checked before "every alive
-/// stream is slow", so a channel with one slow alive stream and three dead ones is `dead` (its
-/// lookup in `_channels_where` for dead rows succeeds) — which is what the plugin's dead
-/// rename/move did with it.
+/// stream is slow". A channel with one slow alive stream and three dead ones is
+/// `low_frame_rate`, not `dead` — the dead lookup needs EVERY row dead-nonblack and the alive
+/// row fails it, while the low-framerate lookup only considers the alive rows (the plugin's
+/// `_channels_where(..., among=Alive)`). The plugin's rename/move did the same with it.
 pub fn verdict_for(streams: &[&StreamVerdict]) -> ChannelVerdict {
     if streams.is_empty() {
         return ChannelVerdict::Inconclusive;
@@ -1152,7 +1154,7 @@ pub struct RecordedVerdict {
     pub format: Option<String>,
 }
 
-/// Read the per-channel verdicts a probe run recorded, for `triage` (step 11).
+/// Read the per-channel verdicts a probe run recorded, for `triage` and `restore`.
 ///
 /// The one place that knows the row shape: `field == "probe_verdict"` carries the verdict and
 /// `field == "probe_format"` the format tier, and a channel the run did not judge is simply
@@ -1191,6 +1193,148 @@ pub fn recorded_verdicts(rows: &[RunRow]) -> Vec<RecordedVerdict> {
         }
     }
     verdicts.into_values().collect()
+}
+
+/// How many of the app's recent runs [`last_verdicts`] looks at to explain a missing probe.
+const RECENT_RUNS: usize = 200;
+
+/// The newest probe's verdicts, or the reason there is none.
+///
+/// The run store is the only source: unlike the plugin's `results.json` there is no file to
+/// read instead, so a probe that was killed before it finished is simply not a result set. A
+/// SUCCEEDED run is required for the same reason the guide's scan requires one — a paused or
+/// cancelled probe may hold partial rows, and a partial set would silently skip the channels
+/// the run never reached. `triage` and `restore` both plan from this.
+///
+/// A windowed probe finishes its backlog over several runs: each window checkpoints the
+/// remainder and the next run resumes it, so the verdicts of one pass are split across the
+/// paused runs and the succeeded run that drained the queue. The verdicts here are the union
+/// of that whole sequence — the newest succeeded run plus every finished run back to (but
+/// excluding) the previous succeeded one, oldest first, newest winning per channel — which is
+/// the plugin's accumulated `results.json`. A `--dry-run` probe counts like any other: it
+/// records the same verdict rows and only skips the Dispatcharr write.
+pub struct LastProbe {
+    pub run_id: i64,
+    pub started_at: String,
+    /// Every run the verdicts were read from, newest first: the succeeded run, then the
+    /// finished runs back to the previous succeeded one. One entry in the common case.
+    pub run_ids: Vec<i64>,
+    pub verdicts: Vec<RecordedVerdict>,
+}
+
+impl LastProbe {
+    /// The verdicts in words, for a summary, a report preamble or a log line.
+    pub fn describe(&self) -> String {
+        let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
+        for verdict in &self.verdicts {
+            *counts.entry(verdict.verdict.as_str()).or_default() += 1;
+        }
+        let tally = counts
+            .iter()
+            .map(|(verdict, count)| format!("{count} {verdict}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "probe run #{} started {} judging {} channel(s){}{tally}{}",
+            self.run_id,
+            self.started_at,
+            self.verdicts.len(),
+            if tally.is_empty() { "" } else { ": " },
+            if self.run_ids.len() > 1 {
+                format!(" (across {} runs)", self.run_ids.len())
+            } else {
+                String::new()
+            },
+        )
+    }
+}
+
+/// The newest succeeded `probe` run's per-channel verdicts.
+pub fn last_verdicts(context: &JobContext) -> Result<LastProbe> {
+    let store = context.store().ok_or_else(|| {
+        anyhow::anyhow!(
+            "this run has no run store, so it cannot read the last probe: run the action from \
+             the daemon or with `crosstalk run`, which record their runs"
+        )
+    })?;
+    let Some(run) = store.last_succeeded_run(crate::APP_ID, ACTION)? else {
+        // "No probe at all" and "the probe did not finish" are different problems, and an
+        // operator looking at the wrong one wastes the evening. The newest run of the action
+        // says which it is.
+        let newest = store
+            .recent_runs_for(crate::APP_ID, RECENT_RUNS)?
+            .into_iter()
+            .find(|candidate| candidate.action == ACTION);
+        if let Some(run) = newest {
+            anyhow::bail!(
+                "the newest `probe` run (#{} started {}) ended {} and is not a result set: its \
+                 rows are partial, so acting on them would skip the channels it never reached. \
+                 Run `probe` to completion first",
+                run.id,
+                run.started_at,
+                run.status
+            );
+        }
+        anyhow::bail!(
+            "no finished `probe` run is recorded, so there is no result set to act on: run \
+             `probe` first (its per-channel verdicts are what this action selects)"
+        );
+    };
+    // The verdicts of the sequence that run completed: the run itself plus every finished
+    // run back to (excluding) the previous succeeded one, oldest first so the newest verdict
+    // per channel wins. A windowed probe splits one pass across a paused run per night and the
+    // succeeded run that drained the queue; reading the newest run alone would silently drop
+    // every channel the earlier windows judged. A finished run's rows are measurements even
+    // when the run did not succeed — a pause, a cancel and a failure all keep what they
+    // recorded — while a still-running run may still be writing and is never read.
+    let recent = store.recent_runs_for(crate::APP_ID, RECENT_RUNS)?;
+    let anchor = recent
+        .iter()
+        .position(|candidate| candidate.action == ACTION && candidate.id == run.id)
+        .unwrap_or(0);
+    let mut sequence = vec![run.id];
+    for candidate in recent.iter().skip(anchor + 1) {
+        if candidate.action != ACTION {
+            continue;
+        }
+        // A succeeded run is the previous complete result set, which ends the sequence: its
+        // channels are either re-judged above (newer wins) or older than this sequence. A
+        // running run may still be writing, so it is never read (the one-live-run guard
+        // refuses a second live run anyway, which makes this free).
+        if candidate.status == RunStatus::Succeeded || candidate.status == RunStatus::Running {
+            break;
+        }
+        sequence.push(candidate.id);
+    }
+    sequence.reverse();
+    // The two fields the reader understands, not the whole run: the per-stream rows of a 50k
+    // stream probe are an order of magnitude more than the verdicts triage needs.
+    let mut merged: std::collections::BTreeMap<i64, RecordedVerdict> =
+        std::collections::BTreeMap::new();
+    for run_id in &sequence {
+        let rows = store.rows_of_fields(*run_id, &[VERDICT_FIELD, FORMAT_FIELD])?;
+        for verdict in recorded_verdicts(&rows) {
+            merged.insert(verdict.channel_id, verdict);
+        }
+    }
+    let mut run_ids = sequence;
+    run_ids.reverse();
+    Ok(LastProbe {
+        run_id: run.id,
+        started_at: run.started_at,
+        run_ids,
+        verdicts: merged.into_values().collect(),
+    })
+}
+
+/// Say which result set a run is about to plan from.
+pub fn announce(context: &JobContext, action: &str, probe: &LastProbe) {
+    context.progress(&ProgressEvent::new(
+        action,
+        0,
+        probe.verdicts.len() as u64,
+        format!("planning from {}", probe.describe()),
+    ));
 }
 
 /// Roll the per-stream verdicts up per in-scope channel.

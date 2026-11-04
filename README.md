@@ -194,9 +194,9 @@ no daemon restart (a run already in progress finishes with the settings it start
 
 Every action below belongs to the `guide` app (`crosstalk run guide <action>`). The `streams`
 app declares its own list in `crates/streams/src/lib.rs`: `validate`, `status`, the `match_*`,
-`sort_*`, `mirror_*` and `visibility_*` pairs, `probe` and the three read-only tools
-`check_countries`, `scan_placeholders` and `test_rules` (its `triage_*` and `restore_*` pairs
-arrive with the rest of phase 2). `probe` is the one writing action that is not a pair — it
+`sort_*`, `mirror_*`, `triage_*`, `restore_*` and `visibility_*` pairs, `probe` and the three
+read-only tools `check_countries`, `scan_placeholders` and `test_rules`. `probe` is the one
+writing action that is not a pair — it
 writes stream stats, not channel data, so its "preview" is `--dry-run`: the whole probe runs,
 `stream_health`, the run rows and the CSV are written, and no stream stat is. The tools write a CSV and a summary and
 change nothing: `check_countries` compares each stream's group-country label with its guide-id
@@ -446,7 +446,16 @@ the `streams.match` rows are differences from Stream-Mapparr.
 | `streams.probe` records a cancelled probe as neither a verdict nor a count | A killed invocation (cancel, shutdown) is excluded from the run's records, as the plugin excluded its `Cancelled` rows — but it also writes no health row, so the stream stays due for the next run instead of looking dead. |
 | `streams.probe` measures throughput when `enable_throughput_sorting` is on | Stream-Mapparr's separate `probe_throughput` action, folded in: same 8 s download, same 64 KiB-in-under-a-second guard, same "a failed measurement is never fresh". It costs a second connection per stream, so turning the sort's throughput tier off turns the download off too. |
 | `streams.probe` writes a fixed CSV column set | The plugin emitted dynamic `ffprobe_*` columns per run. crosstalk keeps its base twelve columns and adds the evidence as fixed ones (`container_duration_seconds`, `calculated_bitrate_kbps`, `packet_count`, `mean_volume_db`, `throughput_mbps`, `edge_ip`), so two runs' reports diff. |
-| `streams.probe`'s per-channel verdicts are run rows, not a results file | `triage` reads the `probe_verdict` and `probe_format` rows of the last probe run. The plugin read `results.json` and refused to act without it. |
+| `streams.probe`'s per-channel verdicts are run rows, not a results file | `triage` reads the `probe_verdict` and `probe_format` rows of the last probe run. The plugin read `results.json` and refused to act without it. A `--dry-run` probe counts like any other: it records the same verdict rows and only skips the Dispatcharr write. A windowed pass split across nights reads as one: the newest succeeded run plus the finished runs back to the previous succeeded one, newest verdict winning per channel (the plugin's accumulated `results.json`). |
+| `streams.triage_*` is one action with seven switches | The plugin had seven buttons, each its own confirmation, and a scheduler block that gated the same six renames/moves plus the suffix. Here they are `[triage]` switches — `rename_dead_channels`, `rename_blank_channels`, `rename_low_framerate_channels`, `add_video_format_suffix`, `move_dead_channels`, `move_blank_channels`, `move_low_framerate_channels` — that `triage_apply` reads. **All seven default OFF**, as the plugin's scheduler toggles do, so an apply with nothing switched on REFUSES and names them instead of reporting a no-op run. The plugin's scheduled order is a workflow: `["streams.probe", "streams.restore_apply", "streams.triage_apply"]`. |
+| `streams.triage_apply` does not tag a channel twice | The plugin renames from the name the last check recorded, so a channel that stays dead becomes `ESPN [DEAD]` on Monday and `ESPN [DEAD] [DEAD]` on Wednesday, and only Restore collapses the stack. crosstalk appends nothing when the recorded name already ends with the format's own bracket label. Same after a restore; the parity harness counts this shape and asserts the tag is the only difference. |
+| `streams.triage_apply` writes only the values that change | The plugin bulk-updates every channel of a class, including one already carrying the tag and one already in the destination group. `channel_ops` reports those as skipped rows, so the same end state costs fewer writes. |
+| The triage destination group is created only on an apply | The plugin's `get_or_create` runs when the move action runs, so a dry run creates nothing either — but its "preview" was the dry-run switch inside the write. crosstalk's preview plans the move against a placeholder id carrying the real group name, so the CSV shows `Graveyard` and `POST /channels/groups/` is never sent. |
+| `streams.restore_*` reverses crosstalk's own run rows, not `channel_state.json` | The plugin kept a state file of the group each channel came from and an in-memory tag list derived from the current settings. crosstalk records every rename and move with its `before` value in the run store, and a recorded change is still in effect when the channel's current value equals the change's `after`. No file to lose, no last-writer-wins between processes, and the record survives a settings change. |
+| `streams.restore_*` undoes what it recorded, by value | The plugin strips every known trailing tag by NAME, so it also removes a `[HD]` the operator typed by hand, and it cannot see a label the current formats no longer name. crosstalk restores the recorded value (so a hand-typed tag survives) and falls back to the plugin's tag strip only for a channel with no recorded change at all — which is how a channel the plugin tagged before crosstalk took over is healed. |
+| `streams.restore_*` leaves the format suffix alone | The plugin's settings text says restore does not strip the video format suffix, and its regex can. crosstalk never reverts a recorded suffix row, but a suffix stacked on top of a recorded mark does not block the mark's restore either: the trailing format run is stripped to follow the chain (as the plugin's own strip does) and dropped with the mark. Undoing the suffix nightly would flap against the next triage run. |
+| `streams.restore_*` reads the newest 50 `triage_apply` runs | The plugin's `channel_state.json` kept one entry per channel until it was cleared by a restore, however old. crosstalk reads the channel rows of the newest 50 finished `triage_apply` runs (and `[jobs] run_history_days` prunes the table underneath): a change older than either falls back to what the name itself says, so a very old mark still loses its tag but a very old move may keep its group. |
+| A restore back to "No Group" is planned and refused | Dispatcharr's channel serializer rejects a null `channel_group_id`, so a channel triage moved OUT of "No Group" cannot be moved back over REST. The row is planned, reported, and fails with that reason. The plugin never recorded such a channel at all (`_compute_capture_state` skips a channel with no group). The bridge closes this later. |
 | A finite container duration is the only placeholder fingerprint | The plugin's `placeholder_file_detection` needs ffprobe to report a container duration, and a live MPEG-TS never does — so the fingerprint only fires on a container that carries one (HLS, MP4), which is what its measured placeholder was. The evidence is recorded for every stream either way. |
 | `streams.match_preview` drops the plugin's threshold-analysis advice rows | Preview also re-ran the pipeline at 5-point thresholds and collected by exact match against the winning stream name; the plugin itself notes that path disagrees with the real matcher. Those rows were advice, never a write. |
 | With `filter_dead_streams` on, match also excludes store probe verdicts | The plugin only reads `stream_stats` (empty, 0 width/height, `0x0`); crosstalk reproduces that test exactly and additionally skips streams the probe recorded as `dead` in the store — the same verdict, kept where a rerun can see it. |
@@ -495,6 +504,7 @@ python3 -I scripts/channel_ops_parity.py   # the cleanup selections and payloads
 python3 -I scripts/sort_parity.py          # the streams quality model, 840 cases
 python3 -I scripts/match_parity.py         # the streams collector, EPG placeholder fixtures
 python3 -I scripts/tools_parity.py         # check_countries, scan_placeholders, test_rules
+python3 -I scripts/triage_parity.py        # the seven post-actions and Restore Recovered Channels
 
 ./scripts/upstream_drift.sh     # what each reference changed since its pin, in files we port
 ```
@@ -514,8 +524,8 @@ reports each reference separately, against that reference's own list of ported f
 crates/crosstalk-matching   pure, IO-free matcher: normalisation, similarity, callsigns, pipeline
 crates/crosstalk-core       host: config, sub-app trait, Dispatcharr client, AI, store, runner, CSV
 crates/guide                the guide sub-app: scope, matching, heal, scan, cleanup presets, watchdog
-crates/streams              the streams sub-app: stream selection, settings, and (phase 2) match, sort,
-                            mirror, probe, triage, restore, visibility
+crates/streams              the streams sub-app: stream selection, settings, match, sort, mirror,
+                            probe, triage, restore, visibility
 crates/crosstalk-web        axum + Askama UI and JSON API
 crates/crosstalk            the binary: CLI, registry, daemon
 data/                       embedded channel databases, FCC callsigns, aliases

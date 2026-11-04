@@ -26,13 +26,18 @@
 //!     measurement) as one action: it ffprobes every stream that is due, records what it found
 //!     in the store's `stream_health` and in Dispatcharr's `stream_stats`, and leaves the
 //!     per-channel verdicts triage reads;
+//!   * [`triage`] — `triage_preview` / `triage_apply`: IPTV Checker's seven post-actions (rename
+//!     and move dead, blank and slow channels, plus the format suffix) as one run over the last
+//!     probe's verdicts;
+//!   * [`restore`] — `restore_preview` / `restore_apply`: the same plugin's Restore Recovered
+//!     Channels, which puts back the name and group of a channel that came back to life — from
+//!     crosstalk's own run rows rather than the plugin's `channel_state.json`;
 //!   * [`tools`] — `check_countries`, `scan_placeholders` and `test_rules`, the three
 //!     read-only tools (with [`placeholder_scan`], the numbered-family grouping behind the
 //!     second).
 //!
-//! Triage and restore arrive in later steps, so [`StreamsApp::actions`] registers `validate`,
-//! `status`, the `match`, `sort`, `mirror` and `visibility` pairs, `probe` and the three tools:
-//! the layout is there, the rest is not.
+//! [`StreamsApp::actions`] registers `validate`, `status`, the `match`, `sort`, `mirror`,
+//! `triage`, `restore` and `visibility` pairs, `probe` and the three tools.
 //!
 //! What the two plugins did that a host does once, this app does not do at all: the dry-run
 //! switch is the preview half of a pair (or `--dry-run`), the schedules, windows and
@@ -46,12 +51,14 @@ pub mod mirror;
 pub mod placeholder_scan;
 pub mod probe;
 pub mod quality;
+pub mod restore;
 pub mod selection;
 pub mod settings;
 pub mod sort;
 #[cfg(test)]
 mod test_support;
 pub mod tools;
+pub mod triage;
 pub mod visibility;
 
 use anyhow::{bail, Result};
@@ -75,6 +82,10 @@ pub const ACTION_SORT_APPLY: &str = "sort_apply";
 pub const ACTION_MIRROR_PREVIEW: &str = "mirror_preview";
 pub const ACTION_MIRROR_APPLY: &str = "mirror_apply";
 pub const ACTION_PROBE: &str = "probe";
+pub const ACTION_TRIAGE_PREVIEW: &str = "triage_preview";
+pub const ACTION_TRIAGE_APPLY: &str = "triage_apply";
+pub const ACTION_RESTORE_PREVIEW: &str = "restore_preview";
+pub const ACTION_RESTORE_APPLY: &str = "restore_apply";
 pub const ACTION_VISIBILITY_PREVIEW: &str = "visibility_preview";
 pub const ACTION_VISIBILITY_APPLY: &str = "visibility_apply";
 pub const ACTION_CHECK_COUNTRIES: &str = "check_countries";
@@ -107,7 +118,7 @@ impl SubApp for StreamsApp {
 
     /// The actions, in the order the UI shows them.
     ///
-    /// The layout the later steps extend: `validate` and `status` first, then one preview/apply
+    /// The order the UI shows: `validate` and `status` first, then one preview/apply
     /// pair per verb — `match`, `sort`, `mirror`, `probe` (one action, it writes stream stats),
     /// `triage`, `restore`, `visibility` — then the read-only tools (`check_countries`,
     /// `scan_placeholders`, `test_rules`). A pair is declared together, so a preview can never
@@ -224,6 +235,58 @@ impl SubApp for StreamsApp {
                  outlives its window pauses and continues next time. Continue?",
             ),
             ActionSpec::new(
+                ACTION_TRIAGE_PREVIEW,
+                "Triage Streams (Dry Run)",
+                "Read the last probe's per-channel verdicts, work out every rename, group move \
+                 and format suffix the switches in [triage] ask for, and write a CSV. Changes \
+                 nothing and creates no group.",
+                ActionKind::Read,
+            ),
+            ActionSpec::new(
+                ACTION_TRIAGE_APPLY,
+                "Triage Streams (Apply)",
+                "Act on the last probe: rename dead, blank and slow channels, move them to \
+                 their groups (creating a missing group), and tag the ones that play with their \
+                 format. Every change is recorded so Restore can undo it.",
+                // Red: it renames and moves channels, which is what a working lineup is made
+                // of. Nothing is deleted.
+                ActionKind::Destructive,
+            )
+            .with_confirm(
+                "This RENAMES and MOVES channels from what the last probe found: dead channels \
+                 get their Dead Rename Format and are moved to the Dead Group, blank-screen \
+                 channels their Blank format and group, low-framerate channels their Slow \
+                 format and group, and channels that play get a [UHD]/[HD]/[SD] suffix. A \
+                 missing destination group is created. Every change is recorded, so Restore \
+                 Recovered Channels can put the name and the group back. No channel and no \
+                 stream is deleted. Continue?",
+            ),
+            ActionSpec::new(
+                ACTION_RESTORE_PREVIEW,
+                "Restore Recovered Channels (Dry Run)",
+                "Find the channels the last probe found playing again that still carry a triage \
+                 change, and write a CSV of the name and the group it would put back. Changes \
+                 nothing.",
+                ActionKind::Read,
+            ),
+            ActionSpec::new(
+                ACTION_RESTORE_APPLY,
+                "Restore Recovered Channels (Apply)",
+                "Put back the name and the group of every channel the last probe found playing \
+                 again that crosstalk still has a triage change for — and strip a tag crosstalk \
+                 did not write, when the name still carries one.",
+                // Orange: it rewrites names and groups, but only back to what it recorded.
+                ActionKind::Write,
+            )
+            .with_confirm(
+                "This puts BACK the name and the group of every channel that is playing again \
+                 but still carries a change a triage run made: the recorded before values are \
+                 written. A channel renamed by hand since is left alone, a name tagged by IPTV \
+                 Checker before crosstalk took over is stripped of its tags, nothing is \
+                 deleted, and a recorded group that no longer exists is left as it is. \
+                 Continue?",
+            ),
+            ActionSpec::new(
                 ACTION_VISIBILITY_PREVIEW,
                 "Manage Channel Visibility (Dry Run)",
                 "Work out which channel of each name group stays enabled in the profile \
@@ -338,6 +401,10 @@ impl StreamsApp {
             ACTION_MIRROR_PREVIEW => self.mirror(context, true).await,
             ACTION_MIRROR_APPLY => self.mirror(context, dry_run).await,
             ACTION_PROBE => self.probe(context, dry_run).await,
+            ACTION_TRIAGE_PREVIEW => self.triage(context, true).await,
+            ACTION_TRIAGE_APPLY => self.triage(context, dry_run).await,
+            ACTION_RESTORE_PREVIEW => self.restore(context, true).await,
+            ACTION_RESTORE_APPLY => self.restore(context, dry_run).await,
             ACTION_VISIBILITY_PREVIEW => self.visibility(context, true).await,
             ACTION_VISIBILITY_APPLY => self.visibility(context, dry_run).await,
             ACTION_CHECK_COUNTRIES => {
@@ -378,6 +445,18 @@ impl StreamsApp {
     async fn probe(&self, context: &JobContext, dry_run: bool) -> Result<JobOutcome> {
         let settings = self.checked_settings(context)?;
         probe::run(self, context, &settings, dry_run).await
+    }
+
+    /// Act on the last probe's verdicts: preview (a read) or apply.
+    async fn triage(&self, context: &JobContext, dry_run: bool) -> Result<JobOutcome> {
+        let settings = self.checked_settings(context)?;
+        triage::run(self, context, &settings, dry_run).await
+    }
+
+    /// Put back what triage changed on a channel that recovered: preview (a read) or apply.
+    async fn restore(&self, context: &JobContext, dry_run: bool) -> Result<JobOutcome> {
+        let settings = self.checked_settings(context)?;
+        restore::run(self, context, &settings, dry_run).await
     }
 
     /// Manage a profile's channel visibility: preview (a read) or apply.
@@ -484,6 +563,10 @@ mod tests {
                 ACTION_MIRROR_PREVIEW,
                 ACTION_MIRROR_APPLY,
                 ACTION_PROBE,
+                ACTION_TRIAGE_PREVIEW,
+                ACTION_TRIAGE_APPLY,
+                ACTION_RESTORE_PREVIEW,
+                ACTION_RESTORE_APPLY,
                 ACTION_VISIBILITY_PREVIEW,
                 ACTION_VISIBILITY_APPLY,
                 ACTION_CHECK_COUNTRIES,
@@ -589,6 +672,33 @@ mod tests {
             ActionKind::Read,
             "a preview is a read"
         );
+    }
+
+    #[test]
+    fn triage_apply_is_destructive_and_restore_apply_puts_back() {
+        let find = |id: &str| {
+            app()
+                .actions()
+                .into_iter()
+                .find(|action| action.id == id)
+                .unwrap_or_else(|| panic!("{id} is an action"))
+        };
+        // Triage renames and moves: red, and it says what it will do to whom.
+        let triage = find(ACTION_TRIAGE_APPLY);
+        assert_eq!(triage.kind, ActionKind::Destructive);
+        let confirm = triage.confirm.expect("a destructive action asks first");
+        assert!(confirm.contains("RENAMES"), "{confirm}");
+        assert!(confirm.contains("MOVES"), "{confirm}");
+        assert!(confirm.contains("recorded"), "{confirm}");
+        assert_eq!(find(ACTION_TRIAGE_PREVIEW).kind, ActionKind::Read);
+
+        // Restore only puts back what triage recorded: orange.
+        let restore = find(ACTION_RESTORE_APPLY);
+        assert_eq!(restore.kind, ActionKind::Write);
+        let confirm = restore.confirm.expect("an apply asks first");
+        assert!(confirm.contains("puts BACK"), "{confirm}");
+        assert!(confirm.contains("left alone"), "{confirm}");
+        assert_eq!(find(ACTION_RESTORE_PREVIEW).kind, ActionKind::Read);
     }
 
     #[test]

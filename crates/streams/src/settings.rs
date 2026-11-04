@@ -285,6 +285,33 @@ pub struct StreamsSettings {
     pub ffmpeg_path: String,
 
     // --- Triage -------------------------------------------------------------------------
+    //
+    // The seven switches below are IPTV Checker's six post-action toggles plus its format
+    // suffix, under this file's names. In the plugin they only gated the SCHEDULED check (the
+    // manual buttons were per-action); here they gate `triage_apply` itself, so a scheduled
+    // workflow and a hand-run action do the same thing. All seven default OFF, which is the
+    // plugin's own default: a bare `triage_apply` with nothing switched on does nothing and
+    // says so, rather than guessing which changes an operator wants made automatically.
+    /// Rename channels every stream of which failed (and that are not blank screens).
+    /// IPTV Checker's `scheduler_rename_dead_channels`.
+    pub rename_dead_channels: bool,
+    /// Rename blank-screen channels. IPTV Checker's `scheduler_rename_black_screen_channels`.
+    pub rename_blank_channels: bool,
+    /// Rename channels whose playable streams are all below 24 fps. IPTV Checker's
+    /// `scheduler_rename_low_framerate_channels`.
+    pub rename_low_framerate_channels: bool,
+    /// Append the format suffix ([UHD], [HD], …) to channels that play. IPTV Checker's
+    /// `scheduler_add_video_format_suffix`.
+    pub add_video_format_suffix: bool,
+    /// Move channels every stream of which failed to `move_to_group_name`. IPTV Checker's
+    /// `scheduler_move_dead_channels`.
+    pub move_dead_channels: bool,
+    /// Move blank-screen channels to `move_black_screen_group`. IPTV Checker's
+    /// `scheduler_move_black_screen_channels`.
+    pub move_blank_channels: bool,
+    /// Move low-framerate channels to `move_low_framerate_group`. IPTV Checker's
+    /// `scheduler_move_low_framerate_channels`.
+    pub move_low_framerate_channels: bool,
     /// Rename format for a channel every one of whose streams failed. IPTV Checker's
     /// `dead_rename_format`.
     pub dead_rename_format: String,
@@ -362,6 +389,16 @@ impl Default for StreamsSettings {
             streamlink_hosts: "youtube.com, youtu.be, twitch.tv, kick.com".to_string(),
             ffprobe_path: "/usr/bin/ffprobe".to_string(),
             ffmpeg_path: "/usr/bin/ffmpeg".to_string(),
+
+            // Every post-action off, IPTV Checker's own default: an unattended rename is a
+            // choice an operator makes, not one a fresh install makes for them.
+            rename_dead_channels: false,
+            rename_blank_channels: false,
+            rename_low_framerate_channels: false,
+            add_video_format_suffix: false,
+            move_dead_channels: false,
+            move_blank_channels: false,
+            move_low_framerate_channels: false,
 
             dead_rename_format: "{name} [DEAD]".to_string(),
             move_to_group_name: "Graveyard".to_string(),
@@ -546,35 +583,36 @@ const MOVED: [(&str, &str); 45] = [
     ),
     (
         "scheduler_restore_channels",
-        "a workflow in crosstalk.toml, or streams.restore_apply on its own schedule",
+        "streams.restore_apply in a workflow or on its own [schedules] entry, which runs before \
+         the triage step (IPTV Checker restores first too)",
     ),
     (
         "scheduler_rename_dead_channels",
-        "streams.triage_apply, on a [schedules] entry",
+        "rename_dead_channels in this file",
     ),
     (
         "scheduler_rename_black_screen_channels",
-        "streams.triage_apply, on a [schedules] entry",
+        "rename_blank_channels in this file",
     ),
     (
         "scheduler_rename_low_framerate_channels",
-        "streams.triage_apply, on a [schedules] entry",
+        "rename_low_framerate_channels in this file",
     ),
     (
         "scheduler_add_video_format_suffix",
-        "streams.triage_apply, on a [schedules] entry",
+        "add_video_format_suffix in this file",
     ),
     (
         "scheduler_move_dead_channels",
-        "streams.triage_apply, on a [schedules] entry",
+        "move_dead_channels in this file",
     ),
     (
         "scheduler_move_black_screen_channels",
-        "streams.triage_apply, on a [schedules] entry",
+        "move_blank_channels in this file",
     ),
     (
         "scheduler_move_low_framerate_channels",
-        "streams.triage_apply, on a [schedules] entry",
+        "move_low_framerate_channels in this file",
     ),
     (
         "scheduler_delete_dead_channels",
@@ -1341,9 +1379,85 @@ pub fn schema() -> SettingsSchema {
         FieldSpec::section(
             SECTION_TRIAGE,
             "Triage",
-            "What a triage run does with what the last probe found. Tags are applied by \
-             renaming the channel, and every change is recorded so restore can undo it.",
+            "What a triage run does with what the last probe found. Every switch here is off \
+             by default, exactly as IPTV Checker's own post-action switches ship: a run does \
+             only what it is told to. Tags are applied by renaming the channel, and every \
+             change is recorded so restore can undo it.",
         ),
+        FieldSpec::new(
+            "rename_dead_channels",
+            SECTION_TRIAGE,
+            "Rename Dead Channels",
+            FieldKind::Boolean,
+            FieldValue::Boolean(false),
+        )
+        .with_help(
+            "Rename a channel whose EVERY stream failed (and which is not a blank screen) with \
+             the Dead Channel Rename Format below. A channel that still plays on a backup \
+             stream is never renamed, however many of its other streams failed.",
+        ),
+        FieldSpec::new(
+            "rename_blank_channels",
+            SECTION_TRIAGE,
+            "Rename Blank-Screen Channels",
+            FieldKind::Boolean,
+            FieldValue::Boolean(false),
+        )
+        .with_help(
+            "Rename a channel whose every stream decoded to a blank picture with the \
+             Blank-Screen Rename Format below. Needs Black Screen Detection on in the probe.",
+        ),
+        FieldSpec::new(
+            "rename_low_framerate_channels",
+            SECTION_TRIAGE,
+            "Rename Low Framerate Channels",
+            FieldKind::Boolean,
+            FieldValue::Boolean(false),
+        )
+        .with_help(
+            "Rename a channel whose playable streams all deliver below 24 fps with the Low \
+             Framerate Rename Format below.",
+        ),
+        FieldSpec::new(
+            "add_video_format_suffix",
+            SECTION_TRIAGE,
+            "Add Video Format Suffix",
+            FieldKind::Boolean,
+            FieldValue::Boolean(false),
+        )
+        .with_help(
+            "Append the channel's format ([UHD], [FHD], [HD], [SD], [Unknown]) to a channel \
+             that plays. An existing format tag is REPLACED rather than stacked, so a channel \
+             that changes quality does not collect tags.",
+        ),
+        FieldSpec::new(
+            "move_dead_channels",
+            SECTION_TRIAGE,
+            "Move Dead Channels to Group",
+            FieldKind::Boolean,
+            FieldValue::Boolean(false),
+        )
+        .with_help(
+            "Move a dead channel into the Dead Group below. The group is created when it does \
+             not exist yet, and the group the channel came from is recorded so restore can put \
+             it back.",
+        ),
+        FieldSpec::new(
+            "move_blank_channels",
+            SECTION_TRIAGE,
+            "Move Blank-Screen Channels to Group",
+            FieldKind::Boolean,
+            FieldValue::Boolean(false),
+        )
+        .with_help("Move a blank-screen channel into the blank-screen group below."),
+        FieldSpec::new(
+            "move_low_framerate_channels",
+            SECTION_TRIAGE,
+            "Move Low Framerate Channels to Group",
+            FieldKind::Boolean,
+            FieldValue::Boolean(false),
+        )
+        .with_help("Move a low-framerate channel into the low-framerate group below."),
         FieldSpec::new(
             "dead_rename_format",
             SECTION_TRIAGE,
@@ -1359,11 +1473,13 @@ pub fn schema() -> SettingsSchema {
         FieldSpec::new(
             "move_to_group_name",
             SECTION_TRIAGE,
-            "Move Dead Channels to Group",
+            "Dead Channels Group Name",
             FieldKind::Text,
             FieldValue::Text("Graveyard".to_string()),
         )
-        .with_help("The group dead channels are moved into. Empty moves nothing."),
+        .with_help(
+            "The group dead channels are moved into. Created if missing. Empty moves nothing.",
+        ),
         FieldSpec::new(
             "black_screen_rename_format",
             SECTION_TRIAGE,
@@ -1379,11 +1495,11 @@ pub fn schema() -> SettingsSchema {
         FieldSpec::new(
             "move_black_screen_group",
             SECTION_TRIAGE,
-            "Move Blank-Screen Channels to Group",
+            "Blank-Screen Group Name",
             FieldKind::Text,
             FieldValue::Text("Black Screens".to_string()),
         )
-        .with_help("The group blank-screen channels are moved into. Empty moves nothing."),
+        .with_help("The group blank-screen channels are moved into. Created if missing."),
         FieldSpec::new(
             "low_framerate_rename_format",
             SECTION_TRIAGE,
@@ -1396,11 +1512,11 @@ pub fn schema() -> SettingsSchema {
         FieldSpec::new(
             "move_low_framerate_group",
             SECTION_TRIAGE,
-            "Move Low Framerate Channels to Group",
+            "Low Framerate Group Name",
             FieldKind::Text,
             FieldValue::Text("Slow".to_string()),
         )
-        .with_help("The group low-framerate channels are moved into. Empty moves nothing."),
+        .with_help("The group low-framerate channels are moved into. Created if missing."),
         FieldSpec::new(
             "video_format_suffixes",
             SECTION_TRIAGE,
@@ -1409,9 +1525,10 @@ pub fn schema() -> SettingsSchema {
             FieldValue::Text("UHD, FHD, HD, SD, Unknown".to_string()),
         )
         .with_help(
-            "Formats to append as a suffix to channels that play, comma-separated. Restore \
-             does not strip these, because it only undoes the tags it wrote on channels it \
-             marked as failing.",
+            "Formats to append as a suffix to channels that play, comma-separated. A format \
+             not in this list is left alone, and the whole [UHD]/[FHD]/[HD]/[SD]/[Unknown] \
+             set is always recognised as a suffix to replace, so narrowing this list never \
+             stacks a second tag.",
         ),
     ])
 }
@@ -1505,6 +1622,19 @@ pub fn to_values(settings: &StreamsSettings) -> SettingsValues {
         ),
         ("frozen_video_detection", settings.frozen_video_detection),
         ("silent_audio_detection", settings.silent_audio_detection),
+        ("rename_dead_channels", settings.rename_dead_channels),
+        ("rename_blank_channels", settings.rename_blank_channels),
+        (
+            "rename_low_framerate_channels",
+            settings.rename_low_framerate_channels,
+        ),
+        ("add_video_format_suffix", settings.add_video_format_suffix),
+        ("move_dead_channels", settings.move_dead_channels),
+        ("move_blank_channels", settings.move_blank_channels),
+        (
+            "move_low_framerate_channels",
+            settings.move_low_framerate_channels,
+        ),
     ] {
         values.insert(id, FieldValue::Boolean(flag));
     }
@@ -1733,6 +1863,27 @@ pub fn apply_values(settings: &mut StreamsSettings, values: &SettingsValues) -> 
     if let Some(value) = values.bool("silent_audio_detection") {
         settings.silent_audio_detection = value;
     }
+    if let Some(value) = values.bool("rename_dead_channels") {
+        settings.rename_dead_channels = value;
+    }
+    if let Some(value) = values.bool("rename_blank_channels") {
+        settings.rename_blank_channels = value;
+    }
+    if let Some(value) = values.bool("rename_low_framerate_channels") {
+        settings.rename_low_framerate_channels = value;
+    }
+    if let Some(value) = values.bool("add_video_format_suffix") {
+        settings.add_video_format_suffix = value;
+    }
+    if let Some(value) = values.bool("move_dead_channels") {
+        settings.move_dead_channels = value;
+    }
+    if let Some(value) = values.bool("move_blank_channels") {
+        settings.move_blank_channels = value;
+    }
+    if let Some(value) = values.bool("move_low_framerate_channels") {
+        settings.move_low_framerate_channels = value;
+    }
 
     // Whole numbers: the bounds table is the only place a range is written down.
     for (id, _, _) in NUMBER_BOUNDS {
@@ -1856,6 +2007,64 @@ pub fn validate(settings: &StreamsSettings) -> Vec<String> {
                 "{id} must not be empty: it would erase the channel name"
             ));
         }
+    }
+
+    // The post-actions each need one setting, and IPTV Checker refuses the ACTION when it is
+    // missing. Refusing the settings instead means the mistake surfaces while the operator is
+    // looking at the form rather than at 3 a.m. in a scheduled run's failure.
+    for (enabled, id, format) in [
+        (
+            settings.rename_dead_channels,
+            "dead_rename_format",
+            &settings.dead_rename_format,
+        ),
+        (
+            settings.rename_blank_channels,
+            "black_screen_rename_format",
+            &settings.black_screen_rename_format,
+        ),
+        (
+            settings.rename_low_framerate_channels,
+            "low_framerate_rename_format",
+            &settings.low_framerate_rename_format,
+        ),
+    ] {
+        if enabled && !format.contains("{name}") {
+            errors.push(format!(
+                "{id} must contain {{name}} while its class is switched on for renaming: \
+                 without it every channel of the class would get the same name"
+            ));
+        }
+    }
+    for (id, enabled, group) in [
+        (
+            "move_to_group_name",
+            settings.move_dead_channels,
+            &settings.move_to_group_name,
+        ),
+        (
+            "move_black_screen_group",
+            settings.move_blank_channels,
+            &settings.move_black_screen_group,
+        ),
+        (
+            "move_low_framerate_group",
+            settings.move_low_framerate_channels,
+            &settings.move_low_framerate_group,
+        ),
+    ] {
+        if enabled && group.trim().is_empty() {
+            errors.push(format!(
+                "{id} must name a group while its class is switched on for moving"
+            ));
+        }
+    }
+    if settings.add_video_format_suffix && settings.video_format_suffixes.trim().is_empty() {
+        errors.push(
+            "video_format_suffixes must list at least one format while add_video_format_suffix \
+             is on"
+                .to_string(),
+        );
     }
 
     errors
@@ -2075,6 +2284,14 @@ mod tests {
             low_framerate_rename_format: "[Slow] {name}".to_string(),
             move_low_framerate_group: "Slow".to_string(),
             video_format_suffixes: "HD, SD".to_string(),
+            // Every post-action on, so `to_values`/`apply_values` cover all seven.
+            rename_dead_channels: true,
+            rename_blank_channels: true,
+            rename_low_framerate_channels: true,
+            add_video_format_suffix: true,
+            move_dead_channels: true,
+            move_blank_channels: true,
+            move_low_framerate_channels: true,
         };
         let values = to_values(&settings);
         for field in schema().editable() {

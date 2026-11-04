@@ -701,35 +701,91 @@ impl Store {
     /// The rows of a run, in the order the run produced them.
     pub fn rows(&self, run_id: i64) -> Result<Vec<RunRow>> {
         self.with_connection(|connection| {
-            let mut statement = connection.prepare(
-                "SELECT ordinal, channel_id, channel_name, channel_group, channel_number, \
-                 current_epg_name, epg_data_id, epg_name, epg_source, score, method, status, \
-                 reason, ai_decision, field, before_value, after_value, subject FROM run_rows \
-                 WHERE run_id = ?1 ORDER BY ordinal",
-            )?;
-            let rows = statement.query_map(params![run_id], |row| {
-                let subject: String = row.get(17)?;
-                Ok(RunRow {
-                    ordinal: row.get(0)?,
-                    subject: Subject::parse(&subject),
-                    channel_id: row.get(1)?,
-                    channel_name: row.get(2)?,
-                    channel_group: row.get(3)?,
-                    channel_number: row.get(4)?,
-                    current_epg_name: row.get(5)?,
-                    epg_data_id: row.get(6)?,
-                    epg_name: row.get(7)?,
-                    epg_source: row.get(8)?,
-                    score: row.get(9)?,
-                    method: row.get(10)?,
-                    status: row.get(11)?,
-                    reason: row.get(12)?,
-                    ai_decision: row.get(13)?,
-                    field: row.get(14)?,
-                    before_value: row.get(15)?,
-                    after_value: row.get(16)?,
-                })
-            })?;
+            let mut statement = connection.prepare(&format!(
+                "SELECT {RUN_ROW_COLUMNS} FROM run_rows WHERE run_id = ?1 ORDER BY ordinal"
+            ))?;
+            let rows = statement.query_map(params![run_id], map_run_row)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
+    }
+
+    /// One run's rows, limited to the FIELDS asked for.
+    ///
+    /// A probe run at 50k streams writes an order of magnitude more stream rows than the
+    /// per-channel verdicts its readers want, so `triage` and `restore` read the two field
+    /// names instead of the whole run: same rows, a fraction of the memory.
+    pub fn rows_of_fields(&self, run_id: i64, fields: &[&str]) -> Result<Vec<RunRow>> {
+        if fields.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.with_connection(|connection| {
+            let sql = format!(
+                "SELECT {RUN_ROW_COLUMNS} FROM run_rows WHERE run_id = ? AND field IN ({}) \
+                 ORDER BY ordinal",
+                marks(fields.len()),
+            );
+            let mut statement = connection.prepare(&sql)?;
+            let mut values: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(fields.len() + 1);
+            values.push(&run_id);
+            values.extend(fields.iter().map(|field| field as &dyn rusqlite::ToSql));
+            let rows = statement.query_map(rusqlite::params_from_iter(values), map_run_row)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
+    }
+
+    /// The rows of a set of FIELDS from the newest FINISHED runs of some ACTIONS, oldest run
+    /// first — what a `restore` reads to work out which recorded changes are still in effect.
+    ///
+    /// `fields` is the channel fields to read (`name`, `channel_group_id`), and `actions` the
+    /// runs that wrote them (`streams.triage_apply`); every other row is filtered out in SQL,
+    /// because a triage run at 20k channels carries rows a restore has no use for.
+    ///
+    /// Three exclusions, each for a different reason:
+    ///
+    ///   * a DRY RUN's rows are plans, not writes, and reversing one would write a value the
+    ///     channel never had;
+    ///   * a RUNNING run may still be writing, so it is not history yet;
+    ///   * rows whose own `status` is not `ok` never landed — a restore may be recorded from a
+    ///     cancelled run's confirmed rows, which is why the RUN's status is not narrowed to
+    ///     `succeeded`. `RunStatus::Paused` and `RunStatus::Failed` runs are in for the same
+    ///     reason; the row's own status decides.
+    ///
+    /// `runs` caps the scan at the newest N runs, so a busy install does not read a year of
+    /// rows to find one name. `run_history_days` prunes the table underneath; a change older
+    /// than the cap is simply not found, and the caller falls back to what the name itself
+    /// says.
+    pub fn field_history(
+        &self,
+        app: &str,
+        actions: &[&str],
+        fields: &[&str],
+        runs: usize,
+    ) -> Result<Vec<RunRow>> {
+        if actions.is_empty() || fields.is_empty() || runs == 0 {
+            return Ok(Vec::new());
+        }
+        self.with_connection(|connection| {
+            let sql = format!(
+                "SELECT {RUN_ROW_COLUMNS} FROM run_rows WHERE subject = 'channel' \
+                 AND field IN ({}) AND run_id IN (SELECT id FROM runs WHERE app = ? \
+                 AND dry_run = 0 AND status != 'running' AND action IN ({}) \
+                 ORDER BY started_at DESC, id DESC LIMIT ?) ORDER BY run_id, ordinal",
+                marks(fields.len()),
+                marks(actions.len()),
+            );
+            let mut statement = connection.prepare(&sql)?;
+            // Positional parameters follow the SQL text: the field list, then the app, the
+            // action list and the run cap.
+            let limit = runs as i64;
+            let mut values: Vec<&dyn rusqlite::ToSql> =
+                Vec::with_capacity(fields.len() + 3 + actions.len());
+            values.extend(fields.iter().map(|field| field as &dyn rusqlite::ToSql));
+            values.push(&app);
+            values.extend(actions.iter().map(|action| action as &dyn rusqlite::ToSql));
+            values.push(&limit);
+            let rows = statement.query_map(rusqlite::params_from_iter(values), map_run_row)?;
             rows.collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(Into::into)
         })
@@ -1156,6 +1212,41 @@ fn map_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
         counts: serde_json::from_str(&counts).unwrap_or_default(),
         report_path: row.get(9)?,
     })
+}
+
+/// The `run_rows` columns a [`RunRow`] is built from, in the order [`map_run_row`] reads them.
+const RUN_ROW_COLUMNS: &str = "ordinal, channel_id, channel_name, channel_group, \
+     channel_number, current_epg_name, epg_data_id, epg_name, epg_source, score, method, \
+     status, reason, ai_decision, field, before_value, after_value, subject";
+
+/// One `run_rows` row, from the columns [`RUN_ROW_COLUMNS`] selects.
+fn map_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRow> {
+    let subject: String = row.get(17)?;
+    Ok(RunRow {
+        ordinal: row.get(0)?,
+        subject: Subject::parse(&subject),
+        channel_id: row.get(1)?,
+        channel_name: row.get(2)?,
+        channel_group: row.get(3)?,
+        channel_number: row.get(4)?,
+        current_epg_name: row.get(5)?,
+        epg_data_id: row.get(6)?,
+        epg_name: row.get(7)?,
+        epg_source: row.get(8)?,
+        score: row.get(9)?,
+        method: row.get(10)?,
+        status: row.get(11)?,
+        reason: row.get(12)?,
+        ai_decision: row.get(13)?,
+        field: row.get(14)?,
+        before_value: row.get(15)?,
+        after_value: row.get(16)?,
+    })
+}
+
+/// `n` comma-separated SQL placeholders, for an `IN (...)` list built at run time.
+fn marks(n: usize) -> String {
+    std::iter::repeat_n("?", n).collect::<Vec<_>>().join(", ")
 }
 
 #[cfg(test)]
@@ -1695,6 +1786,163 @@ mod tests {
             )
             .expect("inserts into the upgraded table");
         assert_eq!(store.rows(run_id).expect("rows").len(), 1);
+    }
+
+    #[test]
+    fn rows_of_fields_reads_only_the_fields_asked_for() {
+        // A probe run is mostly stream rows; its readers want the per-channel verdicts.
+        let store = Store::in_memory().expect("store");
+        let run_id = store.start_run("streams", "probe", false).expect("start");
+        let rows: Vec<RunRow> = ["probe", "probe_verdict", "probe_format"]
+            .iter()
+            .enumerate()
+            .map(|(ordinal, field)| RunRow {
+                ordinal: ordinal as i64,
+                subject: if *field == "probe" {
+                    Subject::Stream
+                } else {
+                    Subject::Channel
+                },
+                channel_id: 1,
+                field: field.to_string(),
+                after_value: Some("alive".to_string()),
+                ..RunRow::default()
+            })
+            .collect();
+        store.append_rows(run_id, &rows).expect("rows");
+
+        let verdicts = store
+            .rows_of_fields(run_id, &["probe_verdict", "probe_format"])
+            .expect("rows");
+        assert_eq!(verdicts.len(), 2, "{verdicts:?}");
+        assert!(verdicts.iter().all(|row| row.field != "probe"));
+        assert!(store.rows_of_fields(run_id, &[]).expect("rows").is_empty());
+        // Another run's rows are never in the answer.
+        let other = store.start_run("guide", "scan", true).expect("start");
+        assert!(store
+            .rows_of_fields(other, &["probe_verdict"])
+            .expect("rows")
+            .is_empty());
+    }
+
+    #[test]
+    fn field_history_reads_the_channel_rows_of_the_actions_asked_for() {
+        // What a restore reads: the channel rows of `name` and `channel_group_id` from the
+        // newest finished triage runs, oldest run first, and nothing else.
+        let store = Store::in_memory().expect("store");
+        let counter = std::cell::Cell::new(0i64);
+        let row = |channel_id: i64, field: &str, before: &str, after: &str| {
+            let ordinal = counter.get();
+            counter.set(ordinal + 1);
+            RunRow {
+                ordinal,
+                subject: Subject::Channel,
+                channel_id,
+                field: field.to_string(),
+                before_value: Some(before.to_string()),
+                after_value: Some(after.to_string()),
+                status: "ok".to_string(),
+                ..RunRow::default()
+            }
+        };
+
+        // A dry run's rows are plans, not writes; a still-running run is not history yet; a
+        // stream row is about a stream, and another action's rows are not triage's.
+        let preview = store
+            .start_run("streams", "triage_apply", true)
+            .expect("start");
+        store
+            .append_rows(preview, &[row(1, "name", "A", "B")])
+            .expect("rows");
+        store
+            .finish_run(
+                preview,
+                RunStatus::Succeeded,
+                None,
+                &serde_json::json!({}),
+                None,
+            )
+            .expect("finish");
+
+        let guide = store
+            .start_run("guide", "tag_missing_apply", false)
+            .expect("start");
+        store
+            .append_rows(guide, &[row(1, "name", "C", "D")])
+            .expect("rows");
+        store
+            .finish_run(
+                guide,
+                RunStatus::Succeeded,
+                None,
+                &serde_json::json!({}),
+                None,
+            )
+            .expect("finish");
+
+        let triage = store
+            .start_run("streams", "triage_apply", false)
+            .expect("start");
+        store
+            .append_rows(
+                triage,
+                &[
+                    row(1, "name", "X", "X [DEAD]"),
+                    row(1, "channel_group_id", "100", "102"),
+                    row(2, "epg_data_id", "5", "none"),
+                    RunRow {
+                        ordinal: 99,
+                        subject: Subject::Stream,
+                        channel_id: 1,
+                        field: "name".to_string(),
+                        ..RunRow::default()
+                    },
+                ],
+            )
+            .expect("rows");
+        store
+            .finish_run(
+                triage,
+                RunStatus::Cancelled,
+                None,
+                &serde_json::json!({}),
+                None,
+            )
+            .expect("finish");
+
+        // A run still writing is not history yet: it is started here, last, so the store's
+        // one-live-run-per-app index allows the finished ones above.
+        let running = store
+            .start_run("streams", "triage_apply", false)
+            .expect("start");
+        store
+            .append_rows(running, &[row(1, "name", "B", "C")])
+            .expect("rows");
+
+        let history = store
+            .field_history(
+                "streams",
+                &["triage_apply"],
+                &["name", "channel_group_id"],
+                50,
+            )
+            .expect("history");
+        // The cancelled run's confirmed rows ARE history (its `ok` rows landed), the dry run's
+        // and the guide's are not, and the EPG and stream rows are filtered out.
+        assert_eq!(history.len(), 2, "{history:?}");
+        assert_eq!(history[0].field, "name");
+        assert_eq!(history[0].before_value.as_deref(), Some("X"));
+        assert_eq!(history[1].field, "channel_group_id");
+
+        // A cap keeps the scan bounded: one run back finds nothing older.
+        let none = store
+            .field_history("streams", &["triage_apply"], &["name"], 0)
+            .expect("history");
+        assert!(none.is_empty());
+        assert!(store
+            .field_history("streams", &[], &["name"], 10)
+            .expect("history")
+            .is_empty());
     }
 
     #[test]

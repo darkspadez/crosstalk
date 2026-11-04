@@ -450,7 +450,7 @@ impl RenameKind {
 /// The label is both the API's own field name (it is what a CSV row and a run row carry, and
 /// what [`Self::from_label`] parses back) and the serialized form, so an [`Op::Set`] names its
 /// field the same way a restore reads it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Field {
     Name,
     Group,

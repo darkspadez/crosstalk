@@ -92,8 +92,8 @@ pub const FROZEN_VIDEO: &str = "Frozen Video";
 /// Decodes to silence and the detector was armed.
 pub const SILENT_AUDIO: &str = "Silent Audio";
 
-/// IC's `LOW_FRAMERATE_THRESHOLD` (180): below this a stream is "slow" (PAL 25 and film 24 are
-/// deliberately safe).
+/// IC's `LOW_FRAMERATE_THRESHOLD` (plugin.py:180): below this a stream is "slow" (PAL 25 and
+/// film 24 are deliberately safe).
 pub const LOW_FRAMERATE_THRESHOLD: f64 = 24.0;
 
 /// The error types a retry can fix (`_process_streams_parallel` 3243).

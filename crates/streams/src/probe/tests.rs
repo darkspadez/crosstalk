@@ -861,7 +861,7 @@ fn the_format_comes_from_the_last_alive_stream() {
 
 #[test]
 fn triage_can_read_the_verdicts_back_out_of_the_run_rows() {
-    // The contract between this step and step 11: two fields, one channel, one reader.
+    // The contract between the probe and triage: two fields, one channel, one reader.
     let rows = vec![
         RunRow {
             subject: Subject::Channel,
@@ -912,6 +912,118 @@ fn triage_can_read_the_verdicts_back_out_of_the_run_rows() {
     assert_eq!(verdicts[0].format, None, "a dead channel has no format row");
     assert_eq!(verdicts[1].verdict, ChannelVerdict::LowFrameRate);
     assert_eq!(verdicts[1].format.as_deref(), Some("HD"));
+}
+
+/// A verdict row, as a finished probe run records it.
+fn verdict_row(ordinal: i64, channel_id: i64, channel_name: &str, verdict: &str) -> RunRow {
+    RunRow {
+        ordinal,
+        subject: Subject::Channel,
+        channel_id,
+        channel_name: channel_name.to_string(),
+        status: verdict.to_string(),
+        field: VERDICT_FIELD.to_string(),
+        after_value: Some(verdict.to_string()),
+        ..RunRow::default()
+    }
+}
+
+#[tokio::test]
+async fn the_result_set_spans_a_resumed_sequence() {
+    // A windowed pass split across three runs: a paused first window, a paused second
+    // window that re-judged one of its channels, and the succeeded run that drained the
+    // queue. The result set is the union, newest winning per channel — the plugin's
+    // accumulated results.json. The older succeeded run is the previous complete result
+    // set and is not read.
+    let server = ServerFixture::start(&probe_world()).await;
+    let store = server.store();
+    let finish = |run_id: i64, status: RunStatus| {
+        store
+            .finish_run(run_id, status, None, &serde_json::json!({}), None)
+            .expect("finish")
+    };
+
+    let old = store.start_run(APP_ID, ACTION, false).expect("start");
+    store
+        .append_rows(old, &[verdict_row(0, 9, "Old", "dead")])
+        .expect("append");
+    finish(old, RunStatus::Succeeded);
+
+    let first = store.start_run(APP_ID, ACTION, false).expect("start");
+    store
+        .append_rows(
+            first,
+            &[
+                verdict_row(0, 7, "ESPN", "dead"),
+                verdict_row(1, 8, "CNN", "alive"),
+            ],
+        )
+        .expect("append");
+    finish(first, RunStatus::Paused);
+
+    let second = store.start_run(APP_ID, ACTION, false).expect("start");
+    store
+        .append_rows(second, &[verdict_row(0, 8, "CNN", "dead")])
+        .expect("append");
+    finish(second, RunStatus::Succeeded);
+
+    let context = server.context_for_run(ACTION, &store, false);
+    let probe = last_verdicts(&context).expect("a result set");
+    assert_eq!(probe.run_id, second);
+    assert_eq!(probe.run_ids, vec![second, first]);
+    let by_id: std::collections::HashMap<i64, &RecordedVerdict> = probe
+        .verdicts
+        .iter()
+        .map(|verdict| (verdict.channel_id, verdict))
+        .collect();
+    assert_eq!(by_id.len(), 2, "{by_id:?}");
+    assert_eq!(by_id[&7].verdict, ChannelVerdict::Dead);
+    assert_eq!(
+        by_id[&8].verdict,
+        ChannelVerdict::Dead,
+        "the newest verdict wins per channel"
+    );
+    assert!(
+        probe.describe().contains("(across 2 runs)"),
+        "{}",
+        probe.describe()
+    );
+    finish(context.run_id().expect("run id"), RunStatus::Succeeded);
+}
+
+#[tokio::test]
+async fn a_dry_run_probe_is_a_result_set_too() {
+    // A --dry-run probe records the same verdict rows and only skips the Dispatcharr write,
+    // so it counts as the newest succeeded run exactly like an apply does.
+    let server = ServerFixture::start(&probe_world()).await;
+    let store = server.store();
+    let run = store.start_run(APP_ID, ACTION, true).expect("start");
+    store
+        .append_rows(run, &[verdict_row(0, 7, "ESPN", "dead")])
+        .expect("append");
+    store
+        .finish_run(
+            run,
+            RunStatus::Succeeded,
+            None,
+            &serde_json::json!({}),
+            None,
+        )
+        .expect("finish");
+    let context = server.context_for_run(ACTION, &store, false);
+    let probe = last_verdicts(&context).expect("a result set");
+    assert_eq!(probe.run_id, run);
+    assert_eq!(probe.verdicts.len(), 1);
+    assert_eq!(probe.verdicts[0].verdict, ChannelVerdict::Dead);
+    store
+        .finish_run(
+            context.run_id().expect("run id"),
+            RunStatus::Succeeded,
+            None,
+            &serde_json::json!({}),
+            None,
+        )
+        .expect("finish");
 }
 
 #[test]
