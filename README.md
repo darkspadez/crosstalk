@@ -176,9 +176,9 @@ no daemon restart (a run already in progress finishes with the settings it start
 ## Actions
 
 Every action below belongs to the `guide` app (`crosstalk run guide <action>`). The `streams`
-app declares its own list in `crates/streams/src/lib.rs` and currently exposes `validate` and
-`status`; its `match_*`, `sort_*`, `mirror_*`, `probe`, `triage_*`, `restore_*` and
-`visibility_*` pairs arrive with the rest of phase 2.
+app declares its own list in `crates/streams/src/lib.rs` and currently exposes `validate`,
+`status` and the `match_*` and `sort_*` pairs; its `mirror_*`, `probe`, `triage_*`,
+`restore_*` and `visibility_*` pairs arrive with the rest of phase 2.
 
 | Action | Colour | What it does |
 |---|---|---|
@@ -363,11 +363,15 @@ logic, which is the part where equality is claimed.
 
 crosstalk is a port, not a fork, and every place where it behaves differently is listed here
 with the reason. The matching pipeline is not in this table: it is a strict port, and the gates
-above hold it to byte equality. Only `guide` exists so far, so every row is a difference from
-EPG Janitor; later phases add rows here rather than a second table.
+above hold it to byte equality. Rows up to the watchdog are differences from EPG Janitor;
+the `streams.match` rows are differences from Stream-Mapparr.
 
 | Difference | Reason |
 |---|---|
+| `streams.match_apply` only writes channels whose list changed | The plugin deletes and recreates every matched channel's list; crosstalk plans a stream-list write only where the list actually differs. Same end state, so a second run over an unchanged library writes nothing. |
+| `streams.match_preview` drops the plugin's threshold-analysis advice rows | Preview also re-ran the pipeline at 5-point thresholds and collected by exact match against the winning stream name; the plugin itself notes that path disagrees with the real matcher. Those rows were advice, never a write. |
+| With `filter_dead_streams` on, match also excludes store probe verdicts | The plugin only reads `stream_stats` (empty, 0 width/height, `0x0`); crosstalk reproduces that test exactly and additionally skips streams the probe recorded as `dead` in the store — the same verdict, kept where a rerun can see it. |
+| Appending streams renumbers the channel's list | The plugin's append gives the new rows order values that collide with the existing rows; crosstalk writes the same membership in the same playback order, numbered from zero. |
 | EPG-override channels are skipped by `match` | A channel whose guide was set by hand in Dispatcharr keeps it; the plugin re-matches and overwrites. Skipping is safer, and the CSV reason says so. |
 | AI may promote inside the verify band | With the AI gate on, an AI-accepted candidate can be assigned while its heuristic score (60–94) sits below `match_confidence_threshold` (default 95). The threshold still gates every heuristic assignment: the model never re-checks or vetoes one, and heal never asks it at all. |
 | Heal reports a below-threshold replacement without applying it | The row keeps the plugin's `SKIPPED_LOW_CONFIDENCE` / `REPLACEMENT_PREVIEW` wording and the real score, so a preview shows what was nearly a match; the write still needs the threshold. |

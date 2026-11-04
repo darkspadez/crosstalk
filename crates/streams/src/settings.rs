@@ -154,6 +154,23 @@ pub struct StreamsSettings {
     pub stream_prefix_countries: String,
     /// How many channels of one name group receive streams. `visible_channel_limit`.
     pub visible_channel_limit: u32,
+    /// Match only US over-the-air channels, by callsign, per channel.
+    ///
+    /// Stream-Mapparr's *Match US OTA Only*: a separate action there, a mode here. It matches
+    /// every scoped channel individually (no name groups, no visible_channel_limit), only
+    /// channels whose callsign is a real US station, and only upper-case callsigns inside
+    /// stream names.
+    pub ota_only: bool,
+    /// Skip streams IPTV Checker found dead before matching.
+    ///
+    /// Stream-Mapparr's `filter_dead_streams`: a stream is dead on exactly the evidence its
+    /// `_stream_stats_says_dead` reads — an empty `stream_stats` (what IPTV Checker writes
+    /// for a dead stream), a zero width or height, or a `0x0` resolution — and a stream the
+    /// probe recorded as `dead` in the store counts as dead too. A stream with no verdict
+    /// and no stats evidence is kept (fail open, as the plugin's "no metadata" branch
+    /// does), and when every candidate is dead the whole list is kept rather than matching
+    /// nothing.
+    pub filter_dead_streams: bool,
     /// Resolve placeholder names through the currently airing programme.
     /// Stream-Mapparr's `epg_placeholder_matching_enabled`.
     pub epg_placeholder_matching_enabled: bool,
@@ -291,6 +308,8 @@ impl Default for StreamsSettings {
             restrict_matching_to_country: false,
             stream_prefix_countries: String::new(),
             visible_channel_limit: 1,
+            ota_only: false,
+            filter_dead_streams: false,
             epg_placeholder_matching_enabled: false,
             epg_placeholder_name_patterns: EPG_PLACEHOLDER_NAME_PATTERNS.to_string(),
             epg_title_cleanup_rules: EPG_TITLE_CLEANUP_RULES.to_string(),
@@ -403,7 +422,7 @@ pub fn threshold_for(sensitivity: &str) -> u8 {
 /// `deny_unknown_fields` already rejects them; this exists so the rejection says where the
 /// value went instead of only that the key is unknown. A clean break is deliberate: silently
 /// accepting the old keys would leave two files (or a dead key) claiming one setting.
-const MOVED: [(&str, &str); 46] = [
+const MOVED: [(&str, &str); 45] = [
     ("profile_name", "[scope] profiles in crosstalk.toml"),
     ("selected_groups", "[scope] groups in crosstalk.toml"),
     (
@@ -466,10 +485,6 @@ const MOVED: [(&str, &str); 46] = [
     (
         "wait_for_iptv_checker",
         "a workflow in crosstalk.toml: steps run in order, so nothing has to wait",
-    ),
-    (
-        "filter_dead_streams",
-        "streams.probe's verdicts, which match reads",
     ),
     (
         "notify_enabled",
@@ -784,6 +799,33 @@ pub fn schema() -> SettingsSchema {
             "How many channels of one name group receive streams; the rest are left alone. At \
              least 1, because 0 would give no channel a stream. Channels are prioritized by \
              quality tags, then by channel number.",
+        ),
+        FieldSpec::new(
+            "ota_only",
+            SECTION_MATCH,
+            "Match US OTA Only",
+            FieldKind::Boolean,
+            FieldValue::Boolean(false),
+        )
+        .with_help(
+            "Run Stream-Mapparr's Match US OTA Only instead of Match & Assign: match ONLY US \
+             over-the-air channels, by callsign, against the FCC station table. It matches each \
+             channel on its own (no name groups and no Visible Channel Limit), searches stream \
+             names for UPPER-CASE callsigns only (WKRG, WABC-DT2), and skips the country filter \
+             and zone routing. Every other setting above still applies to the write.",
+        ),
+        FieldSpec::new(
+            "filter_dead_streams",
+            SECTION_MATCH,
+            "Filter Dead Streams",
+            FieldKind::Boolean,
+            FieldValue::Boolean(false),
+        )
+        .with_help(
+            "Skip streams IPTV Checker found dead before matching: an empty stream_stats, a \
+             zero width or height, or a 0x0 resolution — or a probe verdict of dead in the \
+             store. A stream with no evidence either way is kept, and when every candidate is \
+             dead the whole list is kept rather than matching nothing.",
         ),
         FieldSpec::section(
             SECTION_EPG,
@@ -1405,6 +1447,8 @@ pub fn to_values(settings: &StreamsSettings) -> SettingsValues {
             "restrict_matching_to_country",
             settings.restrict_matching_to_country,
         ),
+        ("ota_only", settings.ota_only),
+        ("filter_dead_streams", settings.filter_dead_streams),
         (
             "epg_placeholder_matching_enabled",
             settings.epg_placeholder_matching_enabled,
@@ -1616,6 +1660,12 @@ pub fn apply_values(settings: &mut StreamsSettings, values: &SettingsValues) -> 
     if let Some(value) = values.bool("restrict_matching_to_country") {
         settings.restrict_matching_to_country = value;
     }
+    if let Some(value) = values.bool("ota_only") {
+        settings.ota_only = value;
+    }
+    if let Some(value) = values.bool("filter_dead_streams") {
+        settings.filter_dead_streams = value;
+    }
     if let Some(value) = values.bool("epg_placeholder_matching_enabled") {
         settings.epg_placeholder_matching_enabled = value;
     }
@@ -1804,6 +1854,32 @@ pub fn warnings(settings: &StreamsSettings) -> Vec<String> {
             settings.stream_group_filter_mode, DEFAULT_FILTER_MODE
         ));
     }
+    // The US-OTA mode matches per channel and by callsign, so the three settings that shape
+    // name grouping are inert. Saying so beats an operator wondering why a preview ignored
+    // them.
+    if settings.ota_only {
+        if settings.restrict_matching_to_country {
+            warnings.push(
+                "ota_only is on, so restrict_matching_to_country has no effect: the US OTA \
+                 action matches by callsign and never runs the country filter"
+                    .to_string(),
+            );
+        }
+        if settings.visible_channel_limit != 1 {
+            warnings.push(
+                "ota_only is on, so visible_channel_limit has no effect: the US OTA action \
+                 matches every channel on its own, not name groups"
+                    .to_string(),
+            );
+        }
+        if settings.epg_placeholder_matching_enabled {
+            warnings.push(
+                "ota_only is on, so the EPG placeholder settings have no effect: the US OTA \
+                 action matches callsigns only"
+                    .to_string(),
+            );
+        }
+    }
     warnings
 }
 
@@ -1882,6 +1958,8 @@ mod tests {
             restrict_matching_to_country: true,
             stream_prefix_countries: "NOW=UK".to_string(),
             visible_channel_limit: 3,
+            ota_only: true,
+            filter_dead_streams: true,
             epg_placeholder_matching_enabled: true,
             epg_placeholder_name_patterns: "^PPV \\d+$".to_string(),
             epg_title_cleanup_rules: r#"[["^Next ", ""]]"#.to_string(),
@@ -2250,7 +2328,6 @@ mod tests {
             "run_after_iptv_checker_scan",
             "wait_for_iptv_checker",
             "iptv_checker_max_wait_hours",
-            "filter_dead_streams",
             "notify_enabled",
             "notify_report_on",
             "notify_report_format",

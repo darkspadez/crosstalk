@@ -292,6 +292,26 @@ impl CandidateIndex {
             matcher.normalizer(),
             matcher.known(),
             matcher.options().callsign_ladder,
+            &[],
+        )
+    }
+
+    /// [`Self::build`] with the caller's `ignore_tags` applied to the candidates.
+    ///
+    /// The plugin's `precompute_normalizations(names, ignore_tags, ...)` warms its cache with
+    /// the run's tag list, and Stream-Mapparr's `fuzzy_match`/`alias_lookup` then read that
+    /// cache: its candidates are normalised WITH the tags and its query is normalised with
+    /// them too. [`Self::build`] deliberately reproduces the *other* asymmetry (a Janitor
+    /// run normalises its candidates with no tags), so a collector that must agree with
+    /// Stream-Mapparr's own cache has to ask for the tagged form explicitly. This is that
+    /// entry point.
+    pub fn build_with_tags(names: &[String], matcher: &Matcher, tags: &[&str]) -> Self {
+        Self::build_with(
+            names,
+            matcher.normalizer(),
+            matcher.known(),
+            matcher.options().callsign_ladder,
+            tags,
         )
     }
 
@@ -300,6 +320,7 @@ impl CandidateIndex {
         normalizer: &Normalizer,
         known: &KnownCallsigns,
         callsign_ladder: CallsignLadder,
+        tags: &[&str],
     ) -> Self {
         let normalizer = normalizer.without_cinemax();
         let mut index = Self {
@@ -321,7 +342,7 @@ impl CandidateIndex {
             std::collections::HashMap::new();
 
         for name in names {
-            let normalized = normalizer.normalize_name(name, &[]);
+            let normalized = normalizer.normalize_name(name, tags);
             let chars = normalized.chars().count();
             if chars >= 2 {
                 let lowercased = lower(&normalized);
@@ -407,6 +428,43 @@ impl CandidateIndex {
         &self.location[index]
     }
 
+    /// The candidate's normalised name, lowercased, or `None` when it normalises to fewer
+    /// than two characters (which every stage skips).
+    ///
+    /// Exposed read-only for Stream-Mapparr's collector, which compares the *same*
+    /// normalisation its `fuzzy_match` scores: reading it here keeps one normalisation per
+    /// stream per run instead of a second copy for the collector.
+    pub fn normalized_lower(&self, index: usize) -> Option<&str> {
+        self.normalized_lower[index].as_deref()
+    }
+
+    /// The candidate's normalised name with whitespace, `&` and `-` removed.
+    pub fn normalized_nospace(&self, index: usize) -> Option<&str> {
+        self.normalized_nospace[index].as_deref()
+    }
+
+    /// The candidate's normalised name as scalar values, for the similarity ratio.
+    ///
+    /// Pre-collected so the hot loop never re-allocates a `Vec<char>` per comparison.
+    pub fn normalized_chars(&self, index: usize) -> Option<&[char]> {
+        self.normalized_lower_chars[index].as_deref()
+    }
+
+    /// The candidate's token-sorted form (the third fuzzy stage's input).
+    pub fn processed_name(&self, index: usize) -> Option<&str> {
+        self.processed[index].as_deref()
+    }
+
+    /// The digit-only tokens of the candidate's normalised name.
+    pub fn digit_tokens(&self, index: usize) -> &[String] {
+        &self.digit_tokens[index]
+    }
+
+    /// The designator tokens (`1`, `f1`, `tf1`) of the candidate's normalised name.
+    pub fn designator_tokens(&self, index: usize) -> &[String] {
+        &self.designator_tokens[index]
+    }
+
     fn normalized(&self, index: usize) -> Option<(&str, &str)> {
         match (
             self.normalized_lower[index].as_deref(),
@@ -419,11 +477,6 @@ impl CandidateIndex {
 
     fn processed(&self, index: usize) -> Option<&str> {
         self.processed[index].as_deref()
-    }
-
-    /// Pre-collected scalar values of the lowercased candidate, for the hot loop.
-    fn normalized_chars(&self, index: usize) -> Option<&[char]> {
-        self.normalized_lower_chars[index].as_deref()
     }
 
     /// Pre-collected scalar values of the token-sorted candidate, for the fuzzy stage.
@@ -690,6 +743,26 @@ impl Matcher {
         hits
     }
 
+    /// The alias variants `alias_lookup` would compare against, for a query name.
+    ///
+    /// The verbatim entry first, then the case-folded fallback (Stream-Mapparr's
+    /// `_fold_alias_key`) when the profile folds keys. Exposed so a collector can turn the
+    /// variants into an indexed lookup instead of walking every candidate, while still asking
+    /// the SAME question `alias_lookup` asks.
+    pub fn alias_variants(&self, query: &str) -> &[String] {
+        let exact = self.alias_map.aliases_for_exact(query);
+        if !exact.is_empty() {
+            return exact;
+        }
+        if !self.options.fold_alias_keys {
+            return &[];
+        }
+        self.folded_aliases
+            .get(&fold_alias_key(query))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
     /// Stream-Mapparr's `fuzzy_match`: THE winning name, its score and the stage that won.
     ///
     /// Three stages, in order, each returning at most one candidate:
@@ -721,10 +794,66 @@ impl Matcher {
         user_ignored_tags: &[&str],
         remove_cinemax: bool,
     ) -> Option<BestMatch> {
+        self.fuzzy_match_over(query, index, user_ignored_tags, remove_cinemax, None)
+    }
+
+    /// [`Self::fuzzy_match`] over a SUBSET of the index's candidates.
+    ///
+    /// Identical answer to [`Self::fuzzy_match`] whenever `candidates` holds every entry the
+    /// full scan could return: each stage takes the best of its own candidate set, so a subset
+    /// that keeps all possible winners (exact, substring-capable and within-threshold names)
+    /// produces the same stage result. Nothing about the scoring changes — the collector uses
+    /// this to run Stream-Mapparr's own three stages over an indexed candidate block instead of
+    /// over the whole stream list.
+    pub fn fuzzy_match_in(
+        &self,
+        query: &str,
+        index: &CandidateIndex,
+        user_ignored_tags: &[&str],
+        remove_cinemax: bool,
+        candidates: &[usize],
+    ) -> Option<BestMatch> {
+        if candidates.is_empty() {
+            return None;
+        }
+        self.fuzzy_match_over(
+            query,
+            index,
+            user_ignored_tags,
+            remove_cinemax,
+            Some(candidates),
+        )
+    }
+
+    fn fuzzy_match_over(
+        &self,
+        query: &str,
+        index: &CandidateIndex,
+        user_ignored_tags: &[&str],
+        remove_cinemax: bool,
+        candidates: Option<&[usize]>,
+    ) -> Option<BestMatch> {
         let _ = remove_cinemax;
         if index.is_empty() {
             return None;
         }
+        // One closure per stage, so a subset scan and a full scan share the body below.
+        let scan = |visit: &mut dyn FnMut(usize) -> bool| match candidates {
+            Some(list) => {
+                for &candidate in list {
+                    if visit(candidate) {
+                        return;
+                    }
+                }
+            }
+            None => {
+                for candidate in 0..index.len() {
+                    if visit(candidate) {
+                        return;
+                    }
+                }
+            }
+        };
         let query_normalizer = self.normalizer.without_cinemax();
         let normalized_query = query_normalizer.normalize_name(query, user_ignored_tags);
         if normalized_query.is_empty() {
@@ -754,27 +883,33 @@ impl Matcher {
 
         // Stage 1: exact after normalisation, then 97% on the literal forms.
         let mut best: Option<(usize, f64)> = None;
-        for candidate in 0..index.len() {
+        let mut found_exact: Option<usize> = None;
+        scan(&mut |candidate| {
             let Some((_, candidate_nospace)) = index.normalized(candidate) else {
-                continue;
+                return false;
             };
             if !keeps(candidate) {
-                continue;
+                return false;
             }
             if query_nospace == candidate_nospace {
-                return Some(BestMatch {
-                    index: candidate,
-                    score: 100,
-                    method: MatchMethod::Exact,
-                });
+                found_exact = Some(candidate);
+                return true;
             }
             let Some(candidate_chars) = index.normalized_chars(candidate) else {
-                continue;
+                return false;
             };
             let ratio = calculate_similarity_chars(&query_lower_chars, candidate_chars, 0.97);
             if ratio >= 0.97 && best.is_none_or(|(_, best_ratio)| ratio > best_ratio) {
                 best = Some((candidate, ratio));
             }
+            false
+        });
+        if let Some(candidate) = found_exact {
+            return Some(BestMatch {
+                index: candidate,
+                score: 100,
+                method: MatchMethod::Exact,
+            });
         }
         if let Some((candidate, ratio)) = best {
             return Some(BestMatch {
@@ -786,32 +921,33 @@ impl Matcher {
 
         // Stage 2: substring, with a length-ratio floor.
         let mut best: Option<(usize, f64)> = None;
-        for candidate in 0..index.len() {
+        scan(&mut |candidate| {
             let Some((candidate_lower, _)) = index.normalized(candidate) else {
-                continue;
+                return false;
             };
             if !keeps(candidate) {
-                continue;
+                return false;
             }
             if !(candidate_lower.contains(&query_lower) || query_lower.contains(candidate_lower)) {
-                continue;
+                return false;
             }
             let candidate_chars = index.normalized_chars(candidate).unwrap_or(&[]);
             let shorter = query_lower_chars.len().min(candidate_chars.len());
             let longer = query_lower_chars.len().max(candidate_chars.len());
             if longer == 0 {
-                continue;
+                return false;
             }
             let length_ratio = shorter as f64 / longer as f64;
             if length_ratio < 0.75 {
-                continue;
+                return false;
             }
             let ratio =
                 calculate_similarity_chars(&query_lower_chars, candidate_chars, threshold_ratio);
             if best.is_none_or(|(_, best_ratio)| ratio > best_ratio) {
                 best = Some((candidate, ratio));
             }
-        }
+            false
+        });
         if let Some((candidate, ratio)) = best {
             let score = (ratio * 100.0) as u8;
             if score >= self.options.match_threshold {
@@ -827,12 +963,12 @@ impl Matcher {
         let processed_query = process_string_for_matching(&normalized_query);
         let processed_query_chars: Vec<char> = processed_query.chars().collect();
         let mut best: Option<(usize, f64)> = None;
-        for candidate in 0..index.len() {
+        scan(&mut |candidate| {
             if !keeps(candidate) {
-                continue;
+                return false;
             }
             if index.processed(candidate).is_none() {
-                continue;
+                return false;
             }
             let candidate_chars = index.processed_char_list(candidate).unwrap_or(&[]);
             let ratio = calculate_similarity_chars(
@@ -843,7 +979,8 @@ impl Matcher {
             if best.is_none_or(|(_, best_ratio)| ratio > best_ratio) {
                 best = Some((candidate, ratio));
             }
-        }
+            false
+        });
         let (candidate, ratio) = best?;
         let score = (ratio * 100.0) as u8;
         if score >= self.options.match_threshold {

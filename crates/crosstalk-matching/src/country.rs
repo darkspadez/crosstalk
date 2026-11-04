@@ -538,7 +538,7 @@ fn usa_bare_re() -> &'static Regex {
 // ---------------------------------------------------------------------------
 
 /// Canonical feed zone for zone-aware stream routing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FeedZone {
     East,
     West,

@@ -244,6 +244,107 @@ fn build_stream_mapparr_known_callsigns() -> crate::callsign::KnownCallsigns {
     known
 }
 
+/// One entry of Stream-Mapparr's FCC station table (`networks.json`).
+///
+/// Only the three fields its OTA paths read are kept: the callsign itself, the network
+/// affiliation and the community served (both of which corroborate a common-word callsign
+/// such as `KING` or `WHO`), and the state, which no caller reads today but which the same
+/// table carries.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Station {
+    /// The full callsign as the table spells it (`WEWS-TV`, `KFCT`).
+    pub callsign: String,
+    pub network_affiliation: String,
+    pub community_served_city: String,
+    pub community_served_state: String,
+}
+
+/// The station table, keyed by BOTH the full callsign and its `-TV`/`-CD`/`-DT…`-stripped
+/// base, first entry winning.
+///
+/// This is `FuzzyMatcher._load_broadcast_stations` (fuzzy_matcher.py:326): every station is
+/// indexed under its full callsign and, when they differ, under its base, with `setdefault`
+/// semantics so a subchannel entry later in the file cannot clobber the main affiliate. The
+/// matcher's `channel_lookup` is this table plus the channel databases' `broadcast` entries
+/// (which the shipped databases do not carry), so this IS the OTA lookup in production.
+pub fn stream_mapparr_stations() -> &'static std::collections::HashMap<String, Station> {
+    static CACHED: std::sync::OnceLock<std::collections::HashMap<String, Station>> =
+        std::sync::OnceLock::new();
+    CACHED.get_or_init(|| {
+        let mut stations = std::collections::HashMap::new();
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(STREAM_MAPPARR_NETWORKS_JSON)
+        else {
+            return stations;
+        };
+        for station in parsed.as_array().into_iter().flatten() {
+            let text = |key: &str| {
+                station
+                    .get(key)
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string()
+            };
+            let callsign = text("callsign").to_uppercase();
+            if callsign.is_empty() {
+                continue;
+            }
+            let entry = Station {
+                callsign: callsign.clone(),
+                network_affiliation: text("network_affiliation"),
+                community_served_city: text("community_served_city"),
+                community_served_state: text("community_served_state").to_uppercase(),
+            };
+            stations
+                .entry(callsign.clone())
+                .or_insert_with(|| entry.clone());
+            let base = crate::callsign::normalize_callsign(&callsign);
+            if base != callsign {
+                stations.entry(base).or_insert(entry);
+            }
+        }
+        stations
+    })
+}
+
+/// Whether the station table lists this callsign (full or base form).
+///
+/// `_build_us_callsign_database`'s membership test: the OTA-only action skips any channel
+/// whose base callsign is not a real station, so a callsign-shaped word in a channel name
+/// never collects streams on its own.
+pub fn is_us_station(callsign: &str) -> bool {
+    let wanted = callsign.trim().to_uppercase();
+    if wanted.is_empty() {
+        return false;
+    }
+    let stations = stream_mapparr_stations();
+    stations.contains_key(&wanted)
+        || stations.contains_key(&crate::callsign::normalize_callsign(&wanted))
+}
+
+#[cfg(test)]
+mod station_tests {
+    use super::*;
+
+    #[test]
+    fn every_station_is_indexed_by_full_and_base_callsign() {
+        let stations = stream_mapparr_stations();
+        assert!(stations.len() > 1_500, "got {}", stations.len());
+        let full = stations.get("KFCT").expect("KFCT is in the table");
+        assert!(!full.network_affiliation.is_empty() || !full.community_served_city.is_empty());
+        assert!(is_us_station("kfct"));
+        // A callsign-shaped word that is not a station is not in the table.
+        assert!(!is_us_station("ZZZZ"));
+        // The base form resolves a suffixed callsign, as the plugin's setdefault does.
+        for callsign in ["WEWS-TV", "WABC-TV"] {
+            let base = crate::callsign::normalize_callsign(callsign);
+            if stations.contains_key(callsign) {
+                assert!(stations.contains_key(&base), "{callsign} -> {base}");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

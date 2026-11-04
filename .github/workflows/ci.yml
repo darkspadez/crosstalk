@@ -148,6 +148,14 @@ jobs:
       # `crates/streams/examples/sort_io`. ~10s over 840 cases, 1500 channels.
       - name: Streams sort vs the plugin's quality model
         run: python3 -I scripts/sort_parity.py
+      # The streams match pipeline is Stream-Mapparr's Match & Assign, ported. The harness
+      # drives the plugin's REAL `_build_channel_groups`, `_match_streams_to_channel`,
+      # `_channels_to_update_for_group`, `_streams_to_assign`, `_same_country_ids_for` and
+      # `_write_channel_streams` (with the Django stubs its own tests install, plus a fake
+      # ChannelStream table) and compares every channel's final stream list with
+      # `crates/streams/examples/match_io`. ~20s over 1,270 swept cases plus randomised ones.
+      - name: Streams match vs the plugin's collector
+        run: python3 -I scripts/match_parity.py
       # Informational, never failing: what upstream changed since each pinned reference
       # commit in the files crosstalk ports from it. Covers every reference submodule
       # (EPG Janitor, Stream-Mapparr, IPTV Checker), each with its own ported-file list.

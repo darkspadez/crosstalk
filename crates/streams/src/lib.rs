@@ -9,13 +9,16 @@
 //!   * [`settings`] — `streams.toml`, whose field ids and defaults are the plugins' own;
 //!   * [`selection`] — the stream half of the scope: M3U accounts in priority order, stream
 //!     groups, and the regex rules that decide the name matching sees;
+//!   * [`matching`] — `match_preview` / `match_apply`: Stream-Mapparr's collector (grouping,
+//!     the OTA callsign path, the fuzzy winner as a gate, alias force-includes, the
+//!     token/substring family, same-country and zone handling) and the write list it plans;
 //!   * [`quality`] — the one quality model: Stream-Mapparr's sort key and the throughput tiers
 //!     it reads, ported statement for statement;
-//!   * [`sort`] — `sort_preview` / `sort_apply`, which is what uses that model today.
+//!   * [`sort`] — `sort_preview` / `sort_apply`, which is what uses that model.
 //!
-//! Matching, mirror, visibility, probe, triage and restore arrive in later steps, so
-//! [`StreamsApp::actions`] registers `validate`, `status` and the `sort` pair: the layout is
-//! there, the halves that write are not (all of them).
+//! Mirror, visibility, probe, triage and restore arrive in later steps, so
+//! [`StreamsApp::actions`] registers `validate`, `status` and the `match` and `sort` pairs:
+//! the layout is there, the rest is not.
 //!
 //! What the two plugins did that a host does once, this app does not do at all: the dry-run
 //! switch is the preview half of a pair (or `--dry-run`), the schedules, windows and
@@ -23,6 +26,7 @@
 //! CSV retention is `[exports]`, the operation lock and progress files are the run store, and
 //! `view_*` / `export_results` are the run page and its CSV.
 
+pub mod matching;
 pub mod quality;
 pub mod selection;
 pub mod settings;
@@ -44,6 +48,8 @@ pub const APP_NAME: &str = "Streams";
 /// The action ids, as used in schedules and URLs.
 pub const ACTION_VALIDATE: &str = "validate";
 pub const ACTION_STATUS: &str = "status";
+pub const ACTION_MATCH_PREVIEW: &str = "match_preview";
+pub const ACTION_MATCH_APPLY: &str = "match_apply";
 pub const ACTION_SORT_PREVIEW: &str = "sort_preview";
 pub const ACTION_SORT_APPLY: &str = "sort_apply";
 
@@ -77,7 +83,7 @@ impl SubApp for StreamsApp {
     /// pair per verb — `match`, `sort`, `mirror`, `probe` (one action, it writes stream stats),
     /// `triage`, `restore`, `visibility` — then the read-only tools (`check_countries`,
     /// `scan_placeholders`, `test_rules`). A pair is declared together, so a preview can never
-    /// ship without its apply. `sort` is the first pair in place.
+    /// ship without its apply. `match` and `sort` are in place.
     fn actions(&self) -> Vec<ActionSpec> {
         vec![
             ActionSpec::new(
@@ -98,6 +104,32 @@ impl SubApp for StreamsApp {
             )
             // Reads the run store, not Dispatcharr.
             .offline(),
+            ActionSpec::new(
+                ACTION_MATCH_PREVIEW,
+                "Match & Assign Streams (Dry Run)",
+                "Match every in-scope channel against the selected streams and write a CSV of \
+                 what each channel would carry. Changes nothing.",
+                ActionKind::Read,
+            ),
+            ActionSpec::new(
+                ACTION_MATCH_APPLY,
+                "Match & Assign Streams (Apply)",
+                "Give every in-scope channel the streams it matches: replace its list, or \
+                 append to it, keeping custom streams last. With Match US OTA Only on, only US \
+                 over-the-air channels, by callsign.",
+                // Red: with Overwrite Existing Streams on this REMOVES a channel's current
+                // assignments. It removes no channel or guide, which is why it is not a
+                // delete, but it is destructive to a working lineup.
+                ActionKind::Destructive,
+            )
+            .with_confirm(
+                "This will match and assign streams to channels in the scope. With Overwrite \
+                 Existing Streams ON it REPLACES each matched channel's whole stream list with \
+                 the matched streams (with Keep Custom Streams Last off, hand-made streams go \
+                 too); with it OFF it only adds streams a channel does not already have. A \
+                 channel that matches nothing is left exactly as it is, and no channel or guide \
+                 is removed. Continue?",
+            ),
             ActionSpec::new(
                 ACTION_SORT_PREVIEW,
                 "Sort Alternate Streams (Dry Run)",
@@ -181,10 +213,18 @@ impl StreamsApp {
         match action {
             ACTION_VALIDATE => self.validate(context),
             ACTION_STATUS => Ok(self.status(context)),
+            ACTION_MATCH_PREVIEW => self.match_streams(context, true).await,
+            ACTION_MATCH_APPLY => self.match_streams(context, dry_run).await,
             ACTION_SORT_PREVIEW => self.sort(context, true).await,
             ACTION_SORT_APPLY => self.sort(context, dry_run).await,
             other => bail!("{APP_NAME} has no action {other:?}"),
         }
+    }
+
+    /// Match the in-scope channels: preview (a read) or apply.
+    async fn match_streams(&self, context: &JobContext, dry_run: bool) -> Result<JobOutcome> {
+        let settings = self.checked_settings(context)?;
+        matching::run(self, context, &settings, dry_run).await
     }
 
     /// Sort the in-scope channels' streams: preview (a read) or apply.
@@ -306,6 +346,8 @@ mod tests {
             vec![
                 ACTION_VALIDATE,
                 ACTION_STATUS,
+                ACTION_MATCH_PREVIEW,
+                ACTION_MATCH_APPLY,
                 ACTION_SORT_PREVIEW,
                 ACTION_SORT_APPLY
             ]

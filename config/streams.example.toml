@@ -93,6 +93,15 @@ stream_prefix_countries = ""
 # How many channels of one name group receive streams; the rest are left alone. At least 1,
 # because 0 would give no channel a stream.
 visible_channel_limit = 1
+# Run Stream-Mapparr's "Match US OTA Only" instead of Match & Assign: only US over-the-air
+# channels, matched by FCC callsign against the station table, one channel at a time (no name
+# groups and no visible_channel_limit), upper-case callsigns only in stream names, and no
+# country filter or zone routing. Every other setting above still applies to the write.
+ota_only = false
+# Skip streams IPTV Checker found dead before matching: an empty stream_stats (what it
+# writes for a dead stream), a zero width or height, or a 0x0 resolution — or a probe
+# verdict of dead in the store. Off by default, as in Stream-Mapparr.
+filter_dead_streams = false
 
 # --- EPG-Aware Placeholder Matching -----------------------------------------------------
 #

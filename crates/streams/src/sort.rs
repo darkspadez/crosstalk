@@ -232,7 +232,7 @@ pub fn zone_routed(
 /// Both tables exist, and the sort below keeps them, because an unmarked feed ranks WITH East
 /// on either side (issue 55). It can only break a tie that zone filtering itself has already
 /// resolved, which is why the result is the filtered list in quality order.
-fn zone_affinity_rank(channel_zone: FeedZone, stream_zone: FeedZone) -> u8 {
+pub(crate) fn zone_affinity_rank(channel_zone: FeedZone, stream_zone: FeedZone) -> u8 {
     match channel_zone {
         // West channel: own zone first, East and generic after it.
         FeedZone::West => match stream_zone {

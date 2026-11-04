@@ -591,6 +591,7 @@ dependencies = [
  "chrono",
  "crosstalk-core",
  "crosstalk-matching",
+ "rayon",
  "regex",
  "serde",
  "serde_json",

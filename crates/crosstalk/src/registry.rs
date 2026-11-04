@@ -39,7 +39,14 @@ mod tests {
         let ids: Vec<&str> = app.actions().iter().map(|action| action.id).collect();
         assert_eq!(
             ids,
-            vec!["validate", "status", "sort_preview", "sort_apply"]
+            vec![
+                "validate",
+                "status",
+                "match_preview",
+                "match_apply",
+                "sort_preview",
+                "sort_apply"
+            ]
         );
         // Every section of the plan's settings layout is in the form.
         let sections: Vec<&str> = app.schema().sections().map(|s| s.label).collect();
