@@ -46,6 +46,10 @@ mod tests {
                 "match_apply",
                 "sort_preview",
                 "sort_apply",
+                "mirror_preview",
+                "mirror_apply",
+                "visibility_preview",
+                "visibility_apply",
                 "check_countries",
                 "scan_placeholders",
                 "test_rules"

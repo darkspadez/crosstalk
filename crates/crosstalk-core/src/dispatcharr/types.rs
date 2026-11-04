@@ -44,6 +44,19 @@ pub struct Channel {
     /// The channel's streams, in playback order.
     #[serde(default)]
     pub streams: Vec<i64>,
+    /// The channel this one is attached to, when the build has the column.
+    ///
+    /// Dispatcharr's own `Channel` model has no such field (checked against
+    /// `apps/channels/models.py`), and its serializer therefore never sends the key — so this
+    /// stays `None` on a stock install. Stream-Mapparr reads it defensively
+    /// (`_get_all_channels` adds it only when `Channel._meta.get_field('attached_channel')`
+    /// exists) for one rule: an attached channel is never made visible by
+    /// `manage_channel_visibility`, because it is not the channel the guide plays. The field
+    /// is named here so a build that does carry it gets the plugin's rule instead of silently
+    /// enabling both halves of an attached pair; `None` is the honest answer for a build that
+    /// does not.
+    #[serde(default)]
+    pub attached_channel_id: Option<i64>,
 }
 
 impl Channel {

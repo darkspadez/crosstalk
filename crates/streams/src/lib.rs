@@ -17,13 +17,18 @@
 //!   * [`sort`] — `sort_preview` / `sort_apply`, which is what uses that model;
 //!   * [`epg`] — EPG-aware placeholder matching, the optional path that matches a generic
 //!     provider slot (`PPV EVENT 04`) by the programme airing on it;
+//!   * [`mirror`] — `mirror_preview` / `mirror_apply`: Stream-Mapparr's Fill Mirror Backups,
+//!     which gives each channel the same provider stream id from every active host in its M3U
+//!     account's server group;
+//!   * [`visibility`] — `visibility_preview` / `visibility_apply`: Stream-Mapparr's Manage
+//!     Channel Visibility, which leaves one enabled channel per name group in a profile;
 //!   * [`tools`] — `check_countries`, `scan_placeholders` and `test_rules`, the three
 //!     read-only tools (with [`placeholder_scan`], the numbered-family grouping behind the
 //!     second).
 //!
-//! Mirror, visibility, probe, triage and restore arrive in later steps, so
-//! [`StreamsApp::actions`] registers `validate`, `status`, the `match` and `sort` pairs and
-//! the three tools: the layout is there, the rest is not.
+//! Probe, triage and restore arrive in later steps, so [`StreamsApp::actions`] registers
+//! `validate`, `status`, the `match`, `sort`, `mirror` and `visibility` pairs and the three
+//! tools: the layout is there, the rest is not.
 //!
 //! What the two plugins did that a host does once, this app does not do at all: the dry-run
 //! switch is the preview half of a pair (or `--dry-run`), the schedules, windows and
@@ -33,6 +38,7 @@
 
 pub mod epg;
 pub mod matching;
+pub mod mirror;
 pub mod placeholder_scan;
 pub mod quality;
 pub mod selection;
@@ -41,6 +47,7 @@ pub mod sort;
 #[cfg(test)]
 mod test_support;
 pub mod tools;
+pub mod visibility;
 
 use anyhow::{bail, Result};
 use crosstalk_core::jobs::JobContext;
@@ -60,6 +67,10 @@ pub const ACTION_MATCH_PREVIEW: &str = "match_preview";
 pub const ACTION_MATCH_APPLY: &str = "match_apply";
 pub const ACTION_SORT_PREVIEW: &str = "sort_preview";
 pub const ACTION_SORT_APPLY: &str = "sort_apply";
+pub const ACTION_MIRROR_PREVIEW: &str = "mirror_preview";
+pub const ACTION_MIRROR_APPLY: &str = "mirror_apply";
+pub const ACTION_VISIBILITY_PREVIEW: &str = "visibility_preview";
+pub const ACTION_VISIBILITY_APPLY: &str = "visibility_apply";
 pub const ACTION_CHECK_COUNTRIES: &str = "check_countries";
 pub const ACTION_SCAN_PLACEHOLDERS: &str = "scan_placeholders";
 pub const ACTION_TEST_RULES: &str = "test_rules";
@@ -163,6 +174,53 @@ impl SubApp for StreamsApp {
                  zone's streams from its list. It removes no channel. Continue?",
             ),
             ActionSpec::new(
+                ACTION_MIRROR_PREVIEW,
+                "Fill Mirror Backups (Dry Run)",
+                "Give each in-scope channel the same provider stream id from every active host \
+                 in its M3U account's server group, and write a CSV of the additions. Changes \
+                 nothing.",
+                ActionKind::Read,
+            ),
+            ActionSpec::new(
+                ACTION_MIRROR_APPLY,
+                "Fill Mirror Backups (Apply)",
+                "Insert each channel's backup stream from the other hosts in its server group, \
+                 after its last provider stream and before any trailing custom stream.",
+                // Orange: it rewrites stream lists, but only ever ADDS to them.
+                ActionKind::Write,
+            )
+            .with_confirm(
+                "This ADDS stream(s) to every in-scope channel that is missing a backup from a \
+                 host in its M3U account's server group, inserting them after the channel's last \
+                 provider stream and before any trailing custom stream. It never removes a \
+                 stream, never reorders the ones already there, and each changed channel's \
+                 previous order is recorded in this run's rows. Continue?",
+            ),
+            ActionSpec::new(
+                ACTION_VISIBILITY_PREVIEW,
+                "Manage Channel Visibility (Dry Run)",
+                "Work out which channel of each name group stays enabled in the profile \
+                 (the first with a stream) and write a CSV of every membership that would \
+                 change. Changes nothing.",
+                ActionKind::Read,
+            ),
+            ActionSpec::new(
+                ACTION_VISIBILITY_APPLY,
+                "Manage Channel Visibility (Apply)",
+                "Leave exactly one channel per name group enabled in the profile — the first \
+                 with a stream — and disable every other in-scope channel.",
+                // Red: a disabled channel disappears from the profile's lineup. Nothing is \
+                // deleted, but a whole lineup can go dark if the scope is wrong.
+                ActionKind::Destructive,
+            )
+            .with_confirm(
+                "This DISABLES every in-scope channel in the profile except the first channel \
+                 of each name group that has at least one stream. A group where no channel has \
+                 a stream goes dark entirely, and so does a channel attached to another one. \
+                 Only the channels whose membership actually changes are written, and no \
+                 channel or stream is deleted. Continue?",
+            ),
+            ActionSpec::new(
                 ACTION_CHECK_COUNTRIES,
                 "Check Stream Countries",
                 "Compare the country prefix on every stream's group name with the two-letter \
@@ -250,6 +308,10 @@ impl StreamsApp {
             ACTION_MATCH_APPLY => self.match_streams(context, dry_run).await,
             ACTION_SORT_PREVIEW => self.sort(context, true).await,
             ACTION_SORT_APPLY => self.sort(context, dry_run).await,
+            ACTION_MIRROR_PREVIEW => self.mirror(context, true).await,
+            ACTION_MIRROR_APPLY => self.mirror(context, dry_run).await,
+            ACTION_VISIBILITY_PREVIEW => self.visibility(context, true).await,
+            ACTION_VISIBILITY_APPLY => self.visibility(context, dry_run).await,
             ACTION_CHECK_COUNTRIES => {
                 let settings = self.checked_settings(context)?;
                 tools::run_check_countries(self, context, &settings).await
@@ -276,6 +338,18 @@ impl StreamsApp {
     async fn sort(&self, context: &JobContext, dry_run: bool) -> Result<JobOutcome> {
         let settings = self.checked_settings(context)?;
         sort::run(self, context, &settings, dry_run).await
+    }
+
+    /// Fill each in-scope channel's mirror backups: preview (a read) or apply.
+    async fn mirror(&self, context: &JobContext, dry_run: bool) -> Result<JobOutcome> {
+        let settings = self.checked_settings(context)?;
+        mirror::run(self, context, &settings, dry_run).await
+    }
+
+    /// Manage a profile's channel visibility: preview (a read) or apply.
+    async fn visibility(&self, context: &JobContext, dry_run: bool) -> Result<JobOutcome> {
+        let settings = self.checked_settings(context)?;
+        visibility::run(self, context, &settings, dry_run).await
     }
 
     /// This app's settings, refusing the ones a run would trip over.
@@ -395,6 +469,10 @@ mod tests {
                 ACTION_MATCH_APPLY,
                 ACTION_SORT_PREVIEW,
                 ACTION_SORT_APPLY,
+                ACTION_MIRROR_PREVIEW,
+                ACTION_MIRROR_APPLY,
+                ACTION_VISIBILITY_PREVIEW,
+                ACTION_VISIBILITY_APPLY,
                 ACTION_CHECK_COUNTRIES,
                 ACTION_SCAN_PLACEHOLDERS,
                 ACTION_TEST_RULES
@@ -449,6 +527,36 @@ mod tests {
         let confirm = action.confirm.expect("a write asks first");
         assert!(confirm.contains("stream order"), "{confirm}");
         assert!(confirm.contains("feed zone"), "{confirm}");
+    }
+
+    #[test]
+    fn mirror_apply_adds_and_visibility_apply_disables() {
+        let find = |id: &str| {
+            app()
+                .actions()
+                .into_iter()
+                .find(|action| action.id == id)
+                .unwrap_or_else(|| panic!("{id} is an action"))
+        };
+        // A mirror fill only ever ADDS: orange, and it says so.
+        let mirror = find(ACTION_MIRROR_APPLY);
+        assert_eq!(mirror.kind, ActionKind::Write);
+        let confirm = mirror.confirm.expect("an apply asks first");
+        assert!(confirm.contains("never removes"), "{confirm}");
+        assert!(confirm.contains("previous order"), "{confirm}");
+        assert_eq!(find(ACTION_MIRROR_PREVIEW).kind, ActionKind::Read);
+
+        // Visibility DISABLES channels: red, and it names the profile and the rule.
+        let visibility = find(ACTION_VISIBILITY_APPLY);
+        assert_eq!(visibility.kind, ActionKind::Destructive);
+        let confirm = visibility.confirm.expect("a destructive action asks first");
+        assert!(confirm.contains("DISABLES"), "{confirm}");
+        assert!(confirm.contains("name group"), "{confirm}");
+        assert_eq!(
+            find(ACTION_VISIBILITY_PREVIEW).kind,
+            ActionKind::Read,
+            "a preview is a read"
+        );
     }
 
     #[test]

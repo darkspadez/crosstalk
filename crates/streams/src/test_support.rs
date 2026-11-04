@@ -18,7 +18,7 @@ use crosstalk_core::store::Store;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// An active account, first in every priority list by default.
@@ -398,6 +398,19 @@ impl ServerFixture {
                 ResponseTemplate::new(200)
                     .set_body_json(serde_json::json!({"message": "ok", "channels": []})),
             )
+            .mount(&server)
+            .await;
+        // The visibility write: `PATCH /channels/profiles/{id}/channels/bulk-update/` once per
+        // profile, with the `{"channels": [{channel_id, enabled}]}` body.
+        Mock::given(method("PATCH"))
+            .and(path_regex(
+                r"^/api/channels/profiles/\d+/channels/bulk-update/$",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "updated": 1,
+                "created": 0,
+                "invalid_channels": []
+            })))
             .mount(&server)
             .await;
 

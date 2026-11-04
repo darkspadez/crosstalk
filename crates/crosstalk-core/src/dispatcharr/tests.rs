@@ -25,6 +25,25 @@ fn password_config(base_url: &str) -> DispatcharrConfig {
     }
 }
 
+#[test]
+fn a_channel_carries_attached_channel_id_only_when_the_build_sends_it() {
+    // Dispatcharr's own `Channel` has no `attached_channel` field and its serializer never
+    // sends the key, so a stock listing parses to `None` — the visibility action then treats
+    // every channel as unattached, which is what Stream-Mapparr's `_meta.get_field` guard
+    // amounts to there. A build that does carry the column gets the plugin's rule instead.
+    let stock: Channel = serde_json::from_value(serde_json::json!({
+        "id": 7, "name": "TNT", "streams": [1, 2]
+    }))
+    .expect("a stock channel");
+    assert_eq!(stock.attached_channel_id, None);
+
+    let patched: Channel = serde_json::from_value(serde_json::json!({
+        "id": 8, "name": "TNT", "attached_channel_id": 7
+    }))
+    .expect("a channel with the column");
+    assert_eq!(patched.attached_channel_id, Some(7));
+}
+
 #[tokio::test]
 async fn channels_ask_for_hidden_ones_too() {
     let server = MockServer::start().await;

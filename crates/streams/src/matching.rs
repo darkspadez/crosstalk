@@ -786,13 +786,18 @@ struct Collected {
 }
 
 /// One scoped channel's group membership.
+///
+/// Shared with [`crate::visibility`]: Stream-Mapparr's `_build_channel_groups` is ONE
+/// implementation for Match & Assign, Preview and Manage Channel Visibility (bug-158 review
+/// I1 — a second copy silently re-merged the country-split groups and disabled the very
+/// channel the fix was for). The grouping below is that one implementation here too.
 #[derive(Debug, Clone)]
-struct Group {
+pub(crate) struct Group {
     /// The grouping key, kept for diagnostics (the report names groups by their channels).
     #[allow(dead_code)]
-    key: String,
+    pub(crate) key: String,
     /// Positions in [`RunData`]'s scoped channel list, in channel order.
-    members: Vec<usize>,
+    pub(crate) members: Vec<usize>,
 }
 
 /// The result of one group: its collection and the assignments for its channels.
@@ -848,7 +853,10 @@ impl Assignment {
 /// callsign, which none of the shipped databases do — country-qualified with `@@<code>` when
 /// the country filter is on and the channel is not OTA. A channel whose country cannot be
 /// resolved is not qualified (the plugin's fail-open rule).
-fn build_groups(
+///
+/// `pub(crate)` because [`crate::visibility`] groups through this same function: the plugin
+/// shares one grouping between match and visibility, and so does this crate.
+pub(crate) fn build_groups(
     channels: &[Channel],
     database: &ChannelDatabase,
     normalizer: &Normalizer,
@@ -2316,8 +2324,12 @@ fn collect_group(
     }
 }
 
-/// `_sort_channels_by_priority` (8217): quality tag first, then channel number, stable.
-fn sort_channels_by_priority(group: &Group, channels: &[Channel]) -> Vec<usize> {
+/// `Plugin._sort_channels_by_priority` (8217): quality tag first, then channel number.
+///
+/// Returns positions into `channels`, stable, so ties keep world order (as Python's `sorted`
+/// does). [`crate::visibility`] reads the same priority order, which is what makes its
+/// "first eligible channel of the group" agree with the group leader match uses.
+pub(crate) fn sort_channels_by_priority(group: &Group, channels: &[Channel]) -> Vec<usize> {
     let mut sorted = group.members.clone();
     // `sorted(channels, key=(quality_index, channel_number))`: stable, so two channels equal
     // on both keys keep world order (Python's `sorted` and `slice::sort_by` agree).

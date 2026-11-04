@@ -177,9 +177,9 @@ no daemon restart (a run already in progress finishes with the settings it start
 
 Every action below belongs to the `guide` app (`crosstalk run guide <action>`). The `streams`
 app declares its own list in `crates/streams/src/lib.rs` and currently exposes `validate`,
-`status`, the `match_*` and `sort_*` pairs and the three read-only tools `check_countries`,
-`scan_placeholders` and `test_rules`; its `mirror_*`, `probe`, `triage_*`, `restore_*` and
-`visibility_*` pairs arrive with the rest of phase 2. The tools write a CSV and a summary and
+`status`, the `match_*`, `sort_*`, `mirror_*` and `visibility_*` pairs and the three
+read-only tools `check_countries`, `scan_placeholders` and `test_rules`; its `probe`,
+`triage_*` and `restore_*` pairs arrive with the rest of phase 2. The tools write a CSV and a summary and
 change nothing: `check_countries` compares each stream's group-country label with its guide-id
 suffix, `scan_placeholders` lists the numbered name families the placeholder patterns miss and
 the regex to paste for each, and `test_rules` shows what the stream-name regex rules would do to
@@ -375,6 +375,13 @@ the `streams.match` rows are differences from Stream-Mapparr.
 | Difference | Reason |
 |---|---|
 | `streams.match_apply` only writes channels whose list changed | The plugin deletes and recreates every matched channel's list; crosstalk plans a stream-list write only where the list actually differs. Same end state, so a second run over an unchanged library writes nothing. |
+| `streams.mirror_apply` leaves a channel holding a dangling stream id alone | The plugin plans such a channel from its join (which drops the id) and then refuses it at the locked re-read (which still sees it). crosstalk plans it the same way and never writes it, instead of rewriting the list without the id. The CSV still lists the planned additions with a `skipped` status, and the readout counts match the plugin's. |
+| `streams.mirror_*` reads streams from one loaded pool | The stream list over REST omits streams on inactive M3U accounts, so a channel holding one of those is left alone too — strictly less than the plugin writes there, never more. |
+| `streams.mirror_apply` records the previous order in the run store, not a snapshot file | The plugin refuses to write unless it first saved every changed channel's order to a snapshot file, and skips a channel that moved mid-run. crosstalk plans and writes one world snapshot: what the run reports as `before` is what Dispatcharr held when the run started, and a concurrent edit after that is overwritten rather than detected. Same trade as every other channel-write action. |
+| `streams.visibility_apply` writes only the memberships that move | The plugin disables every channel in scope and re-enables the winners — two bulk updates touching rows that end up unchanged. crosstalk writes the end state as per-channel values, so a channel already holding its value is a skipped row, not a write. Same end state. |
+| `streams.visibility_apply` writes the first named profile that exists | Stream-Mapparr's `profile_name` list resolves to `profile_ids[0]` for the write while every named profile widens the channel set; crosstalk does exactly that. With a single profile the action only ever disables. |
+| `streams.visibility_apply` creates the membership row a winner is missing | The plugin's two `update(enabled=...)` statements touch existing rows only, so a channel with no row in the profile stays hidden even as the winner. The membership write goes through `PATCH .../bulk-update/`, which creates a missing row, so a rowless winner becomes visible. Rowless losers agree either way and are never written. In practice every channel has a row in every profile; the parity harness covers the sparse shape with the divergence counted. |
+| `streams.visibility_*` reads Dispatcharr live, not the last load snapshot | The plugin reads its `processed_data` file and refuses to run without it. A channel created since the last load takes part here. |
 | `streams.match_preview` drops the plugin's threshold-analysis advice rows | Preview also re-ran the pipeline at 5-point thresholds and collected by exact match against the winning stream name; the plugin itself notes that path disagrees with the real matcher. Those rows were advice, never a write. |
 | With `filter_dead_streams` on, match also excludes store probe verdicts | The plugin only reads `stream_stats` (empty, 0 width/height, `0x0`); crosstalk reproduces that test exactly and additionally skips streams the probe recorded as `dead` in the store — the same verdict, kept where a rerun can see it. |
 | EPG placeholder titles come from one batched read | The plugin queries the programme table per EPG record and memoizes per pass (~8600 queries in one pass before the cache existed). crosstalk resolves the record ids a run can actually reach — a placeholder name on a channel, a placeholder or watched name on a stream — and reads them in one chunked `POST /epg/current-programs/`. The cleanup rules, skip titles, "Next Event" gate and watch containment are the plugin's own. |
