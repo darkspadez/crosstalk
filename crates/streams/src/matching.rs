@@ -14,9 +14,11 @@
 //!      cleaned name, or `OTA_<callsign>` for a channel whose database entry carries one,
 //!      country-qualified (`key@@US`) when the country filter is on.
 //!   3. **Collect once per group** — [`collect_for_channel`], `_match_streams_to_channel`:
-//!      the OTA callsign path first, then the fuzzy winner, alias force-includes and the
+//!      the OTA callsign path first, then the fuzzy winner, alias force-includes, the EPG
+//!      watched-stream force-include (when the optional EPG path is on) and the
 //!      token/substring family, then `_finalize_streams` (quality sort, same-country first,
-//!      dedupe).
+//!      dedupe). With the EPG path on, a placeholder channel or stream is matched under the
+//!      programme airing on it — see [`crate::epg`] for that half.
 //!   4. **Assign to the group's channels** — `visible_channel_limit` / zone siblings
 //!      (`_channels_to_update_for_group`), per-channel zone routing and country partition,
 //!      then `_write_channel_streams`'s overwrite-or-append list.
@@ -57,6 +59,7 @@
 //!     the whole list is kept rather than matching nothing.
 //!   * **No AI gate.** The plugin has none, and the plan says not to add one.
 
+use crate::epg::{EpgRun, EpgSettings, EpgTitles};
 use crate::quality::{self, QualityKey, QualityModel, StreamView, ThroughputSource};
 use crate::selection::{self, StreamPool};
 use crate::settings::StreamsSettings;
@@ -391,13 +394,14 @@ struct StreamNames {
 }
 
 impl StreamNames {
-    /// Built over the run's CANDIDATE list, which is the pool minus the streams a probe
-    /// verdict excluded — the same order and length as the candidate index.
-    fn new(pool: &StreamPool<'_>, ids: &[i64], index: &CandidateIndex) -> Self {
-        let match_names: Vec<String> = ids
-            .iter()
-            .map(|id| pool.match_name_of(*id).unwrap_or_default().to_string())
-            .collect();
+    /// Built over the run's candidate names, in the order and length of the candidate index.
+    ///
+    /// The names handed over are the ones MATCHING sees — after the regex rules and, with the
+    /// EPG feature on, after the placeholder substitution — so every predicate below reads the
+    /// same string the index was built from. Reading the pool's own names here instead would
+    /// split the two views apart exactly on the streams EPG resolution rewrote.
+    fn new(match_names: &[String], index: &CandidateIndex) -> Self {
+        let match_names: Vec<String> = match_names.to_vec();
         let tokens = (0..match_names.len())
             .map(|position| {
                 index
@@ -777,6 +781,8 @@ struct Collected {
     /// The plugin's reason string, for the report.
     reason: String,
     country: CountryStats,
+    /// Streams `_collect_epg_watch_streams` force-included for this group.
+    watch_hits: usize,
 }
 
 /// One scoped channel's group membership.
@@ -1071,6 +1077,15 @@ struct RunData<'a> {
     position_of_id: HashMap<i64, usize>,
     /// The quality sort key of each position's stream.
     keys: Vec<QualityKey>,
+    /// EPG-aware placeholder matching, when the feature is on: the resolved current titles and
+    /// the name overrides they allow. `None` when it is off, which is the default.
+    epg: Option<&'a EpgTitles>,
+    /// Positions whose RAW name is on the watched-stream list
+    /// (`_collect_epg_watch_streams`), in pool order. Built once per run, because the plugin's
+    /// scan of every stream per group is the shape this port exists to avoid.
+    watch_positions: Vec<usize>,
+    /// What the stream-side EPG pass did, for the report.
+    epg_run: EpgRun,
     /// `extract_zone(stream['name'])`, from the RAW name, as `_order_streams_for_zone` reads it.
     zones: HashMap<i64, FeedZone>,
     /// The stream's country, per position. Empty when the country filter is off.
@@ -1096,6 +1111,7 @@ impl<'a> RunData<'a> {
         throughput: &dyn ThroughputSource,
         dead: &HashSet<i64>,
         restrict_country: bool,
+        epg: Option<&'a EpgTitles>,
     ) -> Self {
         let tags: Vec<String> = options.ignore_tags.clone();
         let tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
@@ -1132,8 +1148,35 @@ impl<'a> RunData<'a> {
             .iter()
             .map(|id| pool.match_name_of(*id).unwrap_or_default().to_string())
             .collect();
+
+        // `_apply_epg_resolution_to_streams` (3848): a placeholder-named stream's match name
+        // becomes the currently airing programme title. It runs AFTER the regex rules and
+        // overrides their result for placeholder streams only; the RAW name stays everywhere
+        // else (ordering, quality, dedupe, the report).
+        let mut names = names;
+        let mut epg_run = EpgRun::default();
+        if let Some(titles) = epg.filter(|titles| titles.is_enabled()) {
+            for (position, id) in ids.iter().enumerate() {
+                let Some(stream) = pool.get(*id) else {
+                    continue;
+                };
+                let raw = stream.name.as_str();
+                if raw.chars().count() > selection::REGEX_NAME_MAX_LEN {
+                    epg_run.skipped_long += 1;
+                    continue;
+                }
+                if !titles.settings().is_placeholder(raw) {
+                    continue;
+                }
+                epg_run.checked += 1;
+                if let Some(title) = titles.title_for_stream(stream) {
+                    names[position] = title.to_string();
+                    epg_run.resolved += 1;
+                }
+            }
+        }
         let index = CandidateIndex::build_with_tags(&names, &options.matcher, &tag_refs);
-        let stream_names = StreamNames::new(pool, &ids, &index);
+        let stream_names = StreamNames::new(&names, &index);
         let name_index = NameIndex::build(
             &index,
             &stream_names,
@@ -1211,6 +1254,24 @@ impl<'a> RunData<'a> {
             .map(|(position, id)| (*id, position))
             .collect();
 
+        // The watched-stream list, resolved once: a stream whose RAW name is on it can be
+        // force-included on another channel's group when its current programme contains that
+        // channel's name (`_collect_epg_watch_streams`).
+        let mut watch_positions: Vec<usize> = Vec::new();
+        if let Some(titles) = epg.filter(|titles| titles.is_enabled()) {
+            let watch_names = &titles.settings().watch_names;
+            if !watch_names.is_empty() {
+                for (position, id) in ids.iter().enumerate() {
+                    let Some(stream) = pool.get(*id) else {
+                        continue;
+                    };
+                    if watch_names.contains(&stream.name.trim().to_lowercase()) {
+                        watch_positions.push(position);
+                    }
+                }
+            }
+        }
+
         let mut by_country: HashMap<String, Vec<usize>> = HashMap::new();
         let mut known_total = 0;
         if restrict_country {
@@ -1231,6 +1292,9 @@ impl<'a> RunData<'a> {
             ids,
             position_of_id,
             keys,
+            epg,
+            watch_positions,
+            epg_run,
             zones,
             stream_countries,
             by_country,
@@ -1244,6 +1308,15 @@ impl<'a> RunData<'a> {
 
     fn tag_refs(&self) -> Vec<&str> {
         self.tags.iter().map(String::as_str).collect()
+    }
+
+    /// The channel name matching should see: the plugin's local `channel_name`, which the EPG
+    /// path rewrites (schedule cleanup, then the current title for a placeholder).
+    fn matching_channel_name(&self, channel: &Channel) -> String {
+        match self.epg {
+            Some(titles) if titles.is_enabled() => titles.channel_name(channel),
+            _ => channel.name.clone(),
+        }
     }
 
     /// The group label of a channel, as `channel_group__name`.
@@ -1354,7 +1427,13 @@ impl<'a> Collector<'a> {
     fn collect_with(&self, leader: &Channel, all: bool) -> Collected {
         let data = self.data;
         let group_name = data.channel_group_name(leader);
-        let channel_has_max = leader.name.to_lowercase().contains("max");
+        // The plugin's local `channel_name`: the EPG path rewrites it (schedule cleanup, then
+        // the current title for a placeholder) and every MATCHING predicate below reads it.
+        // The OTA callsign and the country filter read the channel's real name, as they do
+        // in the plugin (`_channel_ota_callsign` / `_get_channel_info_and_matches` take the
+        // channel row, not this string).
+        let channel_name = data.matching_channel_name(leader);
+        let channel_has_max = channel_name.to_lowercase().contains("max");
         let callsign = ota_callsign(leader, &data.database, &data.normalizer, &data.tag_refs());
 
         // bug-158/bug-161: the country filter removes proven-foreign streams, is skipped for
@@ -1409,12 +1488,12 @@ impl<'a> Collector<'a> {
             None => None,
         };
 
-        let cleaned_channel = data.clean_channel(&leader.name);
+        let cleaned_channel = data.clean_channel(&channel_name);
         // The family loop compares against the `remove_cinemax` cleaning of the channel name
         // (the plugin passes `channel_has_max` there too), which for every other name is the
         // same string.
         let family_channel = if channel_has_max {
-            data.clean_channel_cinemax(&leader.name)
+            data.clean_channel_cinemax(&channel_name)
         } else {
             cleaned_channel.clone()
         };
@@ -1461,6 +1540,7 @@ impl<'a> Collector<'a> {
                     ids: self.finalize(&matched, same_country.as_ref()),
                     reason: "Callsign match".to_string(),
                     country,
+                    watch_hits: 0,
                 };
             }
         }
@@ -1546,7 +1626,7 @@ impl<'a> Collector<'a> {
         // set has no hit does the sound union decide — and that is what keeps a class of
         // groups cheap at 20k channels, where the union is thousands of streams wide.
         let mut winner: Option<BestMatch> = self.options.matcher.fuzzy_match_in(
-            &leader.name,
+            &channel_name,
             &data.index,
             &data.tag_refs(),
             channel_has_max,
@@ -1554,7 +1634,7 @@ impl<'a> Collector<'a> {
         );
         if winner.is_none() && gate_positions.len() > family_positions.len() {
             winner = self.options.matcher.fuzzy_match_in(
-                &leader.name,
+                &channel_name,
                 &data.index,
                 &data.tag_refs(),
                 channel_has_max,
@@ -1562,18 +1642,29 @@ impl<'a> Collector<'a> {
             );
         }
 
-        let aliases = self.alias_positions(leader, &excluded);
+        let aliases = self.alias_positions(&channel_name, &excluded);
+        // `_collect_epg_watch_streams`: the independent force-include list, exactly like the
+        // alias list — a watched stream keeps matching its own channel by name AND can
+        // surface here.
+        let watch = self.watch_positions(&channel_name, &excluded);
+        let watch_hits = watch.len();
 
-        if winner.is_none() && aliases.is_empty() {
+        if winner.is_none() && aliases.is_empty() && watch.is_empty() {
             return Collected {
                 ids: Vec::new(),
                 reason: "No fuzzy match".to_string(),
                 country,
+                watch_hits: 0,
             };
         }
 
-        let alias_set: HashSet<usize> = aliases.iter().copied().collect();
+        let alias_set: HashSet<usize> = aliases.iter().chain(watch.iter()).copied().collect();
+        // `list(alias_streams) + list(epg_watch_streams)`: the force-includes first, in the
+        // plugin's order. A stream on both lists appears twice here and `_finalize_streams`'
+        // dedupe keeps the first, exactly as the plugin's does.
+        let had_aliases = !aliases.is_empty();
         let mut matched: Vec<usize> = aliases;
+        matched.extend(watch.iter().copied());
         for position in &family_positions {
             if alias_set.contains(position) {
                 continue;
@@ -1599,22 +1690,27 @@ impl<'a> Collector<'a> {
                 ids: Vec::new(),
                 reason: "No fuzzy match".to_string(),
                 country,
+                watch_hits,
             };
         }
         // `_match_streams_to_channel`'s reason: an alias-only group says so, anything the
-        // fuzzy stage found names the stage and its score.
+        // fuzzy stage found names the stage and its score. A group force-included ONLY by the
+        // watched-stream rule keeps the plugin's own wording for that case, which is the
+        // fuzzy report with no winner.
         let reason = match &winner {
             Some(winner) => format!(
                 "Fuzzy match ({}, score: {})",
                 winner.method.label(),
                 winner.score
             ),
-            None => "Alias match".to_string(),
+            None if had_aliases => "Alias match".to_string(),
+            None => "Fuzzy match (None, score: 0)".to_string(),
         };
         Collected {
             ids: self.finalize(&matched, same_country.as_ref()),
             reason,
             country,
+            watch_hits,
         }
     }
 }
@@ -1627,9 +1723,9 @@ impl<'a> Collector<'a> {
     /// one of them, in stream order. Looking the variants up in the no-space block reaches the
     /// same streams (an equal normalised form implies an equal no-space form) and the exact
     /// predicate below rejects anything the block over-collected.
-    fn alias_positions(&self, leader: &Channel, excluded: &dyn Fn(usize) -> bool) -> Vec<usize> {
+    fn alias_positions(&self, channel_name: &str, excluded: &dyn Fn(usize) -> bool) -> Vec<usize> {
         let matcher = &self.options.matcher;
-        let variants = matcher.alias_variants(&leader.name);
+        let variants = matcher.alias_variants(channel_name);
         if variants.is_empty() {
             return Vec::new();
         }
@@ -1684,6 +1780,52 @@ impl<'a> Collector<'a> {
             lows.contains(&lower) || nospaces.contains(&nospace)
         });
         positions
+    }
+
+    /// `_collect_epg_watch_streams` (4045): force-include a watched stream when its CURRENT
+    /// programme title contains every cleaned token of the target channel name.
+    ///
+    /// The "ESPN airs a WWE SummerSlam pre-show" case: the real event never gets its own
+    /// placeholder stream and only ever appears as time-boxed programming on a real,
+    /// permanently-named channel. Deliberately NOT done through the `match_name` override:
+    /// that would stop the watched stream matching its OWN channel.
+    ///
+    /// Token CONTAINMENT is the gate, not whole-string similarity: a real title is the target
+    /// name plus promotional wrapping ("WWE SummerSlam Special"), which dilutes a ratio below
+    /// any reasonable threshold even for a correct hit (the plugin measured 63% against a 70%
+    /// threshold). A channel name that cleans to fewer than two tokens is too generic to gate
+    /// on containment ("Max", "Live", "News" would swallow a watched stream's whole day), so
+    /// it force-includes nothing — and the check happens BEFORE any title is resolved.
+    fn watch_positions(&self, channel_name: &str, excluded: &dyn Fn(usize) -> bool) -> Vec<usize> {
+        let Some(titles) = self.data.epg.filter(|titles| titles.is_enabled()) else {
+            return Vec::new();
+        };
+        if titles.settings().watch_names.is_empty() || self.data.watch_positions.is_empty() {
+            return Vec::new();
+        }
+        let cleaned_channel = self.data.clean_channel(channel_name);
+        let channel_tokens: HashSet<&str> = cleaned_channel.split_whitespace().collect();
+        if channel_tokens.len() < 2 {
+            return Vec::new();
+        }
+        let mut hits: Vec<usize> = Vec::new();
+        for position in &self.data.watch_positions {
+            if excluded(*position) {
+                continue;
+            }
+            let Some(stream) = self.data.pool.get(self.data.ids[*position]) else {
+                continue;
+            };
+            let Some(title) = titles.title_for_stream(stream) else {
+                continue;
+            };
+            let cleaned_title = self.data.clean_channel(title);
+            let title_tokens: HashSet<&str> = cleaned_title.split_whitespace().collect();
+            if channel_tokens.is_subset(&title_tokens) {
+                hits.push(*position);
+            }
+        }
+        hits
     }
 
     /// `_finalize_streams` (5441): quality sort, same-country first, then dedupe.
@@ -1895,6 +2037,9 @@ pub struct MatchOptions {
     pub filter_dead_streams: bool,
     /// Streams a probe verdict found dead: not candidates when the dead filter is on.
     pub dead_streams: HashSet<i64>,
+    /// The EPG placeholder titles a run resolved, when `epg_placeholder_matching_enabled` is
+    /// on. `None` — the default — is the plugin's default too: names match as they are written.
+    pub epg: Option<Arc<EpgTitles>>,
 }
 
 impl MatchOptions {
@@ -1945,7 +2090,14 @@ impl MatchOptions {
             prefix_countries: parse_prefix_country_overrides(&settings.stream_prefix_countries),
             database,
             dead_streams: HashSet::new(),
+            epg: None,
         }
+    }
+
+    /// Carry the EPG placeholder titles this run resolved (see [`crate::epg`]).
+    pub fn with_epg(mut self, titles: Arc<EpgTitles>) -> Self {
+        self.epg = Some(titles);
+        self
     }
 }
 
@@ -1977,6 +2129,8 @@ pub struct MatchOutcome {
     pub dead_filtered: usize,
     /// OTA-only mode's skips.
     pub ota: Option<OtaSkipped>,
+    /// What EPG-aware placeholder matching did, when it is on.
+    pub epg: Option<EpgRun>,
 }
 
 impl MatchOutcome {
@@ -2027,6 +2181,9 @@ pub fn plan(
         pool: pool.stats.clone(),
         ..MatchOutcome::default()
     };
+    if options.epg.is_some() {
+        outcome.epg = Some(EpgRun::default());
+    }
     outcome.dead_filtered = if options.filter_dead_streams {
         pool.eligible
             .iter()
@@ -2061,6 +2218,7 @@ pub fn plan(
         throughput,
         &options.dead_streams,
         options.restrict_matching_to_country,
+        options.epg.as_deref(),
     );
     let tag_refs = data.tag_refs();
     let groups = build_groups(
@@ -2086,7 +2244,16 @@ pub fn plan(
         .collect();
     for result in results {
         outcome.country.merge(result.collected.country);
+        if let Some(epg) = outcome.epg.as_mut() {
+            epg.watch_hits += result.collected.watch_hits;
+        }
         outcome.assignments.extend(result.assignments);
+    }
+    // The stream-side pass ran once, in `RunData::new`, before the groups.
+    if let Some(epg) = outcome.epg.as_mut() {
+        epg.checked = data.epg_run.checked;
+        epg.resolved = data.epg_run.resolved;
+        epg.skipped_long = data.epg_run.skipped_long;
     }
     Ok(outcome)
 }
@@ -2421,7 +2588,16 @@ fn ota_plan(
         throughput,
         &options.dead_streams,
         false,
+        options.epg.as_deref(),
     );
+    if options.epg.is_some() {
+        outcome.epg = Some(EpgRun {
+            checked: data.epg_run.checked,
+            resolved: data.epg_run.resolved,
+            skipped_long: data.epg_run.skipped_long,
+            watch_hits: 0,
+        });
+    }
     let known = crosstalk_matching::data::stream_mapparr_known_callsigns();
     let mut skipped = OtaSkipped::default();
     let mut assignments: Vec<Assignment> = Vec::with_capacity(channels.len());
@@ -2551,12 +2727,17 @@ pub async fn run(
 
     // Every slice a match reads: channels (their own lists), groups (labels, stream groups,
     // zone bases), profiles (the scope's profile filter), streams (names, stats, accounts,
-    // custom flag) and the M3U accounts (priority order). No EPG: placeholder matching is off.
-    let kinds = WorldKinds::only(WorldKind::Channels)
+    // custom flag) and the M3U accounts (priority order). EPG entries are loaded only when
+    // placeholder matching is on: they are the `tvg_id` -> EPG record join it needs.
+    let epg_settings = EpgSettings::from_settings(settings);
+    let mut kinds = WorldKinds::only(WorldKind::Channels)
         | WorldKind::Groups
         | WorldKind::Profiles
         | WorldKind::Streams
         | WorldKind::M3uAccounts;
+    if epg_settings.enabled {
+        kinds = kinds | WorldKind::EpgEntries;
+    }
     context.progress(&crosstalk_core::jobs::ProgressEvent::new(
         "streams.match",
         0,
@@ -2566,6 +2747,63 @@ pub async fn run(
     let world = Arc::new(client.load_world_with(kinds).await?);
 
     let mut options = MatchOptions::new(settings, &context.config().matching);
+    // EPG-aware placeholder matching: resolve the titles BEFORE the blocking pass, in ONE
+    // batched read for the entries a placeholder or watched name can actually reach. The
+    // plugin asks the programme table per lookup (memoized per pass); this asks once.
+    let mut epg_error: Option<String> = None;
+    let mut epg_timezone_error: Option<String> = None;
+    if epg_settings.enabled {
+        let scoped = scope_channels(&world, &scope)?;
+        // The "Next Event" gate compares an embedded date against today in Dispatcharr's
+        // own timezone (what the plugin reads in-process), fetched once per run. A settings
+        // read that fails degrades to the host's date rather than refusing the match.
+        let today = match client.system_timezone().await {
+            Ok(zone) => {
+                tracing::info!("streams.match: Dispatcharr timezone is {zone}");
+                crosstalk_core::dispatcharr::today_in_zone(&zone)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "streams.match: could not read Dispatcharr's timezone, so the EPG \
+                     date gate uses the host's date for this run: {error:#}"
+                );
+                epg_timezone_error = Some(format!("{error:#}"));
+                crate::epg::local_today()
+            }
+        };
+        let mut titles = EpgTitles::prepare(epg_settings.clone(), &world.entries, today);
+        let needed = titles.needed_ids(&scoped.channels, &world.streams);
+        tracing::info!(
+            "streams.match: EPG placeholder matching compiled {} of {} pattern(s); asking about \
+             {} EPG entr{}",
+            epg_settings.patterns.len(),
+            epg_settings.pattern_report.len(),
+            needed.len(),
+            if needed.len() == 1 { "y" } else { "ies" }
+        );
+        if !needed.is_empty() {
+            context.progress(&crosstalk_core::jobs::ProgressEvent::new(
+                "streams.match",
+                0,
+                0,
+                "reading what is airing on the placeholder slots",
+            ));
+            // Degrade-don't-fail, like every other EPG read in the plugin: a guide that
+            // cannot be read leaves the names as they are written, and the report says so.
+            // Refusing the run instead would block a whole match over one auxiliary read.
+            match client.current_programs(&needed).await {
+                Ok(programmes) => titles.set_programmes(&programmes),
+                Err(error) => {
+                    tracing::warn!(
+                        "streams.match: could not read what is airing, so EPG placeholder \
+                         matching is skipped for this run: {error:#}"
+                    );
+                    epg_error = Some(format!("{error:#}"));
+                }
+            }
+        }
+        options = options.with_epg(Arc::new(titles));
+    }
     // The store's `stream_health` verdicts join `stream_stats` as dead evidence, but only
     // when the dead filter is on, as in the plugin. A context with no store matches as the
     // plugin does without IPTV Checker metadata: nothing is store-dead.
@@ -2716,6 +2954,35 @@ pub async fn run(
                     .count(),
             ),
         );
+    if let Some(epg) = outcome.epg.as_ref() {
+        let epg_state = match &epg_error {
+            Some(error) => format!("current programmes could not be read ({error})"),
+            None => epg.summary(),
+        };
+        spec = spec.note(
+            "EPG placeholder matching",
+            format!(
+                "{} pattern(s); {} — {} force-included by the watched-stream rule, {} name(s) \
+                 over {} characters skipped",
+                EpgSettings::from_settings(settings).patterns.len(),
+                epg_state,
+                epg.watch_hits,
+                epg.skipped_long,
+                selection::REGEX_NAME_MAX_LEN,
+            ),
+        );
+        // The date gate ran on the host's date, not Dispatcharr's, so a boundary-day
+        // title may have resolved differently than in the plugin. The log carries both.
+        if let Some(error) = &epg_timezone_error {
+            spec = spec.note(
+                "Dispatcharr timezone",
+                format!(
+                    "the system timezone could not be read ({error}), so the EPG date \
+                     gate used the host's date for this run"
+                ),
+            );
+        }
+    }
     if settings.restrict_matching_to_country {
         spec = spec.note(
             "Country filter",
@@ -3746,6 +4013,7 @@ mod tests {
             &throughput,
             &options.dead_streams,
             options.restrict_matching_to_country,
+            options.epg.as_deref(),
         );
         let tags = data.tag_refs();
         let scoped = scope_channels(world, &ScopeConfig::default()).expect("scope");
@@ -3922,6 +4190,408 @@ mod tests {
         .await
         .expect_err("no Dispatcharr");
         assert!(format!("{error:#}").contains("Dispatcharr"), "{error:#}");
+    }
+
+    // -----------------------------------------------------------------------------------
+    // EPG-aware placeholder matching
+    // -----------------------------------------------------------------------------------
+
+    fn epg_settings(overrides: &str) -> StreamsSettings {
+        StreamsSettings {
+            epg_placeholder_matching_enabled: true,
+            epg_placeholder_name_patterns: overrides.to_string(),
+            ..StreamsSettings::default()
+        }
+    }
+
+    fn programme(epg_data_id: i64, title: &str) -> crosstalk_core::dispatcharr::CurrentProgram {
+        crosstalk_core::dispatcharr::CurrentProgram {
+            epg_data_id,
+            title: title.to_string(),
+            ..crosstalk_core::dispatcharr::CurrentProgram::default()
+        }
+    }
+
+    fn epg_world() -> World {
+        World {
+            channels: vec![
+                Channel {
+                    id: 1,
+                    name: "PPV EVENT 04".to_string(),
+                    channel_number: Some(json!(1)),
+                    channel_group_id: Some(TVE),
+                    epg_data_id: Some(7),
+                    streams: Vec::new(),
+                    ..Channel::default()
+                },
+                Channel {
+                    id: 2,
+                    name: "WWE SummerSlam".to_string(),
+                    channel_number: Some(json!(2)),
+                    channel_group_id: Some(TVE),
+                    streams: Vec::new(),
+                    ..Channel::default()
+                },
+            ],
+            streams: vec![
+                stream(10, "WWE SummerSlam", Some(1), Some(TVE)),
+                stream(11, "PPV EVENT 04", Some(1), Some(TVE)),
+                stream(12, "ESPN", Some(1), Some(TVE)),
+                stream(13, "PPV EVENT 09", Some(1), Some(TVE)),
+            ],
+            entries: vec![
+                crosstalk_core::dispatcharr::EpgEntry {
+                    id: 7,
+                    name: "PPV 04".to_string(),
+                    tvg_id: "ppv04.us".to_string(),
+                    epg_source: Some(1),
+                },
+                crosstalk_core::dispatcharr::EpgEntry {
+                    id: 8,
+                    name: "ESPN".to_string(),
+                    tvg_id: "espn.us".to_string(),
+                    epg_source: Some(1),
+                },
+            ],
+            m3u_accounts: accounts(),
+            groups: groups(),
+            ..World::default()
+        }
+    }
+
+    /// Plan with the EPG titles a run would have resolved, so the collector sees exactly what
+    /// the action hands it.
+    fn plan_with_epg(
+        world: &World,
+        settings: &StreamsSettings,
+        programmes: &[crosstalk_core::dispatcharr::CurrentProgram],
+    ) -> MatchOutcome {
+        let mut options = match_options(settings);
+        if settings.epg_placeholder_matching_enabled {
+            let epg = crate::epg::EpgSettings::from_settings(settings);
+            let mut titles = EpgTitles::prepare(epg, &world.entries, (8, 5));
+            titles.set_programmes(programmes);
+            options = options.with_epg(Arc::new(titles));
+        }
+        let throughput = quality::MemoryThroughputSource::new();
+        plan(
+            world,
+            &ScopeConfig::default(),
+            settings,
+            &options,
+            &throughput,
+        )
+        .expect("plan")
+    }
+
+    #[test]
+    fn a_placeholder_channel_is_matched_under_its_current_title() {
+        let world = epg_world();
+        let settings = epg_settings(r"^PPV EVENT \d+$");
+        let outcome = plan_with_epg(&world, &settings, &[programme(7, "WWE SummerSlam")]);
+        let row = assignment(&outcome, 1);
+        // The channel's own name would have matched stream 11 ("PPV EVENT 04"); under the
+        // resolved title it matches the event stream instead.
+        assert_eq!(row.after, vec![10], "{row:?}");
+        assert_eq!(row.matched, 1);
+        // The stream side resolves the same title, so the two placeholder names still collect
+        // each other's streams: stream 11's match name became "WWE SummerSlam" too.
+        assert!(outcome.epg.is_some());
+    }
+
+    #[test]
+    fn a_placeholder_stream_is_matched_under_its_current_title() {
+        // The concrete case the feature exists for: the CHANNEL carries the real name and the
+        // provider's stream is the generic slot.
+        let world = World {
+            streams: vec![
+                stream(11, "PPV EVENT 04", Some(1), Some(TVE)),
+                stream(13, "PPV EVENT 09", Some(1), Some(TVE)),
+            ],
+            entries: vec![crosstalk_core::dispatcharr::EpgEntry {
+                id: 7,
+                name: "PPV 04".to_string(),
+                tvg_id: "ppv04.us".to_string(),
+                epg_source: Some(1),
+            }],
+            ..World {
+                channels: vec![Channel {
+                    id: 2,
+                    name: "WWE SummerSlam".to_string(),
+                    channel_number: Some(json!(2)),
+                    channel_group_id: Some(TVE),
+                    streams: Vec::new(),
+                    ..Channel::default()
+                }],
+                streams: Vec::new(),
+                m3u_accounts: accounts(),
+                groups: groups(),
+                ..World::default()
+            }
+        };
+        // Give the placeholder stream its guide id, which the fixture helper does not set.
+        let mut world = world;
+        world.streams[0].tvg_id = "ppv04.us".to_string();
+        let settings = epg_settings(r"^PPV EVENT \d+$");
+        let outcome = plan_with_epg(&world, &settings, &[programme(7, "WWE SummerSlam")]);
+        let row = assignment(&outcome, 2);
+        assert_eq!(row.after, vec![11], "{row:?}");
+        // `PPV EVENT 09` has no guide id, so it keeps its own name and matches nothing.
+        assert_eq!(row.reason, "Fuzzy match (exact, score: 100)");
+    }
+
+    #[test]
+    fn a_watched_stream_is_force_included_when_its_programme_contains_the_channel_name() {
+        let mut world = epg_world();
+        world.streams[2].tvg_id = "espn.us".to_string();
+        let settings = StreamsSettings {
+            epg_watch_source_streams: "ESPN".to_string(),
+            ..epg_settings(r"^PPV EVENT \d+$")
+        };
+        let outcome = plan_with_epg(
+            &world,
+            &settings,
+            &[
+                programme(7, "WWE SummerSlam"),
+                programme(8, "WWE SummerSlam Special"),
+            ],
+        );
+        let row = assignment(&outcome, 2);
+        // The watched ESPN stream joins the family hit on the event's own name.
+        assert!(row.after.contains(&12), "{row:?}");
+        assert!(row.after.contains(&10), "{row:?}");
+        // Two groups force-included it: the event channel's own, and the placeholder
+        // channel's, whose resolved title is the same event. The plugin counts per call, so
+        // this is the same tally it would report over the same pass.
+        assert_eq!(outcome.epg.map(|epg| epg.watch_hits), Some(2));
+    }
+
+    #[test]
+    fn a_watched_stream_needs_every_channel_token_and_two_of_them() {
+        let mut world = epg_world();
+        world.streams[2].tvg_id = "espn.us".to_string();
+        let settings = StreamsSettings {
+            epg_watch_source_streams: "ESPN".to_string(),
+            ..epg_settings(r"^PPV EVENT \d+$")
+        };
+        // "SummerSlam 2026 Kickoff" drops the "WWE" token: the real but weaker guide entry the
+        // plugin's test says must not match.
+        let outcome = plan_with_epg(
+            &world,
+            &settings,
+            &[
+                programme(7, "WWE SummerSlam"),
+                programme(8, "SummerSlam 2026 Kickoff"),
+            ],
+        );
+        assert!(!assignment(&outcome, 2).after.contains(&12));
+        assert_eq!(outcome.epg.map(|epg| epg.watch_hits), Some(0));
+
+        // A single-token channel name is too generic to gate on containment at all
+        // ("Max", "Live", "News" would swallow a watched stream's whole day).
+        let mut world = world.clone();
+        world.channels[1].name = "Max".to_string();
+        let outcome = plan_with_epg(
+            &world,
+            &settings,
+            &[
+                programme(7, "WWE SummerSlam"),
+                programme(8, "WWE SummerSlam Special"),
+            ],
+        );
+        assert!(!assignment(&outcome, 2).after.contains(&12));
+    }
+
+    #[test]
+    fn the_feature_off_matches_the_names_as_written() {
+        let world = epg_world();
+        let outcome = plan_match(&world, &StreamsSettings::default());
+        assert!(outcome.epg.is_none());
+        // Off is the plugin's default: "PPV EVENT 04" matches its own slot stream, not .
+        assert_eq!(assignment(&outcome, 1).after, vec![11]);
+    }
+
+    #[test]
+    fn a_skip_title_and_an_old_next_event_clause_resolve_to_nothing() {
+        let world = epg_world();
+        let settings = epg_settings(r"^PPV EVENT \d+$");
+        let outcome = plan_with_epg(
+            &world,
+            &settings,
+            &[
+                programme(7, "No Event Today"),
+                programme(8, "Next Event: WWE SummerSlam at 05:00PM on Aug 9"),
+            ],
+        );
+        // Nothing resolved: the channel keeps its own placeholder name.
+        assert_eq!(assignment(&outcome, 1).after, vec![11]);
+        assert_eq!(outcome.epg.map(|epg| epg.resolved), Some(0));
+    }
+
+    #[test]
+    fn a_channel_carrying_an_inline_schedule_is_cleaned_before_matching() {
+        // Without the schedule strip, the trailing "| Monday @ 5" dilutes the score against the
+        // resolved title and its stray digit trips the channel-has-numbers guard.
+        let world = World {
+            channels: vec![Channel {
+                id: 5,
+                name: "WWE SummerSlam | Monday @ 5".to_string(),
+                channel_number: Some(json!(5)),
+                channel_group_id: Some(TVE),
+                streams: Vec::new(),
+                ..Channel::default()
+            }],
+            streams: vec![stream(30, "WWE SummerSlam", Some(1), Some(TVE))],
+            m3u_accounts: accounts(),
+            groups: groups(),
+            ..World::default()
+        };
+        let settings = epg_settings(r"^PPV EVENT \d+$");
+        let outcome = plan_with_epg(&world, &settings, &[]);
+        assert_eq!(assignment(&outcome, 5).after, vec![30]);
+    }
+
+    #[tokio::test]
+    async fn nothing_is_asked_of_the_guide_when_no_name_can_use_it() {
+        // The feature is on but every name is a real one: no entry is needed, so the run must
+        // not spend a request on the guide at 50k streams.
+        let mut world = epg_world();
+        world.channels[0].name = "ESPN2".to_string();
+        world.channels[0].epg_data_id = Some(7);
+        world.channels[0].streams = vec![12];
+        world.streams = vec![crosstalk_core::dispatcharr::Stream {
+            id: 12,
+            name: "ESPN2".to_string(),
+            m3u_account: Some(1),
+            channel_group: Some(TVE),
+            ..Stream::default()
+        }];
+        let fixture = ServerFixture::start_with_programmes(&world, Vec::new()).await;
+        let store = fixture.store();
+        let context = fixture.context_for_run("match_preview", &store, true);
+        let settings = epg_settings(r"^PPV EVENT \d+$");
+        run(&crate::StreamsApp::new(), &context, &settings, true)
+            .await
+            .expect("preview");
+        let bodies = fixture.bodies("POST", "/api/epg/current-programs/").await;
+        assert!(bodies.is_empty(), "{bodies:?}");
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_guide_degrades_to_matching_the_names_as_written() {
+        // The plugin treats every EPG lookup failure as "no title" and proceeds; a run that
+        // refused the whole match over one auxiliary read would be worse than the plugin.
+        let mut world = epg_world();
+        world.channels[0].streams = vec![11];
+        let fixture = ServerFixture::start_with_epg_error(&world).await;
+        let store = fixture.store();
+        let context = fixture.context_for_run("match_preview", &store, true);
+        let settings = epg_settings(r"^PPV EVENT \d+$");
+        let outcome = run(&crate::StreamsApp::new(), &context, &settings, true)
+            .await
+            .expect("preview still runs");
+        // The event channel still matches by its own name; the placeholder's group matched
+        // only its own slot stream, so it is unchanged and the run is not refused.
+        assert_eq!(outcome.counts.get("changes"), Some(&1));
+        assert!(
+            outcome.summary.contains("Dry run complete"),
+            "{}",
+            outcome.summary
+        );
+        let report = std::fs::read_to_string(outcome.report_path.expect("report")).expect("read");
+
+        assert!(
+            report.contains("current programmes could not be read"),
+            "the report says the guide was unreadable"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_timezone_degrades_to_the_host_date_and_says_so() {
+        // The settings read is auxiliary, like the guide read: a 500 there must not refuse
+        // the match, but the report must admit the date gate ran on the host's date.
+        let mut world = epg_world();
+        world.channels[0].streams = vec![11];
+        let fixture = ServerFixture::start_with_timezone_error(&world).await;
+        let store = fixture.store();
+        let context = fixture.context_for_run("match_preview", &store, true);
+        let settings = epg_settings(r"^PPV EVENT \d+$");
+        let outcome = run(&crate::StreamsApp::new(), &context, &settings, true)
+            .await
+            .expect("preview still runs");
+        assert_eq!(outcome.counts.get("changes"), Some(&1));
+        let report = std::fs::read_to_string(outcome.report_path.expect("report")).expect("read");
+        assert!(
+            report.contains("host's date"),
+            "the report admits the fallback: {report}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_timezone_is_read_once_per_run_and_only_when_the_epg_path_is_on() {
+        // One `GET /core/settings/` per run, and only when placeholder matching is on:
+        // with the feature off the date gate never runs, so the run must not spend the
+        // request at all.
+        let mut world = epg_world();
+        world.channels[0].streams = vec![11];
+        let fixture = ServerFixture::start_with_programmes(&world, Vec::new()).await;
+        let store = fixture.store();
+        let context = fixture.context_for_run("match_preview", &store, true);
+        run(
+            &crate::StreamsApp::new(),
+            &context,
+            &StreamsSettings::default(),
+            true,
+        )
+        .await
+        .expect("preview");
+        assert_eq!(
+            fixture.request_count("GET", "/api/core/settings/").await,
+            0,
+            "the date gate is off, so no timezone is read"
+        );
+
+        let fixture = ServerFixture::start_with_programmes(&world, Vec::new()).await;
+        let store = fixture.store();
+        let context = fixture.context_for_run("match_preview", &store, true);
+        run(
+            &crate::StreamsApp::new(),
+            &context,
+            &epg_settings(r"^PPV EVENT \d+$"),
+            true,
+        )
+        .await
+        .expect("preview");
+        assert_eq!(
+            fixture.request_count("GET", "/api/core/settings/").await,
+            1,
+            "the zone is read once per run, not once per lookup"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_reads_the_placeholder_titles_in_one_batched_request() {
+        let mut world = epg_world();
+        world.channels[0].streams = vec![11];
+        let fixture =
+            ServerFixture::start_with_programmes(&world, vec![programme(7, "WWE SummerSlam")])
+                .await;
+        let store = fixture.store();
+        let context = fixture.context_for_run("match_preview", &store, true);
+        let settings = epg_settings(r"^PPV EVENT \d+$");
+        let outcome = run(&crate::StreamsApp::new(), &context, &settings, true)
+            .await
+            .expect("preview");
+        assert!(
+            outcome.summary.contains("Would update"),
+            "{}",
+            outcome.summary
+        );
+        // One request for the entries the run can reach, and only the ones it can reach: the
+        // channel's epg_data_id and the placeholder stream's tvg_id both point at entry 7.
+        let bodies = fixture.bodies("POST", "/api/epg/current-programs/").await;
+        assert_eq!(bodies.len(), 1, "{bodies:?}");
+        assert_eq!(bodies[0], json!({"epg_data_ids": [7]}));
     }
 
     /// A synthetic world of `channels` channels and 2.5×`channels` streams over 100 accounts

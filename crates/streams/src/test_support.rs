@@ -11,7 +11,7 @@
 
 use crosstalk_core::config::CrosstalkConfig;
 use crosstalk_core::dispatcharr::{
-    Channel, ChannelGroup, DispatcharrClient, M3uAccount, Stream, World,
+    Channel, ChannelGroup, CurrentProgram, DispatcharrClient, M3uAccount, Stream, World,
 };
 use crosstalk_core::jobs::{JobContext, VecSink};
 use crosstalk_core::store::Store;
@@ -303,6 +303,32 @@ pub struct ServerFixture {
 
 impl ServerFixture {
     pub async fn start(world: &World) -> Self {
+        Self::start_with_programmes(world, Vec::new()).await
+    }
+
+    /// The same, with what `/epg/current-programs/` answers: the EPG placeholder path's one
+    /// batched read.
+    pub async fn start_with_programmes(world: &World, programmes: Vec<CurrentProgram>) -> Self {
+        Self::start_inner(world, programmes, 200, 200).await
+    }
+
+    /// The same, with the EPG read failing: the run must degrade, not abort.
+    pub async fn start_with_epg_error(world: &World) -> Self {
+        Self::start_inner(world, Vec::new(), 500, 200).await
+    }
+
+    /// The same, with the system-timezone read failing: the date gate must fall back to
+    /// the host's date, say so in the report, and still run.
+    pub async fn start_with_timezone_error(world: &World) -> Self {
+        Self::start_inner(world, Vec::new(), 200, 500).await
+    }
+
+    async fn start_inner(
+        world: &World,
+        programmes: Vec<CurrentProgram>,
+        epg_status: u16,
+        timezone_status: u16,
+    ) -> Self {
         let server = MockServer::start().await;
         let list = |items: serde_json::Value| ResponseTemplate::new(200).set_body_json(items);
 
@@ -335,6 +361,35 @@ impl ServerFixture {
             .respond_with(list(
                 serde_json::to_value(&world.m3u_accounts).expect("accounts"),
             ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/epg/epgdata/"))
+            .respond_with(list(serde_json::to_value(&world.entries).expect("entries")))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/epg/current-programs/"))
+            .respond_with(if epg_status == 200 {
+                list(serde_json::to_value(&programmes).expect("programmes"))
+            } else {
+                ResponseTemplate::new(epg_status).set_body_string("no guide for you")
+            })
+            .mount(&server)
+            .await;
+        // Dispatcharr's configured timezone, read once per EPG run for the "Next Event"
+        // date gate (see `DispatcharrClient::system_timezone`).
+        Mock::given(method("GET"))
+            .and(path("/api/core/settings/"))
+            .respond_with(if timezone_status == 200 {
+                list(serde_json::json!([
+                    {"id": 1, "key": "stream_settings", "name": "Stream", "value": {}},
+                    {"id": 2, "key": "system_settings", "name": "System",
+                     "value": {"time_zone": "UTC"}},
+                ]))
+            } else {
+                ResponseTemplate::new(timezone_status).set_body_string("no settings for you")
+            })
             .mount(&server)
             .await;
         Mock::given(method("PATCH"))
@@ -377,6 +432,21 @@ impl ServerFixture {
         JobContext::new(Arc::new(self.config.clone()), Arc::new(VecSink::new()))
             .with_dispatcharr(self.client())
             .for_run(run_id, store.clone(), Arc::new(AtomicBool::new(false)))
+    }
+
+    /// How many requests were received for one path and method.
+    ///
+    /// Separate from [`Self::bodies`]: a GET carries no JSON body to parse, so counting
+    /// is the only read that works for them (the timezone and entry listings).
+    pub async fn request_count(&self, method_name: &str, path: &str) -> usize {
+        self.server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|request| request.method.as_str() == method_name)
+            .filter(|request| request.url.path() == path)
+            .count()
     }
 
     /// The JSON bodies of every request received for one path and method.

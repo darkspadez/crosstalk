@@ -222,6 +222,23 @@ impl RuleSet {
         }
     }
 
+    /// Apply the rules to ONE name, in order, with no containment bookkeeping.
+    ///
+    /// The EPG paths clean a single string at a time — a programme title, a channel name — and
+    /// the plugin runs exactly this: `for compiled, replacement: cleaned = compiled.sub(...)`.
+    /// The per-name growth revert is not applied here because a title is bounded by the guide
+    /// row, not by an operator's rule set; the stream-name pass keeps it (see [`Self::apply`]).
+    pub fn apply_to_str(&self, name: &str) -> String {
+        let mut result = name.to_string();
+        for rule in &self.rules {
+            result = rule
+                .regex
+                .replace_all(&result, rule.replacement.as_str())
+                .into_owned();
+        }
+        result
+    }
+
     /// Apply every rule to every name, stamping the name matching should see.
     ///
     /// Faithful to `_apply_regex_rules_to_streams`, containment included: a name over
@@ -229,7 +246,7 @@ impl RuleSet {
     /// `max(4x, 1000)` characters reverts to what the offending rule received and stops there,
     /// and the whole pass gives up after [`REGEX_PASS_BUDGET`] (reporting that it did, rather
     /// than quietly half-cleaning the pool).
-    fn clean_names(&self, names: &[(i64, &str)]) -> (HashMap<i64, String>, RegexRun) {
+    pub fn apply(&self, names: &[(i64, &str)]) -> (HashMap<i64, String>, RegexRun) {
         let mut cleaned: HashMap<i64, String> = HashMap::with_capacity(names.len());
         let mut counters = RegexRun::default();
         if self.rules.is_empty() {
@@ -1127,7 +1144,7 @@ pub fn build<'a>(world: &'a World, settings: &StreamsSettings) -> Result<StreamP
     }
     pool.stats.eligible = pool.eligible.len();
 
-    let (cleaned, regex) = rules.clean_names(&eligible_names);
+    let (cleaned, regex) = rules.apply(&eligible_names);
     pool.stats.regex = regex;
     if let Some(summary) = pool.stats.regex.summary() {
         warnings.push(summary);
@@ -1604,7 +1621,7 @@ mod tests {
             .iter()
             .map(|(id, name)| (*id, name.as_str()))
             .collect();
-        let (cleaned, counters) = rules.clean_names(&pairs);
+        let (cleaned, counters) = rules.apply(&pairs);
         assert_eq!(
             cleaned[&1], "ESPN Extra",
             "the second rule collapses the gap"
@@ -1618,17 +1635,17 @@ mod tests {
         let rules = RuleSet::parse(r#"[["^(\\w+) HD$", "\\1"]]"#);
         assert!(rules.rejected().count() == 0, "{:?}", rules.report);
         let pairs = vec![(1i64, "ESPN HD")];
-        let (cleaned, _) = rules.clean_names(&pairs);
+        let (cleaned, _) = rules.apply(&pairs);
         assert_eq!(cleaned[&1], "ESPN");
 
         let rules = RuleSet::parse(r#"[["^(?<base>\\w+) HD$", "\\g<base>"]]"#);
         assert!(rules.rejected().count() == 0, "{:?}", rules.report);
-        let (cleaned, _) = rules.clean_names(&pairs);
+        let (cleaned, _) = rules.apply(&pairs);
         assert_eq!(cleaned[&1], "ESPN");
 
         // A literal $ is not a group reference.
         let rules = RuleSet::parse(r#"[["^(\\w+) HD$", "\\1 5$"]]"#);
-        let (cleaned, _) = rules.clean_names(&pairs);
+        let (cleaned, _) = rules.apply(&pairs);
         assert_eq!(cleaned[&1], "ESPN 5$");
     }
 
@@ -1702,7 +1719,7 @@ mod tests {
         let rules = RuleSet::parse(r#"[["X", "Y"]]"#);
         let long = "X".repeat(REGEX_NAME_MAX_LEN + 1);
         let pairs = vec![(1i64, long.as_str())];
-        let (cleaned, counters) = rules.clean_names(&pairs);
+        let (cleaned, counters) = rules.apply(&pairs);
         assert_eq!(cleaned[&1], long, "left exactly as it was");
         assert_eq!(counters.skipped_long, 1);
         assert!(counters.summary().unwrap().contains("characters skipped"));
@@ -1714,7 +1731,7 @@ mod tests {
         let rules = RuleSet::parse(r#"[["(a)", "\\1\\1"]]"#);
         let name = "a".repeat(300);
         let pairs = vec![(1i64, name.as_str())];
-        let (cleaned, counters) = rules.clean_names(&pairs);
+        let (cleaned, counters) = rules.apply(&pairs);
         assert_eq!(cleaned[&1].chars().count(), 600);
         assert_eq!(counters.growth_reverted, 0);
 
@@ -1725,7 +1742,7 @@ mod tests {
             "b".repeat(REGEX_PATTERN_MAX_LEN)
         ));
         let pairs = vec![(1i64, name.as_str())];
-        let (cleaned, counters) = rules.clean_names(&pairs);
+        let (cleaned, counters) = rules.apply(&pairs);
         assert_eq!(counters.growth_reverted, 1, "{:?}", counters);
         assert_eq!(cleaned[&1], name, "the name is left as it arrived");
         assert_eq!(counters.changed, 0, "nothing was written for this name");
@@ -1735,7 +1752,7 @@ mod tests {
     fn an_emptied_name_is_counted_because_nothing_can_match_it() {
         let rules = RuleSet::parse(r#"[["^.*$", ""]]"#);
         let pairs = vec![(1i64, "ESPN")];
-        let (cleaned, counters) = rules.clean_names(&pairs);
+        let (cleaned, counters) = rules.apply(&pairs);
         assert_eq!(cleaned[&1], "");
         assert_eq!(counters.emptied, 1);
         assert!(counters.summary().unwrap().contains("unmatchable"));
@@ -1745,7 +1762,7 @@ mod tests {
     fn no_rules_stamp_the_raw_name() {
         let rules = RuleSet::parse("");
         let pairs = vec![(7i64, "ESPN HD")];
-        let (cleaned, counters) = rules.clean_names(&pairs);
+        let (cleaned, counters) = rules.apply(&pairs);
         assert_eq!(cleaned[&7], "ESPN HD");
         assert_eq!(counters, RegexRun::default());
         assert!(counters.summary().is_none());
@@ -1843,22 +1860,22 @@ mod tests {
         let rules = RuleSet::parse(r#"[["^(\\w+) HD$", "\\1 5$"]]"#);
         assert!(rules.rejected().count() == 0, "{:?}", rules.report);
         let pairs = vec![(1i64, "ESPN HD")];
-        let (cleaned, _) = rules.clean_names(&pairs);
+        let (cleaned, _) = rules.apply(&pairs);
         assert_eq!(cleaned[&1], "ESPN 5$");
 
         let rules = RuleSet::parse(r#"[["^(\\w+) HD$", "\\g<1>-\\g<0>"]]"#);
-        let (cleaned, _) = rules.clean_names(&pairs);
+        let (cleaned, _) = rules.apply(&pairs);
         assert_eq!(cleaned[&1], "ESPN-ESPN HD");
 
         // `\\g<00>` is the whole match and `\\g<01>` is group 1, in both engines.
         let rules = RuleSet::parse(r#"[["^(a)(b)$", "\\g<00>/\\g<01>"]]"#);
         let pairs = vec![(1i64, "ab")];
-        let (cleaned, _) = rules.clean_names(&pairs);
+        let (cleaned, _) = rules.apply(&pairs);
         assert_eq!(cleaned[&1], "ab/a");
 
         let rules = RuleSet::parse(r#"[["HD", "A\\$B"]]"#);
         let pairs = vec![(1i64, "ESPN HD")];
-        let (cleaned, _) = rules.clean_names(&pairs);
+        let (cleaned, _) = rules.apply(&pairs);
         assert_eq!(cleaned[&1], "ESPN A\\$B");
 
         // An invalid group reference is refused once at parse, and the name is untouched —

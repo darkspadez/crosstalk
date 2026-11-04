@@ -24,6 +24,7 @@ rusqlite.workspace = true
 dashmap.workspace = true
 csv.workspace = true
 chrono.workspace = true
+chrono-tz.workspace = true
 tracing.workspace = true
 tokio-cron-scheduler.workspace = true
 croner.workspace = true

@@ -177,8 +177,14 @@ no daemon restart (a run already in progress finishes with the settings it start
 
 Every action below belongs to the `guide` app (`crosstalk run guide <action>`). The `streams`
 app declares its own list in `crates/streams/src/lib.rs` and currently exposes `validate`,
-`status` and the `match_*` and `sort_*` pairs; its `mirror_*`, `probe`, `triage_*`,
-`restore_*` and `visibility_*` pairs arrive with the rest of phase 2.
+`status`, the `match_*` and `sort_*` pairs and the three read-only tools `check_countries`,
+`scan_placeholders` and `test_rules`; its `mirror_*`, `probe`, `triage_*`, `restore_*` and
+`visibility_*` pairs arrive with the rest of phase 2. The tools write a CSV and a summary and
+change nothing: `check_countries` compares each stream's group-country label with its guide-id
+suffix, `scan_placeholders` lists the numbered name families the placeholder patterns miss and
+the regex to paste for each, and `test_rules` shows what the stream-name regex rules would do to
+every name in the library — unscoped, as the plugin's action is: M3U and stream-group scoping
+are ignored — sample changes included.
 
 | Action | Colour | What it does |
 |---|---|---|
@@ -371,6 +377,11 @@ the `streams.match` rows are differences from Stream-Mapparr.
 | `streams.match_apply` only writes channels whose list changed | The plugin deletes and recreates every matched channel's list; crosstalk plans a stream-list write only where the list actually differs. Same end state, so a second run over an unchanged library writes nothing. |
 | `streams.match_preview` drops the plugin's threshold-analysis advice rows | Preview also re-ran the pipeline at 5-point thresholds and collected by exact match against the winning stream name; the plugin itself notes that path disagrees with the real matcher. Those rows were advice, never a write. |
 | With `filter_dead_streams` on, match also excludes store probe verdicts | The plugin only reads `stream_stats` (empty, 0 width/height, `0x0`); crosstalk reproduces that test exactly and additionally skips streams the probe recorded as `dead` in the store — the same verdict, kept where a rerun can see it. |
+| EPG placeholder titles come from one batched read | The plugin queries the programme table per EPG record and memoizes per pass (~8600 queries in one pass before the cache existed). crosstalk resolves the record ids a run can actually reach — a placeholder name on a channel, a placeholder or watched name on a stream — and reads them in one chunked `POST /epg/current-programs/`. The cleanup rules, skip titles, "Next Event" gate and watch containment are the plugin's own. |
+| The `tvg_id` join lists every EPG entry | A stream carries only the guide identifier, so joining it to a record id lists `GET /epg/epgdata/` (`ceil(n / 1000)` requests — ~55 at 55k entries). Not narrowed: `EPGData` has no `tvg_id` filter, and the programme search is not equivalent (multi-source `tvg_id`s, no `parsing` marker, no dummy/index fallback). |
+| The "Next Event" day is Dispatcharr's date | The plugin reads General Settings -> Time Zone in-process. Over REST the same value is read once per run from `GET /api/core/settings/` (`system_settings.value.time_zone`), so the "at TIME on DATE" clause is compared against today in Dispatcharr's zone on both sides. When that read fails the run degrades to the host's date and says so in the report, rather than refusing the match. |
+| A guide that cannot be read leaves names as written | The plugin's lookup failures were per-record and swallowed; over REST the read is one request, so a failure is logged and reported in the CSV preamble and the run proceeds with the raw names. Refusing the match over one auxiliary read would be worse than the plugin. |
+| The read-only tools write a CSV, not a text readout | The plugin wrote a `.txt` into its own readout directory and put a clipped headline in a toast. crosstalk writes `<app>_<tool>_<timestamp>.csv` into `[exports]` under the same retention rule as every other app, and the headline is the run summary. |
 | Appending streams renumbers the channel's list | The plugin's append gives the new rows order values that collide with the existing rows; crosstalk writes the same membership in the same playback order, numbered from zero. |
 | EPG-override channels are skipped by `match` | A channel whose guide was set by hand in Dispatcharr keeps it; the plugin re-matches and overwrites. Skipping is safer, and the CSV reason says so. |
 | AI may promote inside the verify band | With the AI gate on, an AI-accepted candidate can be assigned while its heuristic score (60–94) sits below `match_confidence_threshold` (default 95). The threshold still gates every heuristic assignment: the model never re-checks or vetoes one, and heal never asks it at all. |
@@ -408,6 +419,9 @@ cargo fmt --all
 python3 scripts/parity_sweep.py --kinds normalize,callsign,location,network --limit 300
 python3 scripts/parity_sweep.py --kinds match,score --limit 300 --pool 60
 python3 -I scripts/channel_ops_parity.py   # the cleanup selections and payloads
+python3 -I scripts/sort_parity.py          # the streams quality model, 840 cases
+python3 -I scripts/match_parity.py         # the streams collector, EPG placeholder fixtures
+python3 -I scripts/tools_parity.py         # check_countries, scan_placeholders, test_rules
 
 ./scripts/upstream_drift.sh     # what each reference changed since its pin, in files we port
 ```

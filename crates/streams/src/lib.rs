@@ -14,11 +14,16 @@
 //!     token/substring family, same-country and zone handling) and the write list it plans;
 //!   * [`quality`] — the one quality model: Stream-Mapparr's sort key and the throughput tiers
 //!     it reads, ported statement for statement;
-//!   * [`sort`] — `sort_preview` / `sort_apply`, which is what uses that model.
+//!   * [`sort`] — `sort_preview` / `sort_apply`, which is what uses that model;
+//!   * [`epg`] — EPG-aware placeholder matching, the optional path that matches a generic
+//!     provider slot (`PPV EVENT 04`) by the programme airing on it;
+//!   * [`tools`] — `check_countries`, `scan_placeholders` and `test_rules`, the three
+//!     read-only tools (with [`placeholder_scan`], the numbered-family grouping behind the
+//!     second).
 //!
 //! Mirror, visibility, probe, triage and restore arrive in later steps, so
-//! [`StreamsApp::actions`] registers `validate`, `status` and the `match` and `sort` pairs:
-//! the layout is there, the rest is not.
+//! [`StreamsApp::actions`] registers `validate`, `status`, the `match` and `sort` pairs and
+//! the three tools: the layout is there, the rest is not.
 //!
 //! What the two plugins did that a host does once, this app does not do at all: the dry-run
 //! switch is the preview half of a pair (or `--dry-run`), the schedules, windows and
@@ -26,13 +31,16 @@
 //! CSV retention is `[exports]`, the operation lock and progress files are the run store, and
 //! `view_*` / `export_results` are the run page and its CSV.
 
+pub mod epg;
 pub mod matching;
+pub mod placeholder_scan;
 pub mod quality;
 pub mod selection;
 pub mod settings;
 pub mod sort;
 #[cfg(test)]
 mod test_support;
+pub mod tools;
 
 use anyhow::{bail, Result};
 use crosstalk_core::jobs::JobContext;
@@ -52,6 +60,9 @@ pub const ACTION_MATCH_PREVIEW: &str = "match_preview";
 pub const ACTION_MATCH_APPLY: &str = "match_apply";
 pub const ACTION_SORT_PREVIEW: &str = "sort_preview";
 pub const ACTION_SORT_APPLY: &str = "sort_apply";
+pub const ACTION_CHECK_COUNTRIES: &str = "check_countries";
+pub const ACTION_SCAN_PLACEHOLDERS: &str = "scan_placeholders";
+pub const ACTION_TEST_RULES: &str = "test_rules";
 
 /// The sub-app itself.
 #[derive(Debug, Default)]
@@ -151,6 +162,28 @@ impl SubApp for StreamsApp {
                  Zone routing keeps only the channel's own feed zone and can drop the other \
                  zone's streams from its list. It removes no channel. Continue?",
             ),
+            ActionSpec::new(
+                ACTION_CHECK_COUNTRIES,
+                "Check Stream Countries",
+                "Compare the country prefix on every stream's group name with the two-letter \
+                 suffix on its EPG identifier and write a CSV of where they disagree. Opens no \
+                 provider connection and changes nothing.",
+                ActionKind::Read,
+            ),
+            ActionSpec::new(
+                ACTION_SCAN_PLACEHOLDERS,
+                "Scan Placeholder Names",
+                "Find numbered stream-name families (MAX 100, PPV EVENT 04) that none of the \
+                 placeholder patterns covers, and suggest a regex for each. Changes no setting.",
+                ActionKind::Read,
+            ),
+            ActionSpec::new(
+                ACTION_TEST_RULES,
+                "Test Regex Rules",
+                "Show what the stream name regex rules would do to every stream name, with a \
+                 sample of the changes and the per-rule validation report. Changes nothing.",
+                ActionKind::Read,
+            ),
         ]
     }
 
@@ -217,6 +250,18 @@ impl StreamsApp {
             ACTION_MATCH_APPLY => self.match_streams(context, dry_run).await,
             ACTION_SORT_PREVIEW => self.sort(context, true).await,
             ACTION_SORT_APPLY => self.sort(context, dry_run).await,
+            ACTION_CHECK_COUNTRIES => {
+                let settings = self.checked_settings(context)?;
+                tools::run_check_countries(self, context, &settings).await
+            }
+            ACTION_SCAN_PLACEHOLDERS => {
+                let settings = self.checked_settings(context)?;
+                tools::run_scan_placeholders(self, context, &settings).await
+            }
+            ACTION_TEST_RULES => {
+                let settings = self.checked_settings(context)?;
+                tools::run_test_rules(self, context, &settings).await
+            }
             other => bail!("{APP_NAME} has no action {other:?}"),
         }
     }
@@ -349,7 +394,10 @@ mod tests {
                 ACTION_MATCH_PREVIEW,
                 ACTION_MATCH_APPLY,
                 ACTION_SORT_PREVIEW,
-                ACTION_SORT_APPLY
+                ACTION_SORT_APPLY,
+                ACTION_CHECK_COUNTRIES,
+                ACTION_SCAN_PLACEHOLDERS,
+                ACTION_TEST_RULES
             ]
         );
         // The plugin's own ids are never copied, and its housekeeping is a host feature.

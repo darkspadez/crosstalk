@@ -45,7 +45,10 @@ mod tests {
                 "match_preview",
                 "match_apply",
                 "sort_preview",
-                "sort_apply"
+                "sort_apply",
+                "check_countries",
+                "scan_placeholders",
+                "test_rules"
             ]
         );
         // Every section of the plan's settings layout is in the form.

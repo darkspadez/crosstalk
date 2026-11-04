@@ -493,6 +493,78 @@ impl DispatcharrClient {
         Ok(me.user_level)
     }
 
+    /// Dispatcharr's configured timezone: General Settings -> Time Zone.
+    ///
+    /// `GET /api/core/settings/` lists the `CoreSettings` rows (`key`, `value`), and the
+    /// `system_settings` row's `value.time_zone` is the source Stream-Mapparr reads
+    /// in-process via `CoreSettings.get_system_time_zone()` for its scheduler and its
+    /// "Next Event" date gate. Reading it here keeps a match on the same calendar day
+    /// as the plugin on an installation whose appliance and Dispatcharr disagree about
+    /// the zone. One short listing per run (the table holds dozens of rows); the caller
+    /// falls back to the host's date when this fails, and says so in the report.
+    ///
+    /// The name is validated with [`coerce_timezone`]: blank, missing or unknown names
+    /// become `"UTC"`, exactly like the plugin's own fallback.
+    pub async fn system_timezone(&self) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Setting {
+            #[serde(default)]
+            key: String,
+            #[serde(default)]
+            value: serde_json::Value,
+        }
+
+        #[derive(Deserialize)]
+        struct Page {
+            #[serde(default)]
+            results: Vec<Setting>,
+            #[serde(default)]
+            next: Option<serde_json::Value>,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Payload {
+            Bare(Vec<Setting>),
+            Paged(Page),
+        }
+
+        // The settings table holds dozens of rows, so one page is the normal answer;
+        // the loop is only for a build that paginates it.
+        let mut page = 1u32;
+        loop {
+            let payload: Payload = self
+                .get_json(
+                    "/core/settings/",
+                    &[("page", page.to_string()), ("page_size", "100".to_string())],
+                )
+                .await
+                .context("reading Dispatcharr's system timezone (GET /core/settings/)")?;
+            let (rows, more) = match payload {
+                Payload::Bare(rows) => (rows, false),
+                Payload::Paged(envelope) => (
+                    envelope.results,
+                    envelope.next.is_some_and(|next| !next.is_null()),
+                ),
+            };
+            for row in &rows {
+                if row.key == "system_settings" {
+                    if let Some(name) = row.value.get("time_zone").and_then(|name| name.as_str()) {
+                        return Ok(coerce_timezone(name));
+                    }
+                }
+            }
+            if !more {
+                break;
+            }
+            page += 1;
+            if page > 100 {
+                bail!("GET /core/settings/ did not terminate after 100 pages");
+            }
+        }
+        Ok("UTC".to_string())
+    }
+
     /// A list endpoint that answers either a bare array or a page envelope.
     ///
     /// Like [`Self::epg_entries`]: most builds answer these listings with a bare array,
@@ -615,4 +687,50 @@ fn truncate(text: &str, limit: usize) -> String {
     }
     let cut: String = trimmed.chars().take(limit).collect();
     format!("{cut}…")
+}
+
+/// Validate an IANA timezone name, falling back to `"UTC"`.
+///
+/// Stream-Mapparr's `coerce_timezone`: `pytz.timezone(name)` validated, blank / missing /
+/// non-string / unknown names became `"UTC"`. Whitespace is trimmed and the operator's
+/// spelling is kept on success (`"US/Eastern"` stays `"US/Eastern"`, links included).
+///
+/// Pure and total, so the EPG date gate and its tests never touch the network.
+///
+/// [`DispatcharrClient::system_timezone`] is the caller that reads the name.
+/// [`today_in_zone`] is the caller that turns it into a calendar day.
+pub fn coerce_timezone(name: &str) -> String {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return "UTC".to_string();
+    }
+    match trimmed.parse::<chrono_tz::Tz>() {
+        Ok(_) => trimmed.to_string(),
+        Err(_) => "UTC".to_string(),
+    }
+}
+
+/// The calendar day it is right now in `zone`, as `(month, day)`.
+///
+/// Stream-Mapparr's `_epg_local_now`: `datetime.now(pytz.timezone(...))` in Dispatcharr's
+/// configured zone, falling back to UTC. An unparseable zone can still arrive here when a
+/// caller passes one through unchecked, so it falls back to the host's date rather than
+/// panicking — the plugin's degrade-don't-fail, not a new refusal.
+///
+/// Only the month and day come back because that is all the "Next Event" gate compares.
+pub fn today_in_zone(zone: &str) -> (u32, u32) {
+    use chrono::Datelike;
+    // The raw name is parsed, not the coerced one: `coerce_timezone` maps every
+    // unknown name to `"UTC"`, which parses, so routing through it would make the
+    // host-date fallback below unreachable and report UTC's day as the host's.
+    match zone.trim().parse::<chrono_tz::Tz>() {
+        Ok(tz) => {
+            let today = chrono::Utc::now().with_timezone(&tz).date_naive();
+            (today.month(), today.day())
+        }
+        Err(_) => {
+            let today = chrono::Local::now().date_naive();
+            (today.month(), today.day())
+        }
+    }
 }

@@ -12,8 +12,10 @@ crosstalk-matching.workspace = true
 
 anyhow.workspace = true
 chrono.workspace = true
+chrono-tz.workspace = true
 regex.workspace = true
 serde.workspace = true
+unicode-general-category.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 toml.workspace = true

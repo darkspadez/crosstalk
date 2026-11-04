@@ -2152,3 +2152,97 @@ async fn an_everything_world_carries_streams_accounts_and_logos() {
     assert_eq!(world.m3u_account_map()[&3].name, "Provider A");
     assert_eq!(world.logos.len(), 1);
 }
+
+#[test]
+fn coerce_timezone_keeps_valid_names_and_falls_back_to_utc() {
+    // Stream-Mapparr's `coerce_timezone`, including the link names pytz accepts.
+    assert_eq!(coerce_timezone("US/Eastern"), "US/Eastern");
+    assert_eq!(coerce_timezone("Europe/Oslo"), "Europe/Oslo");
+    assert_eq!(coerce_timezone("  UTC  "), "UTC");
+    assert_eq!(coerce_timezone(""), "UTC");
+    assert_eq!(coerce_timezone("   "), "UTC");
+    assert_eq!(coerce_timezone("Not/AZone"), "UTC");
+    assert_eq!(coerce_timezone("US/Central/Bogus"), "UTC");
+}
+
+#[test]
+fn today_in_zone_matches_utc_for_utc_and_the_host_for_garbage() {
+    use chrono::Datelike;
+    let now = chrono::Utc::now().date_naive();
+    assert_eq!(today_in_zone("UTC"), (now.month(), now.day()));
+    let local = chrono::Local::now().date_naive();
+    assert_eq!(today_in_zone("Not/AZone"), (local.month(), local.day()));
+}
+
+#[tokio::test]
+async fn system_timezone_reads_the_system_settings_row() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/core/settings/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {"id": 1, "key": "stream_settings", "name": "Stream Settings", "value": {}},
+            {"id": 2, "key": "system_settings", "name": "System Settings",
+             "value": {"time_zone": "America/Phoenix"}},
+        ])))
+        .mount(&server)
+        .await;
+
+    let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+    assert_eq!(
+        client.system_timezone().await.expect("zone"),
+        "America/Phoenix"
+    );
+}
+
+#[tokio::test]
+async fn system_timezone_accepts_a_page_envelope_and_repairs_bad_names() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/core/settings/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": [
+                {"id": 2, "key": "system_settings", "name": "System Settings",
+                 "value": {"time_zone": "Not/AZone"}},
+            ],
+            "next": null,
+        })))
+        .mount(&server)
+        .await;
+
+    let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+    // An unknown name is not an error: the plugin falls back to UTC, so this does too.
+    assert_eq!(client.system_timezone().await.expect("zone"), "UTC");
+}
+
+#[tokio::test]
+async fn system_timezone_is_utc_when_the_row_or_name_is_missing() {
+    for body in [
+        serde_json::json!([]),
+        serde_json::json!([{"id": 1, "key": "stream_settings", "value": {}}]),
+        serde_json::json!([{"id": 2, "key": "system_settings", "value": {}}]),
+        serde_json::json!([{"id": 2, "key": "system_settings", "value": {"time_zone": null}}]),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/core/settings/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        assert_eq!(client.system_timezone().await.expect("zone"), "UTC");
+    }
+}
+
+#[tokio::test]
+async fn system_timezone_propagates_a_transport_failure_for_the_caller_to_degrade() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/core/settings/"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("bad gateway"))
+        .mount(&server)
+        .await;
+
+    let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+    client.system_timezone().await.expect_err("500");
+}

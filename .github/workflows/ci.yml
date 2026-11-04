@@ -153,9 +153,16 @@ jobs:
       # `_channels_to_update_for_group`, `_streams_to_assign`, `_same_country_ids_for` and
       # `_write_channel_streams` (with the Django stubs its own tests install, plus a fake
       # ChannelStream table) and compares every channel's final stream list with
-      # `crates/streams/examples/match_io`. ~20s over 1,270 swept cases plus randomised ones.
+      # `crates/streams/examples/match_io`. ~20s over 1,800 swept cases plus randomised ones,
+      # EPG placeholder fixtures included.
       - name: Streams match vs the plugin's collector
         run: python3 -I scripts/match_parity.py
+      # The three read-only streams tools, against the plugin's own code: its
+      # `check_stream_countries_action` and `test_regex_rules_action` driven end to end, and
+      # `placeholder_scan.py` imported directly (it is plain Python). The EPG placeholder path
+      # is part of the match step above, with the two ORM lookups stubbed to fixtures.
+      - name: Streams read-only tools vs the plugin's own code
+        run: python3 -I scripts/tools_parity.py
       # Informational, never failing: what upstream changed since each pinned reference
       # commit in the files crosstalk ports from it. Covers every reference submodule
       # (EPG Janitor, Stream-Mapparr, IPTV Checker), each with its own ported-file list.

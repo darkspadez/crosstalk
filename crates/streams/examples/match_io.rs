@@ -18,7 +18,10 @@
 //! ```
 
 use crosstalk_core::config::{MatchingConfig, ScopeConfig};
-use crosstalk_core::dispatcharr::{Channel, ChannelGroup, M3uAccount, Stream, World};
+use crosstalk_core::dispatcharr::{
+    Channel, ChannelGroup, CurrentProgram, EpgEntry, M3uAccount, Stream, World,
+};
+use crosstalk_streams::epg::{EpgSettings, EpgTitles};
 use crosstalk_streams::matching::{self, ChannelDatabase, DatabaseEntry, MatchOptions};
 use crosstalk_streams::quality::{MemoryThroughputSource, ThroughputEntry};
 use crosstalk_streams::settings::StreamsSettings;
@@ -38,6 +41,9 @@ struct ChannelInput {
     /// The channel's current list, in playback order.
     #[serde(default)]
     streams: Vec<i64>,
+    /// The EPG record the channel's own column points at (`Channel.epg_data_id`).
+    #[serde(default)]
+    epg_data_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -55,6 +61,9 @@ struct StreamInput {
     url: Option<String>,
     #[serde(default)]
     stats: Value,
+    /// The guide identifier the placeholder lookup joins on (`Stream.tvg_id`).
+    #[serde(default)]
+    tvg_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -124,6 +133,13 @@ struct SettingsInput {
     enable_throughput_sorting: bool,
     bitrate_safety_margin: f64,
     probe_cache_ttl_minutes: u32,
+    // The EPG-aware placeholder block.
+    epg_placeholder_matching_enabled: bool,
+    epg_placeholder_name_patterns: String,
+    epg_title_cleanup_rules: String,
+    epg_skip_titles: String,
+    epg_channel_schedule_cleanup_rules: String,
+    epg_watch_source_streams: String,
     // `[matching]`.
     ignore_quality: bool,
     ignore_regional: bool,
@@ -157,6 +173,15 @@ impl Default for SettingsInput {
             enable_throughput_sorting: true,
             bitrate_safety_margin: 1.10,
             probe_cache_ttl_minutes: 30,
+            epg_placeholder_matching_enabled: false,
+            epg_placeholder_name_patterns:
+                crosstalk_streams::settings::EPG_PLACEHOLDER_NAME_PATTERNS.to_string(),
+            epg_title_cleanup_rules: crosstalk_streams::settings::EPG_TITLE_CLEANUP_RULES
+                .to_string(),
+            epg_skip_titles: crosstalk_streams::settings::EPG_SKIP_TITLES.to_string(),
+            epg_channel_schedule_cleanup_rules:
+                crosstalk_streams::settings::EPG_CHANNEL_SCHEDULE_CLEANUP_RULES.to_string(),
+            epg_watch_source_streams: String::new(),
             ignore_quality: true,
             ignore_regional: true,
             ignore_geographic: true,
@@ -180,9 +205,38 @@ struct Case {
     throughput: HashMap<String, Value>,
     /// Streams a probe verdict found dead (`filter_dead_streams`).
     dead: Vec<i64>,
+    /// The world's EPG entries: the `tvg_id` -> record-id join the placeholder path needs.
+    #[serde(default)]
+    epg_entries: Vec<EpgEntryInput>,
+    /// What is airing right now, per EPG record id: `{"7": "WWE SummerSlam"}`. The RAW titles,
+    /// so the plugin's own cleanup/skip/date gates decide the rest on both sides.
+    #[serde(default)]
+    current_programs: HashMap<String, String>,
+    /// The local calendar day the "Next Event: … on DATE" gate compares against, `M-D`.
+    #[serde(default = "default_today")]
+    epg_today: String,
+}
+
+fn default_today() -> String {
+    "8-5".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct EpgEntryInput {
+    id: i64,
+    #[serde(default)]
+    tvg_id: String,
 }
 
 impl Case {
+    /// The local day the EPG date gate compares against.
+    fn today(&self) -> (u32, u32) {
+        let mut parts = self.epg_today.split('-');
+        let month = parts.next().and_then(|value| value.trim().parse().ok());
+        let day = parts.next().and_then(|value| value.trim().parse().ok());
+        (month.unwrap_or(1), day.unwrap_or(1))
+    }
+
     fn world(&self) -> World {
         World {
             channels: self
@@ -197,6 +251,7 @@ impl Case {
                         .map(|number| json!(number))
                         .or(Some(Value::Null)),
                     streams: channel.streams.clone(),
+                    epg_data_id: channel.epg_data_id,
                     ..Channel::default()
                 })
                 .collect(),
@@ -209,6 +264,16 @@ impl Case {
                 })
                 .collect(),
             m3u_accounts: self.accounts.iter().map(AccountInput::to_account).collect(),
+            entries: self
+                .epg_entries
+                .iter()
+                .map(|entry| EpgEntry {
+                    id: entry.id,
+                    name: String::new(),
+                    tvg_id: entry.tvg_id.clone(),
+                    epg_source: Some(1),
+                })
+                .collect(),
             streams: self
                 .streams
                 .iter()
@@ -220,6 +285,7 @@ impl Case {
                     is_custom: stream.custom,
                     url: stream.url.clone(),
                     stream_stats: stream.stats.clone(),
+                    tvg_id: stream.tvg_id.clone(),
                     ..Stream::default()
                 })
                 .collect(),
@@ -244,6 +310,12 @@ impl Case {
             selected_stream_groups: input.selected_stream_groups.clone(),
             stream_group_filter_mode: input.stream_group_filter_mode.clone(),
             stream_name_regex_rules: input.stream_name_regex_rules.clone(),
+            epg_placeholder_matching_enabled: input.epg_placeholder_matching_enabled,
+            epg_placeholder_name_patterns: input.epg_placeholder_name_patterns.clone(),
+            epg_title_cleanup_rules: input.epg_title_cleanup_rules.clone(),
+            epg_skip_titles: input.epg_skip_titles.clone(),
+            epg_channel_schedule_cleanup_rules: input.epg_channel_schedule_cleanup_rules.clone(),
+            epg_watch_source_streams: input.epg_watch_source_streams.clone(),
             prioritize_quality: input.prioritize_quality,
             audio_channels_priority: input.audio_channels_priority.clone(),
             audio_codec_priority: input.audio_codec_priority.clone(),
@@ -301,6 +373,25 @@ fn run_case(case: &Case) -> anyhow::Result<Value> {
     let matching = case.matching();
     let mut options = MatchOptions::with_database(&settings, &matching, Some(case.database()));
     options.dead_streams = case.dead.iter().copied().collect();
+    if settings.epg_placeholder_matching_enabled {
+        let mut titles = EpgTitles::prepare(
+            EpgSettings::from_settings(&settings),
+            &world.entries,
+            case.today(),
+        );
+        let mut programmes: Vec<CurrentProgram> = case
+            .current_programs
+            .iter()
+            .map(|(id, title)| CurrentProgram {
+                epg_data_id: id.trim().parse().unwrap_or_default(),
+                title: title.clone(),
+                ..CurrentProgram::default()
+            })
+            .collect();
+        programmes.sort_by_key(|programme| programme.epg_data_id);
+        titles.set_programmes(&programmes);
+        options = options.with_epg(std::sync::Arc::new(titles));
+    }
 
     let mut throughput = MemoryThroughputSource::new();
     for (key, entry) in &case.throughput {
@@ -332,6 +423,12 @@ fn run_case(case: &Case) -> anyhow::Result<Value> {
     }
     Ok(json!({
         "assignments": rows,
+        "epg": outcome.epg.map(|epg| json!({
+            "checked": epg.checked,
+            "resolved": epg.resolved,
+            "skipped_long": epg.skipped_long,
+            "watch_hits": epg.watch_hits,
+        })),
         "channels": outcome.channels,
         "groups": outcome.groups,
         "country": {

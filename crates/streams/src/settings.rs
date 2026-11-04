@@ -1834,6 +1834,38 @@ pub fn warnings(settings: &StreamsSettings) -> Vec<String> {
     if let Some(message) = parsed.rejection_summary() {
         warnings.push(message);
     }
+    // The EPG placeholder block is opt-in, so it only speaks up when a run would consult it:
+    // a flag with no usable pattern matches nothing, and a rejected pattern is the operator's
+    // typo rather than a runtime surprise (the plugin logs both and proceeds).
+    if settings.epg_placeholder_matching_enabled {
+        let (patterns, report) =
+            crate::epg::resolve_placeholder_patterns(&settings.epg_placeholder_name_patterns);
+        if patterns.is_empty() {
+            warnings.push(
+                "epg_placeholder_matching_enabled is on but no placeholder pattern compiles; \
+                 no channel or stream name is treated as a placeholder"
+                    .to_string(),
+            );
+        }
+        for entry in report.iter().filter(|entry| !entry.is_ok()) {
+            warnings.push(format!(
+                "epg_placeholder_name_patterns: skipping {:?} ({}): {}",
+                entry.pattern, entry.status, entry.detail
+            ));
+        }
+        for (label, rules) in [
+            ("epg_title_cleanup_rules", &settings.epg_title_cleanup_rules),
+            (
+                "epg_channel_schedule_cleanup_rules",
+                &settings.epg_channel_schedule_cleanup_rules,
+            ),
+        ] {
+            let parsed = crate::selection::RuleSet::parse(rules);
+            if let Some(message) = parsed.rejection_summary() {
+                warnings.push(format!("{label}: {message}"));
+            }
+        }
+    }
     if !SENSITIVITY
         .iter()
         .any(|(name, _)| *name == settings.match_sensitivity.trim().to_lowercase())
@@ -2170,6 +2202,55 @@ mod tests {
         assert!(
             warnings.iter().any(|w| w.contains("include")),
             "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_broken_epg_placeholder_block_is_a_warning_not_a_refusal() {
+        // Off by default, so a bad pattern in a disabled block says nothing.
+        let settings = StreamsSettings {
+            epg_placeholder_name_patterns: "^HBO ([".to_string(),
+            ..StreamsSettings::default()
+        };
+        assert!(warnings(&settings).is_empty(), "{:?}", warnings(&settings));
+
+        let settings = StreamsSettings {
+            epg_placeholder_matching_enabled: true,
+            epg_placeholder_name_patterns: "^HBO ([".to_string(),
+            ..StreamsSettings::default()
+        };
+        let messages = warnings(&settings);
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("no placeholder pattern compiles")),
+            "{messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("epg_placeholder_name_patterns")),
+            "{messages:?}"
+        );
+
+        // Cleanup rules are warned about with the setting that carries them, and only when
+        // the block is on.
+        let settings = StreamsSettings {
+            epg_title_cleanup_rules: r#"[["(unclosed", ""]]"#.to_string(),
+            ..StreamsSettings::default()
+        };
+        assert!(warnings(&settings).is_empty(), "{:?}", warnings(&settings));
+        let settings = StreamsSettings {
+            epg_placeholder_matching_enabled: true,
+            epg_title_cleanup_rules: r#"[["(unclosed", ""]]"#.to_string(),
+            ..StreamsSettings::default()
+        };
+        let messages = warnings(&settings);
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("epg_title_cleanup_rules")),
+            "{messages:?}"
         );
     }
 

@@ -115,7 +115,11 @@ const DIGIT_NOT_DECIMAL_RANGES: [(u32, u32); 20] = [
     (0x1F100, 0x1F10A),
 ];
 
-fn is_digit_char(c: char) -> bool {
+/// Python's `str.isdigit()` for one character: decimal digits plus the Digit numeric type.
+///
+/// Public because the streams placeholder scan splits names on digit runs the same way the
+/// matcher reads a channel number, and the two must agree about `²` and `٣`.
+pub fn is_digit_char(c: char) -> bool {
     if get_general_category(c) == G::DecimalNumber {
         return true;
     }
