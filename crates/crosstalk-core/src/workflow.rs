@@ -23,6 +23,10 @@
 //!   at its schedule window's end pauses the whole workflow: the checkpoint names the step, and
 //!   the next firing resumes THAT step — with the step's own checkpoint picking up its backlog —
 //!   and continues from there.
+//! * A workflow holds no app BETWEEN its steps, so a hook or a schedule may start a run of the
+//!   next step's app in the gap. The step then waits for that run to finish (at most 30
+//!   minutes, never past the window, and not once the workflow is cancelled) rather than
+//!   failing a sequence whose probe already ran.
 //! * The window's deadline reaches every step, so a workflow inside `{ cron = "0 23 * * *",
 //!   window = "4h" }` never runs past 03:00 by accident.
 //! * Cancelling the workflow cancels the step it is inside (see
@@ -327,7 +331,17 @@ async fn execute(
             format!("running {step}"),
         ));
 
-        let started = match runner.start_with(&step.app, &step_action, step_dry, step_options) {
+        let started = match start_step(
+            runner,
+            slot,
+            options,
+            step,
+            &step_action,
+            step_dry,
+            step_options,
+        )
+        .await
+        {
             Ok(started) => started,
             Err(error) => {
                 // A refused start (the app is busy, or the step names nothing runnable) is this
@@ -423,6 +437,75 @@ async fn execute(
     .count("steps_planned", total as i64)
     .count("resumed_from_step", resumed_from as i64)
     .build())
+}
+
+/// How long a step waits for its app to free before the workflow gives up on it.
+///
+/// The same bound a hook's queued follow-up has: a webhook-triggered `streams.match_apply` that
+/// starts in the gap between two steps holds the app for minutes, not hours.
+const STEP_BUSY_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// How often a step waiting for a busy app re-tries its start.
+const STEP_BUSY_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Start one step, waiting while its app is busy with someone else's run.
+///
+/// A workflow holds no app between its steps, so a hook or a schedule can take the app in the
+/// gap. That run is legitimate work, and failing the whole sequence because of it would throw
+/// away a finished probe step; so a refused start whose app is busy (in this process or, via
+/// its `running` row, in another) waits for it, bounded by [`STEP_BUSY_MAX_WAIT`], the window's
+/// deadline and the workflow's own cancel. Any other refusal is returned at once.
+async fn start_step(
+    runner: &JobRunner,
+    slot: &crate::runner::WorkflowSlot,
+    options: &RunOptions,
+    step: &Step,
+    step_action: &str,
+    step_dry: bool,
+    step_options: RunOptions,
+) -> Result<StartedRun> {
+    let give_up = tokio::time::Instant::now() + STEP_BUSY_MAX_WAIT;
+    let out_of_time = || {
+        tokio::time::Instant::now() >= give_up
+            || options
+                .deadline
+                .is_some_and(|deadline| Utc::now() >= deadline)
+    };
+    let mut logged = false;
+    loop {
+        let error = match runner.start_with(&step.app, step_action, step_dry, step_options.clone())
+        {
+            Ok(started) => return Ok(started),
+            Err(error) => error,
+        };
+        let busy = runner.is_busy(&step.app)
+            || runner
+                .store()
+                .running_runs(&step.app)
+                .is_ok_and(|runs| !runs.is_empty());
+        if !busy || out_of_time() || slot.is_cancelled() || runner.is_shutting_down() {
+            return Err(error);
+        }
+        if !logged {
+            tracing::info!(
+                step = %step,
+                "the step's app is busy with another run; waiting for it to free"
+            );
+            logged = true;
+        }
+        // Never sleep past the window: a step that could only start after it must not.
+        let mut pause = STEP_BUSY_POLL;
+        if let Some(left) = options
+            .deadline
+            .and_then(|deadline| (deadline - Utc::now()).to_std().ok())
+        {
+            pause = pause.min(left);
+        }
+        tokio::time::sleep(pause).await;
+        if out_of_time() || slot.is_cancelled() {
+            return Err(error);
+        }
+    }
 }
 
 /// The step index this pass starts at, from the checkpoint a paused or cancelled pass left.

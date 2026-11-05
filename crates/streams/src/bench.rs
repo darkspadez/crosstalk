@@ -697,12 +697,12 @@ fn visibility_phase(
         Err(error) => return BenchPhase::failed("visibility", error),
     };
 
-    let mut values: HashMap<i64, SetValue> = HashMap::new();
-    for (channel_id, enabled) in &outcome.end_state {
-        values.insert(*channel_id, SetValue::Flag(*enabled));
-    }
-    let (writes, write_plan_time, error) =
-        plan_write(world, scope, Field::Membership(outcome.profile_id), values);
+    let (writes, write_plan_time, error) = plan_write(
+        world,
+        scope,
+        Field::Membership(outcome.profile_id),
+        outcome.values(),
+    );
     BenchPhase {
         action: "visibility".to_string(),
         setup_time: Some(setup_time),

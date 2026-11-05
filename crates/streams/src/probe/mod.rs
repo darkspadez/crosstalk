@@ -68,10 +68,12 @@
 //!     `consecutive_failures`, and the throughput measurement when one was taken. This replaces
 //!     Stream-Mapparr's JSON throughput cache and IPTV Checker's results file;
 //!   * `Stream.stream_stats`, read-merge-written per stream exactly as
-//!     `_update_dispatcharr_metadata` did it: non-null keys merged on Alive, `{}` on Dead,
+//!     `_update_dispatcharr_metadata` did it (the base re-read from Dispatcharr just before
+//!     the write, never the hours-old world): non-null keys merged on Alive, `{}` on Dead,
 //!     untouched on Skipped (a skipped stream was never judged, so writing `0x0` would read as
 //!     dead to every other reader — the plugin's own comment, 5361);
-//!   * run rows: one per probed stream (`subject: Stream`), and the per-channel verdicts triage
+//!   * run rows: one per probed stream (`subject: Stream`, with what became of its
+//!     `stream_stats` in `method`), and the per-channel verdicts triage
 //!     reads ([`VERDICT_FIELD`], [`FORMAT_FIELD`]). The verdicts live in run rows rather than a
 //!     table of their own because the run row already carries a `field`, a `before` and an
 //!     `after`, and triage's rule is "select run rows by field, never by channel id alone";
@@ -1418,6 +1420,14 @@ struct Session {
     streams: HashMap<i64, Stream>,
     done: AtomicUsize,
     progress: Mutex<PacedProgress>,
+    /// Where each batch's `stream_health` rows go as soon as the batch finishes, so a run
+    /// killed mid-night (a crash, a restart) keeps what it probed: those streams are fresh
+    /// afterwards and the next run skips them. `None` in a bare test context.
+    store: Option<Store>,
+    /// The health the store held when the run started: the previous class and failure count
+    /// each new row builds on. A stream is probed once per run, so it never goes stale.
+    health: HashMap<i64, StreamHealth>,
+    health_written: AtomicUsize,
 }
 
 /// What one lane produced.
@@ -1530,6 +1540,7 @@ async fn run_lane(session: Arc<Session>, mut queue: VecDeque<QueueEntry>) -> Res
             queue.pop_front();
         }
 
+        let batch_start = verdicts.len();
         let mut set = tokio::task::JoinSet::new();
         for entry in batch {
             let session = Arc::clone(&session);
@@ -1552,6 +1563,13 @@ async fn run_lane(session: Arc<Session>, mut queue: VecDeque<QueueEntry>) -> Res
                 // run rather than dropping it silently.
                 None => unprobed.push(entry),
             }
+        }
+        // The batch's health now, not at the end of the run: hours of probing must survive a
+        // run that never reaches its end.
+        if let Some(store) = &session.store {
+            let written =
+                write_health(store, &session.health, &verdicts[batch_start..], Utc::now())?;
+            session.health_written.fetch_add(written, Ordering::SeqCst);
         }
     }
     if session.should_stop() {
@@ -1698,6 +1716,9 @@ pub async fn run_with(
         streams,
         done: AtomicUsize::new(0),
         progress: Mutex::new(context.paced("streams.probe", total as u64, PROGRESS_INTERVAL)),
+        store: store.clone(),
+        health,
+        health_written: AtomicUsize::new(0),
     });
 
     // One lane per account: a provider counts connections per account, so the parallelism that
@@ -1726,9 +1747,9 @@ pub async fn run_with(
     // The checkpoint: the remaining queue, so tomorrow continues. Written on a pause and on a
     // cancel (the host's rule is that a cancel keeps its place), cleared when the queue drained.
     // Written when the run STOPS (a pause, or a cancel), not per stream: the store's health
-    // rows are the finer-grained record, and they are what makes an interrupted run resume —
-    // a stream probed before a crash is fresh afterwards, so the next run skips it. This is the
-    // plugin's resume file with the state moved where it belongs.
+    // rows, written after every batch, are the finer-grained record, and they are what makes an
+    // interrupted run resume — a stream probed before a crash is fresh afterwards, so the next
+    // run skips it. This is the plugin's resume file with the state moved where it belongs.
     if remaining.is_empty() {
         context.clear_checkpoint()?;
     } else {
@@ -1741,33 +1762,57 @@ pub async fn run_with(
 
     // Attach what the store already knew, so a row can show the transition.
     for verdict in &mut verdicts {
-        verdict.previous_class = health.get(&verdict.stream_id).map(|row| row.class.clone());
+        verdict.previous_class = session
+            .health
+            .get(&verdict.stream_id)
+            .map(|row| row.class.clone());
     }
 
-    // `stream_health` first: it is crosstalk's own record and must survive a Dispatcharr write
-    // that fails.
-    let health_written = match &store {
-        Some(store) => write_health(store, &health, &verdicts, Utc::now())?,
-        None => 0,
-    };
+    // `stream_health` went in batch by batch (crosstalk's own record, so it survives a
+    // Dispatcharr write that fails, and a run that never gets here).
+    let health_written = session.health_written.load(Ordering::SeqCst);
 
-    // `stream_stats`, read-merge-write, skipped entirely on a dry run.
-    let current_stats: HashMap<i64, Value> = world
-        .streams
-        .iter()
-        .map(|stream| (stream.id, stream.stream_stats.clone()))
-        .collect();
-    let (stats_written, stats_unchanged, stats_failed) = if dry_run {
-        (0, 0, 0)
+    // `stream_stats`, read-merge-write, skipped entirely on a dry run. The merge base is
+    // re-read now, not taken from the world loaded hours ago: Dispatcharr's live proxy writes
+    // `stream_stats` while a stream plays, and merging over the old snapshot would revert it.
+    let stats = if dry_run || !verdicts.iter().any(StreamVerdict::writes_stats) {
+        HashMap::new()
     } else {
-        write_stats(
-            client,
-            &verdicts,
-            &current_stats,
-            settings.write_concurrency.max(1) as usize,
-        )
-        .await
+        match client.streams().await {
+            Ok(fresh) => {
+                let current: HashMap<i64, Value> = fresh
+                    .into_iter()
+                    .map(|stream| (stream.id, stream.stream_stats))
+                    .collect();
+                write_stats(
+                    client,
+                    &verdicts,
+                    &current,
+                    settings.write_concurrency.max(1) as usize,
+                )
+                .await
+            }
+            Err(error) => {
+                // Without a fresh base a merge could revert what the proxy wrote: write
+                // nothing, and say so on every row that would have been written.
+                let reason = format!(
+                    "stats not written: re-reading the stream list before the write failed: \
+                     {error:#}"
+                );
+                tracing::warn!("{reason}");
+                verdicts
+                    .iter()
+                    .filter(|verdict| verdict.writes_stats())
+                    .map(|verdict| (verdict.stream_id, StatsOutcome::Failed(reason.clone())))
+                    .collect()
+            }
+        }
     };
+    let count_stats =
+        |wanted: fn(&StatsOutcome) -> bool| stats.values().filter(|o| wanted(o)).count();
+    let stats_written = count_stats(|outcome| matches!(outcome, StatsOutcome::Written));
+    let stats_unchanged = count_stats(|outcome| matches!(outcome, StatsOutcome::Unchanged));
+    let stats_failed = count_stats(|outcome| matches!(outcome, StatsOutcome::Failed(_)));
 
     let by_stream: HashMap<i64, StreamVerdict> = verdicts
         .iter()
@@ -1778,7 +1823,7 @@ pub async fn run_with(
     // Run rows: the per-stream record, then the per-channel verdicts triage reads. Written in
     // batches so a 50k-stream run does not hold the whole table as a `Vec<RunRow>` plus one
     // enormous transaction; ordinals stay unique because they are assigned across the whole set.
-    let rows = run_rows(&verdicts, &channels, &world, &by_id);
+    let rows = run_rows(&verdicts, &channels, &world, &by_id, &stats, dry_run);
     for batch in rows.chunks(ROW_BATCH) {
         context.record_rows(batch)?;
     }
@@ -2155,7 +2200,7 @@ fn write_health(
     now: DateTime<Utc>,
 ) -> Result<usize> {
     let stamp = now.to_rfc3339_opts(SecondsFormat::Secs, true);
-    let mut written = 0;
+    let mut rows: Vec<StreamHealth> = Vec::with_capacity(verdicts.len());
     for verdict in verdicts {
         let before = previous
             .get(&verdict.stream_id)
@@ -2176,7 +2221,7 @@ fn write_health(
             Class::Dead => before.consecutive_failures.saturating_add(1),
             Class::Skipped => before.consecutive_failures,
         };
-        store.upsert_stream_health(&StreamHealth {
+        rows.push(StreamHealth {
             stream_id: verdict.stream_id,
             probed_at: Some(stamp.clone()),
             class: verdict.health_class.to_string(),
@@ -2185,26 +2230,34 @@ fn write_health(
             throughput_at,
             edge_ip,
             consecutive_failures,
-        })?;
-        written += 1;
+        });
     }
-    Ok(written)
+    store.upsert_stream_health_many(&rows)
+}
+
+/// What happened to one stream's `stream_stats`: the probe's one write outside channel ops,
+/// so its outcome is recorded on the stream's run row (the `method` column) like any write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StatsOutcome {
+    Written,
+    Unchanged,
+    Failed(String),
 }
 
 /// Write the stream stats that change, with bounded concurrency.
 ///
 /// Streams whose stats would not change are not rewritten: the end state is the same and a
-/// nightly run over 50k streams should not be 50k PATCHes. Returns
-/// `(written, unchanged, failed)`; a failed write is counted and reported, never fatal — the
-/// probe's own record is already in the store.
+/// nightly run over 50k streams should not be 50k PATCHes. Returns each judged stream's
+/// outcome (a skipped stream is absent: its stats are never touched); a failed write is
+/// recorded and reported, never fatal — the probe's own record is already in the store.
 async fn write_stats(
     client: &DispatcharrClient,
     verdicts: &[StreamVerdict],
     current: &HashMap<i64, Value>,
     concurrency: usize,
-) -> (usize, usize, usize) {
+) -> HashMap<i64, StatsOutcome> {
+    let mut outcomes: HashMap<i64, StatsOutcome> = HashMap::new();
     let mut writes: Vec<(i64, Value)> = Vec::new();
-    let mut unchanged = 0;
     for verdict in verdicts.iter().filter(|verdict| verdict.writes_stats()) {
         let existing = current
             .get(&verdict.stream_id)
@@ -2212,37 +2265,47 @@ async fn write_stats(
             .unwrap_or(json!({}));
         let merged = verdict.merged_stats(&existing);
         if merged == existing {
-            unchanged += 1;
+            outcomes.insert(verdict.stream_id, StatsOutcome::Unchanged);
             continue;
         }
         writes.push((verdict.stream_id, merged));
     }
 
-    let mut written = 0;
-    let mut failed = 0;
     for chunk in writes.chunks(concurrency.max(1)) {
         let mut set = tokio::task::JoinSet::new();
         for (stream_id, stats) in chunk {
             let client = client.clone();
             let stream_id = *stream_id;
             let stats = stats.clone();
-            set.spawn(async move { client.update_stream_stats(stream_id, &stats).await });
+            set.spawn(async move {
+                (
+                    stream_id,
+                    client.update_stream_stats(stream_id, &stats).await,
+                )
+            });
         }
         while let Some(joined) = set.join_next().await {
             match joined {
-                Ok(Ok(_)) => written += 1,
-                Ok(Err(error)) => {
-                    failed += 1;
+                Ok((stream_id, Ok(_))) => {
+                    outcomes.insert(stream_id, StatsOutcome::Written);
+                }
+                Ok((stream_id, Err(error))) => {
                     tracing::warn!("could not write stream stats: {error:#}");
+                    outcomes.insert(stream_id, StatsOutcome::Failed(format!("{error:#}")));
                 }
                 Err(error) => {
-                    failed += 1;
+                    // A panicked task loses its id; the stream reads as never answered below.
                     tracing::warn!("stream stat write task failed: {error}");
                 }
             }
         }
     }
-    (written, unchanged, failed)
+    for (stream_id, _) in &writes {
+        outcomes
+            .entry(*stream_id)
+            .or_insert_with(|| StatsOutcome::Failed("the write task failed".to_string()));
+    }
+    outcomes
 }
 
 /// Every run row this run writes, numbered.
@@ -2254,8 +2317,10 @@ fn run_rows(
     channels: &[ChannelResult],
     world: &World,
     by_id: &HashMap<i64, &Stream>,
+    stats: &HashMap<i64, StatsOutcome>,
+    dry_run: bool,
 ) -> Vec<RunRow> {
-    let mut rows = stream_rows(verdicts, world, by_id);
+    let mut rows = stream_rows(verdicts, world, by_id, stats, dry_run);
     rows.extend(channel_rows(channels));
     for (ordinal, row) in rows.iter_mut().enumerate() {
         row.ordinal = ordinal as i64;
@@ -2264,31 +2329,53 @@ fn run_rows(
 }
 
 /// One run row per probed stream, with the transition the store recorded.
+///
+/// `method` says what became of the stream's `stream_stats`, the probe's one Dispatcharr
+/// write: `stats_written`, `stats_unchanged`, `stats_failed` (the error appended to the
+/// reason), `stats_dry_run`, or empty for a skipped stream, whose stats are never touched.
 fn stream_rows(
     verdicts: &[StreamVerdict],
     world: &World,
     by_id: &HashMap<i64, &Stream>,
+    stats: &HashMap<i64, StatsOutcome>,
+    dry_run: bool,
 ) -> Vec<RunRow> {
     verdicts
         .iter()
-        .map(|verdict| RunRow {
-            subject: Subject::Stream,
-            channel_id: verdict.stream_id,
-            channel_name: verdict.stream_name.clone(),
-            channel_group: by_id
-                .get(&verdict.stream_id)
-                .map(|stream| world.group_name(stream.channel_group))
-                .unwrap_or_default(),
-            status: verdict.class.label().to_string(),
-            reason: if verdict.error.is_empty() {
+        .map(|verdict| {
+            let (method, failure) = match stats.get(&verdict.stream_id) {
+                Some(StatsOutcome::Written) => ("stats_written", None),
+                Some(StatsOutcome::Unchanged) => ("stats_unchanged", None),
+                Some(StatsOutcome::Failed(error)) => ("stats_failed", Some(error.as_str())),
+                None if dry_run && verdict.writes_stats() => ("stats_dry_run", None),
+                None => ("", None),
+            };
+            let reason = if verdict.error.is_empty() {
                 verdict.error_type.clone()
             } else {
                 verdict.error.clone()
-            },
-            field: STREAM_FIELD.to_string(),
-            before_value: verdict.previous_class.clone(),
-            after_value: Some(verdict.health_class.to_string()),
-            ..RunRow::default()
+            };
+            let reason = match failure {
+                Some(error) if reason.is_empty() => format!("stats write failed: {error}"),
+                Some(error) => format!("{reason}; stats write failed: {error}"),
+                None => reason,
+            };
+            RunRow {
+                subject: Subject::Stream,
+                channel_id: verdict.stream_id,
+                channel_name: verdict.stream_name.clone(),
+                channel_group: by_id
+                    .get(&verdict.stream_id)
+                    .map(|stream| world.group_name(stream.channel_group))
+                    .unwrap_or_default(),
+                status: verdict.class.label().to_string(),
+                reason,
+                method: method.to_string(),
+                field: STREAM_FIELD.to_string(),
+                before_value: verdict.previous_class.clone(),
+                after_value: Some(verdict.health_class.to_string()),
+                ..RunRow::default()
+            }
         })
         .collect()
 }

@@ -178,16 +178,22 @@ async fn a_failed_step_stops_the_sequence_and_is_recorded_failed() {
 }
 
 #[tokio::test]
-async fn a_busy_step_app_fails_the_workflow_with_the_reason() {
+async fn a_step_app_that_stays_busy_fails_the_workflow_with_the_reason() {
     let runner = runner(config_with(&["resumable.run"]));
-    // Something else holds the step's app.
+    // Something else holds the step's app (for ~100 ms) for longer than the window lasts.
     let manual = runner
         .start("resumable", "run", false)
         .expect("a manual run holds the app");
 
-    let outcome = run_to_completion(&runner, "nightly", false, RunOptions::default())
-        .await
-        .expect("the workflow answers");
+    let deadline = Utc::now() + chrono::Duration::milliseconds(40);
+    let outcome = run_to_completion(
+        &runner,
+        "nightly",
+        false,
+        RunOptions::default().with_deadline(Some(deadline)),
+    )
+    .await
+    .expect("the workflow answers");
     assert!(outcome.is_failed(), "{}", outcome.summary);
     assert!(
         outcome.summary.contains("already has run"),
@@ -199,6 +205,35 @@ async fn a_busy_step_app_fails_the_workflow_with_the_reason() {
     assert!(steps.is_empty(), "no step run was created: {steps:?}");
 
     runner.cancel(manual.run_id);
+    wait_until_workflow_idle(&runner).await;
+}
+
+#[tokio::test]
+async fn a_step_waits_for_a_run_that_took_its_app_between_steps() {
+    // A hook or a schedule can start a run of the step's app in the gap between two steps.
+    // That is legitimate work: the step waits for it instead of failing the sequence.
+    let runner = runner(config_with(&["lab.ok", "resumable.run"]));
+    let manual = runner
+        .start("resumable", "run", false)
+        .expect("a manual run holds the app");
+    let canceller = {
+        let runner = runner.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            runner.cancel(manual.run_id);
+        })
+    };
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(60),
+        run_to_completion(&runner, "nightly", false, RunOptions::default()),
+    )
+    .await
+    .expect("the step starts once the app frees")
+    .expect("the workflow answers");
+    canceller.await.expect("canceller");
+    assert!(!outcome.is_failed(), "{}", outcome.summary);
+    assert_eq!(outcome.counts["steps_run"], 2, "{}", outcome.summary);
     wait_until_workflow_idle(&runner).await;
 }
 

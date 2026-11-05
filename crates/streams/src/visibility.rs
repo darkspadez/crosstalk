@@ -46,11 +46,11 @@
 //! filter `channel_profile_id=profile_id`. The rest of the list still widens the channel set,
 //! because that is the filter the load step used (`channel_profile_id__in=profile_ids`).
 //!
-//! crosstalk does exactly that: the FIRST profile named in `[scope] profiles` that exists is
-//! the one whose membership is written, and every named profile contributes channels — so a
-//! channel enabled in a second profile but disabled in the first is a channel this run may
-//! enable in the first, which is the one case where the plugin's "enable" step does anything
-//! on a stock install. With a single profile (the plugin's own default shape) the enable step
+//! crosstalk does the same selection: the FIRST profile named in `[scope] profiles` that
+//! exists is the one whose membership is written, and every named profile contributes
+//! channels. A winner enabled in a second profile but not in the first is the one case where
+//! the plugin's "enable" step does anything, and crosstalk **withholds** that enable (see the
+//! divergences below). With a single profile (the plugin's own default shape) the enable step
 //! is a no-op and this action only ever disables, as the plugin's does.
 //!
 //! A scope with no profile named is refused with the plugin's own words ("Profile name is
@@ -78,16 +78,18 @@
 //!   * The plugin reports `Enabled N of M channels` where N counts the winners it *tried* to
 //!     enable, including a channel whose membership row only exists in another profile. The
 //!     report here counts the winners and the membership writes separately.
-//!   * A channel with NO membership row in the host profile: the plugin's two
-//!     `update(enabled=...)` statements touch existing rows only, so the row stays absent
-//!     and the channel stays hidden — even when the end state names it the winner. The
-//!     membership write here goes through `PATCH .../bulk-update/`, which CREATES a missing
-//!     row (its answer counts it under `created`), so a rowless winner becomes visible
-//!     where the plugin leaves it hidden. A rowless loser agrees on `False` either way, and
-//!     the plan writes nothing for it (it already reads as disabled), so only the enable
-//!     side differs. In practice every channel has a row in every profile — Dispatcharr
-//!     creates them with the channel and with the profile — and the parity harness covers
-//!     the sparse shape with the divergence counted, not failed.
+//!   * **A winner that is not enabled in the host profile is never enabled.** The plugin's
+//!     `update(enabled=True)` reaches an existing (disabled) row and enables it, but cannot
+//!     reach a channel with NO row there, which stays hidden. Over REST the two look the same
+//!     (a profile lists only its enabled channels), and the only write, `PATCH
+//!     .../bulk-update/`, CREATES a missing row — which would put a channel into a profile the
+//!     operator curated without it (a `start_empty` profile, or channels created for chosen
+//!     profiles only: `apps/channels/api_views.py` and `signals.py` both leave rows out). So
+//!     crosstalk withholds every such enable, reports the channels in the preamble and the
+//!     `enable_withheld` count, and only ever disables: its writes are a subset of the
+//!     plugin's. The bridge (an ORM `update()`) is what restores the plugin's enable step
+//!     exactly. A rowless loser agrees on `False` either way, and the plan writes nothing for
+//!     it (it already reads as disabled).
 
 use crate::matching::{self, MatchOptions};
 use crate::settings::StreamsSettings;
@@ -115,8 +117,13 @@ pub struct VisibilityOutcome {
     pub channels: usize,
     /// Name groups the channels fell into.
     pub groups: usize,
-    /// The channels the end state leaves enabled, in the order the end state names them.
+    /// The channels the plugin's latch picks, one per name group, in group order. A winner
+    /// in [`Self::withheld`] is not enabled by this run.
     pub winners: Vec<i64>,
+    /// Winners that are not enabled in the host profile right now: the plugin would enable
+    /// them (when a disabled row exists), crosstalk leaves them as they are, because the REST
+    /// write would create a row the plugin cannot. Their end state is `false`.
+    pub withheld: Vec<i64>,
     /// In-scope channels that are enabled in the host profile right now.
     pub enabled_before: usize,
     /// Channels left out of the winner race because `attached_channel_id` is set.
@@ -132,9 +139,25 @@ pub struct VisibilityOutcome {
 }
 
 impl VisibilityOutcome {
-    /// The channels the end state disables.
+    /// The channels the end state disables (including withheld winners, which stay off).
     pub fn disabled(&self) -> usize {
         self.end_state.values().filter(|enabled| !**enabled).count()
+    }
+
+    /// The channels the end state leaves enabled: the winners minus the withheld ones.
+    pub fn enabled(&self) -> usize {
+        self.end_state.values().filter(|enabled| **enabled).count()
+    }
+
+    /// The per-channel membership values to write: the end state minus the withheld winners,
+    /// which get no value (so no row and no write) and are reported instead.
+    pub fn values(&self) -> HashMap<i64, SetValue> {
+        let withheld: HashSet<i64> = self.withheld.iter().copied().collect();
+        self.end_state
+            .iter()
+            .filter(|(channel_id, _)| !withheld.contains(channel_id))
+            .map(|(channel_id, enabled)| (*channel_id, SetValue::Flag(*enabled)))
+            .collect()
     }
 
     /// The plugin's completion sentence (`10273`).
@@ -237,21 +260,19 @@ pub fn plan_with_options(
         &group_names,
     );
 
+    // One set, not a `Vec::contains` per channel: at 20k channels the vector scan would be a
+    // quadratic pass over the profile.
+    let host_enabled: HashSet<i64> = host.channels.iter().copied().collect();
     let mut outcome = VisibilityOutcome {
         profile_id: host.id,
         profile_name: host.name.clone(),
         channels: scoped.channels.len(),
         groups: groups.len(),
-        // One set, not a `Vec::contains` per channel: at 20k channels the vector scan would
-        // be a quadratic pass over the profile.
-        enabled_before: {
-            let enabled: HashSet<i64> = host.channels.iter().copied().collect();
-            scoped
-                .channels
-                .iter()
-                .filter(|channel| enabled.contains(&channel.id))
-                .count()
-        },
+        enabled_before: scoped
+            .channels
+            .iter()
+            .filter(|channel| host_enabled.contains(&channel.id))
+            .count(),
         description: format!("channels in scope{}", scope_suffix(scope)),
         ..VisibilityOutcome::default()
     };
@@ -272,6 +293,11 @@ pub fn plan_with_options(
                 continue;
             }
             outcome.winners.push(channel.id);
+            if !host_enabled.contains(&channel.id) {
+                // Rowless or disabled in the host: REST cannot tell which, and enabling a
+                // rowless channel creates its row. See the module docs.
+                outcome.withheld.push(channel.id);
+            }
             enabled_in_group = true;
         }
         if !enabled_in_group {
@@ -283,7 +309,13 @@ pub fn plan_with_options(
     // every channel so the plan can report each one's transition; `channel_ops` drops the
     // ones that already hold their value. The winner lookup is a set: a `Vec::contains` per
     // channel would be quadratic at 20k channels.
-    let winners: HashSet<i64> = outcome.winners.iter().copied().collect();
+    let withheld: HashSet<i64> = outcome.withheld.iter().copied().collect();
+    let winners: HashSet<i64> = outcome
+        .winners
+        .iter()
+        .copied()
+        .filter(|id| !withheld.contains(id))
+        .collect();
     for channel in &scoped.channels {
         outcome
             .end_state
@@ -331,13 +363,9 @@ pub async fn run(
         ));
     }
 
-    let mut values: HashMap<i64, SetValue> = HashMap::new();
-    for (channel_id, enabled) in &outcome.end_state {
-        values.insert(*channel_id, SetValue::Flag(*enabled));
-    }
     let operations = vec![Op::Set {
         field: Field::Membership(outcome.profile_id),
-        values,
+        values: outcome.values(),
     }];
     let op_plan = channel_ops::plan(&world, &Selection::in_scope(&scope), &operations)?;
 
@@ -371,10 +399,35 @@ pub async fn run(
             "End state",
             format!(
                 "{} channel(s) enabled, {} disabled ({} enabled before this run)",
-                outcome.winners.len(),
+                outcome.enabled(),
                 outcome.disabled(),
                 outcome.enabled_before
             ),
+        )
+        .note(
+            "Enables withheld",
+            if outcome.withheld.is_empty() {
+                "none: every winner is already enabled in the profile written".to_string()
+            } else {
+                let shown: Vec<String> = outcome
+                    .withheld
+                    .iter()
+                    .take(50)
+                    .map(|id| id.to_string())
+                    .collect();
+                format!(
+                    "{} winner(s) not enabled in {:?} were left as they are (enabling one \
+                     over REST would add it to the profile): channel id(s) {}{}",
+                    outcome.withheld.len(),
+                    outcome.profile_name,
+                    shown.join(", "),
+                    if outcome.withheld.len() > shown.len() {
+                        ", …"
+                    } else {
+                        ""
+                    }
+                )
+            },
         )
         .note(
             "Attached channels",
@@ -421,7 +474,8 @@ pub async fn run(
     })
     .count("selected", outcome.channels as i64)
     .count("groups", outcome.groups as i64)
-    .count("enabled", outcome.winners.len() as i64)
+    .count("enabled", outcome.enabled() as i64)
+    .count("enable_withheld", outcome.withheld.len() as i64)
     .count("disabled", outcome.disabled() as i64)
     .count("enabled_before", outcome.enabled_before as i64)
     .count("attached_skipped", outcome.attached_skipped as i64)
@@ -443,6 +497,14 @@ pub async fn run(
             "{} name group(s) had no channel with a stream, so every channel in them is \
              disabled",
             outcome.groups_without_winner
+        ));
+    }
+    if !outcome.withheld.is_empty() {
+        builder = builder.note(format!(
+            "{} winner(s) are not enabled in profile {:?} and were left as they are: \
+             crosstalk only disables over REST (see the report preamble)",
+            outcome.withheld.len(),
+            outcome.profile_name
         ));
     }
     // The cancel rule (see crosstalk_core::jobs): whatever landed stays recorded, and the run
@@ -617,6 +679,36 @@ mod tests {
         // All four "Kids" channels are enabled in the host profile, and only ESPN [HD] and CNN
         // survive: the rest move to disabled.
         assert_eq!(outcome.enabled_before, 4);
+        assert!(outcome.withheld.is_empty(), "{:?}", outcome.withheld);
+    }
+
+    #[test]
+    fn a_winner_not_enabled_in_the_host_profile_is_withheld_not_enabled() {
+        // "Kids" lacks ESPN [HD] (3), the ESPN group's winner, which is enabled in "All"
+        // only. The plugin would enable it if a disabled row exists and leave it hidden if
+        // none does; REST cannot tell the two apart and its write would CREATE the row, so
+        // crosstalk leaves it as it is.
+        let mut world = visibility_world();
+        world.profiles.push(ChannelProfile {
+            id: 7,
+            name: "Kids".to_string(),
+            channels: vec![1, 2, 4],
+        });
+        let scope = ScopeConfig {
+            profiles: "Kids, All".to_string(),
+            ..ScopeConfig::default()
+        };
+        let (settings, matching) = options();
+        let outcome = plan(&world, &scope, &settings, &matching).expect("plan");
+        assert!(outcome.winners.contains(&3), "{:?}", outcome.winners);
+        assert_eq!(outcome.withheld, vec![3]);
+        assert_eq!(outcome.end_state.get(&3), Some(&false));
+        assert_eq!(
+            outcome.end_state.get(&4),
+            Some(&true),
+            "CNN is enabled already"
+        );
+        assert_eq!(outcome.enabled(), 1);
     }
 
     #[tokio::test]

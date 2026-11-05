@@ -313,7 +313,7 @@ table below is in that order.
 | `restore_preview` | blue | Find the channels the last probe found playing again that still carry a triage change, and write a CSV of the name and group it would put back. Changes nothing |
 | `restore_apply` | **orange** | Put back the name and group of every recovered channel that still carries a triage change — or strip the plugin's own tag from a name crosstalk has no record of |
 | `visibility_preview` | blue | Work out which channel of each name group stays enabled in the profile (the first with a stream) and write a CSV of every membership that would change. Changes nothing |
-| `visibility_apply` | **red** | Leave exactly one channel per name group enabled in the profile and disable every other in-scope channel. A group where no channel has a stream goes dark |
+| `visibility_apply` | **red** | Leave exactly one channel per name group enabled in the profile and disable every other in-scope channel. A group where no channel has a stream goes dark, and a winner not already enabled in the profile is left as it is (never enabled over REST) |
 | `check_countries` | blue | Compare the country prefix on every stream's group name with the two-letter suffix on its guide identifier, and write a CSV of where they disagree. No provider connection, no change |
 | `scan_placeholders` | blue | Find numbered stream-name families (`MAX 100`, `PPV EVENT 04`) that none of the placeholder patterns covers, and suggest a regex for each. Changes no setting |
 | `test_rules` | blue | Show what the stream-name regex rules would do to every stream name, with sample changes and the per-rule validation report. Unscoped, as the plugin's action is: M3U and stream-group scoping do not apply |
@@ -565,6 +565,9 @@ Each step is an ordinary run: its own app's one-run-per-app slot, its own run pa
 CSV, its own checkpoint. The workflow itself is one more run record (app `workflow`, action =
 the name) and every step run points at it, so the workflow's run page lists the steps it ran.
 Steps run one at a time and the sequence **stops at the first step that fails or is cancelled**.
+A workflow holds no app between steps: if a hook or a schedule started a run of the next step's
+app in the gap, the step waits for it (at most 30 minutes, never past the window) instead of
+failing.
 A step that pauses at its window's end pauses the workflow; the next firing resumes *that* step,
 with the step's own checkpoint picking up its backlog, and continues from there. Cancelling the
 workflow cancels the step it is inside. The window's deadline reaches every step, so a workflow
@@ -610,15 +613,19 @@ How a delivery is handled:
   CSRF only for that reason. Deliveries are rate limited per address
   (`hooks.rate_per_minute` over a minute, `429` with `Retry-After`).
 - **Which event**: an `?event=` query parameter, then an `event` or `type` field in the body,
-  then — because Dispatcharr's default payload names none — the payload's own keys
-  (`account_name`/`total_processed` is `m3u_refresh`, `source_name`/`programs` is
-  `epg_refresh`), and only for an event the configuration names.
+  then — because Dispatcharr's default payload names none — the payload's own counters
+  (`total_processed`/`streams_created`/`streams_updated`/`elapsed_time` is `m3u_refresh`,
+  `programs`/`channels`/`skipped_programs`/`unmapped_channels` is `epg_refresh`; never the bare
+  `account_name`/`source_name`, which the error events carry too), and only for an event the
+  configuration names.
 - **Debounce**: several M3U accounts finishing together is one logical "the playlists changed",
   so every delivery of the same event restarts a `debounce_secs` timer and the run happens once
   after the burst settles.
 - **Busy target**: if the target app (or the workflow slot) is busy, exactly **one** follow-up
   run is queued for when it frees — Stream-Mapparr's dirty-flag behaviour, so a late account is
-  not dropped and a busy app is not started twenty times.
+  not dropped and a busy app is not started twenty times. The follow-up waits at most 30
+  minutes (a multi-hour probe outlasts it; the drop is logged and the next event triggers
+  normally).
 - **Answer**: `202` immediately, because Connect waits ten seconds and a match can take minutes;
   the work runs in the background. An event the configuration does not name is logged and
   answered `202` too — "I do not act on this" is not a delivery failure.
@@ -727,7 +734,7 @@ a host feature every app shares (`Clear exports`, CSV quoting) says so instead.
 | `streams.mirror_apply` records the previous order in the run store, not a snapshot file | The plugin refuses to write unless it first saved every changed channel's order to a snapshot file, and skips a channel that moved mid-run. crosstalk plans and writes one world snapshot: what the run reports as `before` is what Dispatcharr held when the run started, and a concurrent edit after that is overwritten rather than detected. Same trade as every other channel-write action. |
 | `streams.visibility_apply` writes only the memberships that move | The plugin disables every channel in scope and re-enables the winners — two bulk updates touching rows that end up unchanged. crosstalk writes the end state as per-channel values, so a channel already holding its value is a skipped row, not a write. Same end state. |
 | `streams.visibility_apply` writes the first named profile that exists | Stream-Mapparr's `profile_name` list resolves to `profile_ids[0]` for the write while every named profile widens the channel set; crosstalk does exactly that. With a single profile the action only ever disables. |
-| `streams.visibility_apply` creates the membership row a winner is missing | The plugin's two `update(enabled=...)` statements touch existing rows only, so a channel with no row in the profile stays hidden even as the winner. The membership write goes through `PATCH .../bulk-update/`, which creates a missing row, so a rowless winner becomes visible. Rowless losers agree either way and are never written. In practice every channel has a row in every profile; the parity harness covers the sparse shape with the divergence counted. |
+| `streams.visibility_apply` never enables a channel that is not already enabled in the profile | The plugin enables each winner with `update(enabled=True)`, which reaches a disabled row but not a channel with no row in the profile (a `start_empty` profile, or a channel created for chosen profiles only). Over REST a profile lists only its enabled channels, so the two cases look the same, and the only write, `PATCH .../bulk-update/`, *creates* a missing row. So crosstalk withholds every such enable (the report lists them, `enable_withheld` counts them) and only ever disables: its writes are a subset of the plugin's. This only matters with several profiles in `[scope] profiles` (a winner enabled in the second but not the first); with one profile the plugin's enable step is a no-op too. The bridge would restore the exact behaviour. |
 | `streams.visibility_*` reads Dispatcharr live, not the last load snapshot | The plugin reads its `processed_data` file and refuses to run without it. A channel created since the last load takes part here. |
 | `streams.probe` is one action with `--dry-run`, not a pair | It writes stream stats and crosstalk's health table, never a channel's data, so "what would change" is a number the run only learns by measuring. `--dry-run` runs the whole probe, records health, the CSV and the per-channel verdicts, and writes no stream stats. |
 | `streams.probe` caps connections per M3U account, not workers | IPTV Checker's global `parallel_workers` (2) is gone: `probe_per_account_limit` (default 1) connections per account, never above that account's `max_streams`, with `stream_check_delay` between starts on it. Total parallelism grows with the number of accounts, which is the limit a provider actually enforces. |

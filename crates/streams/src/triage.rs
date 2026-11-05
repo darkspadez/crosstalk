@@ -899,7 +899,11 @@ pub async fn run(
 
     // 3. The destination groups: created here on an apply, named by a placeholder on a
     //    preview, so a preview writes nothing at all.
-    let targets = GroupTargets::resolve(Some(client), &world, &outcome.moves, dry_run).await?;
+    //    A run cancelled before this point creates no group either: its rows are all marked
+    //    cancelled by the apply, and an empty destination group would be its only trace.
+    let create_groups = !dry_run && !context.is_cancelled();
+    let targets =
+        GroupTargets::resolve(Some(client), &world, &outcome.moves, !create_groups).await?;
     let plan_world = targets.plan_world(&world);
 
     // 4. One per-channel value map per field, through `channel_ops`: the same selection, scope

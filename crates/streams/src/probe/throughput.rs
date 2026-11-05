@@ -214,6 +214,9 @@ impl HttpMeter {
             Err(error) => {
                 // WARNING, not DEBUG: a run where every probe failed has to be visible in a
                 // normal log, which is exactly what Stream-Mapparr's 5110 comment says.
+                // `without_url`: reqwest's message otherwise quotes the whole URL, credentials
+                // and all, which is exactly what `target` exists to keep out of the log.
+                let error = error.without_url();
                 tracing::warn!("throughput probe could not open {target}: {error}");
                 return ThroughputMeasure::default();
             }
@@ -238,6 +241,7 @@ impl HttpMeter {
                 Ok(Ok(Some(chunk))) => bytes += chunk.len() as u64,
                 Ok(Ok(None)) => break,
                 Ok(Err(error)) => {
+                    let error = error.without_url();
                     tracing::warn!("throughput probe read interrupted for {target}: {error}");
                     break;
                 }

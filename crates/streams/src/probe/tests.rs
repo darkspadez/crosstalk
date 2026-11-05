@@ -1179,6 +1179,17 @@ async fn the_action_probes_every_due_stream_and_record_health_and_stats() {
         .collect();
     assert_eq!(stream_rows.len(), 4);
     assert!(stream_rows.iter().all(|row| row.subject == Subject::Stream));
+    // The stats write is recorded on each stream's row, like every other write.
+    assert!(
+        stream_rows.iter().all(|row| row.method == "stats_written"),
+        "{stream_rows:?}"
+    );
+    // The merge base was re-read right before the write, not taken from the world loaded
+    // when the run began: the stream list is fetched twice.
+    assert!(
+        fixture.request_count("GET", "/api/channels/streams/").await >= 2,
+        "the stats base is re-read before the write"
+    );
     assert!(stream_rows
         .iter()
         .any(|row| row.channel_id == PROBE_FEED_ONE && row.status == "Alive"));

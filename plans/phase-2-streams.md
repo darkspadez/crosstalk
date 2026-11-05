@@ -309,3 +309,65 @@ phase. The orchestrator runs gates and owns commits; nothing is pushed without a
 - Step 2: a channel's group cannot be cleared over REST (`channel_group_id` has no
   `allow_null`). `MoveGroup(None)` plans and records, but apply refuses it per row. Restore of a
   channel whose recorded group was "No Group" needs the bridge; README divergences must say so.
+
+## Phase 2 review notes
+
+From the end-of-phase review (fixes are in the "Phase 2 review fixes" commit). What phases 3 and
+4 must know:
+
+- **Visibility never enables over REST.** A profile's REST listing holds only ENABLED channels,
+  so a rowless channel and a disabled one look the same, and `PATCH .../bulk-update/` CREATES a
+  missing membership row (`apps/channels/api_views.py`). Dispatcharr does not always create rows:
+  `channel_profile_ids` on channel create and `start_empty` profiles both leave them out. So
+  `streams.visibility_apply` withholds every enable of a channel not already enabled in the host
+  profile (`VisibilityOutcome::withheld`, `enable_withheld` count, report note) and only ever
+  disables: its writes are a subset of the plugin's. This only differs from the plugin with
+  several profiles in `[scope] profiles`. **Events visibility (phase 4) has the same trap**: any
+  "show" over `bulk-update` can add a channel to a profile the operator curated. Use
+  `hidden_from_output` where the plugin did, or the same withhold rule; the bridge (an ORM
+  `update()`) is the only exact port of "enable an existing row".
+- **The one write outside channel ops is probe's `stream_stats`.** Its outcome is now on each
+  stream run row (`method` = `stats_written` / `stats_unchanged` / `stats_failed` /
+  `stats_dry_run`), and the merge base is re-read (`client.streams()`) right before the write,
+  because Dispatcharr's live proxy writes `stream_stats` during playback. The previous stats are
+  NOT recorded (50k JSON blobs per night); a dead stream's cleared stats cannot be restored from
+  crosstalk. Triage's `create_group` is the other direct write; it is reported in the outcome,
+  not as a row, and a run cancelled before it creates nothing. Phase 3's group/channel/logo
+  creation needs the same shape (or a channel-ops "create" stage with rows): decide once there.
+- **`stream_health` is written per probe batch**, one transaction per batch
+  (`Store::upsert_stream_health_many`), so a crash or a daemon restart mid-window keeps what was
+  probed (those streams are fresh next run). Run rows and the stats write still happen at the end
+  of the run; a killed run loses its CSV/rows and stats writes, not its health.
+- **A probe `--dry-run` marks streams fresh without writing their stats.** The next real probe
+  skips them for `probe_freshness_hours`, so their `stream_stats` lag by up to that long. As
+  designed (the plan's dry-run definition), but a dry pass of a workflow containing `probe` has
+  this effect too. The scheduled probe and a workflow's probe step share one checkpoint
+  (`streams`/`probe`), which is intended: one backlog.
+- **Workflows hold no app between steps.** A hook or schedule can start a run of the next step's
+  app in the gap; the step now waits for it (250 ms poll, at most 30 minutes, never past the
+  window, not after cancel) instead of failing the sequence. Hook follow-ups still give up after
+  30 minutes, so an `m3u_refresh` during a multi-hour probe is dropped (logged). Phase 3's
+  `full_sync` and phase 4's `on_m3u_refresh` chains should be workflows (ordered) rather than
+  several hook targets: hook targets of different apps start concurrently, unordered.
+- **Channel ops fields for phase 3.** `Op::Set` covers name, group, EPG, `hidden_from_output`,
+  membership and streams. Channel-Mapparr / Name Cleaner / Lineuparr sync also need channel
+  number and logo (`ChannelEdit` carries both; add `Field::Number`/`Field::Logo` + `SetValue`
+  arms and the `edit/bulk` stage mapping), and channel creation, which has no op at all.
+  `MoveGroup(None)` still cannot be applied over REST.
+- **Match collector reuse for Lineuparr's stream half.** `matching::build_groups`,
+  `sort_channels_by_priority` and `MatchOptions::with_database` are public and already shared by
+  visibility and the bench; a lineup mode should feed lineup channels into the same collector
+  rather than add a second walk. Lineuparr's ordering differs from the SM quality model (phase-3
+  divergence row, as decided).
+- **Pre-existing, not fixed:** a wrong Bearer token on any route other than `/login` (including
+  `/hooks/dispatcharr`) is not counted by the login limiter, so the token can be guessed through
+  the API at request speed. Low risk with a long random token; worth one shared check in
+  `auth::require` when the host is next touched.
+- **Store growth.** A nightly probe at 50k streams / 20k channels writes ~90k run rows (stream
+  rows + verdict + format rows). `run_rows` is keyed `(run_id, ordinal)` and pruned with its run
+  by `run_history_days`; reads go through `rows_of_fields` / `field_history`, which filter in SQL.
+  At 30 days that is ~2.7M rows (hundreds of MB). If that matters, give probe runs a shorter
+  retention than channel-op runs rather than dropping the stream rows (restore never reads them).
+- **Phase 1 notes now closed:** `status` is unguarded (it shows a live run), cancel semantics are
+  one rule (`channel_ops::cancelled_note`, paused vs cancelled), per-channel values and
+  multi-select matching exist, and run rows carry a `subject`.

@@ -123,7 +123,7 @@ impl SubApp for StreamsApp {
     /// pair per verb — `match`, `sort`, `mirror`, `probe` (one action, it writes stream stats),
     /// `triage`, `restore`, `visibility` — then the read-only tools (`check_countries`,
     /// `scan_placeholders`, `test_rules`). A pair is declared together, so a preview can never
-    /// ship without its apply. `match` and `sort` are in place.
+    /// ship without its apply.
     fn actions(&self) -> Vec<ActionSpec> {
         vec![
             ActionSpec::new(
@@ -308,8 +308,9 @@ impl SubApp for StreamsApp {
                 "This DISABLES every in-scope channel in the profile except the first channel \
                  of each name group that has at least one stream. A group where no channel has \
                  a stream goes dark entirely, and so does a channel attached to another one. \
-                 Only the channels whose membership actually changes are written, and no \
-                 channel or stream is deleted. Continue?",
+                 A channel that is not already enabled in the profile is never enabled. Only \
+                 the channels whose membership actually changes are written, and no channel or \
+                 stream is deleted. Continue?",
             ),
             ActionSpec::new(
                 ACTION_CHECK_COUNTRIES,

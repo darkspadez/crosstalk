@@ -273,8 +273,8 @@ def plugin_answer(plugin, matcher, case: dict, workdir: Path) -> dict:
 
     Returns the end state plus the pairs the case left without a membership row: Django's
     `update()` touches existing rows only, so a missing row stays missing, while
-    Dispatcharr's bulk-update endpoint CREATES it (`created` in its answer). That is the one
-    place the two sides can differ, and the harness reports it separately."""
+    Dispatcharr's bulk-update endpoint would CREATE it (`created` in its answer). That is why
+    crosstalk withholds every enable of a channel not enabled in the host profile."""
     logger = logging.getLogger("visibility_parity")
     profiles = _named_profiles(case)
     if not profiles:
@@ -503,7 +503,8 @@ def worlds():
     case("two profiles, the first is written", channels,
          [profile(4, "Kids", [1, 2]), profile(5, "All", [1, 2, 3, 4])],
          profile_name="Kids, All")
-    # The winner is enabled in the second profile only: the write enables it in the first.
+    # The winner is enabled in the second profile only: the plugin enables its disabled row
+    # in the first; crosstalk withholds the enable (the counted divergence).
     channels = [
         channel(1, "ESPN", number=1),
         channel(2, "ESPN", number=2),
@@ -551,8 +552,8 @@ def worlds():
     # Sparse membership rows: channels 2 and 4 have NO row in the host profile (a channel
     # made with an explicit empty profile list). Django's `update()` no-ops on them: the
     # loser stays rowless (False either way) while the winner stays rowless too — hidden —
-    # where Dispatcharr's bulk-update endpoint would CREATE the row. The harness counts that
-    # winner separately as the one documented divergence.
+    # and crosstalk withholds its enable (the bulk-update endpoint would CREATE the row), so
+    # both sides agree.
     channels = [
         channel(1, "ESPN", streams=2, number=2),
         channel(2, "ESPN", streams=1, number=1),
@@ -563,8 +564,8 @@ def worlds():
          [profile(4, "All", all_of(channels))], drop_host_rows=[2, 4])
 
     # The same sparse shape across two profiles: the winner enabled in the second profile
-    # only, with no row in the host. The plugin's enable step cannot reach it (no row);
-    # the Rust end state names it enabled, which is what the bulk-update write would create.
+    # only, with no row in the host. The plugin's enable step cannot reach it (no row), and
+    # crosstalk withholds it: both leave it hidden.
     channels = [
         channel(1, "ESPN", number=1),
         channel(2, "ESPN", number=2),
@@ -674,18 +675,28 @@ def main() -> int:
     plugin, matcher = load_plugin()
     rng = random.Random(args.seed)
     cases = worlds() + [random_case(rng, index) for index in range(args.random)]
+    # A channel with no row in the host profile cannot be listed as enabled there: the
+    # profile's `channels` (what both sides read) is the ENABLED rows, so a dropped pair
+    # leaves the host listing too. Without this the case is a world Dispatcharr cannot hold.
+    for case in cases:
+        named = _named_profiles(case)
+        if named and case.get("drop_host_rows"):
+            dropped = set(case["drop_host_rows"])
+            named[0]["channels"] = [channel_id for channel_id in named[0]["channels"]
+                                     if channel_id not in dropped]
     answers = run_rust(cases, args.binary)
 
     mismatches = 0
     compared = 0
     enabled_total = 0
-    no_row_enables = 0
+    withheld_enables = 0
     with tempfile.TemporaryDirectory() as tmp:
         workdir = Path(tmp)
         for case, answer in zip(cases, answers):
             expected = plugin_answer(plugin, matcher, case, workdir)
             end_state = {channel_id: enabled
                          for channel_id, enabled in answer["end_state"]}
+            withheld = set(answer.get("withheld") or [])
             if set(expected["end_state"]) != set(end_state):
                 mismatches += 1
                 if mismatches <= args.show:
@@ -698,16 +709,15 @@ def main() -> int:
                 enabled_total += int(want)
                 got = end_state[channel_id]
                 if got != want:
-                    # The one documented divergence: the channel has NO membership row in
-                    # the host profile and the end state names it enabled. Django's
-                    # `update(enabled=True)` cannot reach a row that does not exist, so the
-                    # plugin leaves it rowless (hidden); Dispatcharr's bulk-update endpoint
-                    # CREATES the row (its answer counts it under `created`), so the Rust
-                    # write would enable it. A loser with no row agrees on False either way
-                    # — and the Rust plan writes nothing for it — so only the enable side
-                    # can land here.
-                    if not want and got and channel_id in (expected.get("dropped") or []):
-                        no_row_enables += 1
+                    # The one documented divergence: a winner that is NOT enabled in the
+                    # host profile. The plugin's `update(enabled=True)` enables it when a
+                    # disabled row exists (and cannot reach it when none does); over REST
+                    # the two look the same and the bulk-update endpoint would CREATE a
+                    # missing row, so crosstalk withholds the enable. Only that direction
+                    # (plugin True, Rust False, channel withheld) is allowed: crosstalk must
+                    # never enable a channel the plugin leaves hidden.
+                    if want and not got and channel_id in withheld:
+                        withheld_enables += 1
                         continue
                     mismatches += 1
                     if mismatches <= args.show:
@@ -717,32 +727,33 @@ def main() -> int:
                         print(f"  profiles={case['profiles']}")
                         print(f"  settings={case['settings']}")
                         print(f"  dropped host rows={expected.get('dropped')}")
+                        print(f"  withheld={sorted(withheld)}")
                         print(f"  python={want} rust={got}")
-            # The plugin's own sentence counts the winners it TRIED to enable — including a
-            # channel with no membership row (a dropped row: the enable `update()` no-ops,
-            # so the end state stays False). The Rust winners agree minus exactly those.
-            divergent = {channel_id for channel_id in (expected.get("dropped") or [])
-                         if not expected["end_state"][channel_id]
-                         and end_state.get(channel_id)}
+            # The plugin's own sentence counts the winners it TRIED to enable, including a
+            # channel with no membership row (its `update()` no-ops). The Rust winners are
+            # the same latch, before any enable is withheld.
             want_enabled = sum(1 for value in expected["end_state"].values() if value)
             _match = re.search(r"Enabled (\d+) of (\d+) channels", expected["message"])
             if _match is None:
                 raise SystemExit(f"the plugin's message changed shape: {expected['message']}")
-            if (int(_match.group(1)), int(_match.group(2))) != \
-                    (want_enabled + len(divergent), len(expected["end_state"])):
+            if int(_match.group(2)) != len(expected["end_state"]) or \
+                    int(_match.group(1)) < want_enabled:
                 raise SystemExit(f"the plugin's message disagrees with its end state: "
                                  f"{expected['message']} vs {expected['end_state']}")
-            if sorted(set(answer["winners"]) - divergent) != sorted(
-                    channel_id for channel_id, value in expected["end_state"].items() if value):
+            if int(_match.group(1)) != len(answer["winners"]):
                 mismatches += 1
                 if mismatches <= args.show:
-                    print(f"[{case['comment']}] winners differ: "
-                          f"python={sorted(cid for cid, v in expected['end_state'].items() if v)} "
-                          f"rust={sorted(answer['winners'])}")
+                    print(f"[{case['comment']}] winner count differs: "
+                          f"python={expected['message']} rust={sorted(answer['winners'])}")
+            if not withheld <= set(answer["winners"]):
+                mismatches += 1
+                if mismatches <= args.show:
+                    print(f"[{case['comment']}] a withheld channel is not a winner: "
+                          f"{sorted(withheld - set(answer['winners']))}")
 
     print(f"[visibility] {mismatches} mismatch(es) over {len(cases)} case(s), "
-          f"{compared} channel(s) compared, {enabled_total} left enabled, "
-          f"{no_row_enables} no-row enable(s) (the documented bulk-update-creates "
+          f"{compared} channel(s) compared, {enabled_total} left enabled by the plugin, "
+          f"{withheld_enables} withheld enable(s) (the documented REST-cannot-see-rows "
           f"divergence)")
     return 1 if mismatches else 0
 

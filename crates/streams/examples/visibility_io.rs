@@ -232,6 +232,7 @@ fn run_case(case: &Case) -> anyhow::Result<Value> {
         "channels": outcome.channels,
         "groups": outcome.groups,
         "winners": outcome.winners,
+        "withheld": outcome.withheld,
         "end_state": end_state,
         "enabled_before": outcome.enabled_before,
         "attached_skipped": outcome.attached_skipped,

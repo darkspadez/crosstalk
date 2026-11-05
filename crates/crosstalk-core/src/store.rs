@@ -988,31 +988,47 @@ impl Store {
     /// nothing must clear the previous measurement, or a stream that has been failing for hours
     /// would keep sorting on the rate it had this morning.
     pub fn upsert_stream_health(&self, health: &StreamHealth) -> Result<()> {
+        self.upsert_stream_health_many(std::slice::from_ref(health))
+            .map(|_| ())
+    }
+
+    /// [`Store::upsert_stream_health`] for many streams in ONE transaction: a probe batch, or
+    /// a whole run's worth, costs one commit instead of one per stream.
+    pub fn upsert_stream_health_many(&self, rows: &[StreamHealth]) -> Result<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
         self.with_connection(|connection| {
-            connection.execute(
-                "INSERT INTO stream_health (stream_id, probed_at, class, error_type, \
-                 throughput_mbps, throughput_at, edge_ip, consecutive_failures) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
-                 ON CONFLICT(stream_id) DO UPDATE SET \
-                     probed_at = excluded.probed_at, \
-                     class = excluded.class, \
-                     error_type = excluded.error_type, \
-                     throughput_mbps = excluded.throughput_mbps, \
-                     throughput_at = excluded.throughput_at, \
-                     edge_ip = excluded.edge_ip, \
-                     consecutive_failures = excluded.consecutive_failures",
-                params![
-                    health.stream_id,
-                    health.probed_at,
-                    health.class,
-                    health.error_type,
-                    health.throughput_mbps,
-                    health.throughput_at,
-                    health.edge_ip,
-                    health.consecutive_failures,
-                ],
-            )?;
-            Ok(())
+            let transaction = connection.unchecked_transaction()?;
+            {
+                let mut statement = transaction.prepare_cached(
+                    "INSERT INTO stream_health (stream_id, probed_at, class, error_type, \
+                     throughput_mbps, throughput_at, edge_ip, consecutive_failures) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                     ON CONFLICT(stream_id) DO UPDATE SET \
+                         probed_at = excluded.probed_at, \
+                         class = excluded.class, \
+                         error_type = excluded.error_type, \
+                         throughput_mbps = excluded.throughput_mbps, \
+                         throughput_at = excluded.throughput_at, \
+                         edge_ip = excluded.edge_ip, \
+                         consecutive_failures = excluded.consecutive_failures",
+                )?;
+                for health in rows {
+                    statement.execute(params![
+                        health.stream_id,
+                        health.probed_at,
+                        health.class,
+                        health.error_type,
+                        health.throughput_mbps,
+                        health.throughput_at,
+                        health.edge_ip,
+                        health.consecutive_failures,
+                    ])?;
+                }
+            }
+            transaction.commit()?;
+            Ok(rows.len())
         })
     }
 
