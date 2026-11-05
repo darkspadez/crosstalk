@@ -213,6 +213,110 @@ impl AiConfig {
     }
 }
 
+/// One link of the `[ai.verify]` escalation chain: which provider answers, and which model.
+///
+/// ```toml
+/// [ai.verify]
+/// chain = [{provider = "typesafe", model = "jev-latest"}, {provider = "llm", model = "kimi-k3"}]
+/// ```
+///
+/// The `provider` names are the keys of `[ai.providers.<name>]`, so every link is validated
+/// against the configured endpoints.
+///
+/// Both fields are required: a link missing its model must not quietly inherit
+/// `jev-latest` and send it to an endpoint that has never heard of it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AiChainEntry {
+    /// Which entry under `[ai.providers]` answers this link.
+    pub provider: String,
+    /// Model name, as the provider names it.
+    pub model: String,
+}
+
+/// The defaults the single-pair shorthand falls back to, and what a `provider`/`model` left
+/// untouched reads as when the chain is set. Validation refuses a non-default pair alongside
+/// a chain; with no way to tell an explicitly written default from an inherited one, a pair
+/// left at these values reads as "not set".
+pub const DEFAULT_VERIFY_PROVIDER: &str = "typesafe";
+pub const DEFAULT_VERIFY_MODEL: &str = "jev-latest";
+
+impl Default for AiChainEntry {
+    fn default() -> Self {
+        Self {
+            provider: DEFAULT_VERIFY_PROVIDER.to_string(),
+            model: DEFAULT_VERIFY_MODEL.to_string(),
+        }
+    }
+}
+
+impl AiChainEntry {
+    pub fn new(provider: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            provider: provider.into(),
+            model: model.into(),
+        }
+    }
+}
+
+/// Parse `[ai.verify] chain`: either inline tables in the file, or — for
+/// `CROSSTALK_AI__VERIFY__CHAIN` — a JSON string holding the same array.
+///
+/// An environment override arrives as untyped text, and figment has no syntax for a list of
+/// tables, so the JSON string is the only way to set the chain without the file. A value
+/// that parses as neither is a load error naming the field, not a silent empty chain.
+fn deserialize_ai_chain<'de, D>(deserializer: D) -> Result<Vec<AiChainEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, SeqAccess, Visitor};
+
+    struct ChainVisitor;
+
+    impl<'de> Visitor<'de> for ChainVisitor {
+        type Value = Vec<AiChainEntry>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .write_str("a list of {provider, model} tables, or a JSON string holding that list")
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return Ok(Vec::new());
+            }
+            serde_json::from_str(trimmed).map_err(|error| {
+                E::custom(format!(
+                    "ai.verify.chain: not a JSON list of {{provider, model}}: {error}"
+                ))
+            })
+        }
+
+        fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
+            self.visit_str(&value)
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut chain = Vec::new();
+            while let Some(entry) = seq.next_element()? {
+                chain.push(entry);
+            }
+            Ok(chain)
+        }
+    }
+
+    deserializer.deserialize_any(ChainVisitor)
+}
+
 /// When the AI verifier is asked, and how its answers are read: `[ai.verify]`.
 ///
 /// This was `guide.toml`'s `[ai]` block. It moved to the host file because verifying a
@@ -227,6 +331,12 @@ pub struct AiVerifyConfig {
     pub provider: String,
     /// Model name, as the provider names it: `jev-latest`, `clef`, and so on.
     pub model: String,
+    /// The escalation chain: asked in order, each link handling what the earlier ones could
+    /// not decide. Empty means "the `provider`/`model` pair above, as one link": every
+    /// existing file and every `CROSSTALK_AI__VERIFY__...` override keeps working, and setting
+    /// both the pair and the chain is a validation error.
+    #[serde(default, deserialize_with = "deserialize_ai_chain")]
+    pub chain: Vec<AiChainEntry>,
     /// Score band, inclusive, in which a heuristic result is treated as uncertain.
     pub verify_band_low: u8,
     pub verify_band_high: u8,
@@ -244,12 +354,36 @@ pub struct AiVerifyConfig {
     pub min_confidence: f64,
 }
 
+impl AiVerifyConfig {
+    /// The links the gate actually asks, in order: the chain when set, otherwise the
+    /// `provider`/`model` pair above as a single link.
+    pub fn effective_chain(&self) -> Vec<AiChainEntry> {
+        if self.chain.is_empty() {
+            vec![AiChainEntry {
+                provider: self.provider.clone(),
+                model: self.model.clone(),
+            }]
+        } else {
+            self.chain.clone()
+        }
+    }
+
+    /// Whether the shorthand pair carries a non-default value while the chain is also set.
+    /// That combination is refused by validation: with no way to tell an explicitly written
+    /// default from an inherited one, a pair left at its defaults reads as "not set".
+    pub fn has_shorthand_and_chain(&self) -> bool {
+        !self.chain.is_empty()
+            && (self.provider != DEFAULT_VERIFY_PROVIDER || self.model != DEFAULT_VERIFY_MODEL)
+    }
+}
+
 impl Default for AiVerifyConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            provider: "typesafe".to_string(),
-            model: "jev-latest".to_string(),
+            provider: DEFAULT_VERIFY_PROVIDER.to_string(),
+            model: DEFAULT_VERIFY_MODEL.to_string(),
+            chain: Vec::new(),
             verify_band_low: 80,
             verify_band_high: 94,
             rescue: true,
@@ -1055,6 +1189,41 @@ impl CrosstalkConfig {
                 .errors
                 .push("ai.verify.enabled is on but ai.verify.model is empty".to_string());
         }
+        if verify.has_shorthand_and_chain() {
+            report.errors.push(
+                "ai.verify.chain is set and ai.verify.provider/model is also set (in the \
+                 file or a CROSSTALK_AI__VERIFY__PROVIDER/MODEL override): use the chain or \
+                 the single provider/model pair, not both (leave provider and model at their \
+                 defaults to use the chain)"
+                    .to_string(),
+            );
+        }
+        // An explicit chain names its endpoints link by link, so a typo'd provider is a
+        // validation error rather than a run that silently degrades to heuristic-only. The
+        // shorthand pair keeps its old behaviour (a warning at ask time, heuristic-only):
+        // refusing it here would turn every existing enabled-without-provider install from
+        // a warning into a failed run.
+        if verify.enabled && !verify.chain.is_empty() {
+            for (position, entry) in verify.chain.iter().enumerate() {
+                if entry.provider.trim().is_empty() {
+                    report
+                        .errors
+                        .push(format!("ai.verify.chain[{position}].provider is empty"));
+                } else if !self.ai.providers.contains_key(entry.provider.trim()) {
+                    report.errors.push(format!(
+                        "ai.verify.chain[{position}].provider names {:?}, which has no \
+                         [ai.providers.{}] entry",
+                        entry.provider,
+                        entry.provider.trim()
+                    ));
+                }
+                if entry.model.trim().is_empty() {
+                    report
+                        .errors
+                        .push(format!("ai.verify.chain[{position}].model is empty"));
+                }
+            }
+        }
 
         for (key, entry) in &self.schedules {
             if !key.contains('.') {
@@ -1370,7 +1539,23 @@ fn shared_fields() -> Vec<crate::subapp::FieldSpec> {
             FieldValue::Text("jev-latest".to_string()),
         )
         .with_placeholder("jev-latest")
-        .with_help("Model name as the provider spells it."),
+        .with_help("Model name as the provider spells it. Leave at the defaults when the chain below is set: setting both is refused.")
+        ,
+        FieldSpec::new(
+            "ai.verify.chain",
+            "_section_ai",
+            "AI Verify Chain (JSON)",
+            FieldKind::Text,
+            FieldValue::Text(String::new()),
+        )
+        .with_placeholder(r#"[{"provider": "typesafe", "model": "jev-latest"}, {"provider": "llm", "model": "kimi-k3"}]"#)
+        .with_help(
+            "Escalation chain as a JSON list of {provider, model} links, asked in order: a \
+             link that cannot decide hands the same question to the next. Empty means the \
+             provider/model pair above, as one link. Each provider must name an \
+             [ai.providers.<name>] entry in this file. The CROSSTALK_AI__VERIFY__CHAIN \
+             environment override takes the same JSON."
+        ),
         FieldSpec::new(
             "ai.verify.verify_band_low",
             "_section_ai",
@@ -1537,6 +1722,29 @@ fn matching_fields() -> Vec<crate::subapp::FieldSpec> {
     ]
 }
 
+/// The chain as the settings form holds it: empty when unset (so the preamble prints
+/// "(not set)"), otherwise the compact JSON the form parses back verbatim.
+fn chain_form_value(chain: &[AiChainEntry]) -> String {
+    if chain.is_empty() {
+        String::new()
+    } else {
+        serde_json::to_string(chain).unwrap_or_default()
+    }
+}
+
+/// Parse the chain back from the settings form. Blank clears it to the shorthand; anything
+/// else must be the JSON list the form value was rendered from.
+fn parse_chain_form_value(text: &str) -> Result<Vec<AiChainEntry>> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(trimmed).with_context(|| {
+        "ai.verify.chain must be a JSON list like ".to_string()
+            + r#"[{"provider": "typesafe", "model": "jev-latest"}]"#
+    })
+}
+
 /// The host settings as form values, for the settings page and the CSV preamble.
 pub fn host_values(config: &CrosstalkConfig) -> crate::subapp::SettingsValues {
     let mut values = shared_values(config);
@@ -1596,6 +1804,10 @@ pub fn shared_values(config: &CrosstalkConfig) -> crate::subapp::SettingsValues 
         FieldValue::Text(verify.provider.clone()),
     );
     values.insert("ai.verify.model", FieldValue::Text(verify.model.clone()));
+    values.insert(
+        "ai.verify.chain",
+        FieldValue::Text(chain_form_value(&verify.chain)),
+    );
     values.insert(
         "ai.verify.verify_band_low",
         FieldValue::Number(f64::from(verify.verify_band_low)),
@@ -1663,6 +1875,9 @@ pub fn apply_host_values(
     }
     if let Some(text) = values.text("ai.verify.model") {
         config.ai.verify.model = text.to_string();
+    }
+    if let Some(text) = values.text("ai.verify.chain") {
+        config.ai.verify.chain = parse_chain_form_value(text)?;
     }
     if let Some(number) = values.number("ai.verify.verify_band_low") {
         config.ai.verify.verify_band_low = clamp_u8(number)?;
@@ -2822,6 +3037,244 @@ m3u_refresh = ["streams.match_apply"]
             .expect("a digits-only token must not be read as a number");
         std::env::remove_var("CROSSTALK_TESTDIGITS_SERVER__TOKEN");
         assert_eq!(config.server.resolved_token().as_deref(), Some("123456"));
+    }
+
+    #[test]
+    fn the_verify_chain_defaults_to_the_shorthand_pair() {
+        // Old files name one provider and model and no chain: that pair is the one-link
+        // chain, so every existing crosstalk.toml keeps working untouched.
+        let verify = AiVerifyConfig::default();
+        assert!(verify.chain.is_empty());
+        assert_eq!(
+            verify.effective_chain(),
+            vec![AiChainEntry::new("typesafe", "jev-latest")]
+        );
+        assert!(!verify.has_shorthand_and_chain());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            "[ai.verify]\nprovider = \"local\"\nmodel = \"m\"\n",
+        );
+        let config = CrosstalkConfig::load_file(dir.path()).expect("load");
+        assert_eq!(
+            config.ai.verify.effective_chain(),
+            vec![AiChainEntry::new("local", "m")]
+        );
+    }
+
+    #[test]
+    fn the_verify_chain_parses_from_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            r#"
+[dispatcharr]
+api_key = "k"
+
+[ai.providers.typesafe]
+kind = "typesafe"
+base_url = "https://api.typesafe.ai/v1"
+api_key = "k"
+
+[ai.providers.llm]
+kind = "openai_compat"
+base_url = "http://gpu-box:8000/v1"
+
+[ai.verify]
+enabled = true
+chain = [{provider = "typesafe", model = "jev-latest"}, {provider = "llm", model = "kimi-k3"}]
+"#,
+        );
+        let config = CrosstalkConfig::load_file(dir.path()).expect("load");
+        assert_eq!(
+            config.ai.verify.effective_chain(),
+            vec![
+                AiChainEntry::new("typesafe", "jev-latest"),
+                AiChainEntry::new("llm", "kimi-k3"),
+            ]
+        );
+        // The chain replaces the pair: the pair's own values are untouched defaults.
+        assert_eq!(config.ai.verify.provider, "typesafe");
+        assert!(config.validate().is_ok(), "{:?}", config.validate().errors);
+
+        // And it survives a save with the operator's comments.
+        config
+            .save(dir.path().join("crosstalk.toml"))
+            .expect("save");
+        let reloaded = CrosstalkConfig::load_file(dir.path()).expect("reload");
+        assert_eq!(reloaded.ai.verify.effective_chain().len(), 2);
+    }
+
+    #[test]
+    fn setting_both_the_pair_and_the_chain_is_refused() {
+        let mut config = CrosstalkConfig::default();
+        config.dispatcharr.api_key = "k".to_string();
+        config.ai.verify.enabled = true;
+        config.ai.verify.provider = "local".to_string();
+        config.ai.verify.model = "m".to_string();
+        config.ai.verify.chain = vec![AiChainEntry::new("typesafe", "jev-latest")];
+        let report = config.validate();
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("ai.verify.chain is set")
+                    && error.contains("not both")),
+            "{report:?}"
+        );
+
+        // A pair left at its defaults reads as "not set": the chain alone is fine.
+        config.ai.verify.provider = DEFAULT_VERIFY_PROVIDER.to_string();
+        config.ai.verify.model = DEFAULT_VERIFY_MODEL.to_string();
+        assert!(
+            !config
+                .validate()
+                .errors
+                .iter()
+                .any(|error| error.contains("ai.verify.chain is set")),
+            "{:?}",
+            config.validate().errors
+        );
+    }
+
+    #[test]
+    fn a_chain_link_naming_no_provider_is_refused() {
+        let mut config = CrosstalkConfig::default();
+        config.dispatcharr.api_key = "k".to_string();
+        config.ai.verify.enabled = true;
+        config.ai.verify.chain = vec![
+            AiChainEntry::new("typesafe", "jev-latest"),
+            AiChainEntry::new("llm", ""),
+        ];
+        let report = config.validate();
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("ai.verify.chain[0].provider")
+                    && error.contains("no [ai.providers.typesafe] entry")),
+            "{report:?}"
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("ai.verify.chain[1].model is empty")),
+            "{report:?}"
+        );
+
+        // Disabled, the chain is not checked: an operator can stage it before the keys.
+        config.ai.verify.enabled = false;
+        assert!(
+            config
+                .validate()
+                .errors
+                .iter()
+                .all(|error| !error.contains("ai.verify.chain[")),
+            "{:?}",
+            config.validate().errors
+        );
+    }
+
+    #[test]
+    fn the_chain_comes_from_the_environment_as_json() {
+        // Figment has no syntax for a list of tables, so the override is the JSON string
+        // holding the same array the file would hold as tables.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            "[ai.verify]\nenabled = true\n",
+        );
+        std::env::set_var(
+            "CROSSTALK_TESTCHAIN_AI__VERIFY__CHAIN",
+            r#"[{"provider": "typesafe", "model": "jev-latest"}, {"provider": "llm", "model": "kimi-k3"}]"#,
+        );
+        let config =
+            CrosstalkConfig::load_prefixed(dir.path(), "CROSSTALK_TESTCHAIN_").expect("load");
+        std::env::remove_var("CROSSTALK_TESTCHAIN_AI__VERIFY__CHAIN");
+        assert_eq!(config.env_overrides, 1);
+        assert_eq!(
+            config.ai.verify.effective_chain(),
+            vec![
+                AiChainEntry::new("typesafe", "jev-latest"),
+                AiChainEntry::new("llm", "kimi-k3"),
+            ]
+        );
+
+        // And an effective config still refuses to be saved, secrets or not.
+        let error = config
+            .save(dir.path().join("crosstalk.toml"))
+            .expect_err("refuses");
+        assert!(format!("{error}").contains("environment overrides"));
+    }
+
+    #[test]
+    fn a_chain_link_missing_its_model_is_a_load_error() {
+        // Defaulting the model would send `jev-latest` to an LLM endpoint.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            "[ai.verify]\nchain = [{provider = \"llm\"}]\n",
+        );
+        let error = CrosstalkConfig::load_file(dir.path()).expect_err("rejects");
+        assert!(format!("{error:#}").contains("model"), "{error:#}");
+    }
+
+    #[test]
+    fn a_garbled_chain_override_is_a_load_error_naming_the_field() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            "[ai.verify]\nenabled = true\n",
+        );
+        std::env::set_var(
+            "CROSSTALK_TESTCHAINBAD_AI__VERIFY__CHAIN",
+            "not json at all",
+        );
+        let error = CrosstalkConfig::load_prefixed(dir.path(), "CROSSTALK_TESTCHAINBAD_")
+            .expect_err("rejects");
+        std::env::remove_var("CROSSTALK_TESTCHAINBAD_AI__VERIFY__CHAIN");
+        assert!(
+            format!("{error:#}").contains("ai.verify.chain"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn the_chain_round_trips_through_the_settings_form() {
+        // The host page edits the chain as a JSON text field: values -> form -> values is
+        // the identity, and blank clears back to the shorthand.
+        let mut config = CrosstalkConfig::default();
+        config.ai.verify.chain = vec![AiChainEntry::new("llm", "kimi-k3")];
+        let values = shared_values(&config);
+        assert_eq!(
+            values.text("ai.verify.chain"),
+            Some(r#"[{"provider":"llm","model":"kimi-k3"}]"#)
+        );
+
+        let mut applied = CrosstalkConfig::default();
+        apply_host_values(&mut applied, &values).expect("apply");
+        assert_eq!(applied.ai.verify.chain, config.ai.verify.chain);
+
+        let mut blank = SettingsValues::new();
+        blank.insert("ai.verify.chain", FieldValue::Text(String::new()));
+        apply_host_values(&mut applied, &blank).expect("clear");
+        assert!(applied.ai.verify.chain.is_empty());
+        assert_eq!(
+            applied.ai.verify.effective_chain(),
+            vec![AiChainEntry::new("typesafe", "jev-latest")]
+        );
+
+        let mut bad = SettingsValues::new();
+        bad.insert("ai.verify.chain", FieldValue::Text("[{oops}]".to_string()));
+        let error = apply_host_values(&mut applied, &bad).expect_err("rejects");
+        assert!(format!("{error:#}").contains("ai.verify.chain"));
     }
 
     #[test]

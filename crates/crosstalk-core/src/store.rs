@@ -224,7 +224,7 @@ pub struct StreamHealth {
 }
 
 /// One AI request and its answer, kept for auditing why a row was accepted.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AiDecision {
     pub row_ordinal: i64,
     pub provider: String,
@@ -234,6 +234,27 @@ pub struct AiDecision {
     pub output_tokens: i64,
     pub request: serde_json::Value,
     pub response: serde_json::Value,
+    /// Every chain link asked, in order: `{provider, model, result, ...}`. The last entry
+    /// with a response decided; earlier ones were undecided or failed. Empty for rows
+    /// written before the chain existed, which asked exactly one link.
+    #[serde(default)]
+    pub attempts: serde_json::Value,
+}
+
+impl Default for AiDecision {
+    fn default() -> Self {
+        Self {
+            row_ordinal: 0,
+            provider: String::new(),
+            model: String::new(),
+            latency_ms: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            request: serde_json::Value::Null,
+            response: serde_json::Value::Null,
+            attempts: serde_json::json!([]),
+        }
+    }
 }
 
 /// The store handle. Cloneable and cheap: the connection is shared.
@@ -372,6 +393,7 @@ impl Store {
                     output_tokens INTEGER NOT NULL DEFAULT 0,
                     request       TEXT    NOT NULL DEFAULT '{}',
                     response      TEXT    NOT NULL DEFAULT '{}',
+                    attempts      TEXT    NOT NULL DEFAULT '[]',
                     PRIMARY KEY (run_id, row_ordinal)
                 );
 
@@ -424,6 +446,7 @@ impl Store {
             }
             add_run_row_columns(connection)?;
             add_run_columns(connection)?;
+            add_ai_decision_columns(connection)?;
             // Before the index below: the rename turns `janitor` rows into `guide` rows, and
             // must not be the statement that trips over it.
             rename_recorded_history(connection)?;
@@ -603,11 +626,12 @@ impl Store {
     pub fn record_ai_decision(&self, run_id: i64, decision: &AiDecision) -> Result<()> {
         let request = serde_json::to_string(&decision.request)?;
         let response = serde_json::to_string(&decision.response)?;
+        let attempts = serde_json::to_string(&decision.attempts)?;
         self.with_connection(|connection| {
             connection.execute(
                 "INSERT OR REPLACE INTO ai_decisions (run_id, row_ordinal, provider, model, \
-                 latency_ms, input_tokens, output_tokens, request, response) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 latency_ms, input_tokens, output_tokens, request, response, attempts) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     run_id,
                     decision.row_ordinal,
@@ -618,6 +642,7 @@ impl Store {
                     decision.output_tokens,
                     request,
                     response,
+                    attempts,
                 ],
             )?;
             Ok(())
@@ -840,12 +865,13 @@ impl Store {
         self.with_connection(|connection| {
             let mut statement = connection.prepare(
                 "SELECT row_ordinal, provider, model, latency_ms, input_tokens, output_tokens, \
-                 request, response FROM ai_decisions WHERE run_id = ?1 AND row_ordinal = ?2",
+                 request, response, attempts FROM ai_decisions WHERE run_id = ?1 AND row_ordinal = ?2",
             )?;
             statement
                 .query_row(params![run_id, ordinal], |row| {
                     let request: String = row.get(6)?;
                     let response: String = row.get(7)?;
+                    let attempts: String = row.get(8)?;
                     Ok(AiDecision {
                         row_ordinal: row.get(0)?,
                         provider: row.get(1)?,
@@ -855,6 +881,8 @@ impl Store {
                         output_tokens: row.get(5)?,
                         request: serde_json::from_str(&request).unwrap_or_default(),
                         response: serde_json::from_str(&response).unwrap_or_default(),
+                        attempts: serde_json::from_str(&attempts)
+                            .unwrap_or(serde_json::json!([])),
                     })
                 })
                 .optional()
@@ -1194,6 +1222,29 @@ fn add_run_row_columns(connection: &Connection) -> Result<()> {
             "UPDATE run_rows SET subject = 'epg_source' \
              WHERE field = 'epg_source' AND subject != 'epg_source'",
             [],
+        )?;
+    }
+    Ok(())
+}
+
+/// Add the columns the AI audit gained after the first release.
+///
+/// `CREATE TABLE IF NOT EXISTS` leaves an existing `ai_decisions` alone, so a store written
+/// by an earlier build would reject the new inserts. The column is defaulted, so an old row
+/// reads back as "one link asked", which is what it was: the chain did not exist yet.
+fn add_ai_decision_columns(connection: &Connection) -> Result<()> {
+    let mut statement = connection.prepare("PRAGMA table_info(ai_decisions)")?;
+    let existing: std::collections::HashSet<String> = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<_>>()?;
+    // Same lost-race tolerance as `add_run_columns`: two processes migrating together
+    // must not fail the second open.
+    if !existing.contains("attempts") {
+        add_column(
+            connection,
+            "ai_decisions",
+            "attempts",
+            "TEXT NOT NULL DEFAULT '[]'",
         )?;
     }
     Ok(())
@@ -2224,6 +2275,9 @@ mod tests {
             output_tokens: 40,
             request: serde_json::json!({"state": "x"}),
             response: serde_json::json!({"answers": {}}),
+            attempts: serde_json::json!([
+                {"provider": "typesafe", "model": "jev-latest", "result": "decided"},
+            ]),
         };
         store.record_ai_decision(run_id, &decision).expect("record");
 
@@ -2233,7 +2287,60 @@ mod tests {
             .expect("present");
         assert_eq!(loaded.model, "jev-latest");
         assert_eq!(loaded.latency_ms, 120);
+        assert_eq!(loaded.attempts, decision.attempts);
         assert!(store.ai_decision(run_id, 4).expect("load").is_none());
+    }
+
+    #[test]
+    fn ai_decision_attempts_default_to_empty_for_old_rows() {
+        // A database written before the chain existed has no `attempts` column: opening it
+        // backfills the column, and its rows read back as "one link asked", which is what
+        // they were.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("store.sqlite");
+        {
+            let connection = rusqlite::Connection::open(&path).expect("open");
+            connection
+                .execute_batch(
+                    "CREATE TABLE runs (id INTEGER PRIMARY KEY AUTOINCREMENT, app TEXT NOT \
+                     NULL, action TEXT NOT NULL, dry_run INTEGER NOT NULL, started_at TEXT NOT \
+                     NULL, finished_at TEXT, status TEXT NOT NULL, summary TEXT, counts TEXT \
+                     NOT NULL DEFAULT '{}', report_path TEXT, parent_run_id INTEGER); \
+                     CREATE TABLE ai_decisions (run_id INTEGER NOT NULL, row_ordinal INTEGER \
+                     NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, latency_ms INTEGER \
+                     NOT NULL DEFAULT 0, input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens \
+                     INTEGER NOT NULL DEFAULT 0, request TEXT NOT NULL DEFAULT '{}', response \
+                     TEXT NOT NULL DEFAULT '{}', PRIMARY KEY (run_id, row_ordinal));",
+                )
+                .expect("old schema");
+            connection
+                .execute(
+                    "INSERT INTO runs (app, action, dry_run, started_at, status, counts) \
+                     VALUES ('guide', 'match_preview', 1, '2026-01-01T00:00:00Z', 'succeeded', '{}')",
+                    [],
+                )
+                .expect("run");
+            connection
+                .execute(
+                    "INSERT INTO ai_decisions (run_id, row_ordinal, provider, model) VALUES \
+                     (1, 0, 'typesafe', 'jev-latest')",
+                    [],
+                )
+                .expect("decision");
+        }
+        // Opening migrates idempotently: the column appears, and opening again changes
+        // nothing.
+        let store = Store::open(&path).expect("migrate");
+        let reopened = Store::open(&path).expect("migrate again");
+        for store in [&store, &reopened] {
+            let loaded = store.ai_decision(1, 0).expect("load").expect("present");
+            assert_eq!(loaded.provider, "typesafe");
+            assert_eq!(
+                loaded.attempts,
+                serde_json::json!([]),
+                "an old row asked exactly one link"
+            );
+        }
     }
 
     #[test]

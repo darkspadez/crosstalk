@@ -20,8 +20,8 @@
 //! ([`Candidate`]), because "is this the same channel?" is the same question whatever the
 //! candidate is: an EPG entry for guide, a stream for streams, a logo set for lineup.
 
-use crate::ai::{AiService, Answer, DecisionRequest, Question};
-use crate::config::{AiVerifyConfig, CrosstalkConfig};
+use crate::ai::{AiService, Answer, ChainAttempt, DecisionRequest, Question};
+use crate::config::{AiChainEntry, AiVerifyConfig, CrosstalkConfig};
 use crate::dispatcharr::Channel;
 use crate::match_run::Candidate;
 use crate::store::AiDecision;
@@ -85,6 +85,9 @@ pub struct GateOutcome {
     pub confidence: Option<f64>,
     /// A one-line summary for the CSV, for example
     /// `verify: espn 0.93 (accept)`.
+    ///
+    /// When the chain escalated, the trail is appended inside the parentheses, for example
+    /// `verify: espn 0.93 (accept, llm/kimi-k3 after typesafe/jev-latest undecided)`.
     pub decision: String,
     /// The model that answered.
     pub model: String,
@@ -95,24 +98,87 @@ pub struct GateOutcome {
     /// The request and response, for the audit trail.
     pub request: serde_json::Value,
     pub response: serde_json::Value,
+    /// Every chain link asked, in order. Empty for rows that never reached a provider.
+    /// Earlier answered attempts were undecided by construction — a decided link stops
+    /// the chain — and failed ones carry their error.
+    pub attempts: Vec<ChainAttempt>,
     /// Whether an answer was actually obtained. A failed request leaves the channel undecided
     /// rather than failing the run.
     pub answered: bool,
+    /// Whether cancellation stopped the chain between links.
+    pub cancelled: bool,
 }
 
 impl GateOutcome {
     /// Convert to the store's decision row.
-    pub fn to_store(&self, row_ordinal: i64, provider: &str) -> AiDecision {
+    ///
+    /// The recorded provider is the link that decided — the last one that answered — not
+    /// the shorthand pair from the settings, which may name a link that was never asked.
+    /// `fallback_provider` covers rows that never reached a provider (skipped, cancelled
+    /// before the first link) and keeps old callers compiling.
+    pub fn to_store(&self, row_ordinal: i64, fallback_provider: &str) -> AiDecision {
+        let decided = self
+            .attempts
+            .iter()
+            .rposition(|attempt| attempt.response.is_some());
+        let provider = decided
+            .and_then(|position| self.attempts.get(position))
+            .or(self.attempts.last())
+            .map(|attempt| attempt.provider.clone())
+            .unwrap_or_else(|| fallback_provider.to_string());
         AiDecision {
             row_ordinal,
-            provider: provider.to_string(),
+            provider,
             model: self.model.clone(),
             latency_ms: self.latency_ms,
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
             request: self.request.clone(),
             response: self.response.clone(),
+            attempts: self
+                .attempts
+                .iter()
+                .enumerate()
+                .map(|(position, attempt)| {
+                    // A link whose answer stood stops the chain, so every earlier answered
+                    // link was undecided; only the last answered one decided.
+                    let result = if attempt.response.is_none() {
+                        "failed"
+                    } else if Some(position) == decided {
+                        "decided"
+                    } else {
+                        "undecided"
+                    };
+                    serde_json::json!({
+                        "provider": attempt.provider,
+                        "model": attempt.model,
+                        "result": result,
+                        "error": attempt.error,
+                    })
+                })
+                .collect(),
         }
+    }
+
+    /// One-line escalation summary for the run-row reason, for example
+    /// `AI verified (llm/kimi-k3 after typesafe/jev-latest undecided)`.
+    ///
+    /// `None` when no escalation happened: single-link rows read exactly as before.
+    pub fn chain_note(&self) -> Option<String> {
+        if self.attempts.len() <= 1 || self.cancelled {
+            return None;
+        }
+        let trail = chain_trail(&self.attempts);
+        let state = if self.accepted.is_some() {
+            "verified"
+        } else if self.attempts.iter().any(|attempt| !attempt.failed()) {
+            "undecided"
+        } else {
+            // Every link failed: the decision line already lists the errors, and the audit
+            // row carries them link by link.
+            "failed"
+        };
+        Some(format!("AI {state} ({trail})"))
     }
 
     /// The "no result" value: the run was cancelled before this channel was asked.
@@ -131,7 +197,9 @@ impl GateOutcome {
             output_tokens: 0,
             request: serde_json::json!({}),
             response: serde_json::json!({}),
+            attempts: Vec::new(),
             answered: false,
+            cancelled: true,
         }
     }
 }
@@ -211,6 +279,10 @@ fn dedupe_names<C: Candidate>(
 /// The callsign is extracted with the run's allowlist, the same one the matcher scores with —
 /// never an empty default, which would hide denylisted-but-real callsigns (like `KING`) from
 /// the model while the matcher itself sees them.
+///
+/// `task` names the naming domain for a chat-shaped backend's prompt (`"epg"`, `"streams"`,
+/// `"names"`); it travels on the request so the audit row shows what was asked, and a
+/// decision-shaped backend ignores it.
 pub fn build_request<Q: Query, C: Candidate>(
     query: &Q,
     candidates: &[C],
@@ -218,6 +290,7 @@ pub fn build_request<Q: Query, C: Candidate>(
     offered: &[usize],
     known: &KnownCallsigns,
     settings: &AiVerifyConfig,
+    task: Option<&str>,
 ) -> DecisionRequest {
     let callsign = extract_callsign(query.name(), known);
     let location = extract_location(query.name());
@@ -265,6 +338,9 @@ pub fn build_request<Q: Query, C: Candidate>(
 
     let mut request =
         DecisionRequest::new(settings.provider.clone(), settings.model.clone(), state);
+    if let Some(task) = task.map(str::trim).filter(|task| !task.is_empty()) {
+        request = request.with_task(task);
+    }
 
     let mut options = BTreeMap::new();
     options.insert(
@@ -428,10 +504,18 @@ pub fn combine<C: Candidate>(
     let _ = request;
 }
 
-/// Ask the model about one channel.
+/// Ask the model about one channel, escalating down the `[ai.verify]` chain.
 ///
-/// A failed request is reported as `answered: false` and never fails the run: an install whose
-/// AI endpoint is down should still match the channels the heuristics are sure about.
+/// The first link is asked; when its outcome is *undecided* — the yes-probability lands
+/// between the reject and accept thresholds, the answer is missing, or the choice
+/// confidence is below `min_confidence` — or its call *failed*, the same request goes to
+/// the next link, with only the provider and model rewritten. A confident accept or reject
+/// is final, and later links are never asked.
+///
+/// `cancelled` is checked between links, never during one; `task` names the naming domain
+/// for a chat-shaped backend's prompt. A failed chain is reported as `answered: false` and
+/// never fails the run: an install whose AI endpoint is down should still match the
+/// channels the heuristics are sure about.
 #[allow(clippy::too_many_arguments)]
 pub async fn ask<Q: Query, C: Candidate>(
     service: Option<&AiService>,
@@ -442,7 +526,14 @@ pub async fn ask<Q: Query, C: Candidate>(
     reason: GateReason,
     known: &KnownCallsigns,
     settings: &AiVerifyConfig,
+    cancelled: impl Fn() -> bool,
+    task: Option<&str>,
 ) -> GateOutcome {
+    let chain = settings.effective_chain();
+    let fallback = chain.first().cloned().unwrap_or(AiChainEntry {
+        provider: settings.provider.clone(),
+        model: settings.model.clone(),
+    });
     let mut outcome = GateOutcome {
         accepted: None,
         reason,
@@ -450,41 +541,213 @@ pub async fn ask<Q: Query, C: Candidate>(
         probability: None,
         confidence: None,
         decision: format!("{}: skipped (no AI provider available)", reason.as_str()),
-        model: settings.model.clone(),
+        model: fallback.model.clone(),
         calibrated: false,
         latency_ms: 0,
         input_tokens: 0,
         output_tokens: 0,
         request: serde_json::json!({}),
         response: serde_json::json!({}),
+        attempts: Vec::new(),
         answered: false,
+        cancelled: false,
     };
 
     let Some(service) = service else {
         return outcome;
     };
-    let request = build_request(query, candidates, scored, offered, known, settings);
+    let mut request = build_request(query, candidates, scored, offered, known, settings, task);
+    // Address the audited request at the link asked first: with a chain set, the shorthand
+    // pair is an untouched default that may name a provider the chain never asks.
+    request.provider = fallback.provider.clone();
+    request.model = fallback.model.clone();
     outcome.request = serde_json::to_value(&request).unwrap_or_default();
 
-    match service.decide(&request).await {
-        Ok(response) => {
-            outcome.response = serde_json::to_value(&response).unwrap_or_default();
-            combine(
-                &mut outcome,
-                &request,
-                &response,
-                scored,
-                candidates,
-                offered,
-                settings,
-            );
+    let chain_outcome = service
+        .decide_chain(
+            &chain,
+            &request,
+            |response| {
+                link_result(response, &request, scored, candidates, offered, settings)
+                    != "undecided"
+            },
+            &cancelled,
+        )
+        .await;
+    outcome.attempts = chain_outcome.attempts;
+
+    if chain_outcome.cancelled {
+        outcome.cancelled = true;
+        outcome.model = outcome
+            .attempts
+            .last()
+            .map(|attempt| attempt.model.clone())
+            .unwrap_or(fallback.model);
+        outcome.decision = format!(
+            "{}: cancelled by the operator after {} attempt(s)",
+            reason.as_str(),
+            outcome.attempts.len(),
+        );
+        return outcome;
+    }
+
+    let Some(deciding) = outcome
+        .attempts
+        .iter()
+        .rev()
+        .find(|attempt| attempt.response.is_some())
+        .and_then(|attempt| attempt.response.clone())
+    else {
+        // A single link fails exactly as the gate always did, so a shorthand install's
+        // decision line and audit response read as before the chain existed.
+        if let [only] = outcome.attempts.as_slice() {
+            let error = only.error.as_deref().unwrap_or("unknown error");
+            outcome.decision = format!("{}: request failed ({error})", reason.as_str());
+            outcome.response = serde_json::json!({"error": error});
+            return outcome;
         }
-        Err(error) => {
-            outcome.decision = format!("{}: request failed ({error:#})", reason.as_str());
-            outcome.response = serde_json::json!({"error": format!("{error:#}")});
-        }
+        let failures: Vec<String> = outcome
+            .attempts
+            .iter()
+            .map(|attempt| {
+                format!(
+                    "{}/{}: {}",
+                    attempt.provider,
+                    attempt.model,
+                    attempt.error.as_deref().unwrap_or("unknown error")
+                )
+            })
+            .collect();
+        outcome.decision = if failures.is_empty() {
+            format!("{}: no chain links configured", reason.as_str())
+        } else {
+            format!(
+                "{}: request failed ({})",
+                reason.as_str(),
+                failures.join("; ")
+            )
+        };
+        outcome.response = serde_json::json!({"errors": failures});
+        return outcome;
+    };
+
+    outcome.response = serde_json::to_value(&deciding).unwrap_or_default();
+    combine(
+        &mut outcome,
+        &request,
+        &deciding,
+        scored,
+        candidates,
+        offered,
+        settings,
+    );
+    if outcome.attempts.len() > 1 {
+        outcome.decision = with_chain_suffix(&outcome.decision, &outcome.attempts);
     }
     outcome
+}
+
+/// One link's answer, as the escalation rule reads it: a confident accept or reject
+/// decides, and everything else — between the thresholds, missing, low confidence, or a
+/// pick outside the shortlist — hands the same question to the next link.
+fn link_result<C: Candidate>(
+    response: &crate::ai::DecisionResponse,
+    request: &DecisionRequest,
+    scored: &[Scored],
+    candidates: &[C],
+    offered: &[usize],
+    settings: &AiVerifyConfig,
+) -> &'static str {
+    let mut probe = GateOutcome {
+        accepted: None,
+        reason: GateReason::Verify,
+        picked: None,
+        probability: None,
+        confidence: None,
+        decision: String::new(),
+        model: String::new(),
+        calibrated: false,
+        latency_ms: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        request: serde_json::json!({}),
+        response: serde_json::json!({}),
+        attempts: Vec::new(),
+        answered: false,
+        cancelled: false,
+    };
+    combine(
+        &mut probe, request, response, scored, candidates, offered, settings,
+    );
+    // A reject is final only when the pick it rejects clears the confidence floor too: a
+    // low-confidence "no" is as undecided as a low-confidence "yes".
+    if probe.accepted.is_some() {
+        "accept"
+    } else if probe
+        .probability
+        .is_some_and(|probability| probability <= settings.reject_threshold)
+        && probe
+            .confidence
+            .is_some_and(|confidence| confidence >= settings.min_confidence)
+    {
+        "reject"
+    } else {
+        "undecided"
+    }
+}
+
+/// Append the escalation trail inside a decision line's parentheses, for example
+/// `verify: espn 0.93 (accept)` becomes
+/// `verify: espn 0.93 (accept, llm/kimi-k3 after typesafe/jev-latest undecided)`.
+///
+/// Only called for escalated outcomes: a single link keeps its line untouched, so installs
+/// without a chain read exactly as before. Every answered attempt before the last was
+/// undecided by construction — a decided link stops the chain — and failed ones say so.
+fn with_chain_suffix(decision: &str, attempts: &[ChainAttempt]) -> String {
+    let trail = chain_trail(attempts);
+    match decision.strip_suffix(')') {
+        Some(inner) => format!("{inner}, {trail})"),
+        None => format!("{decision} ({trail})"),
+    }
+}
+
+/// Who decided after whom, for example `llm/kimi-k3 after typesafe/jev-latest undecided`,
+/// or every link marked failed when none answered.
+fn chain_trail(attempts: &[ChainAttempt]) -> String {
+    let decided = attempts
+        .iter()
+        .rposition(|attempt| attempt.response.is_some());
+    match decided {
+        Some(position) => {
+            let decider = &attempts[position];
+            let priors: Vec<String> = attempts[..position]
+                .iter()
+                .map(|attempt| {
+                    let state = if attempt.failed() {
+                        "failed"
+                    } else {
+                        "undecided"
+                    };
+                    format!("{}/{} {state}", attempt.provider, attempt.model)
+                })
+                .collect();
+            if priors.is_empty() {
+                format!("{}/{}", decider.provider, decider.model)
+            } else {
+                format!(
+                    "{}/{} after {}",
+                    decider.provider,
+                    decider.model,
+                    priors.join(", ")
+                )
+            }
+        }
+        None => attempts
+            .iter()
+            .map(|attempt| format!("{}/{} failed", attempt.provider, attempt.model))
+            .collect::<Vec<_>>()
+            .join(", "),
+    }
 }
 
 /// The steps that make a gate outcome usable by a caller.
@@ -500,25 +763,39 @@ pub fn network_agreement(response: &crate::ai::DecisionResponse) -> Option<Strin
     }
 }
 
-/// The AI service a run uses, if the policy is on and its provider is configured.
+/// The AI service a run uses, if the policy is on and any of its chain links is configured.
 ///
-/// An enabled gate with no provider is a warning rather than an error: the run proceeds
-/// heuristic-only, which is what the plugin does when its endpoint is unavailable.
+/// An enabled gate with no configured link is a warning rather than an error: the run
+/// proceeds heuristic-only, which is what the plugin does when its endpoint is unavailable.
+/// A link whose provider is missing degrades the same way at ask time — a failed attempt
+/// that hands the question on — so one bad link never fails the run.
 pub fn service(config: &CrosstalkConfig) -> Option<AiService> {
     let policy = &config.ai.verify;
-    let service = AiService::from_config(config);
-    if policy.enabled && service.has(&policy.provider) {
-        Some(service)
-    } else {
-        if policy.enabled {
-            tracing::warn!(
-                "ai.verify.enabled is on but provider {:?} is not configured; matching \
-                 without it",
-                policy.provider
-            );
-        }
-        None
+    if !policy.enabled {
+        return None;
     }
+    let service = AiService::from_config(config);
+    let chain = policy.effective_chain();
+    let missing: Vec<String> = chain
+        .iter()
+        .filter(|entry| !service.has(&entry.provider))
+        .map(|entry| format!("{}/{}", entry.provider, entry.model))
+        .collect();
+    if missing.len() == chain.len() {
+        tracing::warn!(
+            "ai.verify.enabled is on but none of its providers are configured ({}); \
+             matching without them",
+            missing.join(", ")
+        );
+        return None;
+    }
+    if !missing.is_empty() {
+        tracing::warn!(
+            "ai.verify chain links {} are not configured; they will fail and hand on",
+            missing.join(", ")
+        );
+    }
+    Some(service)
 }
 
 /// The concurrent bound for the AI fan-out: the configured provider's own cap.
@@ -532,6 +809,17 @@ pub fn fanout_bound(config: &CrosstalkConfig, provider: &str) -> usize {
         .providers
         .get(provider)
         .map(|provider| provider.max_concurrency.max(1))
+        .unwrap_or(8)
+}
+
+/// The concurrent bound for the AI fan-out over a whole chain: the highest cap among the
+/// chain's links, so the roomiest link still gets its share and a single-link chain reads
+/// exactly the provider's own cap.
+pub fn fanout_bound_for(config: &CrosstalkConfig, chain: &[AiChainEntry]) -> usize {
+    chain
+        .iter()
+        .map(|entry| fanout_bound(config, &entry.provider))
+        .max()
         .unwrap_or(8)
 }
 
@@ -555,6 +843,7 @@ mod tests {
             enabled: true,
             provider: "typesafe".to_string(),
             model: "jev-latest".to_string(),
+            chain: Vec::new(),
             verify_band_low: 80,
             verify_band_high: 94,
             rescue: true,
@@ -688,6 +977,7 @@ mod tests {
             &[0, 1],
             &KnownCallsigns::default(),
             &settings(),
+            None,
         );
 
         assert_eq!(request.provider, "typesafe");
@@ -752,7 +1042,9 @@ mod tests {
             output_tokens: 0,
             request: serde_json::json!({}),
             response: serde_json::json!({}),
+            attempts: Vec::new(),
             answered: false,
+            cancelled: false,
         }
     }
 
@@ -767,6 +1059,7 @@ mod tests {
             &[0],
             &KnownCallsigns::default(),
             &settings(),
+            None,
         );
         let response = response("candidate_0", Some(0.93), 0.9);
 
@@ -798,6 +1091,7 @@ mod tests {
             &[0],
             &KnownCallsigns::default(),
             &settings(),
+            None,
         );
         let response = response("candidate_0", Some(0.2), 0.9);
 
@@ -825,6 +1119,7 @@ mod tests {
             &[0],
             &KnownCallsigns::default(),
             &settings(),
+            None,
         );
         // Probability says yes, but the choice confidence does not clear the floor.
         let response = response("candidate_0", Some(0.9), 0.2);
@@ -856,6 +1151,7 @@ mod tests {
             &[0],
             &KnownCallsigns::default(),
             &settings(),
+            None,
         );
         let response = response("candidate_0", None, 0.0);
 
@@ -892,6 +1188,7 @@ mod tests {
             &[0],
             &KnownCallsigns::default(),
             &settings(),
+            None,
         );
         let response = response("candidate_0", Some(0.93), 0.0);
 
@@ -921,6 +1218,7 @@ mod tests {
             &[0],
             &KnownCallsigns::default(),
             &settings(),
+            None,
         );
         let mut response = response("candidate_0", Some(0.93), 0.9);
         response.calibrated = false;
@@ -950,6 +1248,7 @@ mod tests {
             &[0],
             &KnownCallsigns::default(),
             &settings(),
+            None,
         );
         let response = response("candidate_99", Some(0.99), 0.99);
 
@@ -982,6 +1281,7 @@ mod tests {
             &[0],
             &KnownCallsigns::default(),
             &settings(),
+            None,
         );
         let response = response("none", Some(0.9), 0.9);
 
@@ -1024,6 +1324,8 @@ mod tests {
             GateReason::Verify,
             &KnownCallsigns::default(),
             &settings(),
+            || false,
+            Some("epg"),
         )
         .await;
         assert!(!is_answered(&result));
@@ -1044,7 +1346,15 @@ mod tests {
         };
 
         let empty = KnownCallsigns::default();
-        let denied = build_request(&king_channel, &entries, &ranked, &[0], &empty, &settings());
+        let denied = build_request(
+            &king_channel,
+            &entries,
+            &ranked,
+            &[0],
+            &empty,
+            &settings(),
+            None,
+        );
         assert_eq!(
             denied.state["channel"].get("callsign"),
             None,
@@ -1060,6 +1370,7 @@ mod tests {
             &[0],
             &allowlist,
             &settings(),
+            None,
         );
         assert_eq!(
             request.state["channel"]["callsign"], "KING",
@@ -1122,5 +1433,473 @@ mod tests {
             1,
             "a zero cap still allows one request rather than deadlocking"
         );
+    }
+
+    /// A decider scripted for gate-shaped requests: picks the first offered candidate with
+    /// a fixed yes-probability and confidence — or fails — and counts its calls.
+    struct GateDecider {
+        probability: f64,
+        confidence: f64,
+        model: String,
+        fail: bool,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        trip_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ai::Decider for GateDecider {
+        fn provider(&self) -> &str {
+            "gate"
+        }
+
+        fn calibrated(&self) -> bool {
+            true
+        }
+
+        async fn decide(
+            &self,
+            request: &crate::ai::DecisionRequest,
+        ) -> anyhow::Result<crate::ai::DecisionResponse> {
+            use std::sync::atomic::Ordering;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(flag) = &self.trip_cancel {
+                flag.store(true, Ordering::SeqCst);
+            }
+            if self.fail {
+                anyhow::bail!("the endpoint is down");
+            }
+            let mut answers = BTreeMap::new();
+            if let Some((id, _)) = request
+                .questions
+                .iter()
+                .find(|(id, _)| id.starts_with("same_") && id.as_str() != "same_network")
+            {
+                answers.insert(
+                    "best".to_string(),
+                    Answer::Choice {
+                        choice: id.replacen("same_", "candidate_", 1),
+                        confidence: self.confidence,
+                        probabilities: BTreeMap::new(),
+                    },
+                );
+                answers.insert(
+                    id.clone(),
+                    Answer::Noul {
+                        noul: self.probability,
+                    },
+                );
+            }
+            Ok(crate::ai::DecisionResponse {
+                model: self.model.clone(),
+                answers,
+                input_tokens: 10,
+                output_tokens: 2,
+                latency_ms: 1,
+                calibrated: true,
+            })
+        }
+    }
+
+    fn gate_service(
+        first: (f64, f64, bool),
+        second: (f64, f64, bool),
+        first_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        second_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        trip_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> AiService {
+        AiService::with_deciders(vec![
+            (
+                "typesafe".to_string(),
+                std::sync::Arc::new(GateDecider {
+                    probability: first.0,
+                    confidence: first.1,
+                    model: "jev-1".to_string(),
+                    fail: first.2,
+                    calls: first_calls,
+                    trip_cancel,
+                }),
+            ),
+            (
+                "llm".to_string(),
+                std::sync::Arc::new(GateDecider {
+                    probability: second.0,
+                    confidence: second.1,
+                    model: "kimi-k3-1".to_string(),
+                    fail: second.2,
+                    calls: second_calls,
+                    trip_cancel: None,
+                }),
+            ),
+        ])
+    }
+
+    fn chain_settings() -> AiVerifyConfig {
+        AiVerifyConfig {
+            enabled: true,
+            chain: vec![
+                crate::config::AiChainEntry::new("typesafe", "jev-latest"),
+                crate::config::AiChainEntry::new("llm", "kimi-k3"),
+            ],
+            ..settings()
+        }
+    }
+
+    async fn ask_chain(
+        service: &AiService,
+        settings: &AiVerifyConfig,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> GateOutcome {
+        use std::sync::atomic::Ordering;
+        let entries = vec![entry(10, "ABC San Francisco")];
+        let ranked = vec![scored(90, 0)];
+        ask(
+            Some(service),
+            &channel(),
+            &entries,
+            &ranked,
+            &[0],
+            GateReason::Verify,
+            &KnownCallsigns::default(),
+            settings,
+            || cancelled.load(Ordering::SeqCst),
+            Some("epg"),
+        )
+        .await
+    }
+
+    fn no_cancel() -> std::sync::atomic::AtomicBool {
+        std::sync::atomic::AtomicBool::new(false)
+    }
+
+    #[tokio::test]
+    async fn an_undecided_first_link_escalates_to_the_second() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let first_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let second_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        // Jev says 0.5: between the thresholds, so undecided. The LLM says 0.93.
+        let service = gate_service(
+            (0.5, 0.9, false),
+            (0.93, 0.9, false),
+            std::sync::Arc::clone(&first_calls),
+            std::sync::Arc::clone(&second_calls),
+            None,
+        );
+        let cancel = no_cancel();
+        let outcome = ask_chain(&service, &chain_settings(), &cancel).await;
+
+        assert_eq!(outcome.accepted, Some(0));
+        assert!(outcome.answered);
+        assert_eq!(first_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(outcome.attempts.len(), 2);
+        assert!(
+            outcome
+                .decision
+                .contains("accept, llm/kimi-k3 after typesafe/jev-latest undecided"),
+            "{}",
+            outcome.decision
+        );
+        assert_eq!(
+            outcome.chain_note().as_deref(),
+            Some("AI verified (llm/kimi-k3 after typesafe/jev-latest undecided)")
+        );
+        // The audit row names the link that decided and the one that could not.
+        let stored = outcome.to_store(0, "typesafe");
+        assert_eq!(stored.provider, "llm");
+        assert_eq!(stored.model, "kimi-k3-1", "the answering version is kept");
+        assert_eq!(
+            stored.attempts,
+            serde_json::json!([
+                {"provider": "typesafe", "model": "jev-latest", "result": "undecided", "error": None::<String>},
+                {"provider": "llm", "model": "kimi-k3", "result": "decided", "error": None::<String>},
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_confident_first_link_never_asks_the_second() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let first_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let second_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let service = gate_service(
+            (0.93, 0.9, false),
+            (0.95, 0.9, false),
+            std::sync::Arc::clone(&first_calls),
+            std::sync::Arc::clone(&second_calls),
+            None,
+        );
+        let cancel = no_cancel();
+        let outcome = ask_chain(&service, &chain_settings(), &cancel).await;
+
+        assert_eq!(outcome.accepted, Some(0));
+        assert_eq!(second_calls.load(Ordering::SeqCst), 0, "never asked");
+        assert!(!outcome.decision.contains("after"), "{}", outcome.decision);
+        assert_eq!(outcome.chain_note(), None, "no escalation, no trail");
+        let stored = outcome.to_store(0, "typesafe");
+        assert_eq!(stored.provider, "typesafe");
+    }
+
+    #[tokio::test]
+    async fn a_failed_first_link_hands_the_question_on() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let second_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let service = gate_service(
+            (0.0, 0.0, true),
+            (0.93, 0.9, false),
+            Default::default(),
+            std::sync::Arc::clone(&second_calls),
+            None,
+        );
+        let cancel = no_cancel();
+        let outcome = ask_chain(&service, &chain_settings(), &cancel).await;
+
+        assert_eq!(outcome.accepted, Some(0));
+        assert_eq!(second_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            outcome
+                .decision
+                .contains("accept, llm/kimi-k3 after typesafe/jev-latest failed"),
+            "{}",
+            outcome.decision
+        );
+        assert_eq!(
+            outcome.chain_note().as_deref(),
+            Some("AI verified (llm/kimi-k3 after typesafe/jev-latest failed)")
+        );
+    }
+
+    #[tokio::test]
+    async fn all_links_undecided_leaves_the_channel_unmatched_with_every_attempt_recorded() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let first_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let second_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let service = gate_service(
+            (0.5, 0.9, false),
+            (0.6, 0.9, false),
+            std::sync::Arc::clone(&first_calls),
+            std::sync::Arc::clone(&second_calls),
+            None,
+        );
+        let cancel = no_cancel();
+        let outcome = ask_chain(&service, &chain_settings(), &cancel).await;
+
+        assert_eq!(outcome.accepted, None);
+        assert!(outcome.answered, "the last answer stands, even undecided");
+        assert_eq!(outcome.attempts.len(), 2);
+        assert_eq!(first_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            outcome.decision.contains("undecided"),
+            "{}",
+            outcome.decision
+        );
+        assert_eq!(
+            outcome.chain_note().as_deref(),
+            Some("AI undecided (llm/kimi-k3 after typesafe/jev-latest undecided)")
+        );
+        let stored = outcome.to_store(0, "typesafe");
+        assert_eq!(stored.provider, "llm", "the last link answered last");
+        assert_eq!(stored.attempts[0]["result"], "undecided");
+        assert_eq!(stored.attempts[1]["result"], "decided");
+    }
+
+    #[tokio::test]
+    async fn all_links_failed_is_unanswered_not_a_run_failure() {
+        let service = gate_service(
+            (0.0, 0.0, true),
+            (0.0, 0.0, true),
+            Default::default(),
+            Default::default(),
+            None,
+        );
+        let cancel = no_cancel();
+        let outcome = ask_chain(&service, &chain_settings(), &cancel).await;
+
+        assert!(!outcome.answered);
+        assert_eq!(outcome.accepted, None);
+        assert_eq!(outcome.attempts.len(), 2);
+        assert!(
+            outcome.decision.contains("typesafe/jev-latest")
+                && outcome.decision.contains("llm/kimi-k3"),
+            "{}",
+            outcome.decision
+        );
+        assert!(
+            outcome.decision.contains("request failed"),
+            "{}",
+            outcome.decision
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_between_links_stops_the_chain() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let second_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        // The first link leaves the question undecided and trips the cancel as its answer
+        // lands: the second link is never asked.
+        let service = gate_service(
+            (0.5, 0.9, false),
+            (0.93, 0.9, false),
+            Default::default(),
+            std::sync::Arc::clone(&second_calls),
+            Some(std::sync::Arc::clone(&cancel)),
+        );
+        let outcome = ask_chain(&service, &chain_settings(), &cancel).await;
+
+        assert!(outcome.cancelled);
+        assert!(!outcome.answered);
+        assert_eq!(outcome.attempts.len(), 1);
+        assert_eq!(second_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            outcome.decision.contains("cancelled by the operator"),
+            "{}",
+            outcome.decision
+        );
+        assert_eq!(
+            outcome.chain_note(),
+            None,
+            "a cancelled row is about the cancel"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_task_travels_on_the_request_for_the_audit_trail() {
+        let service = gate_service(
+            (0.93, 0.9, false),
+            (0.93, 0.9, false),
+            Default::default(),
+            Default::default(),
+            None,
+        );
+        let cancel = no_cancel();
+        let outcome = ask_chain(&service, &chain_settings(), &cancel).await;
+        assert_eq!(outcome.request["task"], "epg");
+
+        // And a request built without a task carries no task key at all.
+        let entries = vec![entry(10, "ABC San Francisco")];
+        let ranked = vec![scored(90, 0)];
+        let request = build_request(
+            &channel(),
+            &entries,
+            &ranked,
+            &[0],
+            &KnownCallsigns::default(),
+            &settings(),
+            None,
+        );
+        let value = serde_json::to_value(&request).expect("serialises");
+        assert!(value.get("task").is_none(), "{value}");
+    }
+
+    #[test]
+    fn the_chain_fanout_is_the_roomiest_links_cap() {
+        let mut config = CrosstalkConfig::default();
+        config.ai.providers.insert(
+            "typesafe".to_string(),
+            crate::config::AiProviderConfig {
+                kind: "typesafe".to_string(),
+                max_concurrency: 3,
+                ..crate::config::AiProviderConfig::default()
+            },
+        );
+        config.ai.providers.insert(
+            "llm".to_string(),
+            crate::config::AiProviderConfig {
+                kind: "openai_compat".to_string(),
+                base_url: "http://gpu-box:8000/v1".to_string(),
+                max_concurrency: 2,
+                ..crate::config::AiProviderConfig::default()
+            },
+        );
+        assert_eq!(
+            fanout_bound_for(&config, &chain_settings().effective_chain()),
+            3
+        );
+        assert_eq!(
+            fanout_bound_for(&config, &[]),
+            8,
+            "no links, the default cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_single_failed_link_reads_exactly_as_before_the_chain() {
+        // The shorthand pair is a one-link chain: its failure line and audit response keep
+        // the pre-chain shape, so a shorthand install's CSV and audit rows are unchanged.
+        let service = gate_service(
+            (0.0, 0.0, true),
+            (0.0, 0.0, true),
+            Default::default(),
+            Default::default(),
+            None,
+        );
+        let cancel = no_cancel();
+        let outcome = ask_chain(&service, &settings(), &cancel).await;
+
+        assert!(!outcome.answered);
+        assert_eq!(
+            outcome.decision,
+            "verify: request failed (the endpoint is down)"
+        );
+        assert_eq!(
+            outcome.response,
+            serde_json::json!({"error": "the endpoint is down"})
+        );
+        assert_eq!(outcome.chain_note(), None);
+    }
+
+    #[tokio::test]
+    async fn a_low_confidence_reject_escalates_and_a_confident_one_is_final() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // 0.1 is below the reject threshold, but a 0.2 choice confidence is under the floor:
+        // as undecided as a low-confidence yes, so the LLM is asked.
+        let second_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let service = gate_service(
+            (0.1, 0.2, false),
+            (0.93, 0.9, false),
+            Default::default(),
+            std::sync::Arc::clone(&second_calls),
+            None,
+        );
+        let cancel = no_cancel();
+        let outcome = ask_chain(&service, &chain_settings(), &cancel).await;
+        assert_eq!(second_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(outcome.accepted, Some(0));
+
+        let second_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let service = gate_service(
+            (0.1, 0.9, false),
+            (0.93, 0.9, false),
+            Default::default(),
+            std::sync::Arc::clone(&second_calls),
+            None,
+        );
+        let outcome = ask_chain(&service, &chain_settings(), &cancel).await;
+        assert_eq!(
+            second_calls.load(Ordering::SeqCst),
+            0,
+            "a confident reject is final"
+        );
+        assert_eq!(outcome.accepted, None);
+    }
+
+    #[tokio::test]
+    async fn the_audited_request_names_the_first_chain_link() {
+        // With a chain set the shorthand pair is an untouched default; the audit row must
+        // name the link actually asked first, not the default.
+        let service = gate_service(
+            (0.93, 0.9, false),
+            (0.93, 0.9, false),
+            Default::default(),
+            Default::default(),
+            None,
+        );
+        let mut settings = chain_settings();
+        settings.chain.reverse();
+        let cancel = no_cancel();
+        let outcome = ask_chain(&service, &settings, &cancel).await;
+        assert_eq!(outcome.request["provider"], "llm");
+        assert_eq!(outcome.request["model"], "kimi-k3");
     }
 }

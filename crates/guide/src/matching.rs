@@ -246,7 +246,7 @@ pub async fn run(
     // serial, which preserves the ranked-order winner semantics exactly, and both phases
     // resolve in channel order. Work runs in batches so a cancel is honoured between
     // them rather than only after the whole scope.
-    let ai_bound = ai_gate::fanout_bound(context.config(), &ai_settings.provider);
+    let ai_bound = ai_gate::fanout_bound_for(context.config(), &ai_settings.effective_chain());
     let validation_bound = config.dispatcharr.concurrency.max(1);
     // Copyable borrows for the `async move` futures below: `&probe` inline would capture
     // `probe` itself by value and move it on the first batch.
@@ -293,6 +293,11 @@ pub async fn run(
                             reason,
                             known,
                             ai_settings,
+                            || cancel.is_cancelled(),
+                            // The task prefix changes a chat model's prompt and the audited
+                            // request, so only a configured chain gets it: shorthand installs
+                            // ask exactly what they asked before the chain existed.
+                            (!ai_settings.chain.is_empty()).then_some("epg"),
                         )
                         .await;
                         (ordinal, outcome)
@@ -457,6 +462,19 @@ pub async fn run(
                 allow_without_programs,
                 ranked.first().map(|entry| entry.score),
             );
+        }
+        // An escalated chain says who decided after whom, for example
+        // "AI verified (llm/kimi-k3 after typesafe/jev-latest undecided)": that trail
+        // belongs on the row, not just in the AI column, because the reason is what the
+        // operator reads first. Single-link rows have no trail and read as before.
+        if let Some(note) = ai_outcomes[ordinal]
+            .as_ref()
+            .and_then(|outcome| outcome.chain_note())
+        {
+            if !row.reason.is_empty() {
+                row.reason.push(' ');
+            }
+            row.reason.push_str(&note);
         }
         rows.push(row);
 
@@ -1468,6 +1486,110 @@ mod tests {
         assert_eq!(
             espn.epg_data_id, None,
             "an unanswered channel stays unmatched"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_undecided_first_link_escalates_and_the_row_says_who_decided() {
+        // Jev answers 0.5 (between the thresholds, so undecided) and the LLM answers 0.95:
+        // the channel matches on the second link, and the row reason names the trail.
+        let (_server, world, base_context) = fixture_full(
+            "espn.us",
+            "XYZ WABC - IL Shelbyville",
+            "ABC WABC - IL Springfield",
+        )
+        .await;
+        let first_calls = Arc::new(AtomicUsize::new(0));
+        let second_calls = Arc::new(AtomicUsize::new(0));
+        let service = crosstalk_core::ai::AiService::with_deciders(vec![
+            (
+                "typesafe".to_string(),
+                Arc::new(FixedDecider {
+                    probability: 0.5,
+                    calls: Arc::clone(&first_calls),
+                }) as Arc<dyn crosstalk_core::ai::Decider>,
+            ),
+            (
+                "llm".to_string(),
+                Arc::new(FixedDecider {
+                    probability: 0.95,
+                    calls: Arc::clone(&second_calls),
+                }) as Arc<dyn crosstalk_core::ai::Decider>,
+            ),
+        ]);
+        let settings = GuideSettings::default();
+        let (channels, entries) = scoped(&world);
+
+        let store = crosstalk_core::store::Store::in_memory().expect("store");
+        let run_id = store
+            .start_run("guide", "match_preview", true)
+            .expect("run");
+        let mut config = (*base_context.config_arc()).clone();
+        config.ai.verify = ai_policy();
+        config.ai.verify.chain = vec![
+            crosstalk_core::config::AiChainEntry::new("typesafe", "stub"),
+            crosstalk_core::config::AiChainEntry::new("llm", "stub-llm"),
+        ];
+        let context = JobContext::new(std::sync::Arc::new(config), Arc::new(VecSink::new()))
+            .with_dispatcharr(
+                base_context
+                    .dispatcharr()
+                    .expect("fixture wires a client")
+                    .clone(),
+            )
+            .for_run(
+                crate::APP_ID,
+                "match_preview",
+                run_id,
+                store.clone(),
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            );
+
+        let result = run(
+            &GuideApp::new(),
+            &context,
+            &settings,
+            Some(&service),
+            &world,
+            &channels,
+            &entries,
+            true,
+        )
+        .await
+        .expect("preview");
+        assert_eq!(first_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second_calls.load(Ordering::SeqCst), 1, "Jev was undecided");
+        let espn = result
+            .rows
+            .iter()
+            .find(|row| row.channel_name == "ABC WABC - IL Springfield")
+            .expect("row");
+        assert_eq!(
+            espn.epg_data_id,
+            Some(7),
+            "the second link's pick was accepted"
+        );
+        assert!(
+            espn.reason
+                .contains("AI verified (llm/stub-llm after typesafe/stub undecided)"),
+            "the row reason names the trail: {:?}",
+            espn.reason
+        );
+        assert!(
+            espn.ai_decision
+                .as_deref()
+                .unwrap_or_default()
+                .contains("after"),
+            "{:?}",
+            espn.ai_decision
+        );
+        let stored = (0..32)
+            .filter_map(|ordinal| store.ai_decision(run_id, ordinal).expect("load"))
+            .next()
+            .expect("the escalated channel is audited");
+        assert_eq!(
+            stored.provider, "llm",
+            "the audit names the link that decided"
         );
     }
 
