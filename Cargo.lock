@@ -588,6 +588,7 @@ dependencies = [
  "fancy-regex",
  "rayon",
  "regex",
+ "serde",
  "serde_json",
  "unicode-general-category",
  "unicode-normalization",

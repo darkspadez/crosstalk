@@ -7,6 +7,7 @@ license.workspace = true
 description = "Pure, IO-free channel-name matcher ported from EPG Janitor"
 
 [dependencies]
+serde.workspace = true
 regex.workspace = true
 fancy-regex.workspace = true
 unicode-normalization.workspace = true

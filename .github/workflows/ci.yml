@@ -122,6 +122,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # Phase 3 step 4: data/merged/ and docs/data-merge-report.md are generated,
+      # never hand-edited. Rebuilding them must reproduce every byte; a failure
+      # means someone edited the output instead of the plugins or the script.
+      # Well under a minute. The script refuses to run without -I.
+      # Needs the reference/ submodules checked out (this job's checkout does).
+      - name: Merged data set reproduces byte for byte
+        run: python3 -I scripts/data/build_merged.py --check
       - name: Simulate oracle vs the Python tool
         run: ./scripts/sim_parity.sh --quick
       - name: Primitive sweep vs the Python matcher

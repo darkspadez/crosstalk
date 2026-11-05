@@ -254,7 +254,7 @@ SOFTWARE.
   - `Lineuparr/plugin.json` → `crates/lineup/src/settings.rs`: the `lineup.toml`
     schema follows the plugin's field ids, labels and help text.
   - `Lineuparr/*_lineup.json` (the 29 lineup files) → the vendored lineup files under
-    `data/lineups/`.
+    `data/merged/lineups/` (see the merged-data section below).
 
 ### Reference pin
 
@@ -336,6 +336,50 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+## Merged data set (`data/merged/`)
+
+Phase 3 (`plans/phase-3-lineup.md`, step 4) replaces the per-plugin tables with one
+merged data set, built by `scripts/data/build_merged.py` from the pinned checkouts
+above and reproducible byte for byte (`build_merged.py --check`, enforced in CI).
+Provenance per input file (path, sha256, header date), duplicates merged, field
+conflicts with both values and the winner, case-variant names, and per-plugin
+uniques are logged in `data/merged/PROVENANCE.json`, multi-canonical aliases in
+`data/merged/alias_conflicts.json`; the human-readable companion is
+`docs/data-merge-report.md`. Nothing here is newly authored: every record traces to
+one of the plugin files credited in the sections above.
+
+- `data/merged/channels/<CC>.json` (16 countries): the union of EPG Janitor's 12
+  `*_channels.json` files, Stream-Mapparr's 16 (adds DO/PE/PL/PT plus a `zones`
+  array on 31 US entries) and Channel-Mapparr's 13 (shares PL with Stream-Mapparr;
+  otherwise a same-or-older subset that contributes no name of its own),
+  deduplicated on the verbatim `channel_name` with a sorted `sources` list per
+  entry (case-only variants such as `Afro`/`AFRO` stay separate, as upstream). Newest file version wins
+  header and field conflicts. Loaded behind `crosstalk-matching::data::merged`
+  (not wired into matching yet); the existing profiles keep their current files.
+- `data/merged/stations.json`: Channel-Mapparr's `networks.json` (6,839 FCC
+  stations, 2026-08-10 LMS dump) plus `networks_supplemental.json` (WGCL) with
+  `scripts/networks_corrections.json` applied (WBMA-LD), keyed by full callsign
+  with per-entry `sources`. Stream-Mapparr's `networks.json` (1,915) is
+  byte-identical to Channel-Mapparr's pre-rebuild table, so it contributes no
+  record: its 269 differing fields resolve to Channel-Mapparr's newer values and
+  its 43 extra rows (cancelled licences that rebuild dropped) stay dropped; both
+  are listed in the provenance. EPG Janitor's `us_station_callsigns.json` is
+  folded in as the `callsign_allowlist` array (3,037 callsigns, every one resolving to a merged
+  station under the core `normalize_callsign` base form).
+- `data/merged/aliases.json`: the union of the four `aliases.py`
+  `CHANNEL_ALIASES` tables (Janitor 204 canonicals, Stream-Mapparr 198,
+  Channel-Mapparr 226, Lineuparr 297) as canonical -> aliases with per-alias
+  `sources`, plus the per-country `COUNTRY_ALIASES` unions (DO/PE from
+  Stream-Mapparr and Lineuparr; AU/FR/CA from Lineuparr). Every claim is kept;
+  the 136 alias values listed under two or more canonicals (12 disputed between
+  plugins) are recorded in `data/merged/alias_conflicts.json` for the corpus
+  step to decide.
+- `data/merged/lineups/` (29 files, 7,485 channels): Lineuparr's `*_lineup.json`
+  files copied verbatim (schema in `data/merged/lineups/README.md`).
+
+`Dockerfile` already does `COPY ./data`, so the merged set ships in the image
+with no Dockerfile change.
 
 ## The parity gates and the drift report, over all six references
 
