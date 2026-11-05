@@ -430,6 +430,21 @@ impl Store {
                     edge_ip              TEXT,
                     consecutive_failures INTEGER NOT NULL DEFAULT 0
                 );
+
+                -- Shared channel identities (phase 3 step 6): one row per distinct resolved
+                -- input, namespaced by `data_version` (merged-data provenance sha +
+                -- decisions sha + engine version + the engine settings identities
+                -- depend on, see `UnifiedEngine::identity_version`). A data, rule or
+                -- settings change yields a new version, so stale rows are never read
+                -- — only pruned.
+                CREATE TABLE IF NOT EXISTS identity_cache (
+                    input_key     TEXT NOT NULL,
+                    data_version  TEXT NOT NULL,
+                    identity_json TEXT NOT NULL,
+                    cached_at     TEXT NOT NULL,
+                    PRIMARY KEY (input_key, data_version)
+                );
+                CREATE INDEX IF NOT EXISTS identity_cache_version ON identity_cache(data_version);
                 "#,
             )?;
             // A run left `running` by a crash or a restart can never finish, and pruning
@@ -1006,6 +1021,64 @@ impl Store {
                 params![app, action],
             )?;
             Ok(removed > 0)
+        })
+    }
+
+    /// A cached identity for (`input_key`, `data_version`), or `None`.
+    ///
+    /// Rows are namespaced by data version, so a merged-data or rule change never
+    /// reads a stale identity: it simply misses and re-resolves. A row that no
+    /// longer parses is dropped rather than failing the run (same rule as
+    /// [`Store::load_checkpoint`]).
+    pub fn identity_cache_get(
+        &self,
+        input_key: &str,
+        data_version: &str,
+    ) -> Result<Option<String>> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT identity_json FROM identity_cache WHERE input_key = ?1 AND data_version = ?2",
+                    params![input_key, data_version],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(Into::into)
+        })
+    }
+
+    /// Store one resolved identity, replacing any row for the same key + version.
+    pub fn identity_cache_put(
+        &self,
+        input_key: &str,
+        data_version: &str,
+        identity_json: &str,
+    ) -> Result<()> {
+        let cached_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        self.with_connection(|connection| {
+            connection.execute(
+                "INSERT INTO identity_cache (input_key, data_version, identity_json, cached_at) \
+                 VALUES (?1, ?2, ?3, ?4) ON CONFLICT(input_key, data_version) DO UPDATE SET \
+                 identity_json = excluded.identity_json, cached_at = excluded.cached_at",
+                params![input_key, data_version, identity_json, cached_at],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Drop every cached identity from a data version other than `keep_version`.
+    ///
+    /// Returns the number of rows removed. Called after a resolve run warms the
+    /// current version, so one data/rule/settings change does not grow the table
+    /// forever. Every app shares the one `[matching]` engine, hence one version;
+    /// rows of any other version are stale by definition.
+    pub fn identity_cache_prune(&self, keep_version: &str) -> Result<u64> {
+        self.with_connection(|connection| {
+            let removed = connection.execute(
+                "DELETE FROM identity_cache WHERE data_version != ?1",
+                params![keep_version],
+            )?;
+            Ok(removed as u64)
         })
     }
 

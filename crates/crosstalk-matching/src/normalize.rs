@@ -290,6 +290,19 @@ pub struct NormalizeFlags {
     /// `remove_cinemax`), which its match passes for a channel whose name mentions `max`
     /// so `Cinemax` and `MoreMax` can meet. EPG Janitor never sets it.
     pub remove_cinemax: bool,
+    /// Unified engine (N05=janitor-split): fold `&` to ` and ` inside the core
+    /// pipeline. The shared core never does this; Janitor does. The decided
+    /// engine is the core body plus this statement.
+    pub split_ampersand: bool,
+    /// Unified engine (N06=janitor-letters): split dots only between ASCII
+    /// letters (`JusticeCentral.TV`), not between word characters (`97.2`
+    /// keeps its dot). The shared core splits on `\\w`; Janitor narrows it.
+    pub dots_letters_only: bool,
+    /// Unified engine (N07=janitor-floor): strip a trailing
+    /// `Network`/`Channel`/`TV` only when at least two tokens would remain
+    /// (`Justice Network` keeps its suffix). The shared core strips
+    /// unconditionally.
+    pub suffix_floor: bool,
 }
 
 impl Default for NormalizeFlags {
@@ -302,6 +315,9 @@ impl Default for NormalizeFlags {
             core_pipeline: false,
             rejoin_designators: false,
             remove_cinemax: false,
+            split_ampersand: false,
+            dots_letters_only: false,
+            suffix_floor: false,
         }
     }
 }
@@ -653,10 +669,17 @@ impl Normalizer {
         s = shared.letter_digit.sub(&s, "$1 $2");
         s = shared.digit_letter.sub(&s, "$1 $2");
         s = shared.hyphen.sub(&s, " ");
-        s = t.dot_between_word_chars.sub(&s, " ");
+        if f.dots_letters_only {
+            s = shared.dot_between_letters.sub(&s, " ");
+        } else {
+            s = t.dot_between_word_chars.sub(&s, " ");
+        }
         s = shared.num_words.sub_fn(&s, &number_word_as_digit);
         s = shared.camel_lower_upper_lower.sub(&s, "$1 $2");
         s = shared.camel_acronym.sub(&s, "$1 $2");
+        if f.split_ampersand {
+            s = shared.ampersand.sub(&s, " and ");
+        }
 
         if f.ignore_regional {
             s = t.region_paren_east_west.sub(&s, " ");
@@ -709,12 +732,26 @@ impl Normalizer {
             s = shared.paren_alnum.sub(&s, "");
         }
 
-        // No two-token floor here, unlike EPG Janitor: the shared core strips a trailing
-        // `Network`/`Channel`/`TV` unconditionally.
+        // N07: the decided engine keeps Janitor's two-token floor; the raw core
+        // strips unconditionally.
         s = t.the_prefix.sub(&s, "");
-        s = shared.trailing_network.sub(&s, "");
-        s = shared.trailing_channel.sub(&s, "");
-        s = shared.trailing_tv.sub(&s, "");
+        if f.suffix_floor {
+            for pattern in [
+                &shared.trailing_network,
+                &shared.trailing_channel,
+                &shared.trailing_tv,
+            ] {
+                let stripped = pattern.sub(&s, "");
+                let stripped = py_trim(&stripped);
+                if !stripped.is_empty() && py_split_whitespace(stripped).count() >= 2 {
+                    s = stripped.to_string();
+                }
+            }
+        } else {
+            s = shared.trailing_network.sub(&s, "");
+            s = shared.trailing_channel.sub(&s, "");
+            s = shared.trailing_tv.sub(&s, "");
+        }
 
         // Decorative Unicode badges (`◉`, `²`, superscript `ᴿᴬᵂ`) become spaces.
         s = s

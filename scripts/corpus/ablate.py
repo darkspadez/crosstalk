@@ -270,18 +270,22 @@ def _zone_lu_like(query: str, candidate: str, pacific_or_west: bool,
     return True
 
 
+def sm_zone_noguard(mods, name) -> str:
+    """extract_zone (SM :524-543) without the single-time-zone guard (Z02).
+
+    The decided ZONE (`sm-zone-noguard`) routes on this; the Rust identity's
+    `zone` is the same function (`extract_zone_noguard`)."""
+    sm = mods["sm"]
+    name = name or ""
+    if sm._ZONE_WEST_RE.search(name) or sm._ZONE_PACIFIC_RE.search(name):
+        return "WEST"
+    if sm._ZONE_EAST_RE.search(name):
+        return "EAST"
+    return "DEFAULT"
+
+
 def _zone_filter(variant: str, mods):
     sm_zone = mods["sm"].FuzzyMatcher.extract_zone
-    sm = mods["sm"]
-
-    def sm_zone_noguard(name):
-        # extract_zone (SM :524-543) without the single-time-zone guard (Z02).
-        name = name or ""
-        if sm._ZONE_WEST_RE.search(name) or sm._ZONE_PACIFIC_RE.search(name):
-            return "WEST"
-        if sm._ZONE_EAST_RE.search(name):
-            return "EAST"
-        return "DEFAULT"
 
     def keep(query: str, candidate: str) -> bool:
         if variant == "none":
@@ -303,8 +307,8 @@ def _zone_filter(variant: str, mods):
             # LU's regionless branch also has.
             return (sm_zone(query) == "WEST") == (sm_zone(candidate) == "WEST")
         if variant == "sm-zone-noguard":
-            return ((sm_zone_noguard(query) == "WEST")
-                    == (sm_zone_noguard(candidate) == "WEST"))
+            return ((sm_zone_noguard(mods, query) == "WEST")
+                    == (sm_zone_noguard(mods, candidate) == "WEST"))
         raise ValueError(variant)
     return keep
 
@@ -585,26 +589,37 @@ class Engine:
             return self.matcher.normalize_name(name, []) or ""
 
     def same(self, query: str, candidate: str) -> bool:
+        return self.score(query, candidate) is not None
+
+    def score(self, query: str, candidate: str):
+        """``(score, method)`` when the pair is the same channel, else None.
+
+        One candidate per ``match_all_streams`` call: the base patches leave the
+        query regionless, whose set-level branch is a no-op only for a single
+        candidate, so a candidate SET is scored pair by pair (the engine's
+        verdict on a set is these per-pair verdicts, ranked)."""
         matcher = self.matcher
         matcher._cinemax_pair = "max" in (query or "").lower()
         matcher._query = query
         with _Swapped(self.mods["core"], self.swaps):
             ranked = matcher.match_all_streams(query, [candidate], self.alias_map)
             if not ranked:
-                return False
-            _name, _score, method = ranked[0]
+                return None
+            _name, score, method = ranked[0]
             if method == "callsign":
                 # Callsign-anchored candidates skip the region filter and the
                 # fuzzy-loop guards (JAN :1373-1391, LU :871-893, :970).
-                return True
+                return score, method
             norm_q = (matcher.normalize_name(query, []) or "").lower()
             norm_c = (matcher.normalize_name(candidate, []) or "").lower()
         # Alias hits are added before the fuzzy loop, so the digit and shift
         # guards never see them; the region filter runs over every match.
         if method not in ("alias", "alias-callsign") and not self.digits(
                 query, candidate, norm_q, norm_c):
-            return False
-        return self.zone(query, candidate)
+            return None
+        if not self.zone(query, candidate):
+            return None
+        return score, method
 
 
 # ---------------------------------------------------------------------------

@@ -14,6 +14,8 @@ pub mod alias;
 pub mod callsign;
 pub mod country;
 pub mod data;
+pub mod engine;
+pub mod identity;
 pub mod normalize;
 pub mod pipeline;
 pub mod profile;
@@ -21,6 +23,8 @@ pub mod pyre;
 pub mod similarity;
 pub mod tokens;
 
+pub use engine::{EngineConfig, UnifiedEngine, DEFAULT_THRESHOLD, ENGINE_VERSION};
+pub use identity::{Identity, IdentityCache, ResolveContext};
 pub use normalize::{NormalizeFlags, Normalizer};
 pub use profile::{MatchProfile, MatcherConfig};
 

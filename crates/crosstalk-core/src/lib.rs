@@ -12,6 +12,7 @@ pub mod config;
 pub mod csv_report;
 pub mod dispatcharr;
 pub mod hooks;
+pub mod identity_cache;
 pub mod jobs;
 pub mod limiter;
 pub mod match_run;
@@ -52,6 +53,7 @@ pub use dispatcharr::{
     QueuedTask, Set, Stream, StreamsToChannels, World, WorldKind, WorldKinds,
 };
 pub use hooks::Hooks;
+pub use identity_cache::CachedIdentities;
 pub use jobs::{JobContext, ProgressEvent, ProgressSink};
 pub use limiter::{Limiter, LimiterConfig, Permit};
 pub use runner::{ActiveRun, JobRunner, RunOptions, StartedRun, WorkflowSlot};

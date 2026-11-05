@@ -162,6 +162,13 @@ jobs:
           python3 -I scripts/corpus/ablate.py --self-test
           python3 -I scripts/corpus/build.py --check
           python3 -I scripts/corpus/decide.py --check
+      # Phase 3 step 6: the unified Rust engine reproduces the decided Python
+      # configuration pair by pair (normalize keys, callsigns, alias hits, same
+      # verdicts, family membership/scores) and scores the decided construction
+      # cost. Subset here (the full 28k-pair run is minutes); the full gate runs
+      # on the phase branch before merge. -I for the same oracle isolation.
+      - name: Unified engine vs the decided configuration (subset)
+        run: python3 -I scripts/corpus/engine_parity.py --limit 300 --jobs 4
       # Channel operations replace the plugin's five cleanup actions, so their selection and
       # payload logic is compared against the plugin's own code. -I keeps the harness from
       # importing anything outside the plugin checkout (which it puts on sys.path itself).

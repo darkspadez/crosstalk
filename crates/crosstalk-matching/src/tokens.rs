@@ -249,11 +249,115 @@ pub fn process_string_for_matching(s: &str) -> String {
     tokens.join(" ")
 }
 
-/// True when a token is long enough to identify a channel on its own in the subset
+/// True when a token is distinctive in the SHARED CORE's sense (decided T01=core).
+///
+/// `matching_core.py::_is_distinctive`: not one of the non-distinctive stream-label
+/// variants (`live`/`now`/`new`), and either four characters or more or a pure-digit
+/// token of two characters or more (`360` distinguishes `Canal+Sport 360`). Janitor's
+/// override is a plain five-character length test ([`is_distinctive`]); the two
+/// disagree on real names (`nickelodeon` vs `nickelodeon teen`, `ABC News` vs
+/// `ABC News Live`), and the corpus picks the core's.
+pub fn is_distinctive_core(token: &str) -> bool {
+    if matches!(token, "live" | "now" | "new") {
+        return false;
+    }
+    // Python `len()` counts scalar values; every caller passes lowercased ASCII here.
+    char_len(token) >= 4 || (is_digit(token) && char_len(token) >= 2)
+}
+
+/// Whether two strings share enough distinctive tokens, in the SHARED CORE's sense.
+///
+/// Statement for statement with `matching_core.py::_has_token_overlap`: same common
+/// words, same meaningful-token rule, same majority test, same numeric/ordinal set
+/// (which keeps the number words — normalisation already folded them to digits, so
+/// they only matter on unnormalised input). The subset guard reads
+/// [`is_distinctive_core`], not Janitor's five-character test.
+pub fn has_token_overlap_core(
+    a: &str,
+    b: &str,
+    min_token_len: usize,
+    require_majority: bool,
+) -> bool {
+    const CORE_NUMERIC: [&str; 29] = [
+        "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven",
+        "twelve", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "first", "second",
+        "third", "fourth", "fifth",
+    ];
+    if require_majority {
+        let tokens_a: HashSet<&str> = a
+            .split_whitespace()
+            .filter(|t| !COMMON_WORDS.contains(t))
+            .filter(|t| char_len(t) >= 2 || is_digit(t))
+            .collect();
+        let tokens_b: HashSet<&str> = b
+            .split_whitespace()
+            .filter(|t| !COMMON_WORDS.contains(t))
+            .filter(|t| char_len(t) >= 2 || is_digit(t))
+            .collect();
+        if tokens_a.is_empty() || tokens_b.is_empty() {
+            return true;
+        }
+        let shared: HashSet<&str> = tokens_a.intersection(&tokens_b).copied().collect();
+        if shared.is_empty() {
+            return false;
+        }
+        let smaller = tokens_a.len().min(tokens_b.len());
+        if shared.len() * 2 <= smaller {
+            return false;
+        }
+        let unique_a: HashSet<&str> = tokens_a.difference(&tokens_b).copied().collect();
+        let unique_b: HashSet<&str> = tokens_b.difference(&tokens_a).copied().collect();
+        if unique_a.is_empty() {
+            if unique_b.iter().any(|t| is_distinctive_core(t)) {
+                return false;
+            }
+        } else if unique_b.is_empty() && unique_a.iter().any(|t| is_distinctive_core(t)) {
+            return false;
+        }
+        if !unique_a.is_empty()
+            && !unique_b.is_empty()
+            && unique_a.union(&unique_b).any(|t| char_len(t) >= 4)
+        {
+            return false;
+        }
+        let has_numeric = |set: &HashSet<&str>| set.iter().any(|t| CORE_NUMERIC.contains(t));
+        if has_numeric(&unique_a) && has_numeric(&unique_b) {
+            return false;
+        }
+        return true;
+    }
+    let tokens_a: HashSet<&str> = a
+        .split_whitespace()
+        .filter(|t| !COMMON_WORDS.contains(t))
+        .filter(|t| char_len(t) >= min_token_len)
+        .collect();
+    let tokens_b: HashSet<&str> = b
+        .split_whitespace()
+        .filter(|t| !COMMON_WORDS.contains(t))
+        .filter(|t| char_len(t) >= min_token_len)
+        .collect();
+    if tokens_a.is_empty() || tokens_b.is_empty() {
+        return true;
+    }
+    tokens_a.intersection(&tokens_b).next().is_some()
+}
 /// guard. Five characters, exactly as in Janitor's `_has_token_overlap`; shorter extras
 /// such as `live`, `now` or `two` never turn a legitimate extension into a rejection.
 pub fn is_distinctive(token: &str) -> bool {
     char_len(token) >= 5
+}
+
+/// Meaningful tokens of an already-lowercased name, owned (for index token blocks).
+///
+/// Same rule as the majority guard's token sets: drop `COMMON_WORDS`, keep tokens
+/// of two characters or more plus single digits.
+pub fn meaningful_tokens_owned(lower: &str) -> HashSet<String> {
+    lower
+        .split_whitespace()
+        .filter(|t| !COMMON_WORDS.contains(t))
+        .filter(|t| char_len(t) >= 2 || is_digit(t))
+        .map(str::to_string)
+        .collect()
 }
 
 fn meaningful_tokens(s: &str) -> HashSet<&str> {

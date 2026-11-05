@@ -290,6 +290,10 @@ pub enum CallsignLadder {
     EpgJanitor,
     /// `matching_core.py`'s four-priority ladder, which Stream-Mapparr runs.
     SharedCore,
+    /// The decided unified ladder (C01 `core-known` + C04 `none`): the shared core's
+    /// shape and denylist rescue (C03 `sm`) over the merged allowlist (C02),
+    /// WITHOUT the loose OTA-number rescue (`KING 5` stays callsign-less).
+    SharedCoreNoRescue,
 }
 
 /// Extract a US callsign and say how confident the position makes it.

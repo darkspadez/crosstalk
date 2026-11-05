@@ -1,5 +1,12 @@
 //! Named matcher profiles: one engine, one flag set per plugin.
 //!
+//! > **Deprecated for production code (phase 3 step 6).** Guide and streams keep
+//! > using their `MatchProfile`s unchanged until steps 8–9 migrate them onto the
+//! > unified engine (`crate::engine::UnifiedEngine` + `crate::identity`); the new
+//! > engine is additive and every existing parity gate stays at 0. When 8–9
+//! > complete, `MatchProfile` is retired from production code (kept for the oracle
+//! > harnesses). New code must use [`crate::engine::UnifiedEngine`].
+//!
 //! The plugins do not each get their own matcher. They share this crate and differ only in
 //! the flags they select here, so a fix to normalisation, aliases, callsigns, tokens or
 //! scoring reaches every app at once.

@@ -424,6 +424,10 @@
     },
     {
       "holds": true,
+      "statement": "`(P)` reads as no zone (Z07 `sm-strict`) only under SM's routing (Z01 `sm-zone`) with no post-match filter reading `(p)` (Z04 `none`)."
+    },
+    {
+      "holds": true,
       "statement": "The prefix order fits the prefix table (N12 `first` with the core's N04)."
     },
     {
@@ -739,6 +743,7 @@
     "pairs": 28450,
     "rows_decided": {
       "no-evidence": 31,
+      "orchestrator": 1,
       "strong": 6,
       "weak": 20
     }
@@ -2990,6 +2995,14 @@
       "reason": "No pair can be evidence: The quality_aware opt-in is off on every shipped default. Default `none` (strictest).",
       "strictest": "none",
       "variant": "none"
+    },
+    "Z07": {
+      "confidence": "orchestrator",
+      "evidence_pairs": 0,
+      "method": "orchestrated",
+      "reason": "Orchestrator decision (phase 3 step 6, Appendix C): `(P)` is NOT a Pacific zone marker (Stream-Mapparr's stricter reading; SM `_ZONE_PACIFIC_RE` matches bare PACIFIC and `(Pacific)`/`(PT)` only). The normalizer strips `(P)` as misc noise, so `Sportsnet (P)` == `Sportsnet` and != `Sportsnet Pacific`; Lineuparr's `(P)` = Pacific test expectations are a known conflict (Appendix C).",
+      "strictest": "sm-strict",
+      "variant": "sm-strict"
     }
   }
 }
