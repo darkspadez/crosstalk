@@ -550,7 +550,7 @@ pub fn plan(
     if switches.is_empty() {
         bail!(
             "no triage post-action is switched on, so this run would change nothing: enable the \
-             classes you want in [triage] of streams.toml — rename_dead_channels, \
+             classes you want in streams.toml — rename_dead_channels, \
              rename_blank_channels, rename_low_framerate_channels, add_video_format_suffix, \
              move_dead_channels, move_blank_channels, move_low_framerate_channels. Every one \
              ships off, as IPTV Checker's own post-action switches do, so that a run only \

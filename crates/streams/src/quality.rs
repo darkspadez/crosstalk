@@ -1,6 +1,6 @@
 //! The one quality model: Stream-Mapparr's sort key, and the throughput evidence it sorts on.
 //!
-//! `sort` is the only consumer today and `match` sorts with the same key (phase 2 step 6), so
+//! `sort` and `match` both sort with this key (`match` uses it to finalise a channel's list), so
 //! the key lives here once rather than in each action. Everything below is a statement-for-
 //! statement port of `Plugin._sort_streams_by_quality` (`reference/Stream-Mapparr/Stream-Mapparr/
 //! plugin.py:4739`) and the helpers it calls, cited line by line. There is one deliberate

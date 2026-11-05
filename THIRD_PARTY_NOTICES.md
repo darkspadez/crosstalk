@@ -63,10 +63,9 @@ SOFTWARE.
 - Upstream: <https://github.com/PiratesIRC/Stream-Mapparr>
 - Licence: MIT, Copyright (c) 2025 Pirates IRC (full text below)
 - Ported from, and where it lives: these are the reference files for the `streams` sub-app,
-  which is being written now in phase 2 of `plans/plugin-consolidation.md`
-  (`plans/phase-2-streams.md`). This list is the one `scripts/upstream_drift.sh` watches for
-  this reference; it grows as each phase-2 step lands, and a file named here is a file whose
-  upstream change may matter.
+  ported in phase 2 of `plans/plugin-consolidation.md` (`plans/phase-2-streams.md`). This list
+  is the one `scripts/upstream_drift.sh` watches for this reference, and it is the same list
+  below: a file credited here is a file whose upstream change may matter.
   - `Stream-Mapparr/plugin.py` → `crates/streams`: `match_*` (the per-name-group stream
     collector, replace/append, keep custom streams, visible-channel limit), `sort_*` (the
     quality model), `mirror_*` (`fill_mirror_backups`), `visibility_*`
@@ -80,8 +79,9 @@ SOFTWARE.
     country prefix/restriction rules.
   - `Stream-Mapparr/mirror_backups.py` → `crates/streams/src/mirror.rs`: `plan_mirror_fill`
     over accounts sharing a `server_group`.
-  - `Stream-Mapparr/placeholder_scan.py` → `crates/streams`: `scan_placeholders` and the
-    EPG-placeholder matching path.
+  - `Stream-Mapparr/placeholder_scan.py` → `crates/streams/src/placeholder_scan.rs`: the
+    numbered-family scan behind `scan_placeholders`. The EPG-placeholder matching path is
+    `plugin.py`'s, not this module's (`crates/streams/src/epg.rs`).
   - `Stream-Mapparr/plugin.json` → `crates/streams/src/settings.rs`: the `streams.toml`
     schema follows the plugin's field ids, labels and help text.
   - `Stream-Mapparr/*_channels.json` (AU, BR, CA, DE, DO, ES, FR, IN, MX, NL, NO, PE, PL, PT,
@@ -131,10 +131,10 @@ SOFTWARE.
 
 - Upstream: <https://github.com/PiratesIRC/Dispatcharr-IPTV-Checker-Plugin>
 - Licence: MIT, Copyright (c) 2025 Pirates IRC (full text below)
-- Ported from, and where it lives: the probe, triage and restore halves of the same
-  `streams` sub-app, being written now in phase 2 (`plans/phase-2-streams.md`). This list is
-  the one `scripts/upstream_drift.sh` watches for this reference; it grows as each phase-2
-  step lands.
+- Ported from, and where it lives: the probe, triage and restore halves of the same `streams`
+  sub-app, ported in phase 2 (`plans/phase-2-streams.md`). This list is the one
+  `scripts/upstream_drift.sh` watches for this reference, and it is the same list below: a file
+  credited here is a file whose upstream change may matter.
   - `iptv_checker/plugin.py` → `crates/streams`: `probe` (`load_groups` + `check_streams`:
     `ffprobe`/`ffmpeg` invocation, parsing and classification, `stream_stats` writes,
     per-account concurrency and the 429 throttle), `triage_*` (dead / blank / low-fps

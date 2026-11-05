@@ -45,6 +45,7 @@
 //! CSV retention is `[exports]`, the operation lock and progress files are the run store, and
 //! `view_*` / `export_results` are the run page and its CSV.
 
+pub mod bench;
 pub mod epg;
 pub mod matching;
 pub mod mirror;
@@ -238,7 +239,7 @@ impl SubApp for StreamsApp {
                 ACTION_TRIAGE_PREVIEW,
                 "Triage Streams (Dry Run)",
                 "Read the last probe's per-channel verdicts, work out every rename, group move \
-                 and format suffix the switches in [triage] ask for, and write a CSV. Changes \
+                 and format suffix the switches in streams.toml ask for, and write a CSV. Changes \
                  nothing and creates no group.",
                 ActionKind::Read,
             ),

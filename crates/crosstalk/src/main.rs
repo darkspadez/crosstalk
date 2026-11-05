@@ -6,6 +6,7 @@
 //!   * `validate` — check configuration against Dispatcharr
 //!   * `exports clear` — delete the CSV reports the sub-apps wrote
 //!   * `simulate-streams` — offline stream-to-channel match simulation (the parity oracle)
+//!   * `bench` — time the parts of a run, to decide whether REST is fast enough
 
 mod registry;
 mod simulate;
@@ -40,6 +41,8 @@ enum Command {
     Validate(ConfigArgs),
     /// Manage the CSV reports the sub-apps write.
     Exports(ExportsArgs),
+    /// Time the parts of a sub-app's run: the plan phases, and the writes they would issue.
+    Bench(BenchArgs),
     /// Offline stream-to-channel match simulation.
     #[command(name = "simulate-streams")]
     SimulateStreams(SimulateArgs),
@@ -76,6 +79,52 @@ struct RunArgs {
     /// the scope, for instance.
     #[arg(long)]
     fresh: bool,
+}
+
+#[derive(Args, Debug)]
+struct BenchArgs {
+    #[command(subcommand)]
+    target: BenchTarget,
+}
+
+#[derive(Subcommand, Debug)]
+enum BenchTarget {
+    /// Benchmark the streams sub-app: match, sort, mirror and visibility plans.
+    Streams(StreamsBenchArgs),
+}
+
+/// One of `--synthetic` or `--live` must be chosen: a bench that silently measured nothing
+/// would be worse than one that refuses.
+#[derive(Args, Debug)]
+struct StreamsBenchArgs {
+    /// Directory holding the configuration files.
+    #[arg(long, default_value = "config", env = "CROSSTALK_CONFIG_DIR")]
+    config: PathBuf,
+    /// Time a synthetic world built in memory. No network, no Dispatcharr.
+    #[arg(long)]
+    synthetic: bool,
+    /// Time the plans against the Dispatcharr the configuration names. Read-only.
+    #[arg(long)]
+    live: bool,
+    /// Synthetic channels to build (the plan's target size by default).
+    #[arg(long, default_value_t = 20_000, requires = "synthetic")]
+    channels: usize,
+    /// Synthetic streams to build.
+    #[arg(long, default_value_t = 50_000, requires = "synthetic")]
+    streams: usize,
+    /// Synthetic M3U accounts to build.
+    #[arg(long, default_value_t = 100, requires = "synthetic")]
+    accounts: usize,
+    /// Read back the sampled channels' stream lists and rewrite them to that value, to time
+    /// the two write patterns. Idempotent: nothing changes. Needs --yes.
+    #[arg(long, requires = "live")]
+    write_timing: bool,
+    /// Channels to sample for --write-timing, comma-separated ids.
+    #[arg(long = "channel-ids", requires = "write_timing", value_delimiter = ',')]
+    channel_ids: Vec<i64>,
+    /// Confirm the write timing's no-op rewrite.
+    #[arg(long, short = 'y')]
+    yes: bool,
 }
 
 #[derive(Args, Debug)]
@@ -194,6 +243,9 @@ fn main() -> Result<()> {
         }
         Command::Serve(args) => serve(args),
         Command::Run(args) => run_once(args),
+        Command::Bench(args) => match args.target {
+            BenchTarget::Streams(args) => bench_streams(args),
+        },
         Command::Validate(args) => validate(args),
         Command::Exports(args) => match args.command {
             ExportsCommand::Clear(args) => clear_exports(args),
@@ -571,6 +623,63 @@ fn run_once(args: RunArgs) -> Result<()> {
     if let Some(path) = &outcome.report_path {
         println!("  report: {}", path.display());
     }
+    Ok(())
+}
+
+/// `bench streams`: the timing tool the plan promised, in two modes.
+///
+/// The prints are the report's own lines, so a test can assert on the same strings an
+/// operator reads, and so the numbers a decision quotes are the ones this command wrote.
+fn bench_streams(args: StreamsBenchArgs) -> Result<()> {
+    if args.synthetic == args.live {
+        anyhow::bail!(
+            "choose exactly one mode: --synthetic times a world built in memory (no network), \
+             --live times the Dispatcharr the configuration names"
+        );
+    }
+    let config = CrosstalkConfig::load(&args.config)?;
+    // The settings a run would use, so the numbers describe the configuration in front of the
+    // operator and not a default nobody runs.
+    let registry = registry::builtin();
+    let app = registry
+        .get(crosstalk_streams::APP_ID)
+        .expect("the streams app is registered");
+    let settings_path = app.settings_path(&config.config_dir);
+    let settings = crosstalk_streams::settings::load(&settings_path)?;
+
+    let mut report = if args.synthetic {
+        let options = crosstalk_streams::bench::SyntheticOptions {
+            channels: args.channels,
+            streams: args.streams,
+            accounts: args.accounts,
+        };
+        crosstalk_streams::bench::synthetic(&settings, &config.matching, &options)?
+    } else {
+        if args.write_timing && !args.yes {
+            anyhow::bail!(
+                "refusing --write-timing without --yes: it rewrites the sampled channels' \
+                 stream lists (each read back just before, so nothing changes) to time \
+                 the write path. Add --yes to proceed."
+            );
+        }
+        let ids = if args.write_timing {
+            if args.channel_ids.is_empty() {
+                anyhow::bail!(
+                    "--write-timing needs --channel-ids: name the channels to sample, for \
+                     example --channel-ids 12,13,14"
+                );
+            }
+            Some(args.channel_ids.as_slice())
+        } else {
+            None
+        };
+        let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
+        runtime.block_on(crosstalk_streams::bench::live(&config, &settings, ids))?
+    };
+    report
+        .notes
+        .insert(0, format!("settings: {}", settings_path.display()));
+    report.print();
     Ok(())
 }
 
@@ -1033,6 +1142,156 @@ mod cli_tests {
 
         assert!(!report.exists(), "the guide's own report is deleted");
         assert!(foreign.exists(), "another program's file is untouched");
+    }
+
+    fn bench_args(args: &[&str]) -> StreamsBenchArgs {
+        match parse(args).command {
+            Command::Bench(BenchArgs {
+                target: BenchTarget::Streams(args),
+            }) => args,
+            other => panic!("expected a bench streams command, got {other:?}"),
+        }
+    }
+
+    fn bare_bench_args(config: std::path::PathBuf) -> StreamsBenchArgs {
+        StreamsBenchArgs {
+            config,
+            synthetic: false,
+            live: false,
+            channels: 20_000,
+            streams: 50_000,
+            accounts: 100,
+            write_timing: false,
+            channel_ids: Vec::new(),
+            yes: false,
+        }
+    }
+
+    #[test]
+    fn bench_streams_takes_a_mode_and_the_synthetic_size() {
+        let args = bench_args(&["crosstalk", "bench", "streams", "--synthetic"]);
+        assert!(args.synthetic);
+        assert!(!args.live);
+        assert_eq!(args.channels, 20_000);
+        assert_eq!(args.streams, 50_000);
+        assert_eq!(args.accounts, 100);
+        assert!(!args.write_timing, "a bench is read-only until asked");
+        assert_eq!(args.config, Path::new("config"));
+
+        let args = bench_args(&[
+            "crosstalk",
+            "bench",
+            "streams",
+            "--synthetic",
+            "--channels",
+            "500",
+            "--streams",
+            "1000",
+            "--accounts",
+            "5",
+        ]);
+        assert_eq!(args.channels, 500);
+        assert_eq!(args.streams, 1_000);
+        assert_eq!(args.accounts, 5);
+    }
+
+    #[test]
+    fn the_synthetic_size_belongs_to_a_synthetic_run() {
+        // A size on a live run would be read and silently ignored, which is how a report ends
+        // up describing a world nobody measured.
+        assert!(Cli::try_parse_from([
+            "crosstalk",
+            "bench",
+            "streams",
+            "--live",
+            "--channels",
+            "10"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "crosstalk",
+            "bench",
+            "streams",
+            "--synthetic",
+            "--channels",
+            "10"
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn write_timing_needs_a_live_run_and_channel_ids() {
+        assert!(Cli::try_parse_from([
+            "crosstalk",
+            "bench",
+            "streams",
+            "--synthetic",
+            "--write-timing"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "crosstalk",
+            "bench",
+            "streams",
+            "--live",
+            "--channel-ids",
+            "1"
+        ])
+        .is_err());
+        let args = bench_args(&[
+            "crosstalk",
+            "bench",
+            "streams",
+            "--live",
+            "--write-timing",
+            "--channel-ids",
+            "12,13",
+            "--yes",
+        ]);
+        assert!(args.write_timing);
+        assert!(args.yes);
+        assert_eq!(args.channel_ids, vec![12, 13]);
+    }
+
+    #[test]
+    fn a_bench_without_exactly_one_mode_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (synthetic, live) in [(false, false), (true, true)] {
+            let error = bench_streams(StreamsBenchArgs {
+                synthetic,
+                live,
+                ..bare_bench_args(dir.path().to_path_buf())
+            })
+            .expect_err("refused");
+            assert!(format!("{error}").contains("exactly one mode"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_synthetic_bench_runs_end_to_end_from_the_cli() {
+        // Every step is offline: this is a real CLI run against a world built in memory.
+        let dir = tempfile::tempdir().expect("tempdir");
+        bench_streams(StreamsBenchArgs {
+            synthetic: true,
+            channels: 20,
+            streams: 100,
+            accounts: 20,
+            ..bare_bench_args(dir.path().to_path_buf())
+        })
+        .expect("runs");
+    }
+
+    #[test]
+    fn write_timing_without_yes_is_refused_and_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let error = bench_streams(StreamsBenchArgs {
+            live: true,
+            write_timing: true,
+            channel_ids: vec![1],
+            ..bare_bench_args(dir.path().to_path_buf())
+        })
+        .expect_err("refused");
+        assert!(format!("{error}").contains("--yes"), "{error}");
     }
 
     #[test]

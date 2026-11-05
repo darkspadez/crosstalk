@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 /// Channels per `edit/bulk` request. The endpoint applies one JSON array in a single
 /// transaction, so a whole install would sit under a single timeout; chunks keep each write
 /// small enough to retry on its own.
-const CHANNEL_EDIT_CHUNK_SIZE: usize = 500;
+pub const CHANNEL_EDIT_CHUNK_SIZE: usize = 500;
 
 /// Associations per `batch-set-epg` request, for the same reason as
 /// [`CHANNEL_EDIT_CHUNK_SIZE`].

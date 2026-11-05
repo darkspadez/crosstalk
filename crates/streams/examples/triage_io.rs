@@ -2,7 +2,7 @@
 //!
 //! One JSON object per line, one line back per case. A `triage` case carries a small world —
 //! channels (name, group), channel groups, and the STREAM rows the probe recorded per channel
-//! — plus the `[triage]` switches and formats; the verdicts are derived here through the real
+//! — plus the triage switches and formats; the verdicts are derived here through the real
 //! [`crosstalk_streams::probe::verdict_for`] and [`crosstalk_streams::probe::format_for`], so
 //! the harness compares the plugin's predicates with the port rather than with a fixture's
 //! idea of them. A `restore` case carries the same world, the same probe rows, and the

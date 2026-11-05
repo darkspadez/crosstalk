@@ -167,7 +167,8 @@ run_history_days = 15
 # (m3u_refresh, epg_refresh, m3u_error, …), so unknown names are allowed.
 #
 # Setup, in Dispatcharr: Settings → Connect → Add Connection, type Webhook, URL
-# `http://<crosstalk host>:9191/hooks/dispatcharr`, header `Authorization: Bearer <server.token>`
+# `http://<crosstalk host>:8730/hooks/dispatcharr` (crosstalk's own `server.port`, which
+# defaults to 8730 — not Dispatcharr's port), header `Authorization: Bearer <server.token>`
 # (and `Content-Type: application/json` if you use a payload template), then subscribe the
 # events below. Dispatcharr's own payload carries no event name, so either add `?event=<name>`
 # to the URL or give the subscription a payload template like {"event": "m3u_refresh"}.

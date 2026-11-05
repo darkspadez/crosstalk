@@ -30,12 +30,12 @@
 //!
 //! # Divergences
 //!
-//!   * **Country-first ordering is not here yet.** The plugin also partitions a channel's
-//!     streams by `restrict_matching_to_country` (`_same_country_ids_for` 4432, bug-158), which
-//!     needs the country channel database and the channel→country resolution the match
-//!     collector owns. It arrives with that collector (phase 2 step 6); until then a sort
-//!     orders by the quality key and the zone, whatever the setting says. With the setting off
-//!     — the default — the two agree exactly.
+//!   * **Country-first ordering is not ported.** The plugin also partitions a channel's streams
+//!     by `restrict_matching_to_country` (`_same_country_ids_for` 4432, bug-158), making the
+//!     country tier the OUTER key. A sort here orders by the quality key and the zone whatever
+//!     the setting says; `match` is the action that partitions by country. With the setting
+//!     off — the default — the two agree exactly. `README.md` lists this among the
+//!     differences.
 //!   * **The plugin requires a Channel Profile** ("Profile name is required", 9853). The
 //!     profile list is the shared `[scope] profiles` here, and an empty one means every
 //!     channel, like every other action's scope.
