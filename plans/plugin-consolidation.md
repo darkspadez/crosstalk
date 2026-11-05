@@ -301,6 +301,14 @@ pieces each phase adds, and the cross-cutting rules below.
 
 ### Phase 3: `lineup` (Channel-Mapparr + Channel Name Cleaner + Lineuparr's channel half)
 
+> Detailed plan: `plans/phase-3-lineup.md`. **Goal reset (2026-11-04):** apps must share one
+> implementation and give the same answer, so phase 3 opens by collapsing the per-plugin matcher
+> profiles into one engine (rules chosen on a labelled corpus), one merged data set, a shared
+> channel identity, one tag vocabulary / quality model / template engine / logo resolver, and
+> migrates guide and streams onto it. Plugin parity becomes an oracle report, not a gate. Also:
+> host-level undo, ownership of created channels, hide instead of delete, AI escalation chain
+> (Jev → LLM). This supersedes "One fuzzy matcher, edited once"'s per-plugin profiles.
+
 | crosstalk action | Merged from | Notes |
 |---|---|---|
 | `clean_preview` / `clean_apply` | NC `preview`, `apply` | Junk stripping with protect-list and collision strategy. Also runs as the first stage of `names_*` |
