@@ -114,6 +114,9 @@ pub const COLUMNS: [&str; 9] = [
 
 /// The placeholders a [`RenameKind::Template`] understands. Anything else between braces is
 /// left exactly as written, so a template may also carry `{…}` meant for another tool.
+///
+/// Kept in sync with [`crate::naming::CHANNEL_PLACEHOLDERS`]: the template engine renders
+/// the value, this constant names the set for reports and settings help.
 pub const TEMPLATE_PLACEHOLDERS: [&str; 5] = ["{name}", "{group}", "{number}", "{epg}", "{id}"];
 
 /// Progress is published at most this often, like the plugin's own two-second flush.
@@ -431,11 +434,14 @@ impl RenameKind {
     }
 
     /// The new name, or `None` when it would be empty (a blank name is not a rename).
-    fn produce(&self, current: &str, values: &Placeholders) -> Option<String> {
+    ///
+    /// Templates render through the shared engine ([`crate::naming::render_channel`]);
+    /// suffix/prefix keep their own exact-match guards (the guide's `tag_missing` parity).
+    fn produce(&self, current: &str, values: &crate::naming::ChannelValues) -> Option<String> {
         let name = match self {
             Self::Suffix(text) => format!("{current}{text}"),
             Self::Prefix(text) => format!("{text}{current}"),
-            Self::Template(template) => render_template(template, values),
+            Self::Template(template) => crate::naming::render_channel(template, values),
         };
         if name.trim().is_empty() {
             None
@@ -775,6 +781,18 @@ pub struct PlanOptions {
     /// earlier operation that already planned a change has that change dropped (reported as
     /// a skip) when the guard fires.
     pub suffix_present_skips_rest: bool,
+    /// Resolve rename collisions through the shared engine
+    /// ([`crate::naming::resolve_collisions`], Name Cleaner's suffix/numeric/skip
+    /// strategies, against every channel name in the world) after all operations planned.
+    ///
+    /// Opt-in per plan: `None` (the default) plans exactly what the operations say, which
+    /// is what the guide's `tag_missing` preset relies on for its parity. Lineup's
+    /// clean/names set this; a `skip` reports the loser as a collision,
+    /// `suffix`/`numeric` rewrite the loser's planned name.
+    pub collision: Option<crate::naming::CollisionStrategy>,
+    /// The separator `suffix` collisions join with (`" "`, Name Cleaner's
+    /// `join_separator`). Ignored unless [`Self::collision`] is set.
+    pub collision_sep: String,
 }
 
 /// Plan a selection and a list of operations against the world.
@@ -920,12 +938,109 @@ pub fn plan_with_options(
         changes.extend(planned);
     }
 
+    if let Some(strategy) = options.collision {
+        resolve_plan_collisions(
+            world,
+            &mut changes,
+            &mut skipped,
+            strategy,
+            &options.collision_sep,
+        );
+    }
+
     Ok(Plan {
         description: selection.describe(&scoped.filter_description),
         selected: selected_rows,
         changes,
         skipped,
     })
+}
+
+/// Apply the opt-in collision strategy to a plan's rename changes.
+///
+/// Only [`Field::Name`] changes participate, against EVERY channel name in the world
+/// (global, like Name Cleaner: see [`crate::naming`] for why not per group), minus the old
+/// names the renames free — a rename frees its own slot for a sibling, exactly like the
+/// engine's first pass. A resolved name rewrites the change's `after`; a `Skip` loser, and a
+/// change the resolver turns back into its own current name, loses its change and gains a
+/// `skipped` row. Channel-ops carries no cleaning info, so `suffix` has no removed quality to
+/// re-append and behaves like `numeric`.
+fn resolve_plan_collisions(
+    world: &World,
+    changes: &mut Vec<Change>,
+    skipped: &mut Vec<Skip>,
+    strategy: crate::naming::CollisionStrategy,
+    sep: &str,
+) {
+    use crate::naming::PlannedName;
+    let mut planned: Vec<PlannedName> = Vec::new();
+    for change in changes.iter() {
+        if change.field != Field::Name {
+            continue;
+        }
+        let (Value::Name(old_name), Value::Name(new_name)) = (&change.before, &change.after) else {
+            continue;
+        };
+        planned.push(PlannedName {
+            id: change.channel_id,
+            old_name: old_name.clone(),
+            new_name: new_name.clone(),
+            removed_tags: Vec::new(),
+        });
+    }
+    if planned.is_empty() {
+        return;
+    }
+    let existing: Vec<String> = world
+        .channels
+        .iter()
+        .map(|channel| channel.name.clone())
+        .collect();
+    let resolved = crate::naming::resolve_collisions(&planned, &existing, strategy, sep);
+    let resolved: HashMap<i64, crate::naming::ResolvedName> =
+        resolved.into_iter().map(|row| (row.id, row)).collect();
+    let mut kept: Vec<Change> = Vec::with_capacity(changes.len());
+    for mut change in changes.drain(..) {
+        let row = (change.field == Field::Name)
+            .then(|| resolved.get(&change.channel_id))
+            .flatten();
+        let Some(row) = row else {
+            kept.push(change);
+            continue;
+        };
+        let reason = if row.skipped {
+            Some(format!(
+                "the rename to {:?} collides with another channel's name and the plan's \
+                 collision strategy is skip, so the name is left as {:?}",
+                row.final_name,
+                change.before.display(),
+            ))
+        } else if Value::Name(row.final_name.clone()) == change.before {
+            Some(format!(
+                "the rename collides with another channel's name, and the collision \
+                 strategy resolves it back to the current name {:?}, so nothing changes",
+                change.before.display(),
+            ))
+        } else {
+            None
+        };
+        match reason {
+            Some(reason) => skipped.push(Skip {
+                channel_id: change.channel_id,
+                channel_name: change.channel_name.clone(),
+                channel_number: change.channel_number,
+                channel_group: change.channel_group.clone(),
+                op: Some(change.op),
+                field: Some(change.field),
+                reason,
+            }),
+            None => {
+                change.after = Value::Name(row.final_name.clone());
+                kept.push(change);
+            }
+        }
+    }
+    *changes = kept;
 }
 
 /// Writes many channels' ordered stream lists: the seam every stream-list write goes through.
@@ -1447,42 +1562,11 @@ pub fn compile_pattern(pattern: &str) -> Result<Regex> {
     })
 }
 
-/// Fill a [`RenameKind::Template`].
-///
-/// One pass, so a channel literally named `{group}` is not substituted twice. Unknown
-/// `{…}` tokens are copied through unchanged.
-fn render_template(template: &str, values: &Placeholders) -> String {
-    let mut out = String::with_capacity(template.len());
-    let mut rest = template;
-    while let Some(open) = rest.find('{') {
-        out.push_str(&rest[..open]);
-        let Some(close) = rest[open..].find('}') else {
-            out.push_str(&rest[open..]);
-            return out;
-        };
-        let token = &rest[open..open + close + 1];
-        match token {
-            "{name}" => out.push_str(&values.name),
-            "{group}" => out.push_str(&values.group),
-            "{number}" => out.push_str(&values.number),
-            "{epg}" => out.push_str(&values.epg),
-            "{id}" => out.push_str(&values.id),
-            other => out.push_str(other),
-        }
-        rest = &rest[open + close + 1..];
-    }
-    out.push_str(rest);
-    out
-}
-
-/// What a template can substitute.
-struct Placeholders {
-    name: String,
-    group: String,
-    number: String,
-    epg: String,
-    id: String,
-}
+/// What a per-channel template substitutes: the shared engine's
+/// [`crate::naming::ChannelValues`], kept here under its old name so the call
+/// sites read unchanged. The rendering itself moved to
+/// [`crate::naming::render_channel`] (byte-identical output).
+type Placeholders = crate::naming::ChannelValues;
 
 /// A channel's mutable state while its operations are evaluated.
 struct Working {
@@ -2822,6 +2906,7 @@ mod tests {
         // already carries the suffix is skipped ENTIRELY, keeping its guide.
         let options = PlanOptions {
             suffix_present_skips_rest: true,
+            ..PlanOptions::default()
         };
         let plan = plan_with_options(
             &world(),
@@ -2906,6 +2991,7 @@ mod tests {
         // after the move already planned, and neither change survives.
         let options = PlanOptions {
             suffix_present_skips_rest: true,
+            ..PlanOptions::default()
         };
         let plan = plan_with_options(
             &world(),
@@ -2931,6 +3017,69 @@ mod tests {
                 .any(|skip| skip.reason.contains("already tagged")),
             "{:#?}",
             plan.skipped
+        );
+    }
+
+    #[test]
+    fn collisions_are_opt_in_and_global() {
+        let ops = [Op::Rename {
+            kind: RenameKind::Template("Same".to_string()),
+        }];
+        let selection = Selection {
+            channel_ids: Some(vec![1, 3]),
+            ..Selection::default()
+        };
+        // Default: no collision strategy, both renames planned verbatim (guide
+        // parity: `tag_missing` never opts in).
+        let plain = plan_ops(&world(), &selection, &ops).expect("plans");
+        assert_eq!(plain.changes.len(), 2);
+        assert!(plain
+            .changes
+            .iter()
+            .all(|change| change.after == Value::Name("Same".to_string())));
+        // Opt-in numeric: different groups (Sports vs PPV Live) collide too, because
+        // Dispatcharr's outputs list channels flat.
+        let options = PlanOptions {
+            collision: Some(crate::naming::CollisionStrategy::Numeric),
+            collision_sep: " ".to_string(),
+            ..PlanOptions::default()
+        };
+        let plan = plan_with_options(&world(), &selection, &ops, &options).expect("plans");
+        let mut afters: Vec<String> = plan
+            .changes
+            .iter()
+            .map(|change| change.after.display())
+            .collect();
+        afters.sort();
+        assert_eq!(afters, vec!["Same (2)".to_string(), "Same (3)".to_string()]);
+        // Same group as well: channels 1 and 2 both land on "Same".
+        let selection = Selection {
+            channel_ids: Some(vec![1, 2]),
+            ..Selection::default()
+        };
+        let plan = plan_with_options(&world(), &selection, &ops, &options).expect("plans");
+        let mut afters: Vec<String> = plan
+            .changes
+            .iter()
+            .map(|change| change.after.display())
+            .collect();
+        afters.sort();
+        // Both deferred the unique pass (two claimants), so id order goes numeric.
+        assert_eq!(afters, vec!["Same (2)".to_string(), "Same (3)".to_string()]);
+        // Skip reports the loser instead of renaming it.
+        let options = PlanOptions {
+            collision: Some(crate::naming::CollisionStrategy::Skip),
+            ..PlanOptions::default()
+        };
+        let plan = plan_with_options(&world(), &selection, &ops, &options).expect("plans");
+        // Both rows claimed one name, so both deferred and both report a collision.
+        assert!(plan.changes.is_empty(), "{:#?}", plan.changes);
+        assert_eq!(
+            plan.skipped
+                .iter()
+                .filter(|skip| skip.reason.contains("collision"))
+                .count(),
+            2
         );
     }
 

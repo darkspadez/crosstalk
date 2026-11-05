@@ -430,9 +430,10 @@ pub fn configured_suffixes(settings: &StreamsSettings) -> Vec<String> {
 /// second tag onto a channel that carries one from before the narrowing).
 pub fn known_format_tags(suffixes: &[String]) -> Vec<String> {
     let mut tags: Vec<String> = suffixes.to_vec();
-    for standard in ["uhd", "fhd", "hd", "sd", "unknown"] {
-        if !tags.iter().any(|tag| tag == standard) {
-            tags.push(standard.to_string());
+    for standard in crosstalk_core::quality::IC_FORMAT_LABELS {
+        let standard = standard.to_lowercase();
+        if !tags.contains(&standard) {
+            tags.push(standard);
         }
     }
     tags

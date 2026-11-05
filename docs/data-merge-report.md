@@ -17,7 +17,7 @@ report byte for byte (`build_merged.py --check`, enforced in CI).
   - FR: 2 aliases, 0 multi-canonical.
   - PE: 125 aliases, 0 multi-canonical.
 - Lineup files: 29 files, 7485 channels, copied verbatim.
-- Size of `data/merged/` (excluding `PROVENANCE.json`): 7138782 bytes (6.81 MiB).
+- Size of `data/merged/` (excluding `PROVENANCE.json`): 7145129 bytes (6.81 MiB).
 
 ## Dedup key decisions
 
@@ -68,7 +68,7 @@ report byte for byte (`build_merged.py --check`, enforced in CI).
 
 ## Size
 
-`data/merged/` totals 7138782 bytes (6.81 MiB) without
+`data/merged/` totals 7145129 bytes (6.81 MiB) without
 `PROVENANCE.json`; the US database dominates (31792 entries). Output
 is compact JSON (no pretty-print). `Dockerfile` already does
 `COPY ./data`, so the merged set ships in the image unchanged. The

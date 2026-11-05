@@ -21,6 +21,7 @@ pub mod pipeline;
 pub mod profile;
 pub mod pyre;
 pub mod similarity;
+pub mod tags;
 pub mod tokens;
 
 pub use engine::{EngineConfig, UnifiedEngine, DEFAULT_THRESHOLD, ENGINE_VERSION};

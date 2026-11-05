@@ -589,24 +589,12 @@ pub fn parse_framerate(text: &str) -> f64 {
 }
 
 /// `_get_stream_format` (4644), including its `x`-only parse.
+///
+/// A pure extraction onto the shared model ([`crosstalk_core::quality::QualityTier`]):
+/// the width bands are decided once in core, and this stays byte-identical by delegating
+/// to them (the probe parity harness pins the boundary table).
 pub fn stream_format(resolution: &str) -> &'static str {
-    let Some((width, _)) = resolution.split_once('x') else {
-        return "Unknown";
-    };
-    let Ok(width) = width.parse::<i64>() else {
-        return "Unknown";
-    };
-    if width >= 3800 {
-        "UHD"
-    } else if width >= 1900 {
-        "FHD"
-    } else if width >= 1200 {
-        "HD"
-    } else if width > 0 {
-        "SD"
-    } else {
-        "Unknown"
-    }
+    crosstalk_core::quality::stream_format_of(resolution)
 }
 
 /// `round(value, places)` with Python's semantics: half-to-even over the value's exact binary

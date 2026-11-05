@@ -498,6 +498,159 @@ def merge_stations(root):
     return output, provenance, inputs
 
 
+# ---------------------------------------------------------------------------
+# Tag vocabulary (phase 3 step 7).
+#
+# One table of tag kinds, each entry carrying the plugins that use it:
+#
+# * quality: NC's ``_QUALITY`` picture tokens that describe the feed
+#   (``reference/dispatcharr-channel-name-cleaner/channel_name_cleaner/plugin.py:39``)
+#   plus its ``\d{3,4}p`` bracket forms (:42) and ``UNICODE_QUALITY``
+#   superscript marks (:46); IC's ``STANDARD_QUALITY_TAGS``
+#   (``reference/Dispatcharr-IPTV-Checker-Plugin/iptv_checker/plugin.py:3325``);
+#   CM's ignored-tag picture tokens in ``DEFAULT_IGNORED_TAGS``
+#   (``reference/Dispatcharr-Channel-Maparr-Plugin/Channel-Maparr/plugin.py:104``);
+#   LU's name-fallback tags in ``_get_quality_tier``
+#   (``reference/Dispatcharr-Lineuparr-Plugin/Lineuparr/plugin.py:1651``).
+# * junk: NC's ``_QUALITY`` tokens that describe packaging rather than the
+#   picture (VIP, MULTI, BACKUP, GEO, LOW, DUAL, HQ, LQ), same line as above.
+# * status: crosstalk/IC/CM tags: IC's ``STANDARD_STATUS_TAGS``
+#   (``plugin.py:3324``: DEAD, Slow, Blank), CM's ``[Unk]``
+#   (``DEFAULT_UNKNOWN_SUFFIX``, ``plugin.py:103``) and ``[Slow]``/``[Dead]``
+#   ignored tags (:104), the guide's ``[BadEPG]`` (``crates/guide/src/settings.rs``
+#   default ``bad_epg_suffix``).
+# * regional: SM's ``extract_tags`` regions
+#   (``reference/Stream-Mapparr/Stream-Mapparr/fuzzy_matcher.py``:
+#   East/West/Pacific/Central/Mountain/Atlantic), re-attached by CM's
+#   ``build_final_channel_name`` (``fuzzy_matcher.py:1506``).
+# * timeshift: the ``+N`` markers LU's and EPG Janitor's ``_PLUS_SHIFT_RE``
+#   (``Lineuparr/fuzzy_matcher.py:46``, ``EPG-Janitor/fuzzy_matcher.py:99``)
+#   and NC's ``normalize_plus_one`` (``plugin.py:179``) handle.
+# * country_prefix: the anchored ``CC:``/``[CC]``/``(CC)``/``CC_`` marker
+#   codes, union of SM's ``KNOWN_COUNTRY_CODES``
+#   (``reference/Stream-Mapparr/Stream-Mapparr/country.py:29``) and LU's
+#   ``_KNOWN_COUNTRY_CODES``
+#   (``reference/Dispatcharr-Lineuparr-Plugin/Lineuparr/fuzzy_matcher.py:82``).
+#
+# Tokens NC lumps together but the vocabulary splits (VIP/MULTI/... are junk,
+# not quality) are recorded under their vocabulary kind with source NC: the
+# normalizer keeps consuming its own decided subsets (step 6, N01-N14), and
+# this table is the superset the writers (cleaning, tagging, templates,
+# logos) classify with.
+# ---------------------------------------------------------------------------
+
+# SM's country vocabulary (country.py:29 KNOWN_COUNTRY_CODES), cited above.
+SM_KNOWN_COUNTRY_CODES = [
+    "AL", "AR", "AT", "AU", "AZ", "BE", "BG", "BR", "CA", "CH",
+    "CO", "CR", "CY", "CZ", "DE", "DK", "DO", "ES", "FI", "FR",
+    "GR", "HR", "HU", "IE", "IL", "IN", "IR", "IT", "JP", "KR",
+    "MK", "MX", "NL", "NO", "NZ", "PH", "PL", "PT", "RO", "RS",
+    "RU", "SE", "TH", "TR", "UK", "US",
+]
+
+# LU's country vocabulary (fuzzy_matcher.py:82 _KNOWN_COUNTRY_CODES).
+LU_KNOWN_COUNTRY_CODES = [
+    "US", "UK", "CA", "AU", "DE", "FR", "IT", "ES", "NL", "BR",
+    "MX", "IN", "IE", "SE", "NO", "DK", "PT", "PL", "AT", "CH",
+    "BE", "FI", "TR", "GR", "IR", "AL", "BG", "RO", "RU", "AZ",
+    "HR", "TH", "RS", "MK", "IL", "CO", "CR", "CY", "JP", "KR",
+    "CZ", "HU", "NZ", "PH", "VN", "PK", "SI", "ET", "QA",
+]
+
+TAG_KINDS = {
+    "quality": "picture/format tokens: IC format suffixes, NC picture marks, "
+    "CM ignored picture tags, LU tier name tags; including resolution "
+    "(1080p/720p/\\d{3,4}p), 4K/8K, superscript marks, HEVC/RAW",
+    "junk": "packaging tokens NC strips as junk-only segments: "
+    "VIP/MULTI/BACKUP/GEO/LOW/DUAL/HQ/LQ",
+    "status": "state tags writers append: IC/CM [DEAD]/[Slow]/[Blank], "
+    "CM [Unk], guide [BadEPG], IC format suffixes also live under quality",
+    "regional": "feed-region words SM extracts and CM re-attaches: "
+    "East/West/Pacific/Central/Mountain/Atlantic",
+    "timeshift": "time-shift markers (+1/+2) LU/EJ route on and NC normalizes",
+    "country_prefix": "anchored CC:/[CC]/(CC)/CC_/bare markers; the code list "
+    "is the SM+LU union, delimiter forms are recognized by the classifier",
+}
+
+
+def merge_tags():
+    """Build the unified tag vocabulary table."""
+    entries = []  # (token, kind)
+    sources = {}  # token -> set(sources)
+
+    def add(token, kind, *plugs):
+        entries.append((token, kind))
+        sources.setdefault((token, kind), set()).update(plugs)
+
+    # Quality picture tokens (NC _QUALITY picture subset + resolution +
+    # superscripts; IC STANDARD_QUALITY_TAGS; CM ignored picture tags; LU
+    # name-fallback tags).
+    for token in ["HD", "FHD", "UHD", "4K", "8K", "HEVC", "H.265",
+                  "H.264", "RAW", "1080p", "720p", "480p", "2160p",
+                  "FHD1080", "SD",
+                  # UNICODE_QUALITY (plugin.py:51), codepoint for codepoint:
+                  # ᵁᴴᴰ ᴴᴰ ᴿᴬᵂ ᴴᴱᵛᶜ ⁴ᴷ ᔕᗪ.
+                  "\u1d41\u1d34\u1d30", "\u1d34\u1d30",
+                  "\u1d3f\u1d2c\u1d42", "\u1d34\u1d31\u1d5b\u1d9c",
+                  "\u2074\u1d37", "\u1515\u15ea"]:
+        add(token, "quality", "NC")
+    for token in ["UHD", "FHD", "HD", "SD", "Unknown"]:
+        add(token, "quality", "IC")
+    for token in ["4K", "FHD", "HD", "SD", "Unknown"]:
+        add(token, "quality", "CM")
+    for token in ["4K", "UHD", "FHD", "1080", "HD", "SD"]:
+        add(token, "quality", "LU")
+    # Junk packaging tokens (NC _QUALITY non-picture subset).
+    for token in ["VIP", "MULTI", "MULTI-AUDIO", "MULTIAUDIO", "HQ", "LQ", "LOW",
+                  "DUAL", "GEO", "BACKUP"]:
+        add(token, "junk", "NC")
+    # Status tags (IC STANDARD_STATUS_TAGS; CM unknown/ignored; guide).
+    for token in ["DEAD", "Slow", "Blank"]:
+        add(token, "status", "IC")
+    add("DEAD", "status", "CM")
+    add("Slow", "status", "CM")
+    add("Unk", "status", "CM")
+    add("BadEPG", "status", "guide")
+    # Regional words (SM extract_tags; CM build_final_channel_name).
+    for token in ["East", "West", "Pacific", "Central", "Mountain",
+                  "Atlantic"]:
+        add(token, "regional", "SM", "CM")
+    # Timeshift markers (LU/EJ _PLUS_SHIFT_RE; NC normalize_plus_one).
+    for token in ["+1", "+2"]:
+        add(token, "timeshift", "EJ", "NC", "LU")
+    # Country prefix codes: the SM + LU union.
+    sm_codes = set(SM_KNOWN_COUNTRY_CODES)
+    lu_codes = set(LU_KNOWN_COUNTRY_CODES)
+    for code in sorted(sm_codes | lu_codes):
+        plugs = []
+        if code in sm_codes:
+            plugs.append("SM")
+        if code in lu_codes:
+            plugs.append("LU")
+        add(code, "country_prefix", *plugs)
+
+    seen = set()
+    tags = []
+    for token, kind in entries:
+        if (token, kind) in seen:
+            continue
+        seen.add((token, kind))
+        tags.append({
+            "token": token,
+            "kind": kind,
+            "sources": sorted(sources[(token, kind)]),
+        })
+    tags.sort(key=lambda item: (item["kind"], item["token"].casefold()))
+    counts = {}
+    for item in tags:
+        counts[item["kind"]] = counts.get(item["kind"], 0) + 1
+    provenance = {
+        "tags_out": len(tags),
+        "counts": counts,
+    }
+    return {"kinds": TAG_KINDS, "tags": tags}, provenance
+
+
 def merge_alias_scope(labeled_tables):
     """Merge one alias scope; returns (merged, conflicts).
 
@@ -720,6 +873,9 @@ def build(root, out_dir):
     write_compact(os.path.join(out_dir, "aliases.json"), aliases)
     write_compact(os.path.join(out_dir, "alias_conflicts.json"), aliases_detail)
 
+    tags, tags_prov = merge_tags()
+    write_compact(os.path.join(out_dir, "tags.json"), tags)
+
     lineups_prov, _ = copy_lineups(root, out_dir)
     write_lineups_readme(out_dir, lineups_prov["file_count"], lineups_prov["channels"])
 
@@ -740,6 +896,7 @@ def build(root, out_dir):
         "channels": channels_prov,
         "stations": stations_prov,
         "aliases": aliases_prov,
+        "tags": tags_prov,
         "lineups": lineups_prov,
     }
 

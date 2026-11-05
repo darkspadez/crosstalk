@@ -123,12 +123,16 @@ const REPORT_TITLE: &str = "Restore Recovered Channels";
 pub const HISTORY_RUNS: usize = 50;
 
 /// The tags this plugin can append to a name, whatever the settings say — the plugin's
-/// `STANDARD_STATUS_TAGS` (3324).
-pub const STANDARD_STATUS_TAGS: [&str; 3] = ["DEAD", "Slow", "Blank"];
+/// `STANDARD_STATUS_TAGS` (3324), read from the unified vocabulary (the `status` rows whose
+/// source is IC). The order differs from the plugin's tuple; the strip pattern sorts its
+/// alternation by length, so the order never reaches the output.
+pub fn standard_status_tags() -> Vec<&'static str> {
+    crosstalk_matching::tags::tokens_from(crosstalk_matching::tags::TagKind::Status, "IC")
+}
 
 /// The quality tags this plugin can append, whatever the settings say — the plugin's
-/// `STANDARD_QUALITY_TAGS` (3325).
-pub const STANDARD_QUALITY_TAGS: [&str; 5] = ["UHD", "FHD", "HD", "SD", "Unknown"];
+/// `STANDARD_QUALITY_TAGS` (3325), which is the shared quality model's label set.
+pub const STANDARD_QUALITY_TAGS: [&str; 5] = crosstalk_core::quality::IC_FORMAT_LABELS;
 
 /// Where a restored value came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -318,7 +322,7 @@ pub fn format_tags(format: &str) -> Vec<String> {
 /// Every tag this settings file can strip: the standard status and quality tags, the labels of
 /// the three rename formats, and `video_format_suffixes` — `_derive_strippable_tags` (3419).
 pub fn strippable_tags(settings: &StreamsSettings) -> Vec<String> {
-    let mut tags: Vec<String> = STANDARD_STATUS_TAGS
+    let mut tags: Vec<String> = standard_status_tags()
         .iter()
         .chain(STANDARD_QUALITY_TAGS.iter())
         .map(|tag| tag.to_string())
@@ -338,7 +342,7 @@ pub fn strippable_tags(settings: &StreamsSettings) -> Vec<String> {
 /// the three rename formats — `_derive_status_tags` (3411). A quality tag is not here, which is
 /// why a healthy channel carrying `[HD]` is never touched.
 pub fn status_tags(settings: &StreamsSettings) -> Vec<String> {
-    let mut tags: Vec<String> = STANDARD_STATUS_TAGS
+    let mut tags: Vec<String> = standard_status_tags()
         .iter()
         .map(|tag| tag.to_string())
         .collect();

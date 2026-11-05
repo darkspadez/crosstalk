@@ -537,6 +537,9 @@ pub mod merged {
     /// The merged station table (`data/merged/stations.json`).
     pub const MERGED_STATIONS_JSON: &str = include_str!("../../../data/merged/stations.json");
 
+    /// The merged tag vocabulary (`data/merged/tags.json`, phase 3 step 7).
+    pub const MERGED_TAGS_JSON: &str = include_str!("../../../data/merged/tags.json");
+
     /// The merged alias table (`data/merged/aliases.json`).
     pub const MERGED_ALIASES_JSON: &str = include_str!("../../../data/merged/aliases.json");
 
@@ -941,6 +944,34 @@ pub mod merged {
             // Behaviour every plugin agrees on survives: FS 1 -> FS1 and Fox Sports 1.
             for canonical in ["FS1", "Fox Sports 1"] {
                 assert!(aliases.aliases[canonical].iter().any(|e| e.alias == "FS 1"));
+            }
+        }
+
+        #[test]
+        fn tags_parse_and_match_provenance() {
+            let tags: serde_json::Value =
+                serde_json::from_str(MERGED_TAGS_JSON).expect("merged tags parse");
+            let list = tags
+                .get("tags")
+                .and_then(|v| v.as_array())
+                .expect("tags array");
+            assert_eq!(list.len(), provenance_count("/tags/tags_out"));
+            // Every kind in the table is documented, and every entry's kind too.
+            let kinds = tags
+                .get("kinds")
+                .and_then(|v| v.as_object())
+                .expect("kinds map");
+            for entry in list {
+                let kind = entry.get("kind").and_then(|k| k.as_str()).expect("kind");
+                assert!(kinds.contains_key(kind), "{kind} documented");
+                assert!(
+                    entry
+                        .get("sources")
+                        .and_then(|s| s.as_array())
+                        .is_some_and(|s| !s.is_empty()),
+                    "{} has sources",
+                    entry.get("token").and_then(|t| t.as_str()).unwrap_or("?")
+                );
             }
         }
 

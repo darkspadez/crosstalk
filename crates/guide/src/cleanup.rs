@@ -217,6 +217,7 @@ fn build(
                 // The plugin skips an already-tagged channel ENTIRELY, guide included.
                 PlanOptions {
                     suffix_present_skips_rest: true,
+                    ..PlanOptions::default()
                 },
             ))
         }

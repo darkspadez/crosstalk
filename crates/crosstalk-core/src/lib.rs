@@ -11,11 +11,15 @@ pub mod channel_ops;
 pub mod config;
 pub mod csv_report;
 pub mod dispatcharr;
+pub mod fetch_cache;
 pub mod hooks;
 pub mod identity_cache;
 pub mod jobs;
 pub mod limiter;
+pub mod logos;
 pub mod match_run;
+pub mod naming;
+pub mod quality;
 pub mod runner;
 pub mod scheduler;
 pub mod scope;
@@ -52,10 +56,23 @@ pub use dispatcharr::{
     EpgSourceState, HasPrograms, Logo, M3uAccount, PluginActionInfo, PluginInfo, ProgramWindow,
     QueuedTask, Set, Stream, StreamsToChannels, World, WorldKind, WorldKinds,
 };
+pub use fetch_cache::{FetchCache, Fetched, DEFAULT_SIZE_CAP, TV_LOGOS_TTL};
 pub use hooks::Hooks;
 pub use identity_cache::CachedIdentities;
 pub use jobs::{JobContext, ProgressEvent, ProgressSink};
 pub use limiter::{Limiter, LimiterConfig, Permit};
+pub use logos::{
+    build_logo_url, country_dir_for, match_channel_to_logo, match_station_logo,
+    normalize_channel_name, normalize_logo_filename, parse_station_name, resolve_logo,
+    split_timeshift, LogoLookups, LogoSource, ResolvedLogo, TvLogosIndex, COUNTRY_DIR_MAP,
+    LOGO_MATCH_THRESHOLD, STATION_SUBDIRS, TV_LOGOS_BRANCH, TV_LOGOS_REPO, TV_LOGOS_TREE_URL,
+};
+pub use naming::{
+    apply_prefix, apply_suffix, ota_fields, parse_network_affiliation, render_channel, render_ota,
+    resolve_collisions, ChannelValues, CollisionStrategy, OtaFields, PlannedName, ResolvedName,
+    CHANNEL_PLACEHOLDERS, OTA_PLACEHOLDERS,
+};
+pub use quality::{stream_format_of, QualityTier, IC_FORMAT_LABELS};
 pub use runner::{ActiveRun, JobRunner, RunOptions, StartedRun, WorkflowSlot};
 pub use scheduler::{ScheduleInfo, Scheduler};
 pub use store::{AiDecision, RunRecord, RunRow, RunStatus, Store, Subject};

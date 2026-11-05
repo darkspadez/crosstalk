@@ -366,3 +366,64 @@ Changed from phases 1–2 (user, 2026-11-04):
 - Phase reviewer: **Fable 5.1** (`claude-fable-5-1`) at the end of the phase; whole-phase,
   cross-app consistency, and fixes what it finds (provider `claude-bridge`, Fable 5.1 1M).
 - The orchestrator runs gates and owns commits; nothing is pushed without approval.
+
+## Step 8/9 migration list (from the step 7 review, 2026-11-05)
+
+Step 7 moved only pure extractions (byte-identical output, parity gates 0): probe
+`stream_format` → `core::quality::stream_format_of`; channel-ops templates →
+`core::naming::render_channel`; triage's standard five format tags and restore's
+`STANDARD_QUALITY_TAGS` → `core::quality::IC_FORMAT_LABELS`; restore's status tags →
+`tags::tokens_from(Status, "IC")`. Everything below CHANGES output and belongs to the step
+named; each needs its oracle diff report line.
+
+**Changed decision (step 7 review): the collision resolver is GLOBAL, not per group.**
+Dispatcharr's outputs list channels flat (HDHomeRun `lineup.json` has no group; XMLTV
+display-names are flat; players use `group-title` only as a filter), so two `ESPN`s in
+different groups are indistinguishable in a guide. The resolver only changes the name a
+*planned* rename lands on, never another channel, so global scope is safe. It matches Name
+Cleaner (the oracle for `clean_*`), with two documented fixes: slots are counted (NC's set
+arithmetic freed a name another channel still held) and a `skip` loser's old name stays
+occupied (cascade to a fixpoint). Step 10's create stage and step 14/15 use it as is.
+
+Step 8 (guide):
+- `channel_ops::RenameKind::Suffix` presence check is exact `ends_with`
+  (`crates/crosstalk-core/src/channel_ops.rs`, `RenameKind::already`); the shared rule is
+  `naming::apply_suffix` / `tags::has_trailing` (case-insensitive, bracket-aware: `CNN
+  [badepg]` and `CNN (BadEPG)` count as tagged). Moving guide's `tag_missing` onto it changes
+  Janitor parity for case/bracket variants.
+- `crates/guide/src/settings.rs` `bad_epg_suffix` default `" [BadEPG]"` is a literal; the
+  token is the vocabulary's `status`/`BadEPG` row. Derive the default from it.
+- `crosstalk-matching::identity` builds identity tags with `country::extract_tags` (SM's,
+  D09) — a second tag extractor beside `tags::split_tags`. They differ on bare
+  `Central`/`Atlantic` (SM strips `Comedy Central` → `Comedy`; the vocabulary does not), on
+  `Middle East`/`Far East`, on `+N` shifts and on bracket-only quality. Move identity onto
+  `tags` (bump `ENGINE_VERSION` / identity cache version; the corpus gate must still pass,
+  so D09's regional choice may need a decision row) — this is cross-app, do it first.
+- Not to migrate: the normalizer's comparison tables (`normalize.rs` quality pattern incl.
+  `FD`/`Backup`, `country.rs` `NON_COUNTRY_PREFIXES`) — decided rows N01–N14, comparison
+  only; `tags` is the writing vocabulary and must not feed the match path.
+
+Step 9 (streams):
+- `triage::ends_with_tag` (`crates/streams/src/triage.rs`) → `tags::has_trailing`
+  (accepts `(DEAD)` and literal affixes; today only `[DEAD]`).
+- `triage::FormatTags` strip regex and `restore::trailing_tag_pattern`
+  (`crates/streams/src/restore.rs`) → `tags::strip` with kinds; needs an extension for
+  operator-configured tokens (`video_format_suffixes`, custom rename-format labels are not in
+  the vocabulary). Output changes: parens and stacked mixed runs strip.
+- Restore's standard status set: IC's three today; the vocabulary's `status` kind also has
+  CM `Unk` and guide `BadEPG`. Decide whether restore strips those (likely NO for `BadEPG`:
+  that is guide's mark, not triage's).
+- `triage::render_format` (`{name}` only, format trimmed) → `naming::render_channel`
+  (`{group}`/`{number}`/`{epg}`/`{id}` substitute; no trim). Output changes for formats
+  carrying those tokens.
+- `triage::format_tags` (bracket labels of a format) — keep, but move beside
+  `naming` so lineup's suffix rules read the same parser.
+- Examples `crates/streams/examples/probe_io.rs` and `triage_io.rs` hard-code the five-label
+  map; use `QualityTier::parse_label` / `IC_FORMAT_LABELS`.
+- Stream-Mapparr's sort key (`crates/streams/src/quality.rs`) stays THE stream ordering;
+  lineup mode reads tiers via `QualityTier::from_dimensions` (height-first), which is NOT
+  IC's width rule — triage's suffix keeps `stream_format_of` (width) unless a decision row
+  says otherwise.
+- Logos (step 16 oracle): the resolver's similarity is the unified engine's, not
+  rapidfuzz `ratio`; channel-name punctuation becomes a space (CM deletes it); `NO` →
+  `nordic/norway` and `GB` → `-uk` suffix are fixes over CM; URLs are percent-encoded.
