@@ -1,5 +1,8 @@
 target
 reference
+# The labelled matching corpus (data/corpus, ~8 MB) is a build-time input to
+# step 6, never needed at runtime: keep it out of the image.
+data/corpus
 .git
 .remember
 docs

@@ -36,3 +36,9 @@ wiremock.workspace = true
 # `test-util` gives the tests a paused clock: the limiter's spacing and rate limits are
 # measured in seconds and minutes, and a test that really slept would be slow or flaky.
 tokio = { workspace = true, features = ["test-util"] }
+
+# The corpus labeller's tests (fake provider, settled-probability rule) run with
+# `cargo test --workspace`; examples are only built, not tested, by default.
+[[example]]
+name = "label_pair"
+test = true

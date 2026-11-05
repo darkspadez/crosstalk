@@ -151,6 +151,17 @@ jobs:
       # minute. -I keeps each oracle's plugin import isolated (see oracles.py).
       - name: Corpus oracles load and answer known cases
         run: python3 -I scripts/corpus/disagreements.py --self-test
+      # Phase 3 step 5: the labelled corpus and the decisions table are generated,
+      # never hand-edited. Both --check runs rebuild from the pinned plugins and
+      # data/merged/ and byte-compare the COMMITTED outputs (timings excluded), so
+      # a stale corpus or a hand-edited decision fails here. The ablation
+      # self-test first proves every source-patch anchor still applies to the
+      # pinned plugins. About 3 minutes together (the ablation is most of it).
+      - name: Corpus and decisions reproduce byte for byte
+        run: |
+          python3 -I scripts/corpus/ablate.py --self-test
+          python3 -I scripts/corpus/build.py --check
+          python3 -I scripts/corpus/decide.py --check
       # Channel operations replace the plugin's five cleanup actions, so their selection and
       # payload logic is compared against the plugin's own code. -I keeps the harness from
       # importing anything outside the plugin checkout (which it puts on sys.path itself).

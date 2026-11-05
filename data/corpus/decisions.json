@@ -1,0 +1,2995 @@
+{
+  "aliases": {
+    "CNN HLN": {
+      "canonical": null,
+      "claimed_by": {
+        "HLN": [
+          "CM",
+          "LU",
+          "SM"
+        ],
+        "HLN Headline News Network": [
+          "CM",
+          "LU",
+          "SM"
+        ]
+      },
+      "confidence": "no-evidence",
+      "status": "unresolved",
+      "votes": {
+        "HLN": {
+          "cm": true,
+          "janitor": false,
+          "lu": false,
+          "sm": false
+        },
+        "HLN Headline News Network": {
+          "cm": false,
+          "janitor": false,
+          "lu": false,
+          "sm": false
+        }
+      }
+    },
+    "CNN Headline News": {
+      "canonical": null,
+      "claimed_by": {
+        "HLN": [
+          "CM",
+          "LU",
+          "SM"
+        ],
+        "HLN Headline News Network": [
+          "CM",
+          "LU",
+          "SM"
+        ]
+      },
+      "confidence": "no-evidence",
+      "status": "unresolved",
+      "votes": {
+        "HLN": {
+          "cm": false,
+          "janitor": false,
+          "lu": false,
+          "sm": false
+        },
+        "HLN Headline News Network": {
+          "cm": false,
+          "janitor": false,
+          "lu": false,
+          "sm": false
+        }
+      }
+    },
+    "GAC": {
+      "canonical": null,
+      "claimed_by": {
+        "Great American Country": [
+          "LU"
+        ],
+        "Great American Family": [
+          "LU"
+        ]
+      },
+      "confidence": "no-evidence",
+      "status": "unresolved",
+      "votes": {
+        "Great American Country": {
+          "cm": false,
+          "janitor": false,
+          "lu": false,
+          "sm": false
+        },
+        "Great American Family": {
+          "cm": false,
+          "janitor": false,
+          "lu": false,
+          "sm": false
+        }
+      }
+    },
+    "GETTV": {
+      "canonical": "getTV",
+      "claimed_by": {
+        "GET": [
+          "LU",
+          "SM"
+        ],
+        "Great Entertainment Television": [
+          "LU",
+          "SM"
+        ],
+        "getTV": [
+          "LU",
+          "SM"
+        ]
+      },
+      "confidence": "weak",
+      "status": "decided",
+      "votes": {
+        "GET": {
+          "cm": false,
+          "janitor": false,
+          "lu": false,
+          "sm": true
+        },
+        "Great Entertainment Television": {
+          "cm": false,
+          "janitor": false,
+          "lu": false,
+          "sm": true
+        },
+        "getTV": {
+          "cm": true,
+          "janitor": true,
+          "lu": true,
+          "sm": true
+        }
+      }
+    },
+    "Great Entertainment Television": {
+      "canonical": "Great Entertainment Television",
+      "claimed_by": {
+        "GET": [
+          "LU",
+          "SM"
+        ],
+        "Great Entertainment Television": [
+          "LU",
+          "SM"
+        ],
+        "getTV": [
+          "LU",
+          "SM"
+        ]
+      },
+      "confidence": "weak",
+      "status": "decided",
+      "votes": {
+        "GET": {
+          "cm": false,
+          "janitor": false,
+          "lu": true,
+          "sm": true
+        },
+        "Great Entertainment Television": {
+          "cm": true,
+          "janitor": true,
+          "lu": true,
+          "sm": true
+        },
+        "getTV": {
+          "cm": false,
+          "janitor": false,
+          "lu": true,
+          "sm": true
+        }
+      }
+    },
+    "Headline News Network": {
+      "canonical": null,
+      "claimed_by": {
+        "HLN": [
+          "CM",
+          "LU",
+          "SM"
+        ],
+        "HLN Headline News Network": [
+          "CM",
+          "LU",
+          "SM"
+        ]
+      },
+      "confidence": "no-evidence",
+      "status": "unresolved",
+      "votes": {
+        "HLN": {
+          "cm": false,
+          "janitor": false,
+          "lu": false,
+          "sm": false
+        },
+        "HLN Headline News Network": {
+          "cm": false,
+          "janitor": false,
+          "lu": false,
+          "sm": false
+        }
+      }
+    },
+    "Justice Central": {
+      "canonical": "Justice Central.TV",
+      "claimed_by": {
+        "Justice Central.TV": [
+          "LU",
+          "SM"
+        ],
+        "Justice Network": [
+          "LU",
+          "SM"
+        ],
+        "True Crime Network": [
+          "LU",
+          "SM"
+        ]
+      },
+      "confidence": "weak",
+      "status": "decided",
+      "votes": {
+        "Justice Central.TV": {
+          "cm": true,
+          "janitor": false,
+          "lu": true,
+          "sm": true
+        },
+        "Justice Network": {
+          "cm": false,
+          "janitor": false,
+          "lu": true,
+          "sm": false
+        },
+        "True Crime Network": {
+          "cm": false,
+          "janitor": false,
+          "lu": false,
+          "sm": false
+        }
+      }
+    },
+    "Justice Central TV": {
+      "canonical": "Justice Central.TV",
+      "claimed_by": {
+        "Justice Central.TV": [
+          "LU",
+          "SM"
+        ],
+        "Justice Network": [
+          "LU",
+          "SM"
+        ],
+        "True Crime Network": [
+          "LU",
+          "SM"
+        ]
+      },
+      "confidence": "weak",
+      "status": "decided",
+      "votes": {
+        "Justice Central.TV": {
+          "cm": true,
+          "janitor": true,
+          "lu": true,
+          "sm": true
+        },
+        "Justice Network": {
+          "cm": false,
+          "janitor": false,
+          "lu": true,
+          "sm": false
+        },
+        "True Crime Network": {
+          "cm": false,
+          "janitor": false,
+          "lu": false,
+          "sm": false
+        }
+      }
+    },
+    "Justice Central.TV": {
+      "canonical": "Justice Central.TV",
+      "claimed_by": {
+        "Justice Central.TV": [
+          "LU",
+          "SM"
+        ],
+        "Justice Network": [
+          "LU",
+          "SM"
+        ],
+        "True Crime Network": [
+          "LU",
+          "SM"
+        ]
+      },
+      "confidence": "weak",
+      "status": "decided",
+      "votes": {
+        "Justice Central.TV": {
+          "cm": true,
+          "janitor": true,
+          "lu": true,
+          "sm": true
+        },
+        "Justice Network": {
+          "cm": false,
+          "janitor": false,
+          "lu": true,
+          "sm": true
+        },
+        "True Crime Network": {
+          "cm": false,
+          "janitor": false,
+          "lu": true,
+          "sm": true
+        }
+      }
+    },
+    "Univision Deportes Network": {
+      "canonical": "Univision Deportes",
+      "claimed_by": {
+        "TUDN": [
+          "CM",
+          "LU",
+          "SM"
+        ],
+        "Univision Deportes": [
+          "CM",
+          "LU",
+          "SM"
+        ]
+      },
+      "confidence": "weak",
+      "status": "decided",
+      "votes": {
+        "TUDN": {
+          "cm": false,
+          "janitor": false,
+          "lu": false,
+          "sm": false
+        },
+        "Univision Deportes": {
+          "cm": true,
+          "janitor": true,
+          "lu": true,
+          "sm": true
+        }
+      }
+    },
+    "WGN": {
+      "canonical": null,
+      "claimed_by": {
+        "NewsNation": [
+          "LU",
+          "SM"
+        ],
+        "WGN America": [
+          "LU",
+          "SM"
+        ]
+      },
+      "confidence": "no-evidence",
+      "status": "unresolved",
+      "votes": {
+        "NewsNation": {
+          "cm": false,
+          "janitor": false,
+          "lu": false,
+          "sm": false
+        },
+        "WGN America": {
+          "cm": false,
+          "janitor": false,
+          "lu": false,
+          "sm": true
+        }
+      }
+    },
+    "WGN America": {
+      "canonical": "WGN America",
+      "claimed_by": {
+        "NewsNation": [
+          "LU",
+          "SM"
+        ],
+        "WGN America": [
+          "LU",
+          "SM"
+        ]
+      },
+      "confidence": "weak",
+      "status": "decided",
+      "votes": {
+        "NewsNation": {
+          "cm": false,
+          "janitor": false,
+          "lu": true,
+          "sm": true
+        },
+        "WGN America": {
+          "cm": false,
+          "janitor": true,
+          "lu": true,
+          "sm": true
+        }
+      }
+    }
+  },
+  "case_groups": {
+    "case_pairs": 91,
+    "confidence": "strong",
+    "decision": "fold",
+    "groups": 125,
+    "reason": "case never reaches the matcher (every normalizer folds it); both spellings stay in the DB, no rewrite.",
+    "unanimous_same": 81
+  },
+  "coherence": [
+    {
+      "holds": true,
+      "statement": "Zones have one rule: feed separation is SM's routing (Z01) or a post-match filter (Z04), never both, and D09 keeps what that rule reads (`extract_zone` for routing)."
+    },
+    {
+      "holds": true,
+      "statement": "Bare East/West are stripped for scoring (N02) only when a zone rule enforces feeds afterwards; N10 is N02's bare-region switch."
+    },
+    {
+      "holds": true,
+      "statement": "The prefix order fits the prefix table (N12 `first` with the core's N04)."
+    },
+    {
+      "holds": true,
+      "statement": "Designator repair (N08) exactly when the digit guard (T07) reads designator tokens."
+    },
+    {
+      "holds": true,
+      "statement": "One callsign ladder: C01-C04 are one CALLSIGN configuration; the anchor (D04) reads high-confidence callsigns only, so the loose OTA-number rescue (C04, low confidence) has nothing to feed."
+    },
+    {
+      "holds": true,
+      "statement": "The ranker is LU's match_all_streams shape (T09), which carries the always-majority floor (T02), the guarded exact tier (T04), scaled thresholds (T05), the header skip (Z05) and LU's country rule (G01-G03, strict only once a country is configured)."
+    },
+    {
+      "holds": true,
+      "statement": "Aliases resolve through one index: `identity` (A01) is CM's reverse index (A02) over the merged table (A03)."
+    }
+  ],
+  "country_conflicts": [
+    "AU",
+    "CA",
+    "DO",
+    "FR",
+    "PE"
+  ],
+  "engine": {
+    "config": {
+      "A01": "identity",
+      "A04": "none",
+      "CALLSIGN": "core-merged-norescue",
+      "N01": "core-strip",
+      "N02": "core",
+      "N03": "core",
+      "N04": "core",
+      "N05": "janitor-split",
+      "N06": "janitor-letters",
+      "N07": "janitor-floor",
+      "N08": "sm-rejoin",
+      "N09": "strip",
+      "N11": "keep",
+      "N12": "first",
+      "N13": "strip",
+      "N14": "core",
+      "T01": "core",
+      "T06": "jan-lu",
+      "T07": "janitor-designator",
+      "ZONE": "sm-zone-noguard"
+    },
+    "rounds": 3,
+    "vs_plugins": {
+      "cm": {
+        "cost": 8619,
+        "fn": 7131,
+        "fp": 744,
+        "tn": 6706,
+        "tp": 6369
+      },
+      "engine": {
+        "cost": 856,
+        "fn": 788,
+        "fp": 34,
+        "tn": 7416,
+        "tp": 12712
+      },
+      "janitor": {
+        "cost": 3242,
+        "fn": 2828,
+        "fp": 207,
+        "tn": 7243,
+        "tp": 10672
+      },
+      "lu": {
+        "cost": 1720,
+        "fn": 1236,
+        "fp": 242,
+        "tn": 7208,
+        "tp": 12264
+      },
+      "sm": {
+        "cost": 4002,
+        "fn": 1154,
+        "fp": 1424,
+        "tn": 6026,
+        "tp": 12346
+      }
+    }
+  },
+  "expectations": [
+    {
+      "candidate": "Sportsnet",
+      "cm": false,
+      "engine": false,
+      "expected": false,
+      "janitor": false,
+      "lu": false,
+      "query": "Sportsnet Pacific",
+      "sm": false,
+      "source": "LU tests/test_sportsnet_pacific.py:21-31"
+    },
+    {
+      "candidate": "Sportsnet East",
+      "cm": false,
+      "engine": false,
+      "expected": false,
+      "janitor": false,
+      "lu": false,
+      "query": "Sportsnet Pacific",
+      "sm": false,
+      "source": "LU tests/test_sportsnet_pacific.py:21-31"
+    },
+    {
+      "candidate": "Sportsnet West",
+      "cm": false,
+      "engine": false,
+      "expected": false,
+      "janitor": true,
+      "lu": false,
+      "query": "Sportsnet Pacific",
+      "sm": false,
+      "source": "LU tests/test_sportsnet_pacific.py:21-31"
+    },
+    {
+      "candidate": "Sportsnet",
+      "cm": true,
+      "engine": true,
+      "expected": false,
+      "janitor": false,
+      "lu": false,
+      "query": "Sportsnet (P)",
+      "sm": true,
+      "source": "LU tests/test_sportsnet_pacific.py:33-42"
+    },
+    {
+      "candidate": "Sportsnet Pacific",
+      "cm": false,
+      "engine": false,
+      "expected": true,
+      "janitor": true,
+      "lu": true,
+      "query": "Sportsnet (P)",
+      "sm": false,
+      "source": "LU tests/test_sportsnet_pacific.py:33-42"
+    },
+    {
+      "candidate": "Sportsnet Pacific",
+      "cm": false,
+      "engine": false,
+      "expected": false,
+      "janitor": true,
+      "lu": true,
+      "query": "Sportsnet",
+      "sm": false,
+      "source": "LU tests/test_sportsnet_pacific.py:46-56"
+    },
+    {
+      "candidate": "Sportsnet West",
+      "cm": false,
+      "engine": false,
+      "expected": false,
+      "janitor": true,
+      "lu": true,
+      "query": "Sportsnet",
+      "sm": true,
+      "source": "LU tests/test_sportsnet_pacific.py:46-56"
+    },
+    {
+      "candidate": "Food Network Eastern",
+      "cm": false,
+      "engine": true,
+      "expected": true,
+      "janitor": false,
+      "lu": true,
+      "query": "Food Network",
+      "sm": true,
+      "source": "LU tests/test_eastern_region_matching.py:32"
+    },
+    {
+      "candidate": "Food Network East",
+      "cm": false,
+      "engine": true,
+      "expected": true,
+      "janitor": true,
+      "lu": true,
+      "query": "Food Network",
+      "sm": true,
+      "source": "LU tests/test_eastern_region_matching.py:36"
+    },
+    {
+      "candidate": "Food Network (Eastern)",
+      "cm": true,
+      "engine": true,
+      "expected": true,
+      "janitor": true,
+      "lu": true,
+      "query": "Food Network",
+      "sm": true,
+      "source": "LU tests/test_eastern_region_matching.py:40"
+    },
+    {
+      "candidate": "BBC News",
+      "cm": false,
+      "engine": false,
+      "expected": false,
+      "janitor": false,
+      "lu": false,
+      "query": "ABC News Live",
+      "sm": false,
+      "source": "LU tests/test_alias_callsign_guard.py:33-37"
+    },
+    {
+      "candidate": "CBC News",
+      "cm": false,
+      "engine": false,
+      "expected": false,
+      "janitor": false,
+      "lu": false,
+      "query": "ABC News Live",
+      "sm": false,
+      "source": "LU tests/test_alias_callsign_guard.py:39-43"
+    },
+    {
+      "candidate": "(US) Comedy Central (S)",
+      "cm": false,
+      "engine": false,
+      "expected": false,
+      "janitor": false,
+      "lu": true,
+      "query": "Comedy TV",
+      "sm": false,
+      "source": "LU tests/test_comedy_tv_disambiguation.py:3-8"
+    },
+    {
+      "candidate": "USA: Comedy TV",
+      "cm": true,
+      "engine": true,
+      "expected": true,
+      "janitor": true,
+      "lu": true,
+      "query": "Comedy TV",
+      "sm": true,
+      "source": "LU tests/test_comedy_tv_disambiguation.py:21-34"
+    },
+    {
+      "candidate": "Sky Sports UHD 1",
+      "cm": true,
+      "engine": false,
+      "expected": false,
+      "janitor": false,
+      "lu": true,
+      "query": "Sky Sports F1 UHD",
+      "sm": false,
+      "source": "SM tests/test_designator_tokens.py:92-95"
+    },
+    {
+      "candidate": "Sky Sports F1 HD",
+      "cm": true,
+      "engine": true,
+      "expected": true,
+      "janitor": true,
+      "lu": true,
+      "query": "Sky Sports F1 UHD",
+      "sm": true,
+      "source": "SM tests/test_designator_tokens.py:98-101"
+    },
+    {
+      "candidate": "Fox Sports 2",
+      "cm": false,
+      "engine": false,
+      "expected": false,
+      "janitor": false,
+      "lu": false,
+      "query": "Fox Sports 1",
+      "sm": false,
+      "source": "SM tests/test_designator_tokens.py:104-107"
+    },
+    {
+      "candidate": "Fox Sports 1 HD",
+      "cm": true,
+      "engine": true,
+      "expected": true,
+      "janitor": true,
+      "lu": true,
+      "query": "Fox Sports 1",
+      "sm": true,
+      "source": "SM tests/test_designator_tokens.py:110-112"
+    },
+    {
+      "candidate": "CNN HD",
+      "cm": true,
+      "engine": true,
+      "expected": true,
+      "janitor": true,
+      "lu": true,
+      "query": "CNN",
+      "sm": true,
+      "source": "SM tests/test_designator_tokens.py:115-118"
+    },
+    {
+      "candidate": "Sky Sports",
+      "cm": false,
+      "engine": false,
+      "expected": false,
+      "janitor": false,
+      "lu": false,
+      "query": "Sky Sports F1",
+      "sm": false,
+      "source": "SM tests/test_designator_tokens.py:121-124"
+    }
+  ],
+  "meta": {
+    "construction_pairs": 20950,
+    "pairs": 28450,
+    "rows_decided": {
+      "no-evidence": 31,
+      "strong": 6,
+      "weak": 20
+    }
+  },
+  "rows": {
+    "A01": {
+      "confidence": "weak",
+      "costs": {
+        "80": {
+          "cm": {
+            "cost": 435,
+            "fn": 433,
+            "fp": 1,
+            "tn": 11,
+            "tp": 294
+          },
+          "identity": {
+            "cost": 31,
+            "fn": 7,
+            "fp": 12,
+            "tn": 0,
+            "tp": 720
+          },
+          "janitor": {
+            "cost": 365,
+            "fn": 351,
+            "fp": 7,
+            "tn": 5,
+            "tp": 376
+          },
+          "lu": {
+            "cost": 365,
+            "fn": 351,
+            "fp": 7,
+            "tn": 5,
+            "tp": 376
+          },
+          "sm": {
+            "cost": 352,
+            "fn": 346,
+            "fp": 3,
+            "tn": 9,
+            "tp": 381
+          }
+        },
+        "90": {
+          "cm": {
+            "cost": 443,
+            "fn": 441,
+            "fp": 1,
+            "tn": 7,
+            "tp": 302
+          },
+          "identity": {
+            "cost": 23,
+            "fn": 7,
+            "fp": 8,
+            "tn": 0,
+            "tp": 736
+          },
+          "janitor": {
+            "cost": 365,
+            "fn": 359,
+            "fp": 3,
+            "tn": 5,
+            "tp": 384
+          },
+          "lu": {
+            "cost": 365,
+            "fn": 359,
+            "fp": 3,
+            "tn": 5,
+            "tp": 384
+          },
+          "sm": {
+            "cost": 360,
+            "fn": 354,
+            "fp": 3,
+            "tn": 5,
+            "tp": 389
+          }
+        }
+      },
+      "evidence_pairs": 739,
+      "evidenced_share": 0.9973,
+      "method": "ablation",
+      "reason": "Ablation on the base engine: 739 discriminating construction pairs; cost (2*FP+FN) 31 vs 352 for runner-up `sm`; same winner at cut 90; 100% of the deciding pairs on evidenced forms. Capped at weak: The `same` alias pairs are labelled by the merged alias table the lookups read, so a lookup that consults it in both directions wins recall by construction; only the false-positive side (near-miss aliases, zone variants) is independent evidence. Every shipped lookup resolves only ONE direction (JAN/SM/LU key on the query, CM's reverse index maps the query to a canonical), which is most of the cost; `identity` (both names through CM's reverse index, the plan's resolve) fixes the misses but its normalized keys collide across channels (the false positives). Step 6's identity resolve needs collision-checked keys before it can replace the lookup.",
+      "strictest": "sm",
+      "variant": "identity"
+    },
+    "A02": {
+      "confidence": "weak",
+      "costs": {
+        "80": {
+          "cm-index": {
+            "cost": 20,
+            "fn": 2,
+            "fp": 9,
+            "tn": 0,
+            "tp": 341
+          },
+          "none": {
+            "cost": 341,
+            "fn": 341,
+            "fp": 0,
+            "tn": 9,
+            "tp": 2
+          }
+        },
+        "90": {
+          "cm-index": {
+            "cost": 12,
+            "fn": 2,
+            "fp": 5,
+            "tn": 0,
+            "tp": 349
+          },
+          "none": {
+            "cost": 349,
+            "fn": 349,
+            "fp": 0,
+            "tn": 5,
+            "tp": 2
+          }
+        }
+      },
+      "evidence_pairs": 352,
+      "evidenced_share": 0.9943,
+      "method": "ablation via A01",
+      "reason": "Ablation on the base engine: 352 discriminating construction pairs; cost (2*FP+FN) 20 vs 341 for runner-up `none`; same winner at cut 90; 99% of the deciding pairs on evidenced forms. Capped at weak: Same circularity as A01. Each variant is its cheapest `A01` configuration (`cm-index` = `A01=identity`, `none` = `A01=sm`).",
+      "strictest": "none",
+      "variant": "cm-index"
+    },
+    "A03": {
+      "confidence": "no-evidence",
+      "evidence_pairs": 0,
+      "method": "by design",
+      "reason": "By design: Step 4 built one alias table (union, conflicts listed); the ablation runs on it.",
+      "strictest": "merged-union",
+      "variant": "merged-union"
+    },
+    "A04": {
+      "confidence": "no-evidence",
+      "costs": {
+        "80": {
+          "lu-rescue": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 0,
+            "tp": 0
+          },
+          "none": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 0,
+            "tp": 0
+          }
+        },
+        "90": {
+          "lu-rescue": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 0,
+            "tp": 0
+          },
+          "none": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 0,
+            "tp": 0
+          }
+        }
+      },
+      "evidence_pairs": 0,
+      "evidenced_share": 0.0,
+      "method": "ablation",
+      "reason": "Ablation on the base engine: 0 discriminating construction pairs (< 10): strictest variant. Measured in the alias group: LU's alias-declared callsign rescue never fires on the corpus.",
+      "strictest": "none",
+      "variant": "none"
+    },
+    "C01": {
+      "confidence": "weak",
+      "costs": {
+        "80": {
+          "cm-lookup": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 0,
+            "tp": 14
+          },
+          "core-known": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 0,
+            "tp": 14
+          },
+          "core-naked": {
+            "cost": 14,
+            "fn": 14,
+            "fp": 0,
+            "tn": 0,
+            "tp": 0
+          },
+          "janitor": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 0,
+            "tp": 14
+          }
+        },
+        "90": {
+          "cm-lookup": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 0,
+            "tp": 15
+          },
+          "core-known": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 0,
+            "tp": 15
+          },
+          "core-naked": {
+            "cost": 15,
+            "fn": 15,
+            "fp": 0,
+            "tn": 0,
+            "tp": 0
+          },
+          "janitor": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 0,
+            "tp": 15
+          }
+        }
+      },
+      "evidence_pairs": 14,
+      "evidenced_share": 0.7857,
+      "method": "ablation via CALLSIGN",
+      "reason": "Ablation on the base engine: 14 discriminating construction pairs; cost (2*FP+FN) 0 vs 0 for runner-up `janitor`; same winner at cut 90; 79% of the deciding pairs on evidenced forms. Each variant is its cheapest `CALLSIGN` configuration (`cm-lookup` = `CALLSIGN=cm`, `core-known` = `CALLSIGN=core-merged-norescue`, `core-naked` = `CALLSIGN=lu`, `janitor` = `CALLSIGN=janitor`).",
+      "strictest": "core-naked",
+      "variant": "core-known"
+    },
+    "C02": {
+      "confidence": "weak",
+      "costs": {
+        "80": {
+          "cm": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 0,
+            "tp": 14
+          },
+          "janitor": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 0,
+            "tp": 14
+          },
+          "lu-none": {
+            "cost": 14,
+            "fn": 14,
+            "fp": 0,
+            "tn": 0,
+            "tp": 0
+          },
+          "merged": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 0,
+            "tp": 14
+          },
+          "sm": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 0,
+            "tp": 14
+          }
+        },
+        "90": {
+          "cm": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 0,
+            "tp": 15
+          },
+          "janitor": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 0,
+            "tp": 15
+          },
+          "lu-none": {
+            "cost": 15,
+            "fn": 15,
+            "fp": 0,
+            "tn": 0,
+            "tp": 0
+          },
+          "merged": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 0,
+            "tp": 15
+          },
+          "sm": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 0,
+            "tp": 15
+          }
+        }
+      },
+      "evidence_pairs": 14,
+      "evidenced_share": 0.7857,
+      "method": "ablation via CALLSIGN",
+      "reason": "Ablation on the base engine: 14 discriminating construction pairs; cost (2*FP+FN) 0 vs 0 for runner-up `sm`; same winner at cut 90; 79% of the deciding pairs on evidenced forms. Each variant is its cheapest `CALLSIGN` configuration (`cm` = `CALLSIGN=cm`, `janitor` = `CALLSIGN=janitor`, `lu-none` = `CALLSIGN=lu`, `merged` = `CALLSIGN=core-merged-norescue`, `sm` = `CALLSIGN=core-sm-norescue`).",
+      "strictest": "lu-none",
+      "variant": "merged"
+    },
+    "C03": {
+      "confidence": "weak",
+      "costs": {
+        "80": {
+          "cm": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 0,
+            "tp": 14
+          },
+          "janitor": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 0,
+            "tp": 14
+          },
+          "lu-none": {
+            "cost": 14,
+            "fn": 14,
+            "fp": 0,
+            "tn": 0,
+            "tp": 0
+          },
+          "sm": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 0,
+            "tp": 14
+          }
+        },
+        "90": {
+          "cm": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 0,
+            "tp": 15
+          },
+          "janitor": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 0,
+            "tp": 15
+          },
+          "lu-none": {
+            "cost": 15,
+            "fn": 15,
+            "fp": 0,
+            "tn": 0,
+            "tp": 0
+          },
+          "sm": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 0,
+            "tp": 15
+          }
+        }
+      },
+      "evidence_pairs": 14,
+      "evidenced_share": 0.7857,
+      "method": "ablation via CALLSIGN",
+      "reason": "Ablation on the base engine: 14 discriminating construction pairs; cost (2*FP+FN) 0 vs 0 for runner-up `janitor`; same winner at cut 90; 79% of the deciding pairs on evidenced forms. Each variant is its cheapest `CALLSIGN` configuration (`cm` = `CALLSIGN=cm`, `janitor` = `CALLSIGN=janitor`, `lu-none` = `CALLSIGN=lu`, `sm` = `CALLSIGN=core-merged-norescue`).",
+      "strictest": "lu-none",
+      "variant": "sm"
+    },
+    "C04": {
+      "confidence": "no-evidence",
+      "costs": {
+        "80": {
+          "none": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 0,
+            "tp": 0
+          },
+          "sm-rescue": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 0,
+            "tp": 0
+          }
+        },
+        "90": {
+          "none": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 0,
+            "tp": 0
+          },
+          "sm-rescue": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 0,
+            "tp": 0
+          }
+        }
+      },
+      "evidence_pairs": 0,
+      "evidenced_share": 0.0,
+      "method": "ablation via CALLSIGN",
+      "reason": "Ablation on the base engine: 0 discriminating construction pairs (< 10): strictest variant. Each variant is its cheapest `CALLSIGN` configuration (`none` = `CALLSIGN=core-merged-norescue`, `sm-rescue` = `CALLSIGN=core-merged`).",
+      "strictest": "none",
+      "variant": "none"
+    },
+    "C05": {
+      "confidence": "no-evidence",
+      "evidence_pairs": 0,
+      "method": "by design",
+      "reason": "By design: Every ladder already calls the same normalize_callsign.",
+      "strictest": "shared",
+      "variant": "shared"
+    },
+    "C06": {
+      "confidence": "weak",
+      "evidence_pairs": 1533,
+      "majority_pairs": 83,
+      "method": "whole-path",
+      "reason": "Whole-path comparison only (1533 split pairs, 83 majority-voted, F1 margin 0.029): the plugins' whole decision paths differ in many rules at once, so this cannot isolate the row; weak at best. App-level use of a callsign (JAN +50 structural score, SM's bypass, CM's OTA path, LU's anchor) is a whole-path rule; the ablation base keeps LU's anchor (D04).",
+      "scores": {
+        "cm-ota-path": {
+          "f1": 0.0146,
+          "fn": 1479,
+          "fp": 2,
+          "n": 1533,
+          "precision": 0.7333,
+          "recall": 0.0074,
+          "tn": 41,
+          "tp": 11
+        },
+        "janitor": {
+          "f1": 0.9514,
+          "fn": 138,
+          "fp": 0,
+          "n": 1533,
+          "precision": 1.0,
+          "recall": 0.9074,
+          "tn": 43,
+          "tp": 1352
+        },
+        "lu-anchor": {
+          "f1": 0.998,
+          "fn": 6,
+          "fp": 0,
+          "n": 1533,
+          "precision": 1.0,
+          "recall": 0.996,
+          "tn": 43,
+          "tp": 1484
+        },
+        "sm-bypass": {
+          "f1": 0.9688,
+          "fn": 13,
+          "fp": 41,
+          "n": 1533,
+          "precision": 0.9474,
+          "recall": 0.9913,
+          "tn": 2,
+          "tp": 1477
+        }
+      },
+      "strictest": "janitor",
+      "variant": "lu-anchor"
+    },
+    "D01": {
+      "confidence": "no-evidence",
+      "evidence_pairs": 0,
+      "method": "by design",
+      "reason": "By design: Step 4 built one channel DB per country; pairs cannot re-decide the candidate universe.",
+      "strictest": "merged-union",
+      "variant": "merged-union"
+    },
+    "D02": {
+      "best_cut": 70,
+      "confidence": "weak",
+      "evidence_pairs": 20950,
+      "method": "threshold sweep",
+      "reason": "Cut sweep of the final engine over every construction pair, cost 2*FP+FN: 70: 833 (FP 35, FN 763), 75: 834 (FP 35, FN 764), 80: 856 (FP 34, FN 788), 85: 859 (FP 24, FN 811), 90: 847 (FP 11, FN 825), 95: 847 (FP 8, FN 831). Best cut 70; of the shipped defaults `janitor-95` is cheapest (runner-up `cm-lu-80` by 9). The cut is on the base engine's score (Janitor's 95 is on its own confidence scale with structural bonuses), so step 6 sets the one `[matching]` threshold on this sweep; the row only rules out the cuts that cost most.",
+      "strictest": "janitor-95",
+      "sweep": {
+        "70": {
+          "cost": 833,
+          "fn": 763,
+          "fp": 35,
+          "tn": 7415,
+          "tp": 12737
+        },
+        "75": {
+          "cost": 834,
+          "fn": 764,
+          "fp": 35,
+          "tn": 7415,
+          "tp": 12736
+        },
+        "80": {
+          "cost": 856,
+          "fn": 788,
+          "fp": 34,
+          "tn": 7416,
+          "tp": 12712
+        },
+        "85": {
+          "cost": 859,
+          "fn": 811,
+          "fp": 24,
+          "tn": 7426,
+          "tp": 12689
+        },
+        "90": {
+          "cost": 847,
+          "fn": 825,
+          "fp": 11,
+          "tn": 7439,
+          "tp": 12675
+        },
+        "95": {
+          "cost": 847,
+          "fn": 831,
+          "fp": 8,
+          "tn": 7442,
+          "tp": 12669
+        }
+      },
+      "variant": "janitor-95"
+    },
+    "D03": {
+      "confidence": "no-evidence",
+      "evidence_pairs": 0,
+      "method": "inactive",
+      "reason": "No pair can be evidence: The boost needs a lineup channel number; pairs carry none (Janitor's run path passes None too). Default `none` (strictest).",
+      "strictest": "none",
+      "variant": "none"
+    },
+    "D04": {
+      "confidence": "no-evidence",
+      "evidence_pairs": 0,
+      "majority_pairs": 0,
+      "method": "whole-path",
+      "reason": "Whole-path comparison only: fewer than 10 split pairs (0); default `jan-lu-anchor` (strictest). The anchor is in the ablation base; the CALLSIGN group measures it with each ladder.",
+      "scores": {
+        "jan-lu-anchor": {
+          "f1": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "n": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "tn": 0,
+          "tp": 0
+        },
+        "none": {
+          "f1": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "n": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "tn": 0,
+          "tp": 0
+        }
+      },
+      "strictest": "jan-lu-anchor",
+      "variant": "jan-lu-anchor"
+    },
+    "D05": {
+      "confidence": "no-evidence",
+      "evidence_pairs": 0,
+      "majority_pairs": 0,
+      "method": "whole-path",
+      "reason": "Whole-path comparison only: fewer than 10 split pairs (0); default `sm` (strictest).",
+      "scores": {
+        "cm": {
+          "f1": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "n": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "tn": 0,
+          "tp": 0
+        },
+        "janitor": {
+          "f1": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "n": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "tn": 0,
+          "tp": 0
+        },
+        "lu-none": {
+          "f1": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "n": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "tn": 0,
+          "tp": 0
+        },
+        "sm": {
+          "f1": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "n": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "tn": 0,
+          "tp": 0
+        }
+      },
+      "strictest": "sm",
+      "variant": "sm"
+    },
+    "D06": {
+      "confidence": "no-evidence",
+      "evidence_pairs": 0,
+      "majority_pairs": 0,
+      "method": "whole-path",
+      "reason": "Whole-path comparison only: fewer than 10 split pairs (0); default `janitor` (strictest). Sole implementation (Janitor's EPG scorer); guide migrates onto identity families in step 8. Kept.",
+      "scores": {
+        "janitor": {
+          "f1": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "n": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "tn": 0,
+          "tp": 0
+        },
+        "na": {
+          "f1": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "n": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "tn": 0,
+          "tp": 0
+        }
+      },
+      "strictest": "janitor",
+      "variant": "janitor"
+    },
+    "D07": {
+      "confidence": "no-evidence",
+      "evidence_pairs": 0,
+      "method": "by design",
+      "reason": "By design: The plan's selection rule is the best identity family (goal reset); of the shipped variants only SM's collector attaches a family gated on one winner. LU's attach-all attaches every candidate above the cut, several identities at once.",
+      "strictest": "sm-collector",
+      "variant": "sm-collector"
+    },
+    "D08": {
+      "confidence": "no-evidence",
+      "evidence_pairs": 0,
+      "method": "by design",
+      "reason": "By design: The plan keeps Channel-Mapparr's cleanup at full parity, including its unknown tagging (`[Unk]`), in the one template engine (step 7), with the documented fix that a suffix a name already ends with is never re-appended; CM's build_final_channel_name also re-attaches regional/extra/bracket tags. The strictest alternative (JAN, no unknown tagging) would drop a lineup feature the plan requires.",
+      "strictest": "cm",
+      "variant": "cm"
+    },
+    "D09": {
+      "confidence": "weak",
+      "costs": {
+        "80": {
+          "cm": {
+            "cost": 1828,
+            "fn": 0,
+            "fp": 914,
+            "tn": 0,
+            "tp": 74
+          },
+          "janitor": {
+            "cost": 445,
+            "fn": 63,
+            "fp": 191,
+            "tn": 723,
+            "tp": 11
+          },
+          "lu": {
+            "cost": 169,
+            "fn": 63,
+            "fp": 53,
+            "tn": 861,
+            "tp": 11
+          },
+          "sm-both": {
+            "cost": 11,
+            "fn": 11,
+            "fp": 0,
+            "tn": 914,
+            "tp": 63
+          }
+        },
+        "90": {
+          "cm": {
+            "cost": 1824,
+            "fn": 0,
+            "fp": 912,
+            "tn": 0,
+            "tp": 74
+          },
+          "janitor": {
+            "cost": 445,
+            "fn": 63,
+            "fp": 191,
+            "tn": 721,
+            "tp": 11
+          },
+          "lu": {
+            "cost": 169,
+            "fn": 63,
+            "fp": 53,
+            "tn": 859,
+            "tp": 11
+          },
+          "sm-both": {
+            "cost": 11,
+            "fn": 11,
+            "fp": 0,
+            "tn": 912,
+            "tp": 63
+          }
+        }
+      },
+      "evidence_pairs": 988,
+      "evidenced_share": 0.752,
+      "method": "ablation via ZONE",
+      "reason": "Ablation on the base engine: 988 discriminating construction pairs; cost (2*FP+FN) 11 vs 169 for runner-up `lu`; same winner at cut 90; 75% of the deciding pairs on evidenced forms. Capped at weak: Read off the zone rule for coherence; display re-attachment itself is not measured. Each variant is its cheapest `ZONE` configuration (`cm` = `ZONE=none`, `janitor` = `ZONE=janitor`, `lu` = `ZONE=lu`, `sm-both` = `ZONE=sm-zone-noguard`). Coherence, not a measurement of display re-attachment: the split follows the zone rule chosen in ZONE (SM's routing reads `extract_zone`; LU's and JAN's filters read original names).",
+      "strictest": "lu",
+      "variant": "sm-both"
+    },
+    "D10": {
+      "confidence": "no-evidence",
+      "evidence_pairs": 0,
+      "majority_pairs": 0,
+      "method": "whole-path",
+      "reason": "Whole-path comparison only: fewer than 10 split pairs (0); default `cm` (strictest). Sole implementation (CM's premium rename path); lineup names are built on it in step 15. Kept.",
+      "scores": {
+        "cm": {
+          "f1": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "n": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "tn": 0,
+          "tp": 0
+        },
+        "na": {
+          "f1": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "n": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "tn": 0,
+          "tp": 0
+        }
+      },
+      "strictest": "cm",
+      "variant": "cm"
+    },
+    "G01": {
+      "confidence": "no-evidence",
+      "evidence_pairs": 0,
+      "method": "inactive",
+      "reason": "No pair can be evidence: Country detection never runs in a pair decision: LU's filter needs a lineup country and SM's restrict_matching_to_country is off by default, so no verdict reads the vocabulary. Splits on country-tagged pairs come from the prefix tables (N04/N14). Default `lu` (strictest).",
+      "strictest": "lu",
+      "variant": "lu"
+    },
+    "G02": {
+      "confidence": "no-evidence",
+      "evidence_pairs": 0,
+      "method": "inactive",
+      "reason": "No pair can be evidence: Same as G01: no entry point is called without a lineup country. Default `lu` (strictest).",
+      "strictest": "lu",
+      "variant": "lu"
+    },
+    "G03": {
+      "confidence": "no-evidence",
+      "evidence_pairs": 0,
+      "method": "inactive",
+      "reason": "No pair can be evidence: Same as G01: the cross-border rule needs a configured country. Default `lu-strict` (strictest).",
+      "strictest": "lu-strict",
+      "variant": "lu-strict"
+    },
+    "G04": {
+      "confidence": "no-evidence",
+      "evidence_pairs": 0,
+      "method": "inactive",
+      "reason": "No pair can be evidence: Reporting only: a counter changes no verdict. Default `lu-counter` (strictest).",
+      "strictest": "lu-counter",
+      "variant": "lu-counter"
+    },
+    "N01": {
+      "confidence": "strong",
+      "costs": {
+        "80": {
+          "cm-keep": {
+            "cost": 230,
+            "fn": 230,
+            "fp": 0,
+            "tn": 1,
+            "tp": 0
+          },
+          "core-strip": {
+            "cost": 2,
+            "fn": 0,
+            "fp": 1,
+            "tn": 0,
+            "tp": 230
+          },
+          "janitor": {
+            "cost": 230,
+            "fn": 230,
+            "fp": 0,
+            "tn": 1,
+            "tp": 0
+          }
+        },
+        "90": {
+          "cm-keep": {
+            "cost": 265,
+            "fn": 265,
+            "fp": 0,
+            "tn": 1,
+            "tp": 0
+          },
+          "core-strip": {
+            "cost": 2,
+            "fn": 0,
+            "fp": 1,
+            "tn": 0,
+            "tp": 265
+          },
+          "janitor": {
+            "cost": 265,
+            "fn": 265,
+            "fp": 0,
+            "tn": 1,
+            "tp": 0
+          }
+        }
+      },
+      "evidence_pairs": 231,
+      "evidenced_share": 0.5108,
+      "method": "ablation",
+      "reason": "Ablation on the base engine: 231 discriminating construction pairs; cost (2*FP+FN) 2 vs 230 for runner-up `cm-keep`; same winner at cut 90; 51% of the deciding pairs on evidenced forms. Rests on positives only: a pair differing only by a quality tag is the same channel by construction (the plan keeps quality as an identity attribute, not identity), so no negative exists; the deciding forms are HEVC (15 real names) and HDR (1).",
+      "strictest": "cm-keep",
+      "variant": "core-strip"
+    },
+    "N02": {
+      "confidence": "weak",
+      "costs": {
+        "80": {
+          "cm-keep": {
+            "cost": 638,
+            "fn": 614,
+            "fp": 12,
+            "tn": 1,
+            "tp": 46
+          },
+          "core": {
+            "cost": 37,
+            "fn": 29,
+            "fp": 4,
+            "tn": 9,
+            "tp": 631
+          },
+          "janitor": {
+            "cost": 171,
+            "fn": 169,
+            "fp": 1,
+            "tn": 12,
+            "tp": 491
+          },
+          "lu-strip": {
+            "cost": 42,
+            "fn": 38,
+            "fp": 2,
+            "tn": 11,
+            "tp": 622
+          }
+        },
+        "90": {
+          "cm-keep": {
+            "cost": 615,
+            "fn": 613,
+            "fp": 1,
+            "tn": 1,
+            "tp": 42
+          },
+          "core": {
+            "cost": 32,
+            "fn": 30,
+            "fp": 1,
+            "tn": 1,
+            "tp": 625
+          },
+          "janitor": {
+            "cost": 168,
+            "fn": 166,
+            "fp": 1,
+            "tn": 1,
+            "tp": 489
+          },
+          "lu-strip": {
+            "cost": 38,
+            "fn": 34,
+            "fp": 2,
+            "tn": 0,
+            "tp": 621
+          }
+        }
+      },
+      "evidence_pairs": 673,
+      "evidenced_share": 0.838,
+      "method": "ablation",
+      "reason": "Ablation on the base engine: 673 discriminating construction pairs; cost (2*FP+FN) 37 vs 42 for runner-up `lu-strip`; same winner at cut 90; 84% of the deciding pairs on evidenced forms.",
+      "strictest": "cm-keep",
+      "variant": "core"
+    },
+    "N03": {
+      "confidence": "no-evidence",
+      "costs": {
+        "80": {
+          "core": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 0,
+            "tp": 0
+          },
+          "janitor": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 0,
+            "tp": 0
+          }
+        },
+        "90": {
+          "core": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 0,
+            "tp": 0
+          },
+          "janitor": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 0,
+            "tp": 0
+          }
+        }
+      },
+      "evidence_pairs": 0,
+      "evidenced_share": 0.0,
+      "method": "ablation",
+      "reason": "Ablation on the base engine: 0 discriminating construction pairs (< 10): strictest variant.",
+      "strictest": "core",
+      "variant": "core"
+    },
+    "N04": {
+      "confidence": "weak",
+      "costs": {
+        "80": {
+          "cm-strict": {
+            "cost": 1709,
+            "fn": 1709,
+            "fp": 0,
+            "tn": 3,
+            "tp": 21
+          },
+          "core": {
+            "cost": 28,
+            "fn": 22,
+            "fp": 3,
+            "tn": 0,
+            "tp": 1708
+          },
+          "janitor": {
+            "cost": 663,
+            "fn": 661,
+            "fp": 1,
+            "tn": 2,
+            "tp": 1069
+          }
+        },
+        "90": {
+          "cm-strict": {
+            "cost": 1844,
+            "fn": 1844,
+            "fp": 0,
+            "tn": 1,
+            "tp": 21
+          },
+          "core": {
+            "cost": 24,
+            "fn": 22,
+            "fp": 1,
+            "tn": 0,
+            "tp": 1843
+          },
+          "janitor": {
+            "cost": 748,
+            "fn": 748,
+            "fp": 0,
+            "tn": 1,
+            "tp": 1117
+          }
+        }
+      },
+      "evidence_pairs": 1733,
+      "evidenced_share": 0.4882,
+      "method": "ablation",
+      "reason": "Ablation on the base engine: 1733 discriminating construction pairs; cost (2*FP+FN) 28 vs 663 for runner-up `janitor`; same winner at cut 90; 49% of the deciding pairs on evidenced forms. Negatives for bare-country stripping cannot be built safely: the plugins' own example (`UK Gold`) was the old name of `Gold`, and the near-miss filter drops pairs differing only in country tags, so this row leans to the table that strips more; weak.",
+      "strictest": "cm-strict",
+      "variant": "core"
+    },
+    "N05": {
+      "confidence": "weak",
+      "costs": {
+        "80": {
+          "janitor-split": {
+            "cost": 6,
+            "fn": 0,
+            "fp": 3,
+            "tn": 0,
+            "tp": 11
+          },
+          "keep": {
+            "cost": 11,
+            "fn": 11,
+            "fp": 0,
+            "tn": 3,
+            "tp": 0
+          }
+        },
+        "90": {
+          "janitor-split": {
+            "cost": 4,
+            "fn": 0,
+            "fp": 2,
+            "tn": 0,
+            "tp": 22
+          },
+          "keep": {
+            "cost": 22,
+            "fn": 22,
+            "fp": 0,
+            "tn": 2,
+            "tp": 0
+          }
+        }
+      },
+      "evidence_pairs": 14,
+      "evidenced_share": 0.9286,
+      "method": "ablation",
+      "reason": "Ablation on the base engine: 14 discriminating construction pairs; cost (2*FP+FN) 6 vs 11 for runner-up `keep`; same winner at cut 90; 93% of the deciding pairs on evidenced forms.",
+      "strictest": "keep",
+      "variant": "janitor-split"
+    },
+    "N06": {
+      "confidence": "no-evidence",
+      "costs": {
+        "80": {
+          "core-wordchar": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 0,
+            "tp": 2
+          },
+          "janitor-letters": {
+            "cost": 2,
+            "fn": 2,
+            "fp": 0,
+            "tn": 0,
+            "tp": 0
+          }
+        },
+        "90": {
+          "core-wordchar": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 0,
+            "tp": 2
+          },
+          "janitor-letters": {
+            "cost": 2,
+            "fn": 2,
+            "fp": 0,
+            "tn": 0,
+            "tp": 0
+          }
+        }
+      },
+      "evidence_pairs": 2,
+      "evidenced_share": 1.0,
+      "method": "ablation",
+      "reason": "Ablation on the base engine: 2 discriminating construction pairs (< 10): strictest variant.",
+      "strictest": "janitor-letters",
+      "variant": "janitor-letters"
+    },
+    "N07": {
+      "confidence": "weak",
+      "costs": {
+        "80": {
+          "janitor-floor": {
+            "cost": 67,
+            "fn": 67,
+            "fp": 0,
+            "tn": 0,
+            "tp": 78
+          },
+          "unconditional": {
+            "cost": 78,
+            "fn": 78,
+            "fp": 0,
+            "tn": 0,
+            "tp": 67
+          }
+        },
+        "90": {
+          "janitor-floor": {
+            "cost": 67,
+            "fn": 67,
+            "fp": 0,
+            "tn": 0,
+            "tp": 71
+          },
+          "unconditional": {
+            "cost": 71,
+            "fn": 71,
+            "fp": 0,
+            "tn": 0,
+            "tp": 67
+          }
+        }
+      },
+      "evidence_pairs": 145,
+      "evidenced_share": 0.6621,
+      "method": "ablation",
+      "reason": "Ablation on the base engine: 145 discriminating construction pairs; cost (2*FP+FN) 67 vs 78 for runner-up `unconditional`; same winner at cut 90; 66% of the deciding pairs on evidenced forms.",
+      "strictest": "janitor-floor",
+      "variant": "janitor-floor"
+    },
+    "N08": {
+      "confidence": "weak",
+      "costs": {
+        "80": {
+          "sm-rejoin": {
+            "cost": 6,
+            "fn": 6,
+            "fp": 0,
+            "tn": 5,
+            "tp": 0
+          },
+          "split": {
+            "cost": 10,
+            "fn": 0,
+            "fp": 5,
+            "tn": 0,
+            "tp": 6
+          }
+        },
+        "90": {
+          "sm-rejoin": {
+            "cost": 6,
+            "fn": 6,
+            "fp": 0,
+            "tn": 0,
+            "tp": 0
+          },
+          "split": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 0,
+            "tp": 6
+          }
+        }
+      },
+      "evidence_pairs": 11,
+      "evidenced_share": 0.9091,
+      "method": "ablation",
+      "reason": "Ablation on the base engine: 11 discriminating construction pairs; cost (2*FP+FN) 6 vs 10 for runner-up `split`; DIFFERENT winner at cut 90; 91% of the deciding pairs on evidenced forms. Coherence: designator repair only matters to a designator guard (rejoining RAISES `Sky Sports F1 UHD` vs `Sky Sports UHD 1` to 0.923; the guard refuses it), so it is preferred exactly when T07 reads designator tokens (`ablate.preference_for`).",
+      "strictest": "sm-rejoin",
+      "variant": "sm-rejoin"
+    },
+    "N09": {
+      "confidence": "weak",
+      "costs": {
+        "80": {
+          "keep": {
+            "cost": 15,
+            "fn": 11,
+            "fp": 2,
+            "tn": 0,
+            "tp": 0
+          },
+          "strip": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 2,
+            "tp": 11
+          }
+        },
+        "90": {
+          "keep": {
+            "cost": 15,
+            "fn": 11,
+            "fp": 2,
+            "tn": 0,
+            "tp": 0
+          },
+          "strip": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 2,
+            "tp": 11
+          }
+        }
+      },
+      "evidence_pairs": 13,
+      "evidenced_share": 0.1538,
+      "method": "ablation",
+      "reason": "Ablation on the base engine: 13 discriminating construction pairs; cost (2*FP+FN) 0 vs 15 for runner-up `keep`; same winner at cut 90; 15% of the deciding pairs on evidenced forms.",
+      "strictest": "keep",
+      "variant": "strip"
+    },
+    "N10": {
+      "confidence": "weak",
+      "costs": {
+        "80": {
+          "keep": {
+            "cost": 6,
+            "fn": 0,
+            "fp": 3,
+            "tn": 1,
+            "tp": 9
+          },
+          "lu-strip": {
+            "cost": 11,
+            "fn": 9,
+            "fp": 1,
+            "tn": 3,
+            "tp": 0
+          }
+        },
+        "90": {
+          "keep": {
+            "cost": 3,
+            "fn": 3,
+            "fp": 0,
+            "tn": 1,
+            "tp": 7
+          },
+          "lu-strip": {
+            "cost": 9,
+            "fn": 7,
+            "fp": 1,
+            "tn": 0,
+            "tp": 3
+          }
+        }
+      },
+      "evidence_pairs": 13,
+      "evidenced_share": 0.6923,
+      "method": "ablation via N02",
+      "reason": "Ablation on the base engine: 13 discriminating construction pairs; cost (2*FP+FN) 6 vs 11 for runner-up `lu-strip`; same winner at cut 90; 69% of the deciding pairs on evidenced forms. Each variant is its cheapest `N02` configuration (`keep` = `N02=core`, `lu-strip` = `N02=lu-strip`).",
+      "strictest": "keep",
+      "variant": "keep"
+    },
+    "N11": {
+      "confidence": "strong",
+      "costs": {
+        "80": {
+          "keep": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 0,
+            "tp": 41
+          },
+          "sm-strip": {
+            "cost": 41,
+            "fn": 41,
+            "fp": 0,
+            "tn": 0,
+            "tp": 0
+          }
+        },
+        "90": {
+          "keep": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 0,
+            "tp": 41
+          },
+          "sm-strip": {
+            "cost": 41,
+            "fn": 41,
+            "fp": 0,
+            "tn": 0,
+            "tp": 0
+          }
+        }
+      },
+      "evidence_pairs": 41,
+      "evidenced_share": 0.6585,
+      "method": "ablation",
+      "reason": "Ablation on the base engine: 41 discriminating construction pairs; cost (2*FP+FN) 0 vs 41 for runner-up `sm-strip`; same winner at cut 90; 66% of the deciding pairs on evidenced forms.",
+      "strictest": "keep",
+      "variant": "keep"
+    },
+    "N12": {
+      "confidence": "no-evidence",
+      "costs": {
+        "80": {
+          "after-hyphen": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 0,
+            "tp": 0
+          },
+          "first": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 0,
+            "tp": 0
+          }
+        },
+        "90": {
+          "after-hyphen": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 0,
+            "tp": 0
+          },
+          "first": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 0,
+            "tp": 0
+          }
+        }
+      },
+      "evidence_pairs": 0,
+      "evidenced_share": 0.0,
+      "method": "ablation",
+      "reason": "Ablation on the base engine: 0 discriminating construction pairs (< 10): strictest variant. Coherence: with N04 = core, whose patterns expect the hyphen still in place (`matching_core.py:349-353`), the core order is preferred (`ablate.preference_for`).",
+      "strictest": "first",
+      "variant": "first"
+    },
+    "N13": {
+      "confidence": "weak",
+      "costs": {
+        "80": {
+          "keep": {
+            "cost": 151,
+            "fn": 131,
+            "fp": 10,
+            "tn": 0,
+            "tp": 1
+          },
+          "strip": {
+            "cost": 1,
+            "fn": 1,
+            "fp": 0,
+            "tn": 10,
+            "tp": 131
+          }
+        },
+        "90": {
+          "keep": {
+            "cost": 179,
+            "fn": 177,
+            "fp": 1,
+            "tn": 0,
+            "tp": 1
+          },
+          "strip": {
+            "cost": 1,
+            "fn": 1,
+            "fp": 0,
+            "tn": 1,
+            "tp": 177
+          }
+        }
+      },
+      "evidence_pairs": 142,
+      "evidenced_share": 0.0704,
+      "method": "ablation",
+      "reason": "Ablation on the base engine: 142 discriminating construction pairs; cost (2*FP+FN) 1 vs 151 for runner-up `keep`; same winner at cut 90; 7% of the deciding pairs on evidenced forms.",
+      "strictest": "keep",
+      "variant": "strip"
+    },
+    "N14": {
+      "confidence": "weak",
+      "costs": {
+        "80": {
+          "cm-double-tag": {
+            "cost": 7,
+            "fn": 7,
+            "fp": 0,
+            "tn": 1,
+            "tp": 4
+          },
+          "core": {
+            "cost": 7,
+            "fn": 7,
+            "fp": 0,
+            "tn": 1,
+            "tp": 4
+          },
+          "janitor-anywhere": {
+            "cost": 6,
+            "fn": 4,
+            "fp": 1,
+            "tn": 0,
+            "tp": 7
+          }
+        },
+        "90": {
+          "cm-double-tag": {
+            "cost": 7,
+            "fn": 7,
+            "fp": 0,
+            "tn": 1,
+            "tp": 6
+          },
+          "core": {
+            "cost": 7,
+            "fn": 7,
+            "fp": 0,
+            "tn": 1,
+            "tp": 6
+          },
+          "janitor-anywhere": {
+            "cost": 8,
+            "fn": 6,
+            "fp": 1,
+            "tn": 0,
+            "tp": 7
+          }
+        }
+      },
+      "evidence_pairs": 12,
+      "evidenced_share": 0.5833,
+      "method": "ablation",
+      "reason": "Ablation on the base engine: 12 discriminating construction pairs; cost (2*FP+FN) 7 vs 6 for runner-up `janitor-anywhere`; same winner at cut 90; 58% of the deciding pairs on evidenced forms.",
+      "strictest": "core",
+      "variant": "core"
+    },
+    "R01": {
+      "confidence": "no-evidence",
+      "evidence_pairs": 0,
+      "method": "inactive",
+      "reason": "No pair can be evidence: Every oracle and the ablation base run the pure-Python fallback (no rapidfuzz), so the two arithmetics never meet. Default `fallback` (strictest).",
+      "strictest": "fallback",
+      "variant": "fallback"
+    },
+    "T01": {
+      "confidence": "strong",
+      "costs": {
+        "80": {
+          "cm": {
+            "cost": 32,
+            "fn": 22,
+            "fp": 5,
+            "tn": 20,
+            "tp": 0
+          },
+          "core": {
+            "cost": 22,
+            "fn": 22,
+            "fp": 0,
+            "tn": 25,
+            "tp": 0
+          },
+          "janitor": {
+            "cost": 32,
+            "fn": 22,
+            "fp": 5,
+            "tn": 20,
+            "tp": 0
+          },
+          "sm-never": {
+            "cost": 50,
+            "fn": 0,
+            "fp": 25,
+            "tn": 0,
+            "tp": 22
+          }
+        },
+        "90": {
+          "cm": {
+            "cost": 2,
+            "fn": 2,
+            "fp": 0,
+            "tn": 10,
+            "tp": 0
+          },
+          "core": {
+            "cost": 2,
+            "fn": 2,
+            "fp": 0,
+            "tn": 10,
+            "tp": 0
+          },
+          "janitor": {
+            "cost": 2,
+            "fn": 2,
+            "fp": 0,
+            "tn": 10,
+            "tp": 0
+          },
+          "sm-never": {
+            "cost": 20,
+            "fn": 0,
+            "fp": 10,
+            "tn": 0,
+            "tp": 2
+          }
+        }
+      },
+      "evidence_pairs": 47,
+      "evidenced_share": 0.8723,
+      "method": "ablation",
+      "reason": "Ablation on the base engine: 47 discriminating construction pairs; cost (2*FP+FN) 22 vs 32 for runner-up `janitor`; same winner at cut 90; 87% of the deciding pairs on evidenced forms.",
+      "strictest": "core",
+      "variant": "core"
+    },
+    "T02": {
+      "confidence": "no-evidence",
+      "evidence_pairs": 0,
+      "majority_pairs": 0,
+      "method": "whole-path",
+      "reason": "Whole-path comparison only: fewer than 10 split pairs (0); default `always` (strictest). The basic-mode floor is in the ablation base (LU's match_all_streams, always majority); no rule swap isolates it from T01, whose guard it parameterises.",
+      "scores": {
+        "always": {
+          "f1": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "n": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "tn": 0,
+          "tp": 0
+        },
+        "sm-never": {
+          "f1": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "n": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "tn": 0,
+          "tp": 0
+        }
+      },
+      "strictest": "always",
+      "variant": "always"
+    },
+    "T03": {
+      "confidence": "no-evidence",
+      "evidence_pairs": 0,
+      "majority_pairs": 0,
+      "method": "whole-path",
+      "reason": "Whole-path comparison only: fewer than 10 split pairs (0); default `cm` (strictest). Stage order is fixed by the base (T09); one candidate cannot show it.",
+      "scores": {
+        "cm": {
+          "f1": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "n": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "tn": 0,
+          "tp": 0
+        },
+        "janitor": {
+          "f1": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "n": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "tn": 0,
+          "tp": 0
+        },
+        "lu": {
+          "f1": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "n": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "tn": 0,
+          "tp": 0
+        },
+        "sm": {
+          "f1": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "n": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "tn": 0,
+          "tp": 0
+        }
+      },
+      "strictest": "cm",
+      "variant": "cm"
+    },
+    "T04": {
+      "confidence": "no-evidence",
+      "evidence_pairs": 0,
+      "majority_pairs": 0,
+      "method": "whole-path",
+      "reason": "Whole-path comparison only: fewer than 10 split pairs (0); default `guarded` (strictest). The 0.97 exact tier is guarded in the base (LU); an unguarded exact tier is how `Golf Channel` false positives happen.",
+      "scores": {
+        "guarded": {
+          "f1": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "n": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "tn": 0,
+          "tp": 0
+        },
+        "unguarded": {
+          "f1": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "n": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "tn": 0,
+          "tp": 0
+        }
+      },
+      "strictest": "guarded",
+      "variant": "guarded"
+    },
+    "T05": {
+      "confidence": "no-evidence",
+      "evidence_pairs": 0,
+      "majority_pairs": 0,
+      "method": "whole-path",
+      "reason": "Whole-path comparison only: fewer than 10 split pairs (0); default `scaled` (strictest). Length-scaled thresholds are in the base (LU) at every stage.",
+      "scores": {
+        "scaled": {
+          "f1": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "n": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "tn": 0,
+          "tp": 0
+        },
+        "sm-never": {
+          "f1": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "n": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "tn": 0,
+          "tp": 0
+        }
+      },
+      "strictest": "scaled",
+      "variant": "scaled"
+    },
+    "T06": {
+      "confidence": "strong",
+      "costs": {
+        "80": {
+          "jan-lu": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 68,
+            "tp": 0
+          },
+          "sm": {
+            "cost": 136,
+            "fn": 0,
+            "fp": 68,
+            "tn": 0,
+            "tp": 0
+          }
+        },
+        "90": {
+          "jan-lu": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 40,
+            "tp": 0
+          },
+          "sm": {
+            "cost": 80,
+            "fn": 0,
+            "fp": 40,
+            "tn": 0,
+            "tp": 0
+          }
+        }
+      },
+      "evidence_pairs": 68,
+      "evidenced_share": 1.0,
+      "method": "ablation",
+      "reason": "Ablation on the base engine: 68 discriminating construction pairs; cost (2*FP+FN) 0 vs 136 for runner-up `sm`; same winner at cut 90; 100% of the deciding pairs on evidenced forms.",
+      "strictest": "jan-lu",
+      "variant": "jan-lu"
+    },
+    "T07": {
+      "confidence": "weak",
+      "costs": {
+        "80": {
+          "cm": {
+            "cost": 845,
+            "fn": 1,
+            "fp": 422,
+            "tn": 3,
+            "tp": 15
+          },
+          "janitor": {
+            "cost": 16,
+            "fn": 6,
+            "fp": 5,
+            "tn": 420,
+            "tp": 10
+          },
+          "janitor-designator": {
+            "cost": 11,
+            "fn": 11,
+            "fp": 0,
+            "tn": 425,
+            "tp": 5
+          },
+          "lu-none": {
+            "cost": 21,
+            "fn": 5,
+            "fp": 8,
+            "tn": 417,
+            "tp": 11
+          },
+          "sm-designator": {
+            "cost": 832,
+            "fn": 10,
+            "fp": 411,
+            "tn": 14,
+            "tp": 6
+          }
+        },
+        "90": {
+          "cm": {
+            "cost": 107,
+            "fn": 1,
+            "fp": 53,
+            "tn": 0,
+            "tp": 14
+          },
+          "janitor": {
+            "cost": 6,
+            "fn": 6,
+            "fp": 0,
+            "tn": 53,
+            "tp": 9
+          },
+          "janitor-designator": {
+            "cost": 11,
+            "fn": 11,
+            "fp": 0,
+            "tn": 53,
+            "tp": 4
+          },
+          "lu-none": {
+            "cost": 5,
+            "fn": 5,
+            "fp": 0,
+            "tn": 53,
+            "tp": 10
+          },
+          "sm-designator": {
+            "cost": 113,
+            "fn": 9,
+            "fp": 52,
+            "tn": 1,
+            "tp": 6
+          }
+        }
+      },
+      "evidence_pairs": 441,
+      "evidenced_share": 0.1769,
+      "method": "ablation",
+      "reason": "Ablation on the base engine: 441 discriminating construction pairs; cost (2*FP+FN) 11 vs 16 for runner-up `janitor`; DIFFERENT winner at cut 90; 18% of the deciding pairs on evidenced forms. `janitor-designator` is not a plugin variant: JAN's disagreement shape over SM's designator tokens (with N08's repair), the one guard that keeps SM issue #50 apart without SM's numbered-vs-unnumbered rejections (Appendix C).",
+      "strictest": "sm-designator",
+      "variant": "janitor-designator"
+    },
+    "T08": {
+      "confidence": "no-evidence",
+      "evidence_pairs": 0,
+      "majority_pairs": 0,
+      "method": "whole-path",
+      "reason": "Whole-path comparison only: fewer than 10 split pairs (0); default `cm` (strictest). find_best_match is not on the base's path; CM's in-loop guards match it.",
+      "scores": {
+        "cm": {
+          "f1": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "n": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "tn": 0,
+          "tp": 0
+        },
+        "janitor": {
+          "f1": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "n": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "tn": 0,
+          "tp": 0
+        },
+        "lu-absent": {
+          "f1": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "n": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "tn": 0,
+          "tp": 0
+        },
+        "sm": {
+          "f1": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "n": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "tn": 0,
+          "tp": 0
+        }
+      },
+      "strictest": "cm",
+      "variant": "cm"
+    },
+    "T09": {
+      "confidence": "no-evidence",
+      "evidence_pairs": 0,
+      "method": "by design",
+      "reason": "By design: The ablation base IS Lineuparr's match_all_streams (alias -> exact -> substring -> token-sort, per-candidate guards, region and country filters), so every ablated row was measured in this shape. Janitor's is the same shape plus the dead D03 boost.",
+      "strictest": "lu",
+      "variant": "lu"
+    },
+    "T10": {
+      "best_cut": 70,
+      "confidence": "weak",
+      "evidence_pairs": 20950,
+      "method": "threshold sweep",
+      "reason": "Cut sweep of the final engine over every construction pair, cost 2*FP+FN: 70: 833 (FP 35, FN 763), 75: 834 (FP 35, FN 764), 80: 856 (FP 34, FN 788), 85: 859 (FP 24, FN 811), 90: 847 (FP 11, FN 825), 95: 847 (FP 8, FN 831). Best cut 70; of the shipped defaults `janitor-95` is cheapest (runner-up `cm-lu-80` by 9). The cut is on the base engine's score (Janitor's 95 is on its own confidence scale with structural bonuses), so step 6 sets the one `[matching]` threshold on this sweep; the row only rules out the cuts that cost most.",
+      "strictest": "janitor-95",
+      "sweep": {
+        "70": {
+          "cost": 833,
+          "fn": 763,
+          "fp": 35,
+          "tn": 7415,
+          "tp": 12737
+        },
+        "75": {
+          "cost": 834,
+          "fn": 764,
+          "fp": 35,
+          "tn": 7415,
+          "tp": 12736
+        },
+        "80": {
+          "cost": 856,
+          "fn": 788,
+          "fp": 34,
+          "tn": 7416,
+          "tp": 12712
+        },
+        "85": {
+          "cost": 859,
+          "fn": 811,
+          "fp": 24,
+          "tn": 7426,
+          "tp": 12689
+        },
+        "90": {
+          "cost": 847,
+          "fn": 825,
+          "fp": 11,
+          "tn": 7439,
+          "tp": 12675
+        },
+        "95": {
+          "cost": 847,
+          "fn": 831,
+          "fp": 8,
+          "tn": 7442,
+          "tp": 12669
+        }
+      },
+      "variant": "janitor-95"
+    },
+    "T11": {
+      "confidence": "no-evidence",
+      "evidence_pairs": 0,
+      "method": "inactive",
+      "reason": "No pair can be evidence: Cache staleness needs repeated runs with changing flags. Default `sm-flagged` (strictest).",
+      "strictest": "sm-flagged",
+      "variant": "sm-flagged"
+    },
+    "T12": {
+      "confidence": "no-evidence",
+      "evidence_pairs": 0,
+      "majority_pairs": 0,
+      "method": "whole-path",
+      "reason": "Whole-path comparison only: fewer than 10 split pairs (0); default `lu` (strictest).",
+      "scores": {
+        "cm": {
+          "f1": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "n": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "tn": 0,
+          "tp": 0
+        },
+        "janitor": {
+          "f1": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "n": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "tn": 0,
+          "tp": 0
+        },
+        "lu": {
+          "f1": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "n": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "tn": 0,
+          "tp": 0
+        },
+        "sm": {
+          "f1": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "n": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "tn": 0,
+          "tp": 0
+        }
+      },
+      "strictest": "lu",
+      "variant": "lu"
+    },
+    "Z01": {
+      "confidence": "strong",
+      "costs": {
+        "80": {
+          "none": {
+            "cost": 169,
+            "fn": 63,
+            "fp": 53,
+            "tn": 0,
+            "tp": 11
+          },
+          "sm-zone": {
+            "cost": 11,
+            "fn": 11,
+            "fp": 0,
+            "tn": 53,
+            "tp": 63
+          }
+        },
+        "90": {
+          "none": {
+            "cost": 169,
+            "fn": 63,
+            "fp": 53,
+            "tn": 0,
+            "tp": 11
+          },
+          "sm-zone": {
+            "cost": 11,
+            "fn": 11,
+            "fp": 0,
+            "tn": 53,
+            "tp": 63
+          }
+        }
+      },
+      "evidence_pairs": 127,
+      "evidenced_share": 0.7244,
+      "method": "ablation via ZONE",
+      "reason": "Ablation on the base engine: 127 discriminating construction pairs; cost (2*FP+FN) 11 vs 169 for runner-up `none`; same winner at cut 90; 72% of the deciding pairs on evidenced forms. Each variant is its cheapest `ZONE` configuration (`none` = `ZONE=lu`, `sm-zone` = `ZONE=sm-zone-noguard`).",
+      "strictest": "none",
+      "variant": "sm-zone"
+    },
+    "Z02": {
+      "confidence": "weak",
+      "costs": {
+        "80": {
+          "none": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 14,
+            "tp": 33
+          },
+          "sm-guard": {
+            "cost": 61,
+            "fn": 33,
+            "fp": 14,
+            "tn": 0,
+            "tp": 0
+          }
+        },
+        "90": {
+          "none": {
+            "cost": 0,
+            "fn": 0,
+            "fp": 0,
+            "tn": 14,
+            "tp": 33
+          },
+          "sm-guard": {
+            "cost": 61,
+            "fn": 33,
+            "fp": 14,
+            "tn": 0,
+            "tp": 0
+          }
+        }
+      },
+      "evidence_pairs": 47,
+      "evidenced_share": 0.5532,
+      "method": "ablation via ZONE",
+      "reason": "Ablation on the base engine: 47 discriminating construction pairs; cost (2*FP+FN) 0 vs 61 for runner-up `sm-guard`; same winner at cut 90; 55% of the deciding pairs on evidenced forms. Capped at weak: The evidence rests on the corpus labelling a single-time-zone region (`UK: BBC One West`) as its own channel, the semantic SM's guard was written against (its comment: the plain BBC One channel carrying both regions is fine). Each variant is its cheapest `ZONE` configuration (`none` = `ZONE=sm-zone-noguard`, `sm-guard` = `ZONE=sm-zone`). Measured as SM's routing with and without `_country_has_one_timezone`.",
+      "strictest": "none",
+      "variant": "none"
+    },
+    "Z03": {
+      "confidence": "no-evidence",
+      "evidence_pairs": 0,
+      "majority_pairs": 0,
+      "method": "whole-path",
+      "reason": "Whole-path comparison only: fewer than 10 split pairs (0); default `none` (strictest). Zone expansion changes the candidate universe, not one pair.",
+      "scores": {
+        "none": {
+          "f1": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "n": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "tn": 0,
+          "tp": 0
+        },
+        "sm-expand": {
+          "f1": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "n": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "tn": 0,
+          "tp": 0
+        }
+      },
+      "strictest": "none",
+      "variant": "none"
+    },
+    "Z04": {
+      "confidence": "strong",
+      "costs": {
+        "80": {
+          "janitor": {
+            "cost": 445,
+            "fn": 63,
+            "fp": 191,
+            "tn": 0,
+            "tp": 11
+          },
+          "lu": {
+            "cost": 169,
+            "fn": 63,
+            "fp": 53,
+            "tn": 138,
+            "tp": 11
+          },
+          "none": {
+            "cost": 11,
+            "fn": 11,
+            "fp": 0,
+            "tn": 191,
+            "tp": 63
+          }
+        },
+        "90": {
+          "janitor": {
+            "cost": 445,
+            "fn": 63,
+            "fp": 191,
+            "tn": 0,
+            "tp": 11
+          },
+          "lu": {
+            "cost": 169,
+            "fn": 63,
+            "fp": 53,
+            "tn": 138,
+            "tp": 11
+          },
+          "none": {
+            "cost": 11,
+            "fn": 11,
+            "fp": 0,
+            "tn": 191,
+            "tp": 63
+          }
+        }
+      },
+      "evidence_pairs": 265,
+      "evidenced_share": 0.7132,
+      "method": "ablation via ZONE",
+      "reason": "Ablation on the base engine: 265 discriminating construction pairs; cost (2*FP+FN) 11 vs 169 for runner-up `lu`; same winner at cut 90; 71% of the deciding pairs on evidenced forms. Each variant is its cheapest `ZONE` configuration (`janitor` = `ZONE=janitor`, `lu` = `ZONE=lu`, `none` = `ZONE=sm-zone-noguard`).",
+      "strictest": "lu",
+      "variant": "none"
+    },
+    "Z05": {
+      "confidence": "no-evidence",
+      "evidence_pairs": 0,
+      "majority_pairs": 0,
+      "method": "whole-path",
+      "reason": "Whole-path comparison only: fewer than 10 split pairs (0); default `lu-skip` (strictest). No separator-style names occur in the corpus; the base skips them. Skipping a header can never drop a real channel.",
+      "scores": {
+        "lu-skip": {
+          "f1": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "n": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "tn": 0,
+          "tp": 0
+        },
+        "none": {
+          "f1": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "n": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "tn": 0,
+          "tp": 0
+        }
+      },
+      "strictest": "lu-skip",
+      "variant": "lu-skip"
+    },
+    "Z06": {
+      "confidence": "no-evidence",
+      "evidence_pairs": 0,
+      "method": "inactive",
+      "reason": "No pair can be evidence: The quality_aware opt-in is off on every shipped default. Default `none` (strictest).",
+      "strictest": "none",
+      "variant": "none"
+    }
+  }
+}

@@ -1,0 +1,147 @@
+{
+  "agreement": {
+    "agree": 18906,
+    "split": 9544
+  },
+  "ai": {
+    "disputed": 0,
+    "relabeled": 0,
+    "skipped": "ai not requested"
+  },
+  "build_seconds": 21.5,
+  "by_generator": {
+    "alias": 1770,
+    "case": 91,
+    "collision": 112,
+    "near-miss": 3390,
+    "real": 7109,
+    "station": 1711,
+    "synth": 14267
+  },
+  "by_label": {
+    "different": 14341,
+    "same": 14010,
+    "unknown": 99
+  },
+  "by_label_source": {
+    "construction": 20950,
+    "majority": 505,
+    "unanimous": 6995
+  },
+  "construction_vs_votes": {
+    "ai": 0,
+    "construction": 20950,
+    "majority": 505,
+    "unanimous": 6995,
+    "unknown_excluded": 99
+  },
+  "generator_forms": {
+    "country_prefix": {
+      "(US)": 6,
+      "CA FR:": 0,
+      "CA bare": 8,
+      "CA:": 4,
+      "UK -": 0,
+      "UK bare": 14,
+      "UK:": 45,
+      "UKHD:": 18,
+      "US bare": 12,
+      "US |": 2,
+      "US:": 147,
+      "[UK]": 1,
+      "| US": 0
+    },
+    "decorative_unicode": {
+      "²": 0,
+      "ᴴᴰ": 1,
+      "▶": 0,
+      "◉": 2,
+      "★": 1
+    },
+    "platform_prefix": {
+      "GO:": 12,
+      "PLUTO:": 3,
+      "PRIME:": 7,
+      "RK:": 5,
+      "TUBI:": 3
+    },
+    "plus_one": {
+      " +1": 102,
+      "+1": 27
+    },
+    "quality_suffix": {
+      "(HD)": 8,
+      "(UHD)": 3,
+      "1080p": 5,
+      "4K": 65,
+      "8K": 2,
+      "FHD": 11,
+      "HD": 3477,
+      "HD:": 4,
+      "HDR": 1,
+      "HEVC": 15,
+      "SD": 173,
+      "UHD": 30,
+      "[FHD]": 1,
+      "[HD]": 5
+    },
+    "region": {
+      "(E)": 11,
+      "(East)": 10,
+      "(Pacific)": 260,
+      "(W)": 13,
+      "(West)": 2,
+      "East": 73,
+      "Eastern": 5,
+      "Pacific": 22,
+      "West": 79
+    },
+    "zero_width": {
+      "ZWSP": 1
+    }
+  },
+  "labelling_seconds": 19.5,
+  "oracle_errors": {},
+  "pairs": 28450,
+  "provenance": [
+    "data/merged/channels/*.json (39933 names)",
+    "data/merged/lineups/*.json (3696 names)",
+    "data/merged/aliases.json (473 canonicals)",
+    "data/merged/stations.json (OTA station forms)",
+    "reference/Dispatcharr-EPG-Janitor-Plugin/tests/test_fuzzy_matcher.py",
+    "reference/Dispatcharr-EPG-Janitor-Plugin/tests/test_station_callsigns.py",
+    "reference/Dispatcharr-EPG-Janitor-Plugin/tests/test_regressions.py",
+    "reference/Dispatcharr-EPG-Janitor-Plugin/tests/test_matcher_golden.py",
+    "reference/Stream-Mapparr/tests/test_designator_tokens.py",
+    "reference/Stream-Mapparr/tests/test_fuzzy_matcher.py",
+    "reference/Stream-Mapparr/tests/test_ota_callsign_fallback.py",
+    "reference/Stream-Mapparr/tests/test_alias_key_case.py",
+    "reference/Stream-Mapparr/tests/test_country_detection.py",
+    "reference/Stream-Mapparr/tests/test_zone_single_timezone.py",
+    "reference/Dispatcharr-Channel-Maparr-Plugin/tests/test_broadcast_ota.py",
+    "reference/Dispatcharr-Channel-Maparr-Plugin/tests/test_fuzzy_matcher.py",
+    "reference/Dispatcharr-Lineuparr-Plugin/tests/test_country_filter.py",
+    "reference/Dispatcharr-Lineuparr-Plugin/tests/test_comedy_tv_disambiguation.py",
+    "reference/Dispatcharr-Lineuparr-Plugin/tests/test_eastern_region_matching.py",
+    "reference/Dispatcharr-Lineuparr-Plugin/tests/test_sportsnet_pacific.py",
+    "reference/Dispatcharr-Lineuparr-Plugin/tests/test_dotted_name_normalization.py",
+    "reference/Dispatcharr-Lineuparr-Plugin/tests/test_alias_callsign_guard.py",
+    "reference/Dispatcharr-EPG-Janitor-Plugin/tests/matcher_golden_baseline.json",
+    "reference/Dispatcharr-Channel-Maparr-Plugin/tests/matcher_golden_baseline.json",
+    "scripts/match_parity.py",
+    "scripts/sort_parity.py",
+    "reference/*/tests/*.py (form evidence only)"
+  ],
+  "seed": 20261105,
+  "spec_counts": {
+    "construction_specs": 16135,
+    "kept": {
+      "different": 7450,
+      "real": 7500,
+      "same": 13500
+    },
+    "near_miss_specs": 7450,
+    "real_specs": 9687
+  },
+  "target": 30000
+}
