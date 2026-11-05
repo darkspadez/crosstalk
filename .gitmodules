@@ -7,3 +7,12 @@
 [submodule "reference/Dispatcharr-IPTV-Checker-Plugin"]
 	path = reference/Dispatcharr-IPTV-Checker-Plugin
 	url = https://github.com/PiratesIRC/Dispatcharr-IPTV-Checker-Plugin
+[submodule "reference/Dispatcharr-Channel-Maparr-Plugin"]
+	path = reference/Dispatcharr-Channel-Maparr-Plugin
+	url = https://github.com/PiratesIRC/Dispatcharr-Channel-Maparr-Plugin
+[submodule "reference/Dispatcharr-Lineuparr-Plugin"]
+	path = reference/Dispatcharr-Lineuparr-Plugin
+	url = https://github.com/PiratesIRC/Dispatcharr-Lineuparr-Plugin
+[submodule "reference/dispatcharr-channel-name-cleaner"]
+	path = reference/dispatcharr-channel-name-cleaner
+	url = https://github.com/noodlemctwoodle/dispatcharr-channel-name-cleaner

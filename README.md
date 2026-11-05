@@ -824,7 +824,8 @@ cargo run --release -p crosstalk -- bench streams --live --write-timing --channe
 ```
 
 The Python plugins live in `reference/` as pinned git submodules — EPG Janitor (the guide
-app), Stream-Mapparr and IPTV Checker (the streams app, from phase 2 on) — so the parity
+app), Stream-Mapparr and IPTV Checker (the streams app, from phase 2 on), Channel-Mapparr,
+Lineuparr and Channel Name Cleaner (the lineup app, from phase 3 on) — so the parity
 gates always compare against those exact commits. A fresh clone needs
 `git submodule update --init` to get them. See [How matching works](#how-matching-works) for
 what is strict-parity and what is deliberately Rust-native, and `scripts/upstream_drift.sh`
@@ -853,7 +854,8 @@ A new sub-app is a crate implementing `SubApp` plus one line in `crates/crosstal
 ## Licence
 
 crosstalk is MIT; see [LICENSE](LICENSE). The code and data ported from the Dispatcharr
-plugins (EPG Janitor, Stream-Mapparr and IPTV Checker) are credited, with each upstream
-licence text and pinned reference commit, in
+plugins (EPG Janitor, Stream-Mapparr and IPTV Checker, and from phase 3 Channel-Mapparr,
+Lineuparr and Channel Name Cleaner) are credited, with each upstream licence text and pinned
+reference commit, in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) — both files ship in the release tarball and
 in the container image, under `/usr/share/doc/crosstalk/`.

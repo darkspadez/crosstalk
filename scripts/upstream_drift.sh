@@ -25,6 +25,9 @@ readonly -a references=(
   "Dispatcharr-EPG-Janitor-Plugin"
   "Stream-Mapparr"
   "Dispatcharr-IPTV-Checker-Plugin"
+  "Dispatcharr-Channel-Maparr-Plugin"
+  "Dispatcharr-Lineuparr-Plugin"
+  "dispatcharr-channel-name-cleaner"
 )
 
 # ported_paths_for <reference> fills `ported` with every file crosstalk ports from that
@@ -80,6 +83,43 @@ ported_paths_for() {
         "iptv_checker/plugin.py"
         # The settings schema follows the plugin's field ids, labels and help text.
         "iptv_checker/plugin.json"
+      )
+      ;;
+    Dispatcharr-Channel-Maparr-Plugin)
+      ported=(
+        "Channel-Maparr/plugin.py"
+        "Channel-Maparr/fuzzy_matcher.py"
+        "Channel-Maparr/matching_core.py"
+        "Channel-Maparr/aliases.py"
+        "Channel-Maparr/logo_matcher.py"
+        "Channel-Maparr/channel_seeder.py"
+        "Channel-Maparr/market_index.py"
+        "Channel-Maparr/station_affiliation.py"
+        "Channel-Maparr/group_scope.py"
+        "Channel-Maparr/wildcard_match.py"
+        # The settings schema follows the plugin's field ids, labels and help text.
+        "Channel-Maparr/plugin.json"
+        "Channel-Maparr/*_channels.json"
+        "Channel-Maparr/networks*.json"
+      )
+      ;;
+    Dispatcharr-Lineuparr-Plugin)
+      ported=(
+        "Lineuparr/plugin.py"
+        "Lineuparr/fuzzy_matcher.py"
+        "Lineuparr/matching_core.py"
+        "Lineuparr/aliases.py"
+        "Lineuparr/logo_matcher.py"
+        # The settings schema follows the plugin's field ids, labels and help text.
+        "Lineuparr/plugin.json"
+        "Lineuparr/*_lineup.json"
+      )
+      ;;
+    dispatcharr-channel-name-cleaner)
+      ported=(
+        "channel_name_cleaner/plugin.py"
+        # The settings schema follows the plugin's field ids, labels and help text.
+        "channel_name_cleaner/plugin.json"
       )
       ;;
     *)
