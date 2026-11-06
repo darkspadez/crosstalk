@@ -9,15 +9,15 @@
 //! live one, lineup will walk entries looking for a logo. The order and the tie-break are the
 //! same for all of them, which is why they live here rather than in each app.
 //!
-//! The parallel scoring stage in front of the walk is shared too ([`score_names`]): every app
-//! scores a list of query names against the same kind of candidate index, and the work scales
+//! The parallel scoring stage in front of the walk is shared too ([`score_families`]): every
+//! app scores a list of query names against one unified-engine index, and the work scales
 //! with cores rather than with the async runtime.
 
 use crate::dispatcharr::{EpgEntry, Stream};
 use crate::jobs::{JobContext, ProgressEvent};
 use anyhow::{Context, Result};
 use crosstalk_matching::engine::{EngineIndex, EngineRanked, UnifiedEngine};
-use crosstalk_matching::pipeline::{CandidateIndex, Matcher, Scored};
+use crosstalk_matching::pipeline::Scored;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -291,70 +291,12 @@ pub struct ScoreProgress<'a> {
     pub phase: &'a str,
 }
 
-/// Score every query name against the candidate index, in parallel.
-///
-/// Runs on a blocking thread with rayon, so a big scope never stalls the async runtime. Order
-/// is preserved on collect, so the result is in query order. `progress` is optional because a
-/// short stage (heal scores only the broken channels) is not worth a progress bar.
-pub async fn score_names(
-    names: &[String],
-    matcher: Arc<Matcher>,
-    index: Arc<CandidateIndex>,
-    tags: &[String],
-    progress: Option<ScoreProgress<'_>>,
-) -> Result<Vec<Vec<Scored>>> {
-    let total = names.len();
-    let names = names.to_vec();
-    let tags = tags.to_vec();
-    let progress = progress.map(|progress| {
-        (
-            progress.context.clone(),
-            progress.action.to_string(),
-            progress.phase.to_string(),
-        )
-    });
-
-    tokio::task::spawn_blocking(move || {
-        use rayon::prelude::*;
-        let tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
-        let counter = AtomicUsize::new(0);
-        // Published `current` must be monotonic: rayon workers finish out of order, so a
-        // later-finishing worker with a smaller `done` must not move the bar backwards. Only
-        // the largest value so far is published.
-        let max_sent = AtomicUsize::new(0);
-        names
-            .par_iter()
-            .map(|name| {
-                let ranked = matcher.score_candidates(name, &index, &tag_refs, None);
-                if let Some((context, action, phase)) = progress.as_ref() {
-                    let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if done % PROGRESS_EVERY == 0 || done == total {
-                        let prev = max_sent.fetch_max(done, Ordering::Relaxed);
-                        if done > prev {
-                            context.progress(&ProgressEvent::new(
-                                action.as_str(),
-                                done as u64,
-                                total as u64,
-                                phase.as_str(),
-                            ));
-                        }
-                    }
-                }
-                ranked
-            })
-            .collect()
-    })
-    .await
-    .context("the scoring stage panicked")
-}
-
 /// Score every query name against one shared engine index, in parallel, returning the
 /// best identity FAMILY per query (the unified selection rule: the top's family, in
 /// rank order, at the engine's cut).
 ///
-/// The family-stage twin of [`score_names`]: every migrated app scores one candidate
-/// list per run and fans the queries out over rayon, so a big scope never stalls the
-/// async runtime. Order is preserved on collect, so the result is in query order.
+/// Every migrated app scores one candidate list per run and fans the queries out over
+/// rayon, so a big scope never stalls the async runtime. Order is preserved on collect, so the result is in query order.
 /// `progress` is optional because a short stage (heal scores only the broken channels)
 /// is not worth a progress bar.
 pub async fn score_families(
@@ -664,13 +606,14 @@ mod tests {
             Arc::new(crate::config::CrosstalkConfig::default()),
             sink.clone(),
         );
-        let matcher = Arc::new(Matcher::with_shipped_defaults());
+        let engine = Arc::new(UnifiedEngine::decided());
         let names = vec!["ESPN".to_string(), "CNN".to_string()];
-        let index = Arc::new(CandidateIndex::build(
+        let index = Arc::new(EngineIndex::build(
             &["ESPN HD".to_string(), "CNN".to_string()],
-            &matcher,
+            &engine,
+            &crosstalk_matching::identity::ResolveContext::default(),
         ));
-        let scored = score_names(&names, Arc::clone(&matcher), index, &matcher.tags(), None)
+        let scored = score_families(&names, Arc::clone(&engine), index, None)
             .await
             .expect("scored");
         assert_eq!(scored.len(), 2);

@@ -11,6 +11,7 @@ pub mod channel_ops;
 pub mod config;
 pub mod csv_report;
 pub mod dispatcharr;
+pub mod engine_run;
 pub mod fetch_cache;
 pub mod hooks;
 pub mod identity_cache;

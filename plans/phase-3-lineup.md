@@ -318,7 +318,7 @@ Each step: Muse Spark 1.3 Contributor implements → gate → Opus 5.5 reviews a
   resolver (core / matching), with the fetch cache.
 - [ ] 8. Migrate guide onto identity families (match, heal, scan, cleanup); oracle diff report
   vs Janitor.
-- [ ] 9. Migrate streams (match, sort, mirror, visibility, probe format tiers, triage tags);
+- [x] 9. Migrate streams (match, sort, mirror, visibility, probe format tiers, triage tags);
   oracle diff report vs Stream-Mapparr / IPTV Checker.
 
 **B. Host features**
@@ -420,26 +420,52 @@ Step 8 review (2026-11-05):
   `[matching] sensitivity` (same clean-break rule as the phase-1 moved settings).
 
 Step 9 (streams):
-- `triage::ends_with_tag` (`crates/streams/src/triage.rs`) → `tags::has_trailing`
+- [x] `triage::ends_with_tag` (`crates/streams/src/triage.rs`) → `tags::has_trailing`
   (accepts `(DEAD)` and literal affixes; today only `[DEAD]`).
-- `triage::FormatTags` strip regex and `restore::trailing_tag_pattern`
+- [x] `triage::FormatTags` strip regex and `restore::trailing_tag_pattern`
   (`crates/streams/src/restore.rs`) → `tags::strip` with kinds; needs an extension for
   operator-configured tokens (`video_format_suffixes`, custom rename-format labels are not in
   the vocabulary). Output changes: parens and stacked mixed runs strip.
-- Restore's standard status set: IC's three today; the vocabulary's `status` kind also has
+- [x] Restore's standard status set: IC's three today; the vocabulary's `status` kind also has
   CM `Unk` and guide `BadEPG`. Decide whether restore strips those (likely NO for `BadEPG`:
   that is guide's mark, not triage's).
-- `triage::render_format` (`{name}` only, format trimmed) → `naming::render_channel`
+- [x] `triage::render_format` (`{name}` only, format trimmed) → `naming::render_channel`
   (`{group}`/`{number}`/`{epg}`/`{id}` substitute; no trim). Output changes for formats
   carrying those tokens.
-- `triage::format_tags` (bracket labels of a format) — keep, but move beside
+- [x] `triage::format_tags` (bracket labels of a format) — keep, but move beside
   `naming` so lineup's suffix rules read the same parser.
-- Examples `crates/streams/examples/probe_io.rs` and `triage_io.rs` hard-code the five-label
+- [x] Examples `crates/streams/examples/probe_io.rs` and `triage_io.rs` hard-code the five-label
   map; use `QualityTier::parse_label` / `IC_FORMAT_LABELS`.
-- Stream-Mapparr's sort key (`crates/streams/src/quality.rs`) stays THE stream ordering;
+- [x] Stream-Mapparr's sort key (`crates/streams/src/quality.rs`) stays THE stream ordering;
   lineup mode reads tiers via `QualityTier::from_dimensions` (height-first), which is NOT
   IC's width rule — triage's suffix keeps `stream_format_of` (width) unless a decision row
   says otherwise.
 - Logos (step 16 oracle): the resolver's similarity is the unified engine's, not
   rapidfuzz `ratio`; channel-name punctuation becomes a space (CM deletes it); `NO` →
   `nordic/norway` and `GB` → `-uk` suffix are fixes over CM; URLs are percent-encoded.
+
+Step 9 review (2026-11-05):
+- One matcher in the binary: `simulate-streams` runs the unified engine (a stream passes
+  as a family member at the cut); the Janitor port is `--features oracle` +
+  `--oracle janitor`, still byte-identical to `match_sim.py` (`sim_parity.sh` gate, its
+  `[unified]` line is the report). Streams' SM collector is `cfg(test)` only (the dead
+  `oracle` feature removed); `match_run::score_names` and `MatchingConfig::matcher`
+  removed. `scripts/one_matcher_check.sh` (CI) proves it from the symbol table: 0
+  `profile::`/`CandidateIndex`/`pipeline::Matcher` symbols in the production binary.
+- Grouping key = family key + the country the leader's family is ranked under (the
+  filter's `_channel_country_code`, DB + group name, when on; the name marker when off):
+  restores bug-158 for group-name countries and stops `UK: CNN`'s family being written to
+  `US: CNN` with the filter off. One helper (`query_country`) for key and collector.
+- Engine tie-break (cross-app): identity-equal candidates win a tie before T12's overlap
+  (a reordered name scoring 100 by token sort made the other channel the top).
+  Mirrored in `engine_parity.py`.
+- Restore/triage strip SETS stay the plugin's (IC status + format labels, rename labels,
+  suffixes) over the shared parser: `[BadEPG]`, `[Unk]`, `[1080p]` etc. never strip.
+  `render_format` substitutes real channel values, keeps the format trim, never writes a
+  blank name. `triage_parity.py` covers parens (`paren` divergence) and other apps' tags.
+- AI gate: accepts go through the cut's country exclusion; audit row = leader's report
+  row; task prefix only with a configured chain (guide's rule); no double country count.
+- OPEN (step 6 rule, needs a decision): Z01 `sm-zone` zone extraction ignores a zone word
+  followed by a trailing tag (`HBO West (Backup)`, `HBO West [4K]`, `ITV1 (Central West)
+  HD` → zone Default), so West feeds join the default family in guide and streams. The
+  streams oracle report lists it as unattributed.

@@ -1,43 +1,50 @@
 //! Matching: which streams a channel should carry, and in what order.
 //!
-//! Port of Stream-Mapparr's Match & Assign (`add_streams_to_channels_action`), its Preview
-//! (`preview_changes_action`) and its US-OTA-only mode (`match_us_ota_only_action`). The
-//! behaviour that decides the answer lives in `_match_streams_to_channel` (plugin.py:5808)
-//! and the six functions it calls; every predicate below cites the Python it reproduces.
+//! Step 9 (goal reset): streams runs the unified matching layer — one ranker (the
+//! unified engine's best identity family), one selection rule (the whole family, all
+//! members ranked, above the one `[matching]` cut), one cache. Stream-Mapparr's Match &
+//! Assign (`add_streams_to_channels_action`), its Preview (`preview_changes_action`) and
+//! its US-OTA-only mode (`match_us_ota_only_action`) are the oracles, not the target:
+//! where the answer now differs, `docs/oracle-reports/streams.md` attributes every
+//! difference.
 //!
 //! # The shape of the answer
 //!
-//! A run is a pipeline, and each stage is the plugin's:
+//! A run is a pipeline:
 //!
 //!   1. **Scope the channels** — `[scope]` in `crosstalk.toml` (`scope::scope_channels`).
-//!   2. **Group them by name** — [`build_groups`], `_build_channel_groups` (6820): the
-//!      cleaned name, or `OTA_<callsign>` for a channel whose database entry carries one,
-//!      country-qualified (`key@@US`) when the country filter is on.
-//!   3. **Collect once per group** — [`collect_for_channel`], `_match_streams_to_channel`:
-//!      the OTA callsign path first, then the fuzzy winner, alias force-includes, the EPG
-//!      watched-stream force-include (when the optional EPG path is on) and the
-//!      token/substring family, then `_finalize_streams` (quality sort, same-country first,
-//!      dedupe). With the EPG path on, a placeholder channel or stream is matched under the
-//!      programme airing on it — see [`crate::epg`] for that half.
+//!   2. **Group them by identity family** — [`build_groups`]: channels resolving to the
+//!      same identity family key, qualified (`key@@US`) with the country the leader's
+//!      family is ranked under — the filter's channel country when it is on, the name's
+//!      own marker when it is off — unless the identity carries a callsign. The same
+//!      grouping function serves [`crate::visibility`].
+//!   3. **Collect once per group** — the group's answer is the best identity family of
+//!      streams: the leader's family from the unified engine at the `[matching]` cut,
+//!      all members in rank order, plus the EPG watched-stream force-include (when the
+//!      optional EPG path is on). With the EPG path on, a placeholder channel or stream
+//!      is matched under the programme airing on it — see [`crate::epg`] for that half.
+//!      Then the `_finalize_streams` tail (quality sort, same-country first, dedupe).
 //!   4. **Assign to the group's channels** — `visible_channel_limit` / zone siblings
 //!      (`_channels_to_update_for_group`), per-channel zone routing and country partition,
 //!      then `_write_channel_streams`'s overwrite-or-append list.
 //!
-//! # Why there is an index
+//! The engine and its index are built once per run ([`RunData`]) and every group ranks
+//! against the shared index on rayon, off the async runtime (like
+//! [`crosstalk_core::match_run`]); the answer is assembled in group order, so parallelism
+//! cannot reorder a result.
 //!
-//! The plugin's collector walks EVERY stream for every channel group: measured at ~800
-//! groups × 19,000 streams it is minutes of CPU, and the port exists because that does not
-//! scale to 20k channels. So the run builds name indexes once ([`NameIndex`]) and every group
-//! starts from a small candidate set. The index is a **superset prefilter**: it only ever
-//! narrows which streams are *looked at*, and every one of the plugin's own predicates is
-//! then applied to each candidate unchanged. [`NameIndex`]'s docstring carries the argument
-//! for why nothing the plugin would collect can be dropped, and
-//! `tests::the_indexed_collector_agrees_with_a_full_scan` checks it against a brute-force
-//! full scan over generated adversarial names.
+//! # Removed Stream-Mapparr rules (each traced to its decisions row)
 //!
-//! Groups run in parallel (rayon, off the async runtime, like [`crosstalk_core::match_run`]),
-//! and the answer is assembled in the plugin's group order, so parallelism cannot reorder a
-//! result.
+//!   * The OTA callsign regex path with corroboration (C06/D04: the engine's callsign
+//!     anchor decides callsign agreement at family level; station-format names resolve
+//!     through the merged allowlist, C02/D05).
+//!   * Alias force-includes (A01/A02: the merged reverse index is inside the engine; an
+//!     alias hit is a family member or nothing).
+//!   * The fuzzy gate plus the token/substring family with its number guards (T03/T05/T06:
+//!     stage structure, length scaling and the trailing-number guard live in the engine).
+//!   * SM's normalized-name groups (D07: grouping is the identity family key).
+//!   * The per-app cut `match_sensitivity` (D02/T10: retired in favour of `[matching]`
+//!     sensitivity).
 //!
 //! # Deliberate differences from the plugin
 //!
@@ -57,19 +64,25 @@
 //!     same verdict collected on purpose. A stream with no evidence either way is kept (fail
 //!     open, as the plugin's "no metadata" branch does), and when every candidate is dead
 //!     the whole list is kept rather than matching nothing.
-//!   * **No AI gate.** The plugin has none, and the plan says not to add one.
+//!   * **Borderline groups go through the `[ai.verify]` chain** (task "streams", same
+//!     pattern as guide's step-8 review: `UnifiedEngine::with_threshold`,
+//!     `UnifiedEngine::shortlist_index_in`, `match_run::score_shortlists`,
+//!     `RunEngine::shortlist_engine`). A group with no family at the cut is re-ranked at
+//!     the gate's floor; only a model accept can attach a sub-cut stream.
 
 use crate::epg::{EpgRun, EpgSettings, EpgTitles};
 use crate::quality::{self, QualityKey, QualityModel, StreamView, ThroughputSource};
 use crate::selection::{self, StreamPool};
 use crate::settings::StreamsSettings;
-use anyhow::Result;
+use anyhow::{Context, Result};
+use crosstalk_core::ai_gate;
 use crosstalk_core::channel_ops::{
     self, ApplyReport, Field, Op, Plan, ReportSpec, Selection, SetValue,
 };
-use crosstalk_core::config::{MatchingConfig, ScopeConfig};
+use crosstalk_core::config::{AiVerifyConfig, MatchingConfig, ScopeConfig};
 use crosstalk_core::csv_report;
 use crosstalk_core::dispatcharr::{Channel, Stream, World, WorldKind, WorldKinds};
+use crosstalk_core::engine_run::RunEngine;
 use crosstalk_core::jobs::JobContext;
 use crosstalk_core::scope::scope_channels;
 use crosstalk_core::store::Store;
@@ -78,17 +91,27 @@ use crosstalk_matching::callsign::{
     extract_callsign_with_confidence_for, normalize_callsign, CallsignLadder, CALLSIGN_DENYLIST,
 };
 use crosstalk_matching::country::{
-    self, classify, country_from_group, country_from_name, extract_zone,
+    self, classify, country_from_group, country_from_name, extract_zone_noguard,
     parse_prefix_country_overrides, FeedZone, Relationship,
 };
 use crosstalk_matching::data::{is_us_station, stream_mapparr_stations};
+use crosstalk_matching::engine::{EngineIndex as UnifiedIndex, EngineRanked, UnifiedEngine};
+use crosstalk_matching::identity::{resolve_with, FamilyKey, ResolveContext};
 use crosstalk_matching::normalize::Normalizer;
+use crosstalk_matching::pipeline::Scored;
+// Oracle tooling only (parity tests, the indexed-vs-full-scan check): the Stream-Mapparr
+// profile matcher and its entry points. Production scores with the unified engine.
+#[cfg(test)]
 use crosstalk_matching::pipeline::{
     BestMatch, CandidateIndex, MatchOptions as MatcherOptions, Matcher,
 };
+#[cfg(test)]
 use crosstalk_matching::profile::MatchProfile;
+#[cfg(test)]
 use crosstalk_matching::pyre::py_split_whitespace;
+#[cfg(test)]
 use crosstalk_matching::similarity::calculate_similarity_chars;
+#[cfg(test)]
 use crosstalk_matching::tokens::{is_digit, process_string_for_matching};
 use rayon::prelude::*;
 use regex::Regex;
@@ -382,6 +405,7 @@ impl CountryStats {
 /// name with `_clean_channel_name`, which honours `remove_cinemax` for a channel whose name
 /// contains `max`. [`StreamNames`] keeps the first; the second is computed on demand for those
 /// channels only ([`StreamNames::cinemax_variant`]).
+#[cfg(test)]
 struct StreamNames {
     /// The name matching sees (`_mname`), per eligible position.
     match_names: Vec<String>,
@@ -393,6 +417,7 @@ struct StreamNames {
     has_cinemax: Vec<bool>,
 }
 
+#[cfg(test)]
 impl StreamNames {
     /// Built over the run's candidate names, in the order and length of the candidate index.
     ///
@@ -427,6 +452,7 @@ impl StreamNames {
 }
 
 /// `re.sub(r'[\s&\-]+', '', text)`: the plugin's no-space form.
+#[cfg(test)]
 fn strip_nospace(text: &str) -> String {
     text.chars()
         .filter(|c| !(c.is_whitespace() || *c == '&' || *c == '-'))
@@ -434,6 +460,7 @@ fn strip_nospace(text: &str) -> String {
 }
 
 /// `_same_but_for_word_breaks` (637): identical once spaces are removed.
+#[cfg(test)]
 fn same_but_for_word_breaks(left: &str, right: &str) -> bool {
     if left.is_empty() || right.is_empty() {
         return false;
@@ -442,11 +469,13 @@ fn same_but_for_word_breaks(left: &str, right: &str) -> bool {
 }
 
 /// A two-character gram, packed for a hash key.
+#[cfg(test)]
 fn pack_gram(left: char, right: char) -> u64 {
     ((left as u64) << 32) | (right as u64)
 }
 
 /// Every adjacent pair of characters in `text`, as packed grams.
+#[cfg(test)]
 fn grams(text: &str) -> Vec<u64> {
     let chars: Vec<char> = text.chars().collect();
     chars
@@ -456,13 +485,16 @@ fn grams(text: &str) -> Vec<u64> {
 }
 
 /// The postings of one (gram, length-bucket) pair.
+#[cfg(test)]
 type Postings = Vec<u32>;
 
 /// Postings keyed by a gram and a coarse length bucket, so a lookup only walks names whose
 /// length could possibly qualify.
+#[cfg(test)]
 type GramIndex = HashMap<(u64, u16), Postings>;
 
 /// The length bucket of a name: `len >> 2`, so names within four characters share a bucket.
+#[cfg(test)]
 fn bucket(len: usize) -> u16 {
     (len.min(u32::MAX as usize) >> 2) as u16
 }
@@ -507,6 +539,7 @@ fn bucket(len: usize) -> u16 {
 /// The blocks are a UNION: being generous only costs time. Every predicate is then the
 /// plugin's own, applied per candidate.
 #[derive(Debug, Default)]
+#[cfg(test)]
 pub struct NameIndex {
     /// Normalised-lower name, whitespace/`&`/`-` removed -> positions.
     by_nospace: HashMap<String, Postings>,
@@ -531,6 +564,7 @@ pub struct NameIndex {
     processed_len: Vec<usize>,
 }
 
+#[cfg(test)]
 impl NameIndex {
     /// Build every block over the pool's eligible streams, reading the normalisations the
     /// candidate index already holds so each name is normalised once per run.
@@ -663,14 +697,6 @@ impl NameIndex {
             .unwrap_or_default()
     }
 
-    /// The positions carrying `base` as an upper-case callsign (the US-OTA mode).
-    fn callsign_candidates(&self, base: &str) -> Vec<u32> {
-        self.by_callsign_upper
-            .get(&base.to_uppercase())
-            .cloned()
-            .unwrap_or_default()
-    }
-
     /// The positions holding at least one of `tokens`.
     ///
     /// Used to INTERSECT the candidate union: a numbered channel's family hit always carries
@@ -692,6 +718,7 @@ impl NameIndex {
 /// The inclusive length window a qualifying pair's other side falls in.
 ///
 /// `min/max >= t` rewrites to `other >= t · my_len` and `other <= my_len / t`.
+#[cfg(test)]
 fn length_window(my_len: usize, t: f64) -> (usize, usize) {
     if my_len == 0 {
         return (0, usize::MAX);
@@ -702,6 +729,7 @@ fn length_window(my_len: usize, t: f64) -> (usize, usize) {
 }
 
 /// Union the postings of `grams` whose length bucket could lie in `[low, high]`.
+#[cfg(test)]
 fn collect_blocks(index: &GramIndex, grams: &[u64], low: usize, high: usize, out: &mut Vec<u32>) {
     if grams.is_empty() {
         return;
@@ -718,6 +746,7 @@ fn collect_blocks(index: &GramIndex, grams: &[u64], low: usize, high: usize, out
 }
 
 /// Every `\w+` run of a name (Python's `\w` includes `_` and Unicode letters/digits).
+#[cfg(test)]
 fn word_runs(name: &str) -> Vec<&str> {
     let mut runs = Vec::new();
     let mut start: Option<usize> = None;
@@ -783,21 +812,47 @@ struct Collected {
     country: CountryStats,
     /// Streams `_collect_epg_watch_streams` force-included for this group.
     watch_hits: usize,
+    /// The leader's match name and country hint: the async `[ai.verify]` gate re-ranks
+    /// empty groups at the floor from exactly this query (step 9).
+    gate_query: String,
+    gate_hint: Option<String>,
+}
+
+/// One group's AI-gate input: the leader's match name, its country hint, whether the
+/// `[matching]` cut left it empty, and the channels the accept would attach to.
+///
+/// Recorded by [`plan`] (which already ranks every group) so the async gate in `run`
+/// re-ranks only the empty groups at the `[ai.verify]` floor — the same pattern as
+/// guide's step-8 review.
+#[derive(Debug, Clone, Default)]
+pub struct GateGroup {
+    /// Position into [`MatchOutcome::gate_candidates`]' channels: the group's leader.
+    pub leader_channel_id: i64,
+    /// The match name the cut ranked (`matching_channel_name` of the leader).
+    pub query: String,
+    /// The country hint the cut ranked with (`None` when the filter is off or exempt).
+    pub country_hint: Option<String>,
+    /// The cut left this group with no family: the gate may promote a sub-cut family.
+    pub empty: bool,
+    /// The group's channel ids, in priority order: an accept attaches to all of them.
+    pub member_ids: Vec<i64>,
 }
 
 /// One scoped channel's group membership.
 ///
-/// Shared with [`crate::visibility`]: Stream-Mapparr's `_build_channel_groups` is ONE
-/// implementation for Match & Assign, Preview and Manage Channel Visibility (bug-158 review
-/// I1 — a second copy silently re-merged the country-split groups and disabled the very
-/// channel the fix was for). The grouping below is that one implementation here too.
+/// Shared with [`crate::visibility`]: one grouping for match and visibility (step 9 keys
+/// it by identity family, so both apps group the same channels together). `pub` so the
+/// cross-app consistency gate reads the same groups; constructed only by [`build_groups`].
 #[derive(Debug, Clone)]
-pub(crate) struct Group {
+pub struct Group {
     /// The grouping key, kept for diagnostics (the report names groups by their channels).
     #[allow(dead_code)]
     pub(crate) key: String,
-    /// Positions in [`RunData`]'s scoped channel list, in channel order.
-    pub(crate) members: Vec<usize>,
+    /// Positions in the scoped channel list, in channel order.
+    ///
+    /// `pub` so the cross-app consistency gate reads the same groups match and
+    /// visibility plan against.
+    pub members: Vec<usize>,
 }
 
 /// The result of one group: its collection and the assignments for its channels.
@@ -847,47 +902,108 @@ impl Assignment {
     }
 }
 
-/// Build the channel groups: `_build_channel_groups` (6820).
+/// The grouping key of one channel: the identity family key, qualified with the country
+/// the ranker fixes for the channel's family.
 ///
-/// The key is the cleaned name — `OTA_<callsign>` when the channel's DATABASE entry carries a
-/// callsign, which none of the shipped databases do — country-qualified with `@@<code>` when
-/// the country filter is on and the channel is not OTA. A channel whose country cannot be
-/// resolved is not qualified (the plugin's fail-open rule).
+/// Step 9 (D07): grouping is the [`FamilyKey`] (normalize key + zone + timeshift +
+/// callsign), not SM's normalized name. Identity equality also holds country when it is
+/// known (G03: `UK: CNN` and `US: CNN` are different feeds), and the collector ranks the
+/// group LEADER, so every member must be a channel the leader's family is right for: the
+/// key carries the family's country, `@@<code>`, exactly as [`Collector::collect`] fixes
+/// it — the country filter's code when the filter is on ([`query_country`]: SM's
+/// `_channel_country_code`, database and group name included, bug-158), else the name's
+/// own marker (the engine's rule with no hint). Filter on or off, two channels whose
+/// families would differ by country never share a group, so a leader's family is never
+/// written to another country's channel, and visibility never enables one country's
+/// channel to disable the other's (bug-158 review I1). A callsign-bearing identity is
+/// never country-qualified (bug-161: families ignore country for callsigns). A channel
+/// whose country is unknown is not qualified (fail open).
 ///
-/// `pub(crate)` because [`crate::visibility`] groups through this same function: the plugin
-/// shares one grouping between match and visibility, and so does this crate.
-pub(crate) fn build_groups(
+/// `pub(crate)` because [`crate::visibility`] groups through the same key: match and
+/// visibility group the same channels together.
+pub(crate) fn group_identity_key(
+    channel: &Channel,
+    engine: &UnifiedEngine,
+    restrict_country: bool,
+    database: &ChannelDatabase,
+    group_name: &str,
+) -> String {
+    let identity = resolve_with(engine, &channel.name, &ResolveContext::default());
+    let FamilyKey {
+        key,
+        zone,
+        timeshift,
+        callsign,
+    } = identity.family_key();
+    let mut base = format!(
+        "{key}|{zone:?}|{timeshift}|{}",
+        callsign.as_deref().unwrap_or("")
+    );
+    if callsign.is_none() {
+        let hint = query_country(channel, restrict_country, database, group_name);
+        if let Some(country) = hint.as_deref().or(identity.country.as_deref()) {
+            base.push_str(&format!("@@{country}"));
+        }
+    }
+    base
+}
+
+/// The country hint a channel's family is ranked under: the country filter's code
+/// (`_channel_country_code`, ambiguity guard included) when the filter is on, `None`
+/// when it is off (the engine then reads the name's own marker). One helper for the
+/// grouping key and the collector, so the two can never disagree on a channel's country.
+/// Callsign exemption (bug-161) is the caller's: both callers check the identity first.
+fn query_country(
+    channel: &Channel,
+    restrict_country: bool,
+    database: &ChannelDatabase,
+    group_name: &str,
+) -> Option<String> {
+    if !restrict_country {
+        return None;
+    }
+    channel_country_code(channel, database, true, group_name)
+}
+
+/// Build the channel groups: one group per identity family key.
+///
+/// Step 9 replaces SM's `_build_channel_groups` (6820): the key is
+/// [`group_identity_key`], so a channel name gets the same group in match and in
+/// visibility, and the same identity it gets in guide. `normalizer`/`tags` stay in the
+/// signature (unused) so the oracle harnesses keep compiling against one grouping entry
+/// point; the database and group names feed the country qualifier.
+///
+/// `pub` (not just `pub(crate)`) so [`crate::visibility`] and the cross-app
+/// consistency gate group through this same function: one grouping for match and
+/// visibility.
+#[allow(clippy::too_many_arguments)]
+pub fn build_groups(
     channels: &[Channel],
     database: &ChannelDatabase,
-    normalizer: &Normalizer,
-    tags: &[&str],
+    _normalizer: &Normalizer,
+    _tags: &[&str],
     restrict_country: bool,
     group_names: &HashMap<i64, String>,
+    engine: &UnifiedEngine,
 ) -> Vec<Group> {
     let mut groups: Vec<Group> = Vec::new();
     let mut positions: HashMap<String, usize> = HashMap::new();
+    // One key per distinct (name, channel group): channels share names (four per group
+    // in the bench world, more in real lineups), resolution is the grouping's whole
+    // cost, and the country qualifier reads the channel group's name.
+    let mut keys: HashMap<(&str, Option<i64>), String> = HashMap::new();
     for (position, channel) in channels.iter().enumerate() {
-        let info = database.info(&channel.name);
-        let base = match info.and_then(|entry| entry.callsign.clone()) {
-            Some(callsign) if !callsign.trim().is_empty() => format!("OTA_{}", callsign.trim()),
-            _ => normalizer.normalize_name(&channel.name, tags),
-        };
-        // An OTA channel is never country-qualified (bug-161): the callsign is a stronger
-        // per-channel identity than a country code.
-        let key =
-            if !restrict_country || ota_callsign(channel, database, normalizer, tags).is_some() {
-                base
-            } else {
+        let key = keys
+            .entry((channel.name.as_str(), channel.channel_group_id))
+            .or_insert_with(|| {
                 let group_name = channel
                     .channel_group_id
                     .and_then(|id| group_names.get(&id))
                     .map(String::as_str)
                     .unwrap_or("No Group");
-                match channel_country_code(channel, database, true, group_name) {
-                    Some(code) => format!("{base}@@{code}"),
-                    None => base,
-                }
-            };
+                group_identity_key(channel, engine, restrict_country, database, group_name)
+            })
+            .clone();
         match positions.get(&key) {
             Some(existing) => groups[*existing].members.push(position),
             None => {
@@ -908,6 +1024,7 @@ pub(crate) fn build_groups(
 /// reads one out of the Dispatcharr channel name (the bug-063 fallback, which is the ONLY path
 /// that resolves a callsign in production). Every site that asks "is this channel OTA" goes
 /// through here, so the country filter's exemption and the callsign matcher cannot disagree.
+#[cfg(test)]
 fn ota_callsign(
     channel: &Channel,
     database: &ChannelDatabase,
@@ -926,6 +1043,7 @@ fn ota_callsign(
 
 /// `_resolve_ota_callsign` (5585): a paren callsign, unless it is a 3-letter word the station
 /// table does not list.
+#[cfg(test)]
 fn resolve_ota_callsign(
     channel_name: &str,
     normalizer: &Normalizer,
@@ -958,6 +1076,7 @@ fn resolve_ota_callsign(
 
 /// `Plugin._remove_ignore_tags` (5560): a plain word is stripped on word boundaries, anything
 /// else as a literal followed by `\s*`.
+#[cfg(test)]
 fn remove_ignore_tags(name: &str, normalizer: &Normalizer, tags: &[&str]) -> String {
     let mut out = name.to_string();
     for tag in tags {
@@ -979,11 +1098,13 @@ fn remove_ignore_tags(name: &str, normalizer: &Normalizer, tags: &[&str]) -> Str
 }
 
 /// Python's `^\w+$` for a tag.
+#[cfg(test)]
 fn is_plain_word(tag: &str) -> bool {
     !tag.is_empty() && tag.chars().all(|c| c.is_alphanumeric() || c == '_')
 }
 
 /// `_extract_paren_callsign` (5536): `(WKRG)` / `(WKRG-TV)`, minus the brand words.
+#[cfg(test)]
 fn extract_paren_callsign(name: &str) -> Option<String> {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     let re = RE.get_or_init(|| {
@@ -998,6 +1119,7 @@ fn extract_paren_callsign(name: &str) -> Option<String> {
 }
 
 /// `_fcc_rejects_callsign` (5572): a 3-letter callsign the station table does not list.
+#[cfg(test)]
 fn fcc_rejects_callsign(callsign: &str) -> bool {
     callsign.chars().count() == 3 && !is_us_station(callsign)
 }
@@ -1054,6 +1176,7 @@ fn callsign_corroborated(stream_name: &str, callsign: &str) -> bool {
 
 /// `re.search(r'\b' + re.escape(callsign) + r'\b', name, re.IGNORECASE)`, the grouped path's
 /// predicate.
+#[cfg(test)]
 fn word_boundary_contains_ci(name: &str, callsign: &str) -> bool {
     let pattern = format!(r"(?i)\b{}\b", regex::escape(callsign));
     match Regex::new(&pattern) {
@@ -1074,11 +1197,33 @@ fn word_boundary_contains_ci(name: &str, callsign: &str) -> bool {
 struct RunData<'a> {
     pool: &'a StreamPool<'a>,
     database: ChannelDatabase,
-    /// The candidate index over the eligible streams, built WITH the run's ignore tags so its
-    /// normalisations are the ones `fuzzy_match` scores (`precompute_normalizations`).
+    /// The unified engine (one ranker) and its candidate index over the eligible streams'
+    /// match names: the production collection path ranks leaders against this.
+    engine: Arc<UnifiedEngine>,
+    engine_index: UnifiedIndex,
+    /// The eligible streams' match names (EPG-resolved, regex rules applied), in pool
+    /// order: what the OTA prefilter scans and what the gate reports through.
+    /// Production reads only these, never the oracle names below.
+    match_names: Vec<String>,
+    /// The original positions each deduped engine-index name stands for, in
+    /// first-occurrence order. Pools carry whole families under one name (ten streams
+    /// per family in the bench world); ranking the name once and expanding to its
+    /// positions scores a fraction of the candidates for the same family (same key,
+    /// same name-derived country, pool order among equals).
+    unique_members: Vec<Vec<usize>>,
+    /// The SM oracle index over the eligible streams, built WITH the run's ignore tags so
+    /// its normalisations are the ones `fuzzy_match` scores (`precompute_normalizations`).
+    /// Oracle tooling only (parity tests, the indexed-vs-full-scan check): production
+    /// collection ranks against `engine_index`. Absent from the binary.
+    #[cfg(test)]
     index: CandidateIndex,
+    #[cfg(test)]
     names: StreamNames,
+    #[cfg(test)]
     name_index: NameIndex,
+    /// The upper-case callsign prefilter for the US-OTA-only mode (the mode's narrow
+    /// candidate rule; one map, built once per run).
+    callsign_index: HashMap<String, Vec<usize>>,
     /// Eligible stream ids, in pool order: `ids[position]`.
     ids: Vec<i64>,
     /// The reverse of `ids`, so a stream id resolves to its position in one lookup.
@@ -1094,7 +1239,8 @@ struct RunData<'a> {
     watch_positions: Vec<usize>,
     /// What the stream-side EPG pass did, for the report.
     epg_run: EpgRun,
-    /// `extract_zone(stream['name'])`, from the RAW name, as `_order_streams_for_zone` reads it.
+    /// The identity zone of `stream['name']`, from the RAW name, as `_order_streams_for_zone`
+    /// reads it (step 9: `extract_zone_noguard`, the one zone rule Z01/Z02/Z07).
     zones: HashMap<i64, FeedZone>,
     /// The stream's country, per position. Empty when the country filter is off.
     stream_countries: Vec<Option<String>>,
@@ -1106,6 +1252,9 @@ struct RunData<'a> {
     group_names: HashMap<i64, String>,
     tags: Vec<String>,
     normalizer: Normalizer,
+    /// The oracle cut the SM collector scores at (the host `[matching]` cut): read only
+    /// by the oracle collection path. Absent from the binary.
+    #[cfg(test)]
     threshold: u8,
 }
 
@@ -1122,7 +1271,6 @@ impl<'a> RunData<'a> {
         epg: Option<&'a EpgTitles>,
     ) -> Self {
         let tags: Vec<String> = options.ignore_tags.clone();
-        let tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
 
         // `_filter_working_streams`: a dead stream is not a candidate, on exactly the
         // plugin's evidence — `stream_stats` saying dead (`_stream_stats_says_dead`, which is
@@ -1183,14 +1331,22 @@ impl<'a> RunData<'a> {
                 }
             }
         }
-        let index = CandidateIndex::build_with_tags(&names, &options.matcher, &tag_refs);
-        let stream_names = StreamNames::new(&names, &index);
-        let name_index = NameIndex::build(
-            &index,
-            &stream_names,
-            &options.matcher.normalizer().without_cinemax(),
-            &tag_refs,
-        );
+        // Oracle tooling only: the SM profile index, its names and its blocks (parity
+        // tests, the indexed-vs-full-scan check). Production ranks `match_names`
+        // against the unified index. Absent from the binary.
+        #[cfg(test)]
+        let (index, stream_names, name_index) = {
+            let tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
+            let index = CandidateIndex::build_with_tags(&names, &options.matcher, &tag_refs);
+            let stream_names = StreamNames::new(&names, &index);
+            let name_index = NameIndex::build(
+                &index,
+                &stream_names,
+                &options.matcher.normalizer().without_cinemax(),
+                &tag_refs,
+            );
+            (index, stream_names, name_index)
+        };
 
         let keys: Vec<QualityKey> = ids
             .iter()
@@ -1229,7 +1385,7 @@ impl<'a> RunData<'a> {
 
         let mut zones: HashMap<i64, FeedZone> = HashMap::with_capacity(world.streams.len());
         for stream in &world.streams {
-            zones.insert(stream.id, extract_zone(&stream.name));
+            zones.insert(stream.id, extract_zone_noguard(&stream.name));
         }
 
         let group_names: HashMap<i64, String> = world
@@ -1291,12 +1447,50 @@ impl<'a> RunData<'a> {
             }
         }
 
+        // The unified candidate index over the run's match names (EPG-resolved above):
+        // one normalisation per stream, shared by every group's family rank.
+        // Dedup the match names for the engine index, keeping first-occurrence order:
+        // pools carry whole families under one name, and every position behind one
+        // name shares its key, its name-derived country and its zone. Expansion back to
+        // positions is pool-ordered, which is the engine's own tie order (stable sort).
+        let mut unique_names: Vec<String> = Vec::new();
+        let mut unique_members: Vec<Vec<usize>> = Vec::new();
+        let mut unique_of: HashMap<&str, usize> = HashMap::new();
+        for (position, name) in names.iter().enumerate() {
+            if let Some(&unique) = unique_of.get(name.as_str()) {
+                unique_members[unique].push(position);
+            } else {
+                unique_of.insert(name.as_str(), unique_names.len());
+                unique_names.push(name.clone());
+                unique_members.push(vec![position]);
+            }
+        }
+        let engine_index =
+            UnifiedIndex::build(&unique_names, &options.engine, &ResolveContext::default());
+        // The US-OTA-only mode's upper-case callsign prefilter (the mode's narrow
+        // candidate rule, not the matcher): every upper-case callsign-shaped occurrence
+        // keyed by its base, so a channel's callsign resolves to positions in one lookup.
+        let mut callsign_index: HashMap<String, Vec<usize>> = HashMap::new();
+        for (position, name) in names.iter().enumerate() {
+            for callsign in upper_callsigns(name) {
+                callsign_index.entry(callsign).or_default().push(position);
+            }
+        }
+
         Self {
             pool,
             database: options.database.clone(),
+            engine: Arc::clone(&options.engine),
+            engine_index,
+            #[cfg(test)]
             index,
+            match_names: names,
+            #[cfg(test)]
             names: stream_names,
+            #[cfg(test)]
             name_index,
+            unique_members,
+            callsign_index,
             ids,
             position_of_id,
             keys,
@@ -1309,8 +1503,11 @@ impl<'a> RunData<'a> {
             known_total,
             group_names,
             tags,
-            normalizer: *options.matcher.normalizer(),
-            threshold: options.matcher.options().match_threshold,
+            // One normalizer: the unified engine's decided flags (step 9), not the SM
+            // profile's. `clean_channel` (the watch path) and `zone_routed` read this.
+            normalizer: *options.engine.normalizer(),
+            #[cfg(test)]
+            threshold: options.engine.threshold(),
         }
     }
 
@@ -1348,6 +1545,7 @@ impl<'a> RunData<'a> {
     /// `_clean_channel_name(name, ..., remove_cinemax=True)`, for the family comparison on a
     /// channel whose name contains `max` (the plugin cleans the CHANNEL side with the same
     /// flag it cleans the candidate side with).
+    #[cfg(test)]
     fn clean_channel_cinemax(&self, name: &str) -> String {
         if !name.to_lowercase().contains("cinemax") {
             return self.clean_channel(name);
@@ -1361,6 +1559,7 @@ impl<'a> RunData<'a> {
 
     /// The same, for a stream and a channel whose name contains `max`:
     /// `_clean_channel_name(_mname(stream), ..., remove_cinemax=channel_has_max)`.
+    #[cfg(test)]
     fn clean_stream(&self, position: usize, remove_cinemax: bool) -> (String, Vec<char>) {
         if !remove_cinemax {
             let lower = self
@@ -1424,14 +1623,108 @@ struct Collector<'a> {
 }
 
 impl<'a> Collector<'a> {
-    /// `_match_streams_to_channel` (5808), path for path, over the indexed candidate set.
+    /// The group's answer: the leader's best identity family of streams at the one
+    /// `[matching]` cut (step 9, D07: the whole family, all members in rank order),
+    /// plus the EPG watched-stream force-includes when that path is on.
+    ///
+    /// Removed Stream-Mapparr rules, each traced in the module docs: the OTA callsign
+    /// regex path (C06/D04: the engine anchor decides at family level), alias
+    /// force-includes (A01/A02: the merged reverse index is inside the engine), and the
+    /// fuzzy gate with the token/substring family (T03/T05/T06). EPG placeholder titles
+    /// still supply the match name (`matching_channel_name`); dedupe, same-country
+    /// first, zone routing and the quality sort below are unchanged.
     fn collect(&self, leader: &Channel) -> Collected {
-        self.collect_with(leader, false)
+        let data = self.data;
+        let group_name = data.channel_group_name(leader);
+        // The match name: the EPG path rewrites it (schedule cleanup, then the current
+        // title for a placeholder), and the family rank reads it. The country filter
+        // reads the channel's real name, as the plugin's `_get_channel_info_and_matches`
+        // does.
+        let channel_name = data.matching_channel_name(leader);
+        // bug-158/bug-161: the enforced country, the same-country set and the counters —
+        // one helper shared with the `[ai.verify]` accept path.
+        let (channel_country, same_country, country) =
+            group_country(data, self.options, leader, &group_name);
+        let excluded = |position: usize| -> bool {
+            match channel_country.as_deref() {
+                Some(code) => {
+                    matches!(
+                        classify(Some(code), data.stream_country(position)),
+                        Relationship::Foreign
+                    )
+                }
+                None => false,
+            }
+        };
+
+        // One ranker: the leader's best identity family at the `[matching]` cut, all
+        // members in rank order (D07). The engine already applies its country rule (G03)
+        // on the same hint; `excluded` keeps the run's foreign/unknown counters exact.
+        // The rank runs over the DEDUPED names and expands to positions in pool order:
+        // same set and order as ranking every position (same key, same name-derived
+        // country, stable tie order), at a fraction of the candidates.
+        let family = data.engine.rank_index_in(
+            &channel_name,
+            channel_country.as_deref(),
+            &data.engine_index,
+        );
+        let top = family
+            .first()
+            .map(|member| (member.score, member.method.clone()));
+        let mut matched: Vec<usize> = Vec::new();
+        for member in &family {
+            let Some(members) = data.unique_members.get(member.index) else {
+                continue;
+            };
+            for position in members {
+                if !excluded(*position) {
+                    matched.push(*position);
+                }
+            }
+        }
+        // `_collect_epg_watch_streams`: the independent force-include list — a watched
+        // stream keeps matching its own channel by name AND can surface here. Token
+        // CONTAINMENT is the gate (kept: it is EPG data, not an SM matching rule).
+        let watch = self.watch_positions(&channel_name, &excluded);
+        let watch_hits = watch.len();
+        let mut seen: HashSet<usize> = matched.iter().copied().collect();
+        for position in watch {
+            if seen.insert(position) {
+                matched.push(position);
+            }
+        }
+
+        if matched.is_empty() {
+            return Collected {
+                ids: Vec::new(),
+                reason: "No identity family match".to_string(),
+                country,
+                watch_hits: 0,
+                gate_query: channel_name,
+                gate_hint: channel_country,
+            };
+        }
+        let reason = match top {
+            Some((score, method)) => {
+                format!("Identity family match ({}, score: {score})", method.label())
+            }
+            None => "Identity family match (watch-only)".to_string(),
+        };
+        Collected {
+            ids: self.finalize(&matched, same_country.as_ref()),
+            reason,
+            gate_query: channel_name,
+            gate_hint: channel_country,
+            country,
+            watch_hits,
+        }
     }
 
-    /// The collector itself. `all` makes every stage read the WHOLE pool, which is the
-    /// plugin's own shape and exists so a test can prove the index never changes an answer
-    /// (see `tests::the_indexed_collector_agrees_with_a_full_scan`).
+    /// The Stream-Mapparr collector (`_match_streams_to_channel`, 5808), path for path,
+    /// over the indexed candidate set. Oracle tooling only: the parity tests pin the port
+    /// against the plugin, and `tests::the_indexed_collector_agrees_with_a_full_scan`
+    /// proves the index never changes its answer. Production collects with [`Self::collect`].
+    #[cfg(test)]
     fn collect_with(&self, leader: &Channel, all: bool) -> Collected {
         let data = self.data;
         let group_name = data.channel_group_name(leader);
@@ -1549,6 +1842,8 @@ impl<'a> Collector<'a> {
                     reason: "Callsign match".to_string(),
                     country,
                     watch_hits: 0,
+                    gate_query: channel_name.clone(),
+                    gate_hint: channel_country.clone(),
                 };
             }
         }
@@ -1663,6 +1958,8 @@ impl<'a> Collector<'a> {
                 reason: "No fuzzy match".to_string(),
                 country,
                 watch_hits: 0,
+                gate_query: channel_name,
+                gate_hint: channel_country,
             };
         }
 
@@ -1699,6 +1996,8 @@ impl<'a> Collector<'a> {
                 reason: "No fuzzy match".to_string(),
                 country,
                 watch_hits,
+                gate_query: channel_name,
+                gate_hint: channel_country,
             };
         }
         // `_match_streams_to_channel`'s reason: an alias-only group says so, anything the
@@ -1719,6 +2018,8 @@ impl<'a> Collector<'a> {
             reason,
             country,
             watch_hits,
+            gate_query: channel_name,
+            gate_hint: channel_country,
         }
     }
 }
@@ -1731,6 +2032,7 @@ impl<'a> Collector<'a> {
     /// one of them, in stream order. Looking the variants up in the no-space block reaches the
     /// same streams (an equal normalised form implies an equal no-space form) and the exact
     /// predicate below rejects anything the block over-collected.
+    #[cfg(test)]
     fn alias_positions(&self, channel_name: &str, excluded: &dyn Fn(usize) -> bool) -> Vec<usize> {
         let matcher = &self.options.matcher;
         let variants = matcher.alias_variants(channel_name);
@@ -1886,6 +2188,7 @@ impl<'a> Collector<'a> {
 /// are the whitespace tokens of the two names, pre-split by the caller: this runs once per
 /// candidate per group, so it allocates nothing.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn family_hit(
     stream_lower: &str,
     stream_chars: &[char],
@@ -2009,6 +2312,7 @@ fn family_hit(
 
 /// Python's `int(ratio * 100)`: truncating, so a 0.7 that lands at 69.999… stays below 70 —
 /// which is what the plugin's own float comparison does.
+#[cfg(test)]
 fn percentage(ratio: f64) -> u8 {
     (ratio * 100.0) as u8
 }
@@ -2019,7 +2323,15 @@ fn percentage(ratio: f64) -> u8 {
 
 /// Everything a match run resolves from `streams.toml` and `crosstalk.toml`.
 pub struct MatchOptions {
-    /// The matcher the run scores with, its threshold set from `match_sensitivity`.
+    /// The unified engine the run scores with, at the one `[matching]` cut (step 9,
+    /// D02/T10 `janitor-95`). Production (`plan`, `collect`, `build_groups`) reads only
+    /// this; `match_sensitivity` is retired.
+    pub engine: Arc<UnifiedEngine>,
+    /// The Stream-Mapparr profile matcher: oracle tooling for the parity tests and the
+    /// indexed-vs-full-scan check. Production never consults it: every production
+    /// predicate (grouping, collection, the cut) is the unified engine. Built only
+    /// under `cfg(test)`, so the binary contains one matcher.
+    #[cfg(test)]
     pub matcher: Matcher,
     /// The quality model the finalise sort uses (sort's own, shared).
     pub model: QualityModel,
@@ -2067,24 +2379,32 @@ impl MatchOptions {
         matching: &MatchingConfig,
         database: Option<ChannelDatabase>,
     ) -> Self {
-        let threshold = settings.match_threshold();
-        let config = matching.matcher_config();
-        let profile = MatchProfile::StreamMapparr;
-        let matcher = Matcher::new(
-            profile.normalize_flags(config.flags),
-            config.aliases_for(profile),
-            Arc::new(config.known_callsigns_for(profile)),
-            MatcherOptions {
-                match_threshold: threshold,
-                ..profile.options()
-            },
-        );
+        let engine = Arc::new(UnifiedEngine::new(&matching.engine_config()));
+        // Oracle tooling only (parity tests, the indexed-vs-full-scan check): the SM
+        // profile matcher at the host `[matching]` cut. Production scores with
+        // `engine`, above — and without this field in the binary.
+        #[cfg(test)]
+        let matcher = {
+            let config = matching.matcher_config();
+            let profile = MatchProfile::StreamMapparr;
+            Matcher::new(
+                profile.normalize_flags(config.flags),
+                config.aliases_for(profile),
+                Arc::new(config.known_callsigns_for(profile)),
+                MatcherOptions {
+                    match_threshold: matching.threshold(),
+                    ..profile.options()
+                },
+            )
+        };
         let database = database.unwrap_or_else(|| {
             let codes: Vec<String> = matching.databases();
             let codes: Vec<&str> = codes.iter().map(String::as_str).collect();
             ChannelDatabase::shipped(&codes)
         });
         Self {
+            engine,
+            #[cfg(test)]
             matcher,
             model: QualityModel::from_settings(settings),
             overwrite_streams: settings.overwrite_streams,
@@ -2139,6 +2459,12 @@ pub struct MatchOutcome {
     pub ota: Option<OtaSkipped>,
     /// What EPG-aware placeholder matching did, when it is on.
     pub epg: Option<EpgRun>,
+    /// One entry per group, in group order: the async `[ai.verify]` gate's inputs.
+    /// Empty for OTA-only mode (no grouping, no gate).
+    pub gate_groups: Vec<GateGroup>,
+    /// The candidate match names the engine index ranked, in position order, with their
+    /// stream ids: shortlist positions resolve through these.
+    pub gate_candidates: Vec<(i64, String)>,
 }
 
 impl MatchOutcome {
@@ -2236,6 +2562,7 @@ pub fn plan(
         &tag_refs,
         options.restrict_matching_to_country,
         &data.group_names,
+        &options.engine,
     );
     // `_zone_routed_map` runs once over every scoped channel, because a channel qualifies
     // through a SIBLING's zone.
@@ -2250,13 +2577,30 @@ pub fn plan(
         .par_iter()
         .map(|group| collect_group(&collector, group, &scoped.channels, &zones))
         .collect();
-    for result in results {
+    for (group, result) in groups.iter().zip(results) {
         outcome.country.merge(result.collected.country);
         if let Some(epg) = outcome.epg.as_mut() {
             epg.watch_hits += result.collected.watch_hits;
         }
+        let sorted = sort_channels_by_priority(group, &scoped.channels);
+        outcome.gate_groups.push(GateGroup {
+            leader_channel_id: scoped.channels[sorted[0]].id,
+            query: result.collected.gate_query.clone(),
+            country_hint: result.collected.gate_hint.clone(),
+            empty: result.collected.ids.is_empty(),
+            member_ids: sorted
+                .iter()
+                .map(|position| scoped.channels[*position].id)
+                .collect(),
+        });
         outcome.assignments.extend(result.assignments);
     }
+    outcome.gate_candidates = data
+        .ids
+        .iter()
+        .zip(data.match_names.iter())
+        .map(|(id, name)| (*id, name.clone()))
+        .collect();
     // The stream-side pass ran once, in `RunData::new`, before the groups.
     if let Some(epg) = outcome.epg.as_mut() {
         epg.checked = data.epg_run.checked;
@@ -2276,14 +2620,31 @@ fn collect_group(
     let sorted = sort_channels_by_priority(group, channels);
     let leader = &channels[sorted[0]];
     let collected = collector.collect(leader);
+    assign_group(collector, group, &sorted, channels, zones, &collected)
+}
+
+/// Assign one group's collected streams to its channels: `visible_channel_limit` / zone
+/// siblings select the channels, then per-channel zone routing, the country partition and
+/// the overwrite-or-append list.
+///
+/// Split from [`collect_group`] so the `[ai.verify]` gate reuses the same assignment for
+/// a model-promoted family: only the collection differs (floor-ranked, model-accepted).
+fn assign_group(
+    collector: &Collector<'_>,
+    _group: &Group,
+    sorted: &[usize],
+    channels: &[Channel],
+    zones: &HashMap<i64, FeedZone>,
+    collected: &Collected,
+) -> GroupResult {
     let to_update = channels_to_update(
-        &sorted,
+        sorted,
         channels,
         collector.options.visible_channel_limit,
         zones,
     );
     let mut assignments: Vec<Assignment> = Vec::with_capacity(sorted.len());
-    for channel_position in &sorted {
+    for channel_position in sorted.iter() {
         let channel = &channels[*channel_position];
         // `to_update` holds channel POSITIONS (values of `sorted`), not indices into it.
         let updated = to_update.contains(channel_position);
@@ -2319,9 +2680,382 @@ fn collect_group(
         assignments.push(assignment);
     }
     GroupResult {
-        collected,
+        collected: collected.clone(),
         assignments,
     }
+}
+
+/// The shortlist adapter: the gate speaks the profile `Scored` shape, while the unified
+/// engine ranks families of [`EngineRanked`]. The score and the order carry over untouched,
+/// and the engine method maps onto the coarse components (the same adapter as guide's
+/// `to_scored`: the walk, the gate and the report share one shape).
+fn to_scored(shortlist: &[EngineRanked]) -> Vec<Scored> {
+    use crosstalk_matching::engine::EngineMethod;
+    shortlist
+        .iter()
+        .map(|member| {
+            let components = match member.method {
+                EngineMethod::Alias => vec!["Alias"],
+                EngineMethod::Exact => vec!["Exact"],
+                EngineMethod::Substring => vec!["Substring"],
+                EngineMethod::Fuzzy(_) => vec!["Fuzzy"],
+                EngineMethod::Callsign => vec!["Callsign"],
+            };
+            Scored {
+                index: member.index,
+                score: member.score,
+                components,
+            }
+        })
+        .collect()
+}
+
+/// The `[ai.verify]` gate for borderline groups (step 9, task "streams"): a group with
+/// no family at the `[matching]` cut is re-ranked by the same engine and index at the
+/// gate's floor ([`RunEngine::shortlist_engine`]: [`UnifiedEngine::with_threshold`] +
+/// [`UnifiedEngine::shortlist_index_in`], guide's step-8 pattern, threaded with the
+/// group's country hint so the gate applies the same country rule as the cut), and the
+/// verify-band / rescue candidates go to the chain with task `"streams"`. Only a model
+/// accept attaches streams — the accepted candidate's identity family at the floor —
+/// through the same finalize + assign path as the cut ([`assign_group`]).
+///
+/// A no-op unless the gate can fire and at least one group came back empty: with the
+/// default (off) policy this costs nothing, and [`plan`] alone never consults a model.
+#[allow(clippy::too_many_arguments)]
+async fn apply_ai_gate(
+    outcome: &mut MatchOutcome,
+    world: &World,
+    scoped: &[Channel],
+    settings: &StreamsSettings,
+    options: &Arc<MatchOptions>,
+    throughput: &Arc<dyn ThroughputSource>,
+    context: &JobContext,
+    ai: Option<&crosstalk_core::ai::AiService>,
+) -> Result<()> {
+    let ai_settings: &AiVerifyConfig = &context.config().ai.verify;
+    // The run's own engine (built once from `[matching]` in `MatchOptions`), re-cut at
+    // the gate's floor: the same ranker, the same data, no second load.
+    let run_engine = RunEngine::with_engine(Arc::clone(&options.engine), None);
+    let Some(short_engine) = run_engine.shortlist_engine(ai_settings) else {
+        return Ok(());
+    };
+    let empty: Vec<usize> = outcome
+        .gate_groups
+        .iter()
+        .enumerate()
+        .filter(|(_, group)| group.empty)
+        .map(|(ordinal, _)| ordinal)
+        .collect();
+    if empty.is_empty() {
+        return Ok(());
+    }
+    // Position-aligned candidates for the gate: every engine-index position's stream, so
+    // `Scored.index` addresses the candidate slice (the same contract guide's walk uses).
+    // A dangling id skips the gate, never the run.
+    let by_id: HashMap<i64, &Stream> = world
+        .streams
+        .iter()
+        .map(|stream| (stream.id, stream))
+        .collect();
+    let mut candidates: Vec<Stream> = Vec::with_capacity(outcome.gate_candidates.len());
+    for (id, _) in &outcome.gate_candidates {
+        let Some(stream) = by_id.get(id).copied() else {
+            return Ok(());
+        };
+        candidates.push(stream.clone());
+    }
+    let candidate_names: Vec<String> = outcome
+        .gate_candidates
+        .iter()
+        .map(|(_, name)| name.clone())
+        .collect();
+    let index = Arc::new(UnifiedIndex::build(
+        &candidate_names,
+        &options.engine,
+        &ResolveContext::default(),
+    ));
+    // The same ranker at the floor, with each group's own country hint: rayon off the
+    // async runtime, group order preserved. (`match_run::score_shortlists` is guide's
+    // hintless convenience wrapper; streams groups carry hints, so the hint threads
+    // through here to keep the gate's country rule identical to the cut's.)
+    let queries: Vec<(String, Option<String>)> = empty
+        .iter()
+        .map(|&ordinal| {
+            let group = &outcome.gate_groups[ordinal];
+            (group.query.clone(), group.country_hint.clone())
+        })
+        .collect();
+    let shortlists: Vec<Vec<EngineRanked>> = tokio::task::spawn_blocking({
+        let short_engine = Arc::clone(&short_engine);
+        let index = Arc::clone(&index);
+        move || {
+            queries
+                .par_iter()
+                .map(|(query, hint)| {
+                    short_engine.shortlist_index_in(query, hint.as_deref(), &index)
+                })
+                .collect()
+        }
+    })
+    .await
+    .context("the AI shortlist stage panicked")?;
+    // The gate + ask, one group at a time: borderline groups are rare, and a cancel
+    // lands between groups rather than after the whole scope.
+    let known = run_engine.engine().known().clone();
+    // The audit row is the REPORT row the answer labels: the leader's assignment (the
+    // CSV writes one row per assignment, in `assignments` order), as guide records the
+    // channel ordinal of its one-row-per-channel report.
+    let report_row: HashMap<i64, usize> = outcome
+        .assignments
+        .iter()
+        .enumerate()
+        .map(|(row, assignment)| (assignment.channel_id, row))
+        .collect();
+    let mut accepts: Vec<(usize, usize)> = Vec::new();
+    for (position, &ordinal) in empty.iter().enumerate() {
+        if context.is_cancelled() {
+            anyhow::bail!("cancelled by the operator");
+        }
+        let group = &outcome.gate_groups[ordinal];
+        let Some(&row) = report_row.get(&group.leader_channel_id) else {
+            continue;
+        };
+        let scored = to_scored(&shortlists[position]);
+        let Some((reason, offered)) = ai_gate::shortlist(&scored, &candidates, ai_settings) else {
+            continue;
+        };
+        let Some(leader) = scoped
+            .iter()
+            .find(|channel| channel.id == group.leader_channel_id)
+        else {
+            continue;
+        };
+        let gate_outcome = ai_gate::ask(
+            ai,
+            leader,
+            &candidates,
+            &scored,
+            &offered,
+            reason,
+            &known,
+            ai_settings,
+            || context.is_cancelled(),
+            // The task prefix changes a chat model's prompt and the audited request, so
+            // only a configured chain gets it (guide's rule): shorthand installs ask
+            // exactly what they asked before the chain existed.
+            (!ai_settings.chain.is_empty()).then_some("streams"),
+        )
+        .await;
+        context.record_ai_decision(&gate_outcome.to_store(row as i64, &ai_settings.provider))?;
+        if gate_outcome.answered {
+            if let Some(accepted) = gate_outcome.accepted {
+                accepts.push((ordinal, accepted));
+            }
+        }
+    }
+    if accepts.is_empty() {
+        return Ok(());
+    }
+    // The accepted candidate's identity family at the floor: the whole family promotes,
+    // never a lone stream (D07). Family keys read off the run's own index.
+    let mut families: Vec<(usize, Vec<i64>, String)> = Vec::with_capacity(accepts.len());
+    for &(ordinal, accepted) in &accepts {
+        let position = empty.iter().position(|&o| o == ordinal);
+        let Some(shortlist) = position.and_then(|position| shortlists.get(position)) else {
+            continue;
+        };
+        let Some(accepted_member) = shortlist.get(accepted) else {
+            continue;
+        };
+        let key = index.family_key(accepted_member.index).clone();
+        let mut family: Vec<i64> = Vec::new();
+        for member in shortlist {
+            if *index.family_key(member.index) == key {
+                if let Some((id, _)) = outcome.gate_candidates.get(member.index) {
+                    family.push(*id);
+                }
+            }
+        }
+        families.push((
+            ordinal,
+            family,
+            format!(
+                "AI-accepted {} (score: {})",
+                accepted_member.method.label(),
+                accepted_member.score
+            ),
+        ));
+    }
+    if families.is_empty() {
+        return Ok(());
+    }
+    // Apply every accept through the same finalize + assign path as the cut, inside one
+    // blocking section: the run's own data, zones and groups, rebuilt deterministically
+    // from the same inputs `plan` used.
+    let leaders: Vec<(usize, i64)> = families
+        .iter()
+        .map(|(ordinal, _, _)| (*ordinal, outcome.gate_groups[*ordinal].leader_channel_id))
+        .collect();
+    let outcome_assignments = tokio::task::spawn_blocking({
+        let options = Arc::clone(options);
+        let throughput: Arc<dyn ThroughputSource> = Arc::clone(throughput);
+        let world = world.clone();
+        let settings = settings.clone();
+        let scoped = scoped.to_vec();
+        move || -> Result<Vec<(usize, GroupResult)>> {
+            let pool = selection::build(&world, &settings)?;
+            let data = RunData::new(
+                &world,
+                &pool,
+                &options,
+                &options.model,
+                throughput.as_ref(),
+                &options.dead_streams,
+                options.restrict_matching_to_country,
+                options.epg.as_deref(),
+            );
+            let tag_refs = data.tag_refs();
+            let groups = build_groups(
+                &scoped,
+                &data.database,
+                &data.normalizer,
+                &tag_refs,
+                options.restrict_matching_to_country,
+                &data.group_names,
+                &options.engine,
+            );
+            let zones = crate::sort::zone_routed(&scoped, &data.normalizer, &data.tags);
+            let by_leader: HashMap<i64, &Group> = groups
+                .iter()
+                .map(|group| {
+                    (
+                        scoped[sort_channels_by_priority(group, &scoped)[0]].id,
+                        group,
+                    )
+                })
+                .collect();
+            let collector = Collector {
+                data: &data,
+                options: &options,
+            };
+            let mut applied: Vec<(usize, GroupResult)> = Vec::new();
+            for ((ordinal, leader_id), (_, family_ids, reason)) in
+                leaders.iter().zip(families.iter())
+            {
+                let Some(group) = by_leader.get(leader_id).copied() else {
+                    continue;
+                };
+                let sorted = sort_channels_by_priority(group, &scoped);
+                let leader = &scoped[sorted[0]];
+                let group_name = data.channel_group_name(leader);
+                // The group's country stats were counted when `plan` collected it; only
+                // the enforced country and the same-country set are read here.
+                let (channel_country, same_country, _) =
+                    group_country(&data, &options, leader, &group_name);
+                // The cut path's exclusion, exactly: a stream the filter proves foreign
+                // is never attached, whoever accepted its family.
+                let positions: Vec<usize> = family_ids
+                    .iter()
+                    .filter_map(|id| data.position_of_id.get(id).copied())
+                    .filter(|position| {
+                        !channel_country.as_deref().is_some_and(|code| {
+                            matches!(
+                                classify(Some(code), data.stream_country(*position)),
+                                Relationship::Foreign
+                            )
+                        })
+                    })
+                    .collect();
+                let collected = Collected {
+                    ids: collector.finalize(&positions, same_country.as_ref()),
+                    reason: reason.clone(),
+                    country: CountryStats::default(),
+                    watch_hits: 0,
+                    gate_query: String::new(),
+                    gate_hint: None,
+                };
+                let result = assign_group(&collector, group, &sorted, &scoped, &zones, &collected);
+                applied.push((*ordinal, result));
+            }
+            Ok(applied)
+        }
+    })
+    .await??;
+    // Splice the accepts back into the outcome, in place: the report and the write read
+    // `assignments`, so a promoted family flows through the same write list as the cut.
+    for (ordinal, result) in outcome_assignments {
+        let fresh: HashMap<i64, Assignment> = result
+            .assignments
+            .into_iter()
+            .map(|assignment| (assignment.channel_id, assignment))
+            .collect();
+        for assignment in outcome.assignments.iter_mut() {
+            if let Some(replacement) = fresh.get(&assignment.channel_id) {
+                *assignment = replacement.clone();
+            }
+        }
+        if let Some(group) = outcome.gate_groups.get_mut(ordinal) {
+            group.empty = false;
+        }
+    }
+    Ok(())
+}
+
+/// The group-level country rule for `leader`: the filter's enforced country (with the
+/// bug-161 callsign exemption) plus the run-once same-country set and counters.
+///
+/// Shared by [`Collector::collect`] and the `[ai.verify]` accept path, so a promoted
+/// family partitions and counts exactly like a cut family.
+fn group_country(
+    data: &RunData<'_>,
+    options: &MatchOptions,
+    leader: &Channel,
+    group_name: &str,
+) -> (Option<String>, Option<HashSet<i64>>, CountryStats) {
+    // bug-161: a callsign-bearing identity is never country-qualified, and the filter
+    // is skipped for it. The identity callsign (engine anchor, C06/D04) replaces the SM
+    // callsign regex path.
+    let identity = resolve_with(&data.engine, &leader.name, &ResolveContext::default());
+    let mut country = CountryStats::default();
+    if !(options.restrict_matching_to_country && identity.callsign.is_none()) {
+        return (None, None, country);
+    }
+    // The same helper the grouping key reads, so a group's key and its leader's hint
+    // name one country.
+    let code = query_country(
+        leader,
+        options.restrict_matching_to_country,
+        &data.database,
+        group_name,
+    );
+    if code.is_some() {
+        country.engaged += 1;
+    } else {
+        country.skipped_unknown_channel += 1;
+    }
+    let same_country: Option<HashSet<i64>> = match code.as_deref() {
+        Some(code) => {
+            let same: HashSet<i64> = data
+                .by_country
+                .get(code)
+                .map(|positions| {
+                    positions
+                        .iter()
+                        .map(|position| data.ids[*position])
+                        .collect()
+                })
+                .unwrap_or_default();
+            country.foreign_dropped += data.known_total.saturating_sub(same.len());
+            country.unknown_kept += data.ids.len().saturating_sub(data.known_total);
+            if same.is_empty() {
+                None
+            } else {
+                Some(same)
+            }
+        }
+        None => None,
+    };
+    (code, same_country, country)
 }
 
 /// `Plugin._sort_channels_by_priority` (8217): quality tag first, then channel number.
@@ -2547,9 +3281,13 @@ fn same_country_ids_for(
         return None;
     }
     let data = collector.data;
-    // An OTA channel is exempt from the filter, so nothing here may promote a stream on a
-    // country code that is not being enforced.
-    if ota_callsign(channel, &data.database, &data.normalizer, &data.tag_refs()).is_some() {
+    // An OTA channel is exempt from the filter (bug-161), so nothing here may promote a
+    // stream on a country code that is not being enforced. The identity callsign (engine
+    // anchor, C06/D04) replaces the SM callsign regex path.
+    if resolve_with(&data.engine, &channel.name, &ResolveContext::default())
+        .callsign
+        .is_some()
+    {
         return None;
     }
     let group_name = data.channel_group_name(channel);
@@ -2658,9 +3396,12 @@ fn ota_plan(
         };
         let needs = needs_corroboration(&base);
         let mut matched: Vec<usize> = Vec::new();
-        for position in data.name_index.callsign_candidates(&base) {
-            let position = position as usize;
-            let name = &data.names.match_names[position];
+        // The run-once upper-case callsign prefilter (the mode's narrow candidate rule,
+        // not the matcher): case-sensitive, like the plugin's own pattern.
+        let empty: Vec<usize> = Vec::new();
+        for position in data.callsign_index.get(&base).unwrap_or(&empty) {
+            let position = *position;
+            let name = &data.match_names[position];
             if !pattern.is_match(name) {
                 continue;
             }
@@ -2834,6 +3575,7 @@ pub async fn run(
     let scope_for_plan = scope.clone();
     let world_for_plan = world.clone();
     let options_for_plan = options.clone();
+    let throughput_for_plan = Arc::clone(&throughput);
     context.progress(&crosstalk_core::jobs::ProgressEvent::new(
         "streams.match",
         0,
@@ -2849,7 +3591,7 @@ pub async fn run(
             &scope_for_plan,
             &settings_for_plan,
             &options_for_plan,
-            throughput.as_ref(),
+            throughput_for_plan.as_ref(),
         )
     })
     .await??;
@@ -2860,6 +3602,67 @@ pub async fn run(
         outcome.groups,
         plan_elapsed
     );
+    let mut outcome = outcome;
+
+    // The `[ai.verify]` gate for borderline groups (step 9, task "streams"): a no-op
+    // unless the gate can fire and the cut left a group empty. Only a model accept
+    // attaches streams, so this runs before the nothing-matched check below.
+    let scoped_for_gate = scope_channels(&world, &scope)?;
+    let ai = ai_gate::service(context.config());
+    apply_ai_gate(
+        &mut outcome,
+        &world,
+        &scoped_for_gate.channels,
+        settings,
+        &options,
+        &throughput,
+        context,
+        ai.as_ref(),
+    )
+    .await?;
+
+    // One batch identity write for every query and family member, so guide, streams and
+    // lineup resolve the same name to the same identity (cross-app consistency): one
+    // read pass plus ONE write transaction, resolved on rayon off the runtime.
+    {
+        let run_engine =
+            RunEngine::for_config(&context.config().matching, context.store().cloned());
+        let queries: Vec<String> = outcome
+            .assignments
+            .iter()
+            .map(|assignment| assignment.channel_name.clone())
+            .collect();
+        let position_of_candidate: HashMap<i64, usize> = outcome
+            .gate_candidates
+            .iter()
+            .enumerate()
+            .map(|(position, (id, _))| (*id, position))
+            .collect();
+        let families: Vec<Vec<EngineRanked>> = outcome
+            .assignments
+            .iter()
+            .map(|assignment| {
+                assignment
+                    .after
+                    .iter()
+                    .filter_map(|id| position_of_candidate.get(id).copied())
+                    .map(|index| EngineRanked {
+                        index,
+                        score: run_engine.threshold(),
+                        method: crosstalk_matching::engine::EngineMethod::Exact,
+                    })
+                    .collect()
+            })
+            .collect();
+        let candidates: Vec<String> = outcome
+            .gate_candidates
+            .iter()
+            .map(|(_, name)| name.clone())
+            .collect();
+        run_engine
+            .warm_families(&queries, &families, &candidates, &[])
+            .await;
+    }
 
     if outcome.channels == 0 {
         return Ok(JobOutcome::new(
@@ -2872,7 +3675,7 @@ pub async fn run(
     {
         // The plugin's own wording for a run that matched nothing at all.
         return Ok(JobOutcome::new(
-            "No channel matched any stream. Check the match sensitivity and the stream \
+            "No channel matched any stream. Check the [matching] cut and the stream \
              selection in streams.toml.",
         ));
     }
@@ -2924,15 +3727,15 @@ pub async fn run(
             if options.ota_only {
                 "US OTA only (callsign matching, no grouping)".to_string()
             } else {
-                "Match & Assign (name groups)".to_string()
+                "Match & Assign (identity family groups)".to_string()
             },
         )
         .note(
-            "Sensitivity",
+            "Matching Sensitivity ([matching] in crosstalk.toml)",
             format!(
-                "{} (threshold {})",
-                settings.match_sensitivity,
-                settings.match_threshold()
+                "{}, cut {} out of 100, higher is stricter",
+                context.config().matching.sensitivity.trim(),
+                context.config().matching.threshold()
             ),
         )
         .note(
@@ -3013,7 +3816,7 @@ pub async fn run(
         &outcome,
         &op_plan,
         applied.as_ref(),
-        settings,
+        &context.config().matching,
         &world,
     )?;
 
@@ -3114,10 +3917,11 @@ fn write_match_report(
     outcome: &MatchOutcome,
     plan: &Plan,
     applied: Option<&ApplyReport>,
-    settings: &StreamsSettings,
+    matching: &MatchingConfig,
     world: &World,
 ) -> Result<PathBuf> {
-    let threshold = settings.match_threshold();
+    // The one decision cut (D02/T10): `[matching]` sensitivity, not a per-app threshold.
+    let threshold = matching.threshold();
     let status_of = |channel_id: i64, assignment: &Assignment| -> (String, String) {
         let change = applied
             .and_then(|report| {
@@ -3309,8 +4113,29 @@ mod tests {
         )
     }
 
-    fn plan_match(world: &World, settings: &StreamsSettings) -> MatchOutcome {
-        let options = match_options(settings);
+    /// Step 9: the cut is the host `[matching]` sensitivity, so a test that varies the
+    /// cut builds its own [`MatchingConfig`]. The retired SM preset names map onto the
+    /// host presets (`relaxed`/`normal`/`strict`/`exact` = 70/80/90/95).
+    fn matching_at(preset: &str) -> MatchingConfig {
+        MatchingConfig {
+            sensitivity: match preset {
+                "relaxed" => "low".to_string(),
+                "normal" => "medium".to_string(),
+                "strict" => "high".to_string(),
+                "exact" => "strict".to_string(),
+                other => other.to_string(),
+            },
+            ..MatchingConfig::default()
+        }
+    }
+
+    fn plan_match_with(
+        world: &World,
+        settings: &StreamsSettings,
+        matching: &MatchingConfig,
+    ) -> MatchOutcome {
+        let options =
+            MatchOptions::with_database(settings, matching, Some(ChannelDatabase::empty()));
         let throughput = quality::MemoryThroughputSource::new();
         plan(
             world,
@@ -3320,6 +4145,10 @@ mod tests {
             &throughput,
         )
         .expect("plan")
+    }
+
+    fn plan_match(world: &World, settings: &StreamsSettings) -> MatchOutcome {
+        plan_match_with(world, settings, &MatchingConfig::default())
     }
 
     fn assignment(outcome: &MatchOutcome, channel_id: i64) -> &Assignment {
@@ -3350,7 +4179,12 @@ mod tests {
         // Both feeds on the first account carry identical stats, so the sort ties and the
         // collection order stands: the quality model's own order is `sort`'s test.
         assert_eq!(row.after, vec![10, 11, 12]);
-        assert!(row.reason.starts_with("Fuzzy match"), "{}", row.reason);
+        // Step 9: the whole identity family at the `[matching]` cut (D07).
+        assert!(
+            row.reason.starts_with("Identity family match"),
+            "{}",
+            row.reason
+        );
     }
 
     #[test]
@@ -3377,11 +4211,10 @@ mod tests {
         };
         for sensitivity in ["relaxed", "normal", "strict", "exact"] {
             let settings = StreamsSettings {
-                match_sensitivity: sensitivity.to_string(),
                 ignore_tags: "HD, (WEB)".to_string(),
                 ..StreamsSettings::default()
             };
-            let outcome = plan_match(&world, &settings);
+            let outcome = plan_match_with(&world, &settings, &matching_at(sensitivity));
             assert_eq!(
                 assignment(&outcome, 1).after,
                 vec![101],
@@ -3397,7 +4230,11 @@ mod tests {
     }
 
     #[test]
-    fn an_alias_hit_is_force_included_even_at_the_exact_preset() {
+    fn an_alias_table_hit_joins_the_family() {
+        // Step 9: alias force-includes are retired (A01/A02) — the merged reverse index
+        // is inside the engine, so an alias hit is a family member scoring at the cut or
+        // nothing at all. `MS Now` IS an MSNBC identity in the merged table, while CNN
+        // is not, so the family is exactly the alias member.
         let world = World {
             channels: vec![channel(1, "MSNBC", vec![], 1)],
             streams: vec![
@@ -3408,18 +4245,19 @@ mod tests {
             groups: groups(),
             ..World::default()
         };
-        let settings = StreamsSettings {
-            match_sensitivity: "exact".to_string(),
-            ..StreamsSettings::default()
-        };
-        let outcome = plan_match(&world, &settings);
+        let outcome = plan_match_with(&world, &StreamsSettings::default(), &matching_at("exact"));
         let row = assignment(&outcome, 1);
         assert_eq!(row.after, vec![10], "{:?}", row.reason);
-        assert_eq!(row.reason, "Alias match");
+        assert_eq!(row.reason, "Identity family match (alias, score: 100)");
     }
 
     #[test]
-    fn the_ota_callsign_path_matches_a_paren_callsign_and_skips_uncorroborated_words() {
+    fn the_identity_callsign_anchor_matches_a_paren_callsign_and_skips_uncorroborated_words() {
+        // Step 9: the SM callsign regex path with corroboration is retired (C06/D04) —
+        // the engine's callsign anchor decides agreement at family level and needs high
+        // confidence on BOTH sides. A paren callsign still resolves; a denylisted word
+        // the station table corroborated by city no longer does (oracle: D04 strictness).
+        // The digit guard still keeps a mid-name word from collecting anything.
         let world = World {
             channels: vec![
                 channel(1, "ABC - AL Montgomery (WNCF)", vec![], 1),
@@ -3441,12 +4279,13 @@ mod tests {
         let outcome = plan_match(&world, &StreamsSettings::default());
         let ota = assignment(&outcome, 1);
         assert_eq!(ota.after, vec![10], "{:?} {}", ota.after, ota.reason);
-        assert_eq!(ota.reason, "Callsign match");
-        // A common-word callsign is only accepted when the stream corroborates it: the
-        // station's city does, a bare "KING OF THE HILL" does not.
+        assert_eq!(ota.reason, "Identity family match (callsign, score: 95)");
+        // A denylisted word needs the anchor's high confidence on both sides
+        // (C06/D04): the city's corroboration no longer promotes it, so the group is
+        // empty — while the plugin's regex path collected stream 13.
         let king = assignment(&outcome, 2);
-        assert_eq!(king.after, vec![13], "{:?} {}", king.after, king.reason);
-        assert_eq!(king.reason, "Callsign match");
+        assert!(king.after.is_empty(), "{:?} {}", king.after, king.reason);
+        assert_eq!(king.reason, "No identity family match");
         // "24/7 KING OF THE HILL" resolves no callsign (mid-name, low confidence), and the
         // digit guard then keeps it from collecting anything.
         let hill = assignment(&outcome, 3);
@@ -3625,6 +4464,79 @@ mod tests {
         assert_eq!(row.after, vec![12, 11], "{:?}", row.after);
         assert_eq!(outcome.country.engaged, 1);
         assert_eq!(outcome.country.foreign_dropped, 1);
+    }
+
+    #[test]
+    fn two_countries_never_share_a_group_whether_or_not_the_filter_is_on() {
+        // Filter OFF: `UK: CNN` and `US: CNN` share a normalize key, but their families
+        // differ by country (G03), so the UK leader's family must not land on the US
+        // channel.
+        let world = World {
+            channels: vec![
+                channel(1, "UK: CNN", vec![], 1),
+                channel(2, "US: CNN", vec![], 2),
+            ],
+            streams: vec![
+                stream(10, "UK: CNN", Some(1), Some(TVE)),
+                stream(11, "US: CNN", Some(1), Some(TVE)),
+                stream(12, "CNN", Some(1), Some(TVE)),
+            ],
+            m3u_accounts: accounts(),
+            groups: groups(),
+            ..World::default()
+        };
+        let outcome = plan_match(&world, &StreamsSettings::default());
+        assert_eq!(outcome.groups, 2);
+        assert!(!assignment(&outcome, 1).after.contains(&11));
+        assert!(!assignment(&outcome, 2).after.contains(&10));
+        assert!(assignment(&outcome, 2).after.contains(&11));
+
+        // Filter ON: the country comes from the channel GROUP's name as well (SM's
+        // `_channel_country_code`, bug-158), so two bare `CNN`s in a US and a UK group
+        // are two groups — and visibility, which groups through the same function,
+        // cannot enable one and disable the other.
+        let world = World {
+            channels: vec![
+                Channel {
+                    channel_group_id: Some(200),
+                    ..channel(1, "CNN", vec![], 1)
+                },
+                Channel {
+                    channel_group_id: Some(201),
+                    ..channel(2, "CNN", vec![], 2)
+                },
+            ],
+            streams: vec![
+                stream(10, "UK: CNN", Some(1), Some(TVE)),
+                stream(11, "US: CNN", Some(1), Some(TVE)),
+            ],
+            m3u_accounts: accounts(),
+            groups: vec![
+                ChannelGroup {
+                    id: 200,
+                    name: "US: News".to_string(),
+                },
+                ChannelGroup {
+                    id: 201,
+                    name: "UK: News".to_string(),
+                },
+                ChannelGroup {
+                    id: TVE,
+                    name: "TVE".to_string(),
+                },
+            ],
+            ..World::default()
+        };
+        let settings = StreamsSettings {
+            restrict_matching_to_country: true,
+            ..StreamsSettings::default()
+        };
+        let outcome = plan_match(&world, &settings);
+        assert_eq!(outcome.groups, 2);
+        assert_eq!(assignment(&outcome, 1).after, vec![11]);
+        assert_eq!(assignment(&outcome, 2).after, vec![10]);
+        let off = plan_match(&world, &StreamsSettings::default());
+        assert_eq!(off.groups, 1, "no country is known with the filter off");
     }
 
     #[test]
@@ -3933,7 +4845,6 @@ mod tests {
             for sensitivity in ["relaxed", "normal", "strict", "exact"] {
                 for restrict in [false, true] {
                     let settings = StreamsSettings {
-                        match_sensitivity: sensitivity.to_string(),
                         restrict_matching_to_country: restrict,
                         ignore_tags: if round % 3 == 0 {
                             "HD".to_string()
@@ -3942,7 +4853,12 @@ mod tests {
                         },
                         ..StreamsSettings::default()
                     };
-                    let mut options = match_options(&settings);
+                    let matching = matching_at(sensitivity);
+                    let mut options = MatchOptions::with_database(
+                        &settings,
+                        &matching,
+                        Some(ChannelDatabase::empty()),
+                    );
                     options.database = ChannelDatabase::from_entries([
                         DatabaseEntry {
                             name: "CNN".to_string(),
@@ -4033,6 +4949,7 @@ mod tests {
             &tags,
             options.restrict_matching_to_country,
             &data.group_names,
+            &options.engine,
         );
         let collector = Collector {
             data: &data,
@@ -4397,7 +5314,7 @@ mod tests {
         let row = assignment(&outcome, 2);
         assert_eq!(row.after, vec![11], "{row:?}");
         // `PPV EVENT 09` has no guide id, so it keeps its own name and matches nothing.
-        assert_eq!(row.reason, "Fuzzy match (exact, score: 100)");
+        assert_eq!(row.reason, "Identity family match (exact, score: 100)");
     }
 
     #[test]
@@ -4836,5 +5753,301 @@ mod tests {
             result.write_count(),
             elapsed
         );
+    }
+
+    // ---------------------------------------------------------------------------------
+    // The `[ai.verify]` gate (step 9, task "streams")
+    // ---------------------------------------------------------------------------------
+
+    /// A decider that picks the first offered candidate at a fixed yes-probability.
+    struct FixedDecider {
+        probability: f64,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        tasks: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crosstalk_core::ai::Decider for FixedDecider {
+        fn provider(&self) -> &str {
+            "typesafe"
+        }
+
+        fn calibrated(&self) -> bool {
+            true
+        }
+
+        async fn decide(
+            &self,
+            request: &crosstalk_core::ai::DecisionRequest,
+        ) -> Result<crosstalk_core::ai::DecisionResponse> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.tasks.lock().expect("tasks").push(
+                serde_json::to_value(request)
+                    .ok()
+                    .and_then(|value| value.get("task").and_then(|t| t.as_str().map(String::from))),
+            );
+            let mut answers = std::collections::BTreeMap::new();
+            if let Some((id, _)) = request
+                .questions
+                .iter()
+                .find(|(id, _)| id.starts_with("same_") && id.as_str() != "same_network")
+            {
+                answers.insert(
+                    "best".to_string(),
+                    crosstalk_core::ai::Answer::Choice {
+                        choice: id.replacen("same_", "candidate_", 1),
+                        confidence: 0.9,
+                        probabilities: Default::default(),
+                    },
+                );
+                answers.insert(
+                    id.clone(),
+                    crosstalk_core::ai::Answer::Noul {
+                        noul: self.probability,
+                    },
+                );
+            }
+            Ok(crosstalk_core::ai::DecisionResponse {
+                model: "stub".to_string(),
+                answers,
+                input_tokens: 10,
+                output_tokens: 2,
+                latency_ms: 1,
+                calibrated: true,
+            })
+        }
+    }
+
+    struct Gate {
+        outcome: MatchOutcome,
+        store: Store,
+        run_id: i64,
+        calls: usize,
+        tasks: Vec<Option<String>>,
+        result: Result<()>,
+    }
+
+    /// One plan + gate over `world`: the `[ai.verify]` policy on, a stub model answering
+    /// `probability`, the run recorded in an in-memory store.
+    async fn gate_run(
+        world: World,
+        settings: StreamsSettings,
+        probability: f64,
+        chain: bool,
+        cancelled: bool,
+    ) -> Gate {
+        let mut config = crosstalk_core::config::CrosstalkConfig::default();
+        config.ai.verify = AiVerifyConfig {
+            enabled: true,
+            provider: "typesafe".to_string(),
+            model: "stub".to_string(),
+            ..AiVerifyConfig::default()
+        };
+        if chain {
+            config.ai.verify.chain = vec![crosstalk_core::config::AiChainEntry {
+                provider: "typesafe".to_string(),
+                model: "stub".to_string(),
+            }];
+        }
+        let store = Store::in_memory().expect("store");
+        let run_id = store
+            .start_run("streams", "match_preview", true)
+            .expect("run");
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(cancelled));
+        let context = JobContext::new(
+            Arc::new(config),
+            Arc::new(crosstalk_core::jobs::VecSink::new()),
+        )
+        .for_run("streams", "match_preview", run_id, store.clone(), flag);
+        let options = Arc::new(MatchOptions::with_database(
+            &settings,
+            &MatchingConfig::default(),
+            Some(ChannelDatabase::empty()),
+        ));
+        let throughput: Arc<dyn ThroughputSource> =
+            Arc::new(quality::MemoryThroughputSource::new());
+        let mut outcome = plan(
+            &world,
+            &ScopeConfig::default(),
+            &settings,
+            &options,
+            throughput.as_ref(),
+        )
+        .expect("plan");
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tasks = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let service = crosstalk_core::ai::AiService::with_decider(
+            "typesafe",
+            Arc::new(FixedDecider {
+                probability,
+                calls: Arc::clone(&calls),
+                tasks: Arc::clone(&tasks),
+            }),
+        );
+        let scoped = scope_channels(&world, &ScopeConfig::default()).expect("scope");
+        let result = apply_ai_gate(
+            &mut outcome,
+            &world,
+            &scoped.channels,
+            &settings,
+            &options,
+            &throughput,
+            &context,
+            Some(&service),
+        )
+        .await;
+        let tasks = tasks.lock().expect("tasks").clone();
+        Gate {
+            outcome,
+            store,
+            run_id,
+            calls: calls.load(std::sync::atomic::Ordering::SeqCst),
+            tasks,
+            result,
+        }
+    }
+
+    /// A confident channel first, then a borderline one: `Sky Cinema Premiere` scores 90
+    /// (substring) against its only stream, inside the verify band and under the cut 95.
+    fn borderline_world() -> World {
+        World {
+            channels: vec![
+                channel(1, "ESPN", vec![], 1),
+                channel(2, "Sky Cinema Premiere", vec![], 2),
+            ],
+            streams: vec![
+                stream(10, "ESPN", Some(1), Some(TVE)),
+                stream(11, "Sky Cinema Premiere HD 2", Some(1), Some(TVE)),
+            ],
+            m3u_accounts: accounts(),
+            groups: groups(),
+            ..World::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn the_cut_alone_never_attaches_a_borderline_stream() {
+        let outcome = plan_match(&borderline_world(), &StreamsSettings::default());
+        assert!(assignment(&outcome, 2).after.is_empty());
+        assert!(assignment(&outcome, 1).after.contains(&10));
+    }
+
+    #[tokio::test]
+    async fn a_model_accept_attaches_the_borderline_family_and_is_audited_on_its_row() {
+        let gate = gate_run(
+            borderline_world(),
+            StreamsSettings::default(),
+            0.95,
+            false,
+            false,
+        )
+        .await;
+        gate.result.expect("gate");
+        assert_eq!(gate.calls, 1, "only the borderline group reaches the model");
+        let row = assignment(&gate.outcome, 2);
+        assert_eq!(row.after, vec![11]);
+        assert!(row.reason.starts_with("AI-accepted"), "{}", row.reason);
+        assert!(row.will_write());
+        // The confident group is untouched.
+        assert_eq!(assignment(&gate.outcome, 1).after, vec![10]);
+        // One audit row, on the REPORT row of the borderline channel (row 1), not on
+        // the group ordinal's or the confident channel's.
+        assert_eq!(gate.store.ai_decision_count(gate.run_id).expect("count"), 1);
+        let row_of = gate
+            .outcome
+            .assignments
+            .iter()
+            .position(|assignment| assignment.channel_id == 2)
+            .expect("row") as i64;
+        assert!(gate
+            .store
+            .ai_decision(gate.run_id, row_of)
+            .expect("load")
+            .is_some());
+        // No chain configured: no task prefix (guide's rule).
+        assert_eq!(gate.tasks, vec![None]);
+    }
+
+    #[tokio::test]
+    async fn a_configured_chain_asks_with_the_streams_task() {
+        let gate = gate_run(
+            borderline_world(),
+            StreamsSettings::default(),
+            0.95,
+            true,
+            false,
+        )
+        .await;
+        gate.result.expect("gate");
+        assert_eq!(gate.tasks, vec![Some("streams".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn a_model_that_does_not_accept_attaches_nothing_but_is_audited() {
+        let gate = gate_run(
+            borderline_world(),
+            StreamsSettings::default(),
+            0.10,
+            false,
+            false,
+        )
+        .await;
+        gate.result.expect("gate");
+        assert_eq!(gate.calls, 1);
+        assert!(assignment(&gate.outcome, 2).after.is_empty());
+        assert!(!assignment(&gate.outcome, 2).will_write());
+        assert_eq!(gate.store.ai_decision_count(gate.run_id).expect("count"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_run_asks_nothing() {
+        let gate = gate_run(
+            borderline_world(),
+            StreamsSettings::default(),
+            0.95,
+            false,
+            true,
+        )
+        .await;
+        assert!(gate.result.is_err(), "the gate stops on the cancel flag");
+        assert_eq!(gate.calls, 0);
+        assert!(assignment(&gate.outcome, 2).after.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_accepted_family_never_carries_a_stream_the_country_filter_proves_foreign() {
+        // The stream's GROUP says UK (no marker in its name, so the engine's own country
+        // rule keeps it); the channel's group says US. The cut path drops it, and so must
+        // the accept path.
+        let world = World {
+            channels: vec![Channel {
+                channel_group_id: Some(200),
+                ..channel(2, "Sky Cinema Premiere", vec![], 2)
+            }],
+            streams: vec![
+                stream(11, "Sky Cinema Premiere HD 2", Some(1), Some(201)),
+                stream(12, "Sky Cinema Premiere HD 2", Some(2), Some(200)),
+            ],
+            m3u_accounts: accounts(),
+            groups: vec![
+                ChannelGroup {
+                    id: 200,
+                    name: "US: Movies".to_string(),
+                },
+                ChannelGroup {
+                    id: 201,
+                    name: "UK: Movies".to_string(),
+                },
+            ],
+            ..World::default()
+        };
+        let settings = StreamsSettings {
+            restrict_matching_to_country: true,
+            ..StreamsSettings::default()
+        };
+        let gate = gate_run(world, settings, 0.95, false, false).await;
+        gate.result.expect("gate");
+        assert_eq!(gate.calls, 1);
+        assert_eq!(assignment(&gate.outcome, 2).after, vec![12]);
     }
 }

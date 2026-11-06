@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
-# Parity oracle: `crosstalk simulate-streams` versus the Python plugin's tools/match_sim.py.
+# Parity oracle: `crosstalk simulate-streams --oracle janitor` versus the Python plugin's
+# tools/match_sim.py.
 #
 # Builds a channels CSV and a provider M3U from the shipped channel databases, runs both
 # simulators over the same inputs, and compares the report files byte for byte. Any
-# difference is a port bug, so this is the gate before the guide sub-app is wired up.
+# difference is a port bug in the Janitor ORACLE (the retired pipeline, built only with
+# `--features oracle`); the production simulator runs the unified engine, and its
+# difference from the Python tool is printed as a report line at the end (never a
+# failure: that difference is the migration, attributed in docs/oracle-reports/).
 #
 # Several configurations are compared, not just the defaults: the default flags, a
 # --no-ignore-quality run, a --custom-aliases run, and a --countries US run. The stream
@@ -16,8 +20,7 @@
 #   --quick   smaller corpus, for a fast local check (default is the full corpus)
 #   --keep    keep the work directory and print its path
 #   --report  report mode (step 8): print the per-file summary and exit 0 whatever is
-#             found, for the guide oracle report. The simulator still runs the retired
-#             EpgJanitor profile as oracle tooling; the guide runs the unified engine.
+#             found, for the guide oracle report.
 #
 # Requires python3 and the reference checkout at reference/Dispatcharr-EPG-Janitor-Plugin.
 set -euo pipefail
@@ -59,7 +62,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "==> building release binary"
-cargo build --release -q -p crosstalk
+cargo build --release -q -p crosstalk --features oracle
 
 echo "==> generating inputs in $WORK"
 python3 - "$REPO" "$WORK" "$QUICK" <<'PY'
@@ -149,7 +152,7 @@ compare_case() {
     --threshold 80 \
     --out "$WORK/py-$label" "$@" >/dev/null
 
-  "$REPO/target/release/crosstalk" simulate-streams \
+  "$REPO/target/release/crosstalk" simulate-streams --oracle janitor \
     --channels "$WORK/channels.csv" \
     --streams "$WORK/streams.m3u" \
     --threshold 80 \
@@ -177,6 +180,30 @@ compare_case no-ignore-quality --no-ignore-quality
 compare_case custom-aliases --custom-aliases "$WORK/custom_aliases.json"
 compare_case countries-US --countries US
 
+# The production simulator (the unified engine) against the Python tool's default run:
+# a report line, never a failure.
+"$REPO/target/release/crosstalk" simulate-streams \
+  --channels "$WORK/channels.csv" \
+  --streams "$WORK/streams.m3u" \
+  --threshold 80 \
+  --out "$WORK/unified" >/dev/null
+python3 - "$(ls -d "$WORK"/py-default/*/ | head -1)" "$(ls -d "$WORK"/unified/*/ | head -1)" <<'PY'
+import csv, sys
+def rows(path):
+    with open(path + "per_stream_matches.csv", newline="", encoding="utf-8") as fh:
+        return {row["stream_name"]: row for row in csv.DictReader(fh)}
+py, rs = rows(sys.argv[1]), rows(sys.argv[2])
+taken = lambda row: row["best_channel"] if row["passed"] == "True" else ""
+both = sum(1 for name in py if taken(py[name]) and taken(py[name]) == taken(rs.get(name, py[name])))
+extra = sum(1 for name in py if taken(rs.get(name, {"best_channel": "", "passed": "False"})) and not taken(py[name]))
+fewer = sum(1 for name in py if taken(py[name]) and not taken(rs.get(name, {"best_channel": "", "passed": "False"})))
+other = sum(1 for name in py if taken(py[name]) and taken(rs.get(name, {"best_channel": "", "passed": "False"}))
+            and taken(py[name]) != taken(rs[name]))
+print(f"[unified] {len(py)} stream(s): {both} take the same channel as match_sim.py, "
+      f"{fewer} only the Python tool passes, {extra} only the unified engine passes, "
+      f"{other} pass to a different channel (report; the migration diff)")
+PY
+
 if [ "$status" -eq 0 ]; then
   echo "==> parity OK"
 else
@@ -185,8 +212,8 @@ fi
 if [ "$REPORT" -eq 1 ]; then
   # Report mode (step 8, guide oracle report): the per-file lines above are the
   # summary; never fail.
-  echo "[report] sim_parity differing-files exit was $status (oracle tooling: the " \
-    "simulator still runs the retired profile; see docs/oracle-reports/guide.md)"
+  echo "[report] sim_parity differing-files exit was $status (the Janitor oracle; see " \
+    "docs/oracle-reports/guide.md)"
   exit 0
 fi
 exit "$status"

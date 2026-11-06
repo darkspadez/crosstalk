@@ -655,6 +655,10 @@ def run_rust(cases, binary):
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--show", type=int, default=10, help="mismatches to print")
+    parser.add_argument("--report", action="store_true",
+                        help="report mode (step 9): print the summary and exit 0 "
+                        "whatever is found, for the oracle diff report. The plugin is "
+                        "the oracle; differences trace to decisions rows.")
     parser.add_argument("--random", type=int, default=120, help="randomised cases to add")
     parser.add_argument("--seed", type=int, default=20261104, help="seed for random cases")
     parser.add_argument("--binary",
@@ -755,6 +759,9 @@ def main() -> int:
           f"{compared} channel(s) compared, {enabled_total} left enabled by the plugin, "
           f"{withheld_enables} withheld enable(s) (the documented REST-cannot-see-rows "
           f"divergence)")
+    if args.report:
+        print("[report] exit 0: differences are oracle diffs, not failures")
+        return 0
     return 1 if mismatches else 0
 
 

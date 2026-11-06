@@ -16,10 +16,10 @@ its matching across every core, and can serve several tools from one binary.
 
 ## What it does
 
-- **Auto-match** scores every in-scope channel against every eligible guide entry, using
-  callsign, state, city and network signals alongside a four-stage name pipeline (alias, exact,
-  substring, token-sort fuzzy), with guards that keep numbered siblings, `+1` time-shifts and
-  East/West feeds apart.
+- **Auto-match** scores every in-scope channel against every eligible guide entry with the
+  one unified matching engine (one ranker to the best identity family at the one `[matching]`
+  cut) and assigns the family's first entry carrying programme data, with guards that keep
+  numbered siblings, `+1` time-shifts and East/West feeds apart.
 - **Scan & heal** finds assignments that carry no programme data and replaces them, touching
   only assignments it can prove are empty.
 - **Scan** reports which in-scope channels have a guide but no programme data in the check
@@ -36,10 +36,10 @@ its matching across every core, and can serve several tools from one binary.
   source that starts failing — or whose guide simply runs out — stays broken until someone
   notices. A schedule is what arms the watchdog, which makes the action its interval.
 - **Match & assign streams** gives every in-scope channel the streams that match its name —
-  Stream-Mapparr's collector (name groups, the OTA callsign path, the fuzzy winner as a gate,
-  alias force-includes, the token/substring family), then same-country and feed-zone rules and
-  the quality sort, written as a replace or an append with custom streams kept last. Only the
-  channels whose list actually changes are written.
+  the one unified matching engine (one ranker to the best identity family per channel group at
+  the one `[matching]` cut; the whole family attaches), then same-country and feed-zone rules
+  and the quality sort, written as a replace or an append with custom streams kept last. Only
+  the channels whose list actually changes are written.
 - **Sort alternates** orders every channel's streams by the one quality model (resolution,
   frame rate, bitrate, measured throughput, account priority, audio). Zone routing keeps a West
   feed on a West channel instead of ranking it last, and a hand-made fallback stays last.
@@ -162,7 +162,7 @@ The UI listens on <http://localhost:8730>.
 | `crosstalk exports clear [--app <id>] [--yes]` | Delete the CSV reports the sub-apps wrote (the UI's **Clear exports** button does the same) |
 | `crosstalk bench streams --synthetic [--config <dir>] [--channels N --streams N --accounts N]` | Time the streams plans on a world built in memory: no network, no Dispatcharr. See [Scale](#scale) |
 | `crosstalk bench streams --live [--config <dir>] [--write-timing --channel-ids <ids> --yes]` | Time the same plans against the configured Dispatcharr, read-only unless `--write-timing` is asked for twice |
-| `crosstalk simulate-streams --channels <csv> --streams <m3u>` | Offline stream-to-channel simulation, for tuning without touching a live install |
+| `crosstalk simulate-streams --channels <csv> --streams <m3u> [--threshold 95]` | Offline stream-to-channel simulation on the unified engine (what guide and streams would take: a stream passes as a member of the channel's best identity family at the cut), for tuning the `[matching]` cut without touching a live install |
 
 `crosstalk run` refuses an action that changes data unless `--yes` is passed, because a
 one-shot run has no dialog to confirm in. `crosstalk exports clear` works the same way: it
@@ -299,7 +299,7 @@ table below is in that order.
 
 | Action | Colour | What it does |
 |---|---|---|
-| `validate` | blue | Check `streams.toml` for consistency, without touching Dispatcharr. Reports the threshold the sensitivity preset resolves to and how many regex rules are usable |
+| `validate` | blue | Check `streams.toml` for consistency, without touching Dispatcharr. Reports the one `[matching]` cut and how many regex rules are usable |
 | `status` | blue | Show what the last run did, and what is running now — including a probe's progress. Stays clickable while a run is live |
 | `match_preview` | blue | Match every in-scope channel against the selected streams and write a CSV of what each channel would carry. Changes nothing |
 | `match_apply` | **red** | Give every in-scope channel its matched streams. With Overwrite Existing Streams on (the default) this REPLACES each matched channel's list; with Keep Custom Streams Last on, hand-made streams stay last. A channel that matches nothing is left alone |
@@ -693,8 +693,10 @@ than asserted — but only for the core. The split contract is:
 
 - **Strict parity**: the matching primitives (normalisation, callsign/location/network
 extraction) and the full `match_all_streams` pipeline are byte-identical ports.
-`crosstalk simulate-streams` produces **byte-identical** reports to the plugin's own offline
-tool across four configurations: default flags and `--custom-aliases` (which change matching
+The EPG Janitor port is now ORACLE tooling (the production binary links one matcher, the
+unified engine; `scripts/one_matcher_check.sh` proves it from the symbol table): built with
+`cargo build --features oracle`, `crosstalk simulate-streams --oracle janitor` produces
+**byte-identical** reports to the plugin's own offline tool across four configurations: default flags and `--custom-aliases` (which change matching
 output), `--no-ignore-quality` (which catches Rust wrongly applying the flag), and
 `--countries US` (which proves flag acceptance and call-sign DB merge parity). Duplicate
 stream names in the sim corpus exercise parser dedupe — they are removed before matching,
@@ -766,6 +768,10 @@ a host feature every app shares (`Clear exports`, CSV quoting) says so instead.
 | A restore back to "No Group" is planned and refused | Dispatcharr's channel serializer rejects a null `channel_group_id`, so a channel triage moved OUT of "No Group" cannot be moved back over REST. The row is planned, reported, and fails with that reason. The plugin never recorded such a channel at all (`_compute_capture_state` skips a channel with no group). The bridge closes this later. |
 | A finite container duration is the only placeholder fingerprint | The plugin's `placeholder_file_detection` needs ffprobe to report a container duration, and a live MPEG-TS never does — so the fingerprint only fires on a container that carries one (HLS, MP4), which is what its measured placeholder was. The evidence is recorded for every stream either way. |
 | `streams.match_preview` drops the plugin's threshold-analysis advice rows | Preview also re-ran the pipeline at 5-point thresholds and collected by exact match against the winning stream name; the plugin itself notes that path disagrees with the real matcher. Those rows were advice, never a write. |
+| `streams.match` runs the unified matching engine, not Stream-Mapparr's collector | One ranker (the engine's best identity family per channel group), one selection rule (streams attaches the whole family, all members ranked, above the one `[matching]` cut) and one cache shared with guide. Retired: SM's normalized-name groups (identity family keys), the OTA callsign regex path (the engine's callsign anchor), alias force-includes (the merged reverse index), the fuzzy gate with the token/substring family, and the per-app `match_sensitivity` (a file still naming it fails at load, pointing at `[matching] sensitivity`). Every difference from the oracle is attributed in `docs/oracle-reports/streams.md`. |
+| AI may promote a borderline stream group | With the AI gate on, a group with no family at the `[matching]` cut is re-ranked by the same engine and index at the gate's floor, and the verify-band / rescue candidates go to the `[ai.verify]` chain with task `streams` — the same pattern as guide. Only a model accept attaches streams (the accepted candidate's identity family at the floor, through the same country filter as the cut); the heuristic walk still accepts nothing below the cut. Each ask writes one `ai_decisions` row on the group leader's report row. |
+| Channel groups carry the family's country, filter on or off | Grouping is the identity family key plus the country the leader's family is ranked under: the country filter's `_channel_country_code` (database and channel-group name) when the filter is on, else the name's own `<CC>:` marker. `UK: CNN` and `US: CNN` never share a group, so one country's family is never written to the other's channel, and a bare `CNN` in a `US:` and a `UK:` group stay apart with the filter on (bug-158), in match and visibility alike. |
+| `streams.triage`/`restore` tags and rename formats run on the unified vocabulary | Tag checks and strips read the shared tag table, not per-set regexes: `(DEAD)` counts as trailing alongside `[DEAD]`, parens strip, and stacked mixed runs strip in one pass. Rename formats render through the shared template engine: `{group}`/`{number}`/`{epg}`/`{id}` substitute the channel's own values now (EPG entries are loaded only when a format names `{epg}`); the format is still trimmed, and a blank rendering is never written. The strip SETS stay the plugin's (the IC status and format labels, the rename labels, `video_format_suffixes`): guide's `BadEPG`, CM's `Unk` and provider tags like `[1080p]`/`[HEVC]` are never stripped — other apps' marks, not triage's. |
 | With `filter_dead_streams` on, match also excludes store probe verdicts | The plugin only reads `stream_stats` (empty, 0 width/height, `0x0`); crosstalk reproduces that test exactly and additionally skips streams the probe recorded as `dead` in the store — the same verdict, kept where a rerun can see it. |
 | EPG placeholder titles come from one batched read | The plugin queries the programme table per EPG record and memoizes per pass (~8600 queries in one pass before the cache existed). crosstalk resolves the record ids a run can actually reach — a placeholder name on a channel, a placeholder or watched name on a stream — and reads them in one chunked `POST /epg/current-programs/`. The cleanup rules, skip titles, "Next Event" gate and watch containment are the plugin's own. |
 | The `tvg_id` join lists every EPG entry | A stream carries only the guide identifier, so joining it to a record id lists `GET /epg/epgdata/` (`ceil(n / 1000)` requests — ~55 at 55k entries). Not narrowed: `EPGData` has no `tvg_id` filter, and the programme search is not equivalent (multi-source `tvg_id`s, no `parsing` marker, no dummy/index fallback). |
@@ -806,7 +812,8 @@ cargo test --workspace          # unit, route and mocked-Dispatcharr tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
-./scripts/sim_parity.sh --quick # the oracle: Rust vs the Python tool, byte for byte
+./scripts/sim_parity.sh --quick # the Janitor oracle (--features oracle) vs the Python tool, byte for byte
+./scripts/one_matcher_check.sh  # no retired profile matcher links into the production binary
 python3 scripts/parity_sweep.py --kinds normalize,callsign,location,network --limit 300
 python3 scripts/parity_sweep.py --kinds match,score --limit 300 --pool 60
 python3 scripts/parity_sweep_sm.py --limit 300   # the StreamMapparr matcher profile, vs its own code

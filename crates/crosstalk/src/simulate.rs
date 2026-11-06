@@ -1,20 +1,34 @@
 //! `crosstalk simulate-streams`: the offline stream-to-channel match simulator.
 //!
-//! Port of `tools/match_sim.py` from the Python plugin. Its purpose is the parity oracle:
-//! given the same channels CSV and provider M3U, the per-stream table must be identical
-//! to the Python tool's. It is also useful on its own for tuning thresholds without
-//! touching a live Dispatcharr.
+//! Phase 3 step 9 (goal reset: one matcher in the binary): the simulator runs the UNIFIED
+//! engine — the ranker and selection rule guide and streams match with — so its tables
+//! say what a run would do. A stream `passed` when it is a member of the channel's best
+//! identity family at the cut (what streams attaches; guide assigns the family's first
+//! entry with programme data); `low_confidence.csv` and `top_n.csv` read the same ranker
+//! re-cut at the band's floor, as the `[ai.verify]` shortlist does. Useful for tuning
+//! the `[matching]` cut without touching a live Dispatcharr.
+//!
+//! The report shape is `tools/match_sim.py`'s (the Python plugin's tool). The faithful
+//! port of that tool's EPG Janitor pipeline is ORACLE tooling: built only with
+//! `--features oracle` (and under `cfg(test)`), selected with `--oracle janitor`, and
+//! pinned byte for byte against the Python tool by `scripts/sim_parity.sh`.
 
 use anyhow::{bail, Context, Result};
 use crosstalk_matching::alias::AliasMap;
+#[cfg(feature = "oracle")]
 use crosstalk_matching::callsign::KnownCallsigns;
+#[cfg(feature = "oracle")]
 use crosstalk_matching::data::known_callsigns_for;
+use crosstalk_matching::engine::{EngineConfig, EngineIndex, UnifiedEngine};
+use crosstalk_matching::identity::ResolveContext;
 use crosstalk_matching::normalize::NormalizeFlags;
+#[cfg(any(test, feature = "oracle"))]
 use crosstalk_matching::pipeline::{CandidateIndex, MatchOptions, Matcher};
 use fancy_regex::Regex as FancyRegex;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "oracle")]
 use std::sync::Arc;
 
 /// One parsed `#EXTINF` line.
@@ -154,16 +168,108 @@ pub fn parse_channels_csv(text: &str, channel_col: Option<&str>) -> Result<Vec<S
     Ok(names)
 }
 
-/// Per-stream results: `stream -> [(channel, score, method), ...]`, best first.
-pub type PerStream = HashMap<String, Vec<(String, u8, String)>>;
+/// One candidate channel of one stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SimRow {
+    pub channel: String,
+    pub score: u8,
+    pub method: String,
+    /// Whether the run would take it: a family member at the cut (unified), or a score
+    /// at the threshold (the Janitor oracle's rule).
+    pub passed: bool,
+}
 
-/// Run the simulation.
+/// Per-stream results: `stream -> [row, ...]`, best first.
+pub type PerStream = HashMap<String, Vec<SimRow>>;
+
+/// Which matcher a simulation runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Matching {
+    /// The unified engine guide and streams run (the default; the only one in a
+    /// production build).
+    #[default]
+    Unified,
+    /// The retired EPG Janitor pipeline, ported statement for statement from
+    /// `tools/match_sim.py`: oracle tooling for `scripts/sim_parity.sh`.
+    #[cfg(feature = "oracle")]
+    Janitor,
+}
+
+/// The unified simulation: per channel, the best identity family at `engine`'s cut
+/// (passed), plus the same ranker's shortlist at `floor` for the low-confidence band and
+/// the top-N rows; inverted into the per-stream view.
+///
+/// Each stream's rows are its channels in channel order, family members first (a stream
+/// only passes as a family member), each best first by score; the merge is serial in
+/// channel order, so rayon cannot reorder a tie.
+pub fn simulate_unified(
+    channel_names: &[String],
+    stream_names: &[String],
+    engine: &UnifiedEngine,
+    floor: u8,
+) -> PerStream {
+    let index = EngineIndex::build(stream_names, engine, &ResolveContext::default());
+    let shortlist_engine = engine.with_threshold(floor.min(engine.threshold()));
+    let per_channel: Vec<(Vec<usize>, Vec<crosstalk_matching::engine::EngineRanked>)> = {
+        use rayon::prelude::*;
+        channel_names
+            .par_iter()
+            .map(|channel| {
+                let family: Vec<usize> = engine
+                    .rank_index(channel, &index)
+                    .into_iter()
+                    .map(|member| member.index)
+                    .collect();
+                let shortlist = shortlist_engine.shortlist_index_in(channel, None, &index);
+                (family, shortlist)
+            })
+            .collect()
+    };
+
+    // stream position -> (in family, channel, score, method), channel order.
+    let mut accumulated: Vec<Vec<(bool, String, u8, String)>> =
+        vec![Vec::new(); stream_names.len()];
+    for (channel, (family, shortlist)) in channel_names.iter().zip(per_channel.iter()) {
+        let family: std::collections::HashSet<usize> = family.iter().copied().collect();
+        for entry in shortlist {
+            if let Some(rows) = accumulated.get_mut(entry.index) {
+                rows.push((
+                    family.contains(&entry.index),
+                    channel.clone(),
+                    entry.score,
+                    entry.method.label(),
+                ));
+            }
+        }
+    }
+    let mut per_stream = HashMap::with_capacity(stream_names.len());
+    for (position, stream_name) in stream_names.iter().enumerate() {
+        let mut rows = std::mem::take(&mut accumulated[position]);
+        // Stable: family members first, then by score, ties in channel order.
+        rows.sort_by_key(|row| (std::cmp::Reverse(row.0), std::cmp::Reverse(row.2)));
+        per_stream.insert(
+            stream_name.clone(),
+            rows.into_iter()
+                .map(|(passed, channel, score, method)| SimRow {
+                    channel,
+                    score,
+                    method,
+                    passed,
+                })
+                .collect(),
+        );
+    }
+    per_stream
+}
+
+/// Run the Janitor oracle simulation.
 ///
 /// Channels are the query side, because the alias table is keyed by canonical channel
 /// names; results are inverted into a per-stream view. The candidate side is the stream
 /// list alone, which is exactly the `candidate_names` the Python tool passes; its
 /// `precompute_normalizations(channels + streams)` call only warms a name-keyed cache, and
 /// the channel half of that cache is never read.
+#[cfg(any(test, feature = "oracle"))]
 pub fn simulate(
     channel_names: &[String],
     stream_names: &[String],
@@ -213,12 +319,23 @@ pub fn simulate(
         }
     }
 
+    let threshold = matcher.options().match_threshold;
     let mut per_stream = HashMap::with_capacity(stream_names.len());
     for (position, stream_name) in stream_names.iter().enumerate() {
         let mut rows = std::mem::take(&mut accumulated[position]);
         // Stable, like the Python `rows.sort(key=score, reverse=True)`.
         rows.sort_by_key(|row| std::cmp::Reverse(row.1));
-        per_stream.insert(stream_name.clone(), rows);
+        per_stream.insert(
+            stream_name.clone(),
+            rows.into_iter()
+                .map(|(channel, score, method)| SimRow {
+                    channel,
+                    score,
+                    method,
+                    passed: score >= threshold,
+                })
+                .collect(),
+        );
     }
     per_stream
 }
@@ -236,8 +353,11 @@ pub struct SimulateOptions {
     pub countries: Option<String>,
     pub out: PathBuf,
     /// Which `user_ignored_tags` the run passes, in the plugin's order:
-    /// `[quality, regional, geographic, misc]`.
+    /// `[quality, regional, geographic, misc]`. The unified engine reads them as its
+    /// `ignore_*` normalisation toggles (`[matching]`'s).
     pub tags: [bool; 4],
+    /// The matcher: the unified engine, or (oracle builds) the Janitor port.
+    pub matching: Matching,
 }
 
 /// Read inputs, run the simulation and write the five report files.
@@ -275,17 +395,73 @@ pub fn run(options: &SimulateOptions) -> Result<PathBuf> {
 
     // Custom aliases MERGE over the built-in table, replacing per key; they do not
     // replace it. A file with one entry must still keep the other 200-odd entries.
-    let alias_map = match options.custom_aliases.as_deref() {
+    let overrides: HashMap<String, Vec<String>> = match options.custom_aliases.as_deref() {
         Some(path) if !path.trim().is_empty() => {
             let text = std::fs::read_to_string(path)
                 .with_context(|| format!("reading custom aliases {path}"))?;
             let text = text.trim_start_matches('\u{feff}');
-            match AliasMap::overrides_from_json(text) {
-                Some(overrides) => AliasMap::builtin().with_overrides(overrides),
-                None => AliasMap::builtin(),
-            }
+            AliasMap::overrides_from_json(text).unwrap_or_default()
         }
-        _ => AliasMap::builtin(),
+        _ => HashMap::new(),
+    };
+    let countries: Vec<String> = options
+        .countries
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|code| !code.is_empty())
+        .map(str::to_uppercase)
+        .collect();
+    let tags = tag_list(&options.tags);
+
+    if options.matching == Matching::Unified {
+        // The engine guide and streams build from `[matching]`: the cut, the countries,
+        // the custom aliases and the `ignore_*` toggles are its operator settings.
+        let engine = UnifiedEngine::new(&EngineConfig {
+            threshold: options.threshold,
+            enabled_countries: countries,
+            custom_aliases: overrides,
+            flags: NormalizeFlags {
+                ignore_quality: options.tags[0],
+                ignore_regional: options.tags[1],
+                ignore_geographic: options.tags[2],
+                ignore_misc: options.tags[3],
+                ..NormalizeFlags::default()
+            },
+        });
+        let floor = options.threshold.saturating_sub(options.margin);
+        let per_stream = simulate_unified(&channel_names, &stream_names, &engine, floor);
+        return write_reports(
+            options,
+            &per_stream,
+            &channel_names,
+            &stream_names,
+            engine.alias_map().len(),
+            &tags,
+        );
+    }
+    #[cfg(feature = "oracle")]
+    {
+        janitor_run(options, &channel_names, &stream_names, overrides, &tags)
+    }
+    #[cfg(not(feature = "oracle"))]
+    unreachable!("the Janitor oracle is built only with --features oracle")
+}
+
+/// The Janitor oracle run (`tools/match_sim.py`, statement for statement).
+#[cfg(feature = "oracle")]
+fn janitor_run(
+    options: &SimulateOptions,
+    channel_names: &[String],
+    stream_names: &[String],
+    overrides: HashMap<String, Vec<String>>,
+    tags: &[String],
+) -> Result<PathBuf> {
+    let alias_map = if overrides.is_empty() {
+        AliasMap::builtin()
+    } else {
+        AliasMap::builtin().with_overrides(overrides)
     };
 
     let known = match options.countries.as_deref() {
@@ -319,17 +495,16 @@ pub fn run(options: &SimulateOptions) -> Result<PathBuf> {
         },
     );
 
-    let tags = tag_list(&options.tags);
     let tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
-    let per_stream = simulate(&channel_names, &stream_names, &matcher, &tag_refs);
+    let per_stream = simulate(channel_names, stream_names, &matcher, &tag_refs);
 
     write_reports(
         options,
         &per_stream,
-        &channel_names,
-        &stream_names,
-        &alias_map,
-        &tags,
+        channel_names,
+        stream_names,
+        alias_map.len(),
+        tags,
     )
 }
 
@@ -346,6 +521,7 @@ fn tag_list(enabled: &[bool; 4]) -> Vec<String> {
 }
 
 /// Iterate a `KnownCallsigns` without exposing its internals.
+#[cfg(feature = "oracle")]
 fn known_iter(known: &KnownCallsigns) -> Vec<String> {
     known.to_vec()
 }
@@ -355,7 +531,7 @@ fn write_reports(
     per_stream: &PerStream,
     channel_names: &[String],
     stream_names: &[String],
-    alias_map: &AliasMap,
+    alias_entries: usize,
     tags: &[String],
 ) -> Result<PathBuf> {
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
@@ -408,8 +584,13 @@ fn write_reports(
             continue;
         };
 
-        let (channel, score, method) = best;
-        let passed = *score >= options.threshold;
+        let SimRow {
+            channel,
+            score,
+            method,
+            passed,
+        } = best;
+        let passed = *passed;
         matches.write_record([
             stream_name.as_str(),
             channel.as_str(),
@@ -433,15 +614,13 @@ fn write_reports(
             ])?;
         }
 
-        for (rank, (candidate, candidate_score, candidate_method)) in
-            rows.iter().take(options.top_n).enumerate()
-        {
+        for (rank, row) in rows.iter().take(options.top_n).enumerate() {
             top.write_record([
                 stream_name.as_str(),
                 &(rank + 1).to_string(),
-                candidate.as_str(),
-                &candidate_score.to_string(),
-                candidate_method.as_str(),
+                row.channel.as_str(),
+                &row.score.to_string(),
+                row.method.as_str(),
             ])?;
         }
     }
@@ -483,7 +662,7 @@ fn write_reports(
         options.threshold,
         i32::from(options.threshold) - i32::from(options.margin),
         options.threshold,
-        alias_map.len(),
+        alias_entries,
         channel_names.len(),
         if tags.is_empty() {
             "none".to_string()
@@ -575,12 +754,39 @@ mod tests {
         let per_stream = simulate(&channels, &streams, &matcher, &[]);
 
         let espn = per_stream.get("ESPN HD").expect("stream present");
-        assert_eq!(espn[0].0, "ESPN");
-        assert_eq!(espn[0].1, 100);
+        assert_eq!(espn[0].channel, "ESPN");
+        assert_eq!(espn[0].score, 100);
         assert!(per_stream
             .get("Unrelated")
             .expect("stream present")
             .is_empty());
+    }
+
+    #[test]
+    fn the_unified_simulation_passes_exactly_the_family() {
+        // The engine guide and streams run: `ESPN HD` and `US: ESPN` are the `ESPN`
+        // family at the cut; `ESPN 2` is a different identity, never passed, whatever it
+        // scores; `Unrelated` has no candidate at all.
+        let engine = UnifiedEngine::new(&EngineConfig::default());
+        let channels = vec!["ESPN".to_string(), "CNN".to_string()];
+        let streams = vec![
+            "ESPN HD".to_string(),
+            "US: ESPN".to_string(),
+            "ESPN 2".to_string(),
+            "Unrelated".to_string(),
+        ];
+        let per_stream = simulate_unified(&channels, &streams, &engine, 80);
+        for name in ["ESPN HD", "US: ESPN"] {
+            let rows = per_stream.get(name).expect("stream present");
+            assert_eq!(rows[0].channel, "ESPN", "{name}");
+            assert!(rows[0].passed, "{name}");
+        }
+        assert!(per_stream
+            .get("ESPN 2")
+            .expect("present")
+            .iter()
+            .all(|row| !row.passed));
+        assert!(per_stream.get("Unrelated").expect("present").is_empty());
     }
 
     #[test]

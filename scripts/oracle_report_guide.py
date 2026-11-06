@@ -100,7 +100,9 @@ def sim_section() -> dict:
         # e.g. "    [default] per_stream_matches.csv identical"
         if len(parts) == 3 and parts[0].startswith("[") and parts[2] in ("identical", "DIFFERS"):
             files[f"{parts[0]} {parts[1]}"] = parts[2]
-    return {"files": files, "raw": out}
+    unified = next((line.strip() for line in out.splitlines()
+                    if line.startswith("[unified]")), None)
+    return {"files": files, "unified": unified, "raw": out}
 
 
 def fixture_names() -> tuple[list[str], list[str]]:
@@ -460,6 +462,10 @@ def render(sweep: dict, sim: dict, fixture: dict, representative: dict) -> str:
                 lines.append(f"  - DIFFERS: {name}")
     else:
         lines.append("- (could not parse the sim summary; raw output retained below)")
+    lines.append("- the comparisons above pin the Janitor ORACLE (`--features oracle`, "
+                 "`simulate-streams --oracle janitor`); the production simulator runs the "
+                 "unified engine:")
+    lines.append(f"  - `{sim.get('unified') or '(no [unified] line)'}`")
     truth = representative["truth"]
     lines += [
         "",

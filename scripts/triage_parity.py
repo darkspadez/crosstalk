@@ -24,8 +24,8 @@ plugin with `_channels_where`, the port with `probe::verdict_for`) and, for rest
 recorded changes as `triage_apply` run rows. Nothing of the Rust is mirrored here: the plugin's
 own code decides the expected answer.
 
-Two shapes are constructed rather than compared, and are COUNTED rather than failed — they are
-the two documented divergences:
+Three shapes are constructed rather than compared, and are COUNTED rather than failed — they
+are the documented divergences:
 
   * `stacked`  — a rename whose base name already ends with the format's own tag. The plugin
     appends it again (`ESPN [DEAD] [DEAD]`); the port does not (`ESPN [DEAD]`). The harness
@@ -33,6 +33,12 @@ the two documented divergences:
   * `untracked` — a restore where the plugin strips a QUALITY tag (`[HD]`) the recorded change
     history never mentioned. The port restores only what it recorded. The harness asserts the
     two names differ only by known tags on top of the same base.
+  * `paren` — step 9's shared trailing-tag parser: a known tag in PARENS (`ESPN (HD)`,
+    `ESPN (DEAD)`) counts as a tag. The plugin's regexes read only `[...]`, so it appends
+    beside it (`ESPN (HD) [HD]`, `ESPN (DEAD) [DEAD]`) and its restore leaves it; the port
+    replaces/skips/strips it. The harness asserts the two names differ by exactly that one
+    parenthesised known tag. Every other tag the vocabulary knows (guide `[BadEPG]`, CM
+    `[Unk]`, provider `[1080p]`) must still AGREE: the strip set is the plugin's.
 
 Usage:
     python3 -I scripts/triage_parity.py [--show N] [--random N] [--seed N]
@@ -444,7 +450,50 @@ def ends_with_tag(name, label):
     return bool(match) and match.group(1).strip().lower() == (label or "").strip().lower()
 
 
-def differs_by_one_tag(expected, actual, label):
+def paren_tags(name, tags):
+    """The known tags `name` carries in parens, anywhere in its trailing run (`paren`)."""
+    return [label for label in re.findall(r"\(([^()]+)\)", name or "")
+            if label.strip().lower() in tags]
+
+
+def differs_by_paren(expected, actual, tags):
+    """`paren`: the plugin's name and the port's differ by one parenthesised known tag,
+    either way round (the plugin keeps `(HD)` beside its `[HD]`; the port's restore strips
+    `(DEAD)` the plugin's leaves) — or by the plugin's one extra `[label]` appended beside
+    a `(label)` the port counted as already there."""
+    if expected is None or actual is None:
+        return False
+    for label in paren_tags(expected, tags) + paren_tags(actual, tags):
+        if differs_by_one_tag(expected, actual, label, "()") \
+                or differs_by_one_tag(actual, expected, label, "()"):
+            return True
+        # `ESPN (HD)` + suffix: plugin `ESPN (HD) [HD]`, port `ESPN [HD]`.
+        for left, right in ((expected, actual), (actual, expected)):
+            stripped = left.replace(f" ({label})", "", 1)
+            if stripped != left and stripped == right:
+                return True
+        # `ESPN (DEAD)` dead rename: plugin `ESPN (DEAD) [DEAD]`, port skips.
+        if differs_by_one_tag(expected, actual, label.strip().upper()) \
+                or differs_by_one_tag(expected, actual, label):
+            return True
+        # Restore: the port's strip reads parens in the trailing run, so its name is the
+        # plugin's with that run stripped bracket- AND paren-aware.
+        if strip_tags_any(expected, tags) == actual:
+            return True
+    return False
+
+
+def strip_tags_any(name, tags):
+    """`strip_tags` over `[...]` and `(...)` groups: the port's trailing-run parser."""
+    while True:
+        match = re.search(r"\s*(?:\[([^\[\]]+)\]|\(([^()]+)\))\s*$", name or "")
+        label = match and (match.group(1) or match.group(2))
+        if not match or label.strip().lower() not in tags:
+            return (name or "").rstrip()
+        name = name[:match.start()].rstrip()
+
+
+def differs_by_one_tag(expected, actual, label, shape="[]"):
     """Whether removing exactly one `[label]` group from the plugin's name yields the port's.
 
     The port skips one append of a rename format's own tag when the recorded base name
@@ -455,7 +504,7 @@ def differs_by_one_tag(expected, actual, label):
     """
     if expected is None or actual is None:
         return False
-    tag = f"[{label}]"
+    tag = f"{shape[0]}{label}{shape[1]}"
     index = 0
     while True:
         index = expected.find(tag, index)
@@ -516,6 +565,9 @@ def compare_triage(case, plugin, rust, show, state):
         # removed is the port's.
         if repeated and differs_by_one_tag(expected, actual, repeated):
             stacked += 1
+            continue
+        if differs_by_paren(expected, actual, known_tags(settings)):
+            state["paren"] += 1
             continue
         problems.append(f"channel {channel_id}: plugin name {expected!r} != rust {actual!r}")
 
@@ -580,6 +632,9 @@ def compare_restore(case, plugin, rust, show, state):
         if match and (expected[:match.start()].rstrip() == actual) \
                 and match.group(1).strip().lower() not in tags:
             untracked += 1
+            continue
+        if differs_by_paren(expected, actual, tags):
+            state["paren"] += 1
             continue
         problems.append(f"channel {channel_id}: plugin name {expected!r} != rust {actual!r}")
 
@@ -726,6 +781,18 @@ def triage_worlds():
          dead_rename_format="{name} [GONE]")
     case("the tag is not trailing",
          [channel(1, "[DEAD] ESPN")], [(1, [dead()])])
+    # Step 9 (`paren`): a known tag in parens counts as a tag for the port only.
+    case("a format tag in parens",
+         [channel(1, "ESPN (SD)"), channel(2, "CNN (HD) [SD]")],
+         [(1, [alive("HD")]), (2, [alive("HD")])])
+    case("a status tag in parens",
+         [channel(1, "ESPN (DEAD)")], [(1, [dead()])])
+    # Every other vocabulary tag is NOT a format tag: both sides keep it.
+    case("other apps' and providers' tags stay",
+         [channel(1, "ESPN [BadEPG]"), channel(2, "CNN [1080p]"), channel(3, "AMC [Unk]"),
+          channel(4, "TNT [HEVC] [SD]"), channel(5, "Sky (East)")],
+         [(1, [alive("HD")]), (2, [alive("HD")]), (3, [dead()]), (4, [alive("FHD")]),
+          (5, [alive("HD")])])
 
     # The plugin applies the format to the name the CHECK saw, not to a fresh read.
     case("a name that changed since the check",
@@ -846,6 +913,18 @@ def restore_worlds():
     case("a tag with no recorded change",
          [channel(1, "ESPN [DEAD]", group=102)],
          [(1, [alive("HD")])],
+         [])
+    # Other apps' marks and provider tags are not triage's: the strip keeps them (both
+    # sides agree; the port's strip set is the plugin's).
+    case("other apps' marks survive the tag strip",
+         [channel(1, "ESPN [BadEPG] [DEAD]", group=102), channel(2, "CNN [1080p] [DEAD]"),
+          channel(3, "AMC [Unk] [Slow]"), channel(4, "TNT [BadEPG]")],
+         [(1, [alive("HD")]), (2, [alive("HD")]), (3, [alive("HD")]), (4, [alive("HD")])],
+         [])
+    # Step 9 (`paren`): a status tag in parens strips for the port only.
+    case("a status tag in parens",
+         [channel(1, "ESPN (DEAD)", group=102), channel(2, "CNN [HD] (Slow)")],
+         [(1, [alive("HD")]), (2, [alive("HD")])],
          [])
     # A healthy channel carrying only a quality tag is never touched.
     case("a quality tag alone",
@@ -1002,7 +1081,7 @@ def main() -> int:
     mismatches = 0
     shown = 0
     state = {"names_compared": 0, "groups_compared": 0, "stacked": 0, "untracked": 0,
-             "all_off": 0}
+             "all_off": 0, "paren": 0}
     refusals = 0
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -1076,7 +1155,7 @@ def main() -> int:
           f"{state['names_compared']} channel name(s), {state['groups_compared']} group(s) "
           f"compared; documented divergences: {state['stacked']} stacked tag(s), "
           f"{state['untracked']} untracked tag strip(s), {state['all_off']} all-off "
-          f"refusal(s)")
+          f"refusal(s), {state['paren']} paren tag(s)")
     return 1 if mismatches else 0
 
 

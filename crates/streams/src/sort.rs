@@ -57,13 +57,14 @@ use crosstalk_core::csv_report;
 use crosstalk_core::dispatcharr::{World, WorldKind, WorldKinds};
 use crosstalk_core::jobs::JobContext;
 use crosstalk_core::subapp::{JobOutcome, OutcomeBuilder, SubApp};
-use crosstalk_matching::country::{extract_zone, FeedZone};
+use crosstalk_matching::country::{extract_zone_noguard, FeedZone};
 use crosstalk_matching::normalize::Normalizer;
 use std::collections::HashMap;
 
-/// The feed zone of a channel or stream name, as `fuzzy_matcher.extract_zone` answers it.
+/// The feed zone of a channel or stream name: the identity zone (step 9, Z01/Z02/Z07 —
+/// `extract_zone_noguard`, no single-time-zone guard, no second zone rule).
 fn zone_of(name: &str) -> FeedZone {
-    extract_zone(name)
+    extract_zone_noguard(name)
 }
 
 /// The report's title, without the preview/applied suffix.
@@ -262,8 +263,8 @@ fn order_streams_for_zone<'a>(
         return (Vec::new(), 0);
     }
     // The zones arrive with the streams: one lookup per stream per RUN (see [`RunCache`]),
-    // not two per channel, and `extract_zone` only scans the country tables for a name that
-    // carries a marker.
+    // not two per channel, and the identity zone only scans the country tables for a name
+    // that carries a marker.
     let own_zone: Vec<(FeedZone, StreamView<'_>)> = zoned
         .iter()
         .copied()

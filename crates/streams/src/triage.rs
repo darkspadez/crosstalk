@@ -114,7 +114,6 @@ use crosstalk_core::dispatcharr::{
 };
 use crosstalk_core::jobs::JobContext;
 use crosstalk_core::subapp::{JobOutcome, OutcomeBuilder, SubApp};
-use regex::Regex;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// The report's title, without the preview/applied suffix.
@@ -374,43 +373,11 @@ impl TriageOutcome {
 /// Why a channel the probe judged is not written: the run is held to `[scope]`.
 const OUT_OF_SCOPE: &str = "outside the scope this run may touch, so it is left exactly as it is";
 
-/// The bracket labels a rename format carries — the plugin's `_extract_format_tags` (3393).
-///
-/// `{name} [DEAD]` yields `["DEAD"]`, and `[X] {name} [DEAD]` yields `["X", "DEAD"]`. An
-/// unclosed bracket yields nothing, which is what the plugin's `findall` does too.
+/// The bracket labels a rename format carries — the plugin's `_extract_format_tags`
+/// (3393). Step 9 moved the parser beside `naming` so lineup's suffix rules read the
+/// same one; this delegates there.
 pub fn format_tags(format: &str) -> Vec<String> {
-    let mut tags = Vec::new();
-    let mut rest = format;
-    while let Some(open) = rest.find('[') {
-        let Some(close) = rest[open + 1..].find(']') else {
-            break;
-        };
-        let tag = &rest[open + 1..open + 1 + close];
-        if !tag.contains('[') {
-            tags.push(tag.to_string());
-        }
-        rest = &rest[open + 1 + close + 1..];
-    }
-    tags
-}
-
-/// Whether `name` already ends with the tag `label`, bracketed and case-insensitively — the
-/// plugin's trailing-tag regex for one label.
-///
-/// `ESPN [DEAD]` ends with `DEAD`; `ESPN [dead]` does too (the plugin compiles the tag regex
-/// with `re.IGNORECASE`); `[DEAD] ESPN` does not, because the plugin only ever strips and
-/// compares TRAILING tags.
-pub fn ends_with_tag(name: &str, label: &str) -> bool {
-    let trimmed = name.trim_end();
-    let Some(without_close) = trimmed.strip_suffix(']') else {
-        return false;
-    };
-    let Some(open) = without_close.rfind('[') else {
-        return false;
-    };
-    without_close[open + 1..]
-        .trim()
-        .eq_ignore_ascii_case(label.trim())
+    crosstalk_core::naming::format_tags(format)
 }
 
 /// The configured suffixes, lowercased, split on commas and stripped — the plugin's
@@ -428,6 +395,8 @@ pub fn configured_suffixes(settings: &StreamsSettings) -> Vec<String> {
 /// The tags a format suffix REPLACES: the configured ones plus the standard five, always —
 /// the plugin's `issue #18` rule (3705: narrowing `video_format_suffixes` must not stack a
 /// second tag onto a channel that carries one from before the narrowing).
+///
+/// Step 9: [`strip_format_tags`] strips exactly this set with the shared parser.
 pub fn known_format_tags(suffixes: &[String]) -> Vec<String> {
     let mut tags: Vec<String> = suffixes.to_vec();
     for standard in crosstalk_core::quality::IC_FORMAT_LABELS {
@@ -439,79 +408,78 @@ pub fn known_format_tags(suffixes: &[String]) -> Vec<String> {
     tags
 }
 
-/// The trailing-tag matcher, compiled once per run.
+/// Strip a trailing run of format tags off a name: the standard five plus the configured
+/// `video_format_suffixes` ([`known_format_tags`]) — `_derive` + `trailing_tag_re.sub` +
+/// `rstrip` (3705, 3712-3714), over the shared trailing-tag parser
+/// ([`tags::strip_with`]).
 ///
-/// The plugin compiles one `trailing_tag_re` and reuses it across every channel of the run
-/// (3705); at 20k channels a per-channel `re.compile` (or `Regex::new`) is the difference
-/// between one pass and 20 000 regex compilations. The tags are escaped, so the pattern cannot
-/// fail to compile; a hypothetical failure leaves the name alone rather than losing it.
-#[derive(Debug, Clone)]
-pub struct FormatTags {
-    tags: Vec<String>,
-    pattern: Option<Regex>,
+/// Step 9 output changes: parens strip (`ESPN (HD)` → `ESPN`; the regex only read
+/// `[...]`), and stacked mixed runs strip in one pass. The SET is the plugin's, not the
+/// vocabulary's whole quality kind: `[1080p]`, `[HEVC]`, `[RAW]` and the other provider
+/// tags triage never appends stay in the name. The plugin compiled one
+/// `trailing_tag_re` per run; the parser compiles nothing, so the one-pass shape costs
+/// nothing per channel either.
+pub fn strip_format_tags(name: &str, settings: &StreamsSettings) -> String {
+    crosstalk_matching::tags::strip_with(
+        name,
+        &[],
+        &known_format_tags(&configured_suffixes(settings)),
+    )
 }
 
-impl FormatTags {
-    /// The tags of this settings file: the configured suffixes plus the standard five.
-    pub fn of(settings: &StreamsSettings) -> Self {
-        Self::from_tags(known_format_tags(&configured_suffixes(settings)))
-    }
-
-    /// Explicit tags, lowercased or not: matching is case-insensitive either way.
-    pub fn from_tags(tags: Vec<String>) -> Self {
-        // Longest first, so `[unknown]` is preferred over a shorter tag that prefixes it — the
-        // plugin sorts the same way (3405). The bracketed shape makes the order harmless, but a
-        // stable order keeps two runs' reports identical.
-        let mut sorted: Vec<String> = tags;
-        sorted.sort_by(|left, right| right.len().cmp(&left.len()).then(left.cmp(right)));
-        sorted.dedup();
-        let alternation = sorted
-            .iter()
-            .map(|tag| regex::escape(tag))
-            .collect::<Vec<_>>()
-            .join("|");
-        let pattern = if alternation.is_empty() {
-            None
-        } else {
-            Regex::new(&format!(r"(?i)(?:\s*\[(?:{alternation})\])+\s*$")).ok()
-        };
-        Self {
-            tags: sorted,
-            pattern,
-        }
-    }
-
-    /// The tags themselves, longest first.
-    pub fn tags(&self) -> &[String] {
-        &self.tags
-    }
-
-    /// Strip a trailing run of format tags, then the space before it — `trailing_tag_re.sub`
-    /// plus `rstrip` (3712-3714).
-    pub fn strip(&self, name: &str) -> String {
-        match &self.pattern {
-            Some(pattern) => pattern.replace(name, "").trim_end().to_string(),
-            None => name.trim_end().to_string(),
-        }
-    }
-}
-
-/// [`FormatTags::strip`] for a one-off call (a test, or a harness).
-pub fn strip_format_tags(name: &str, tags: &[String]) -> String {
-    FormatTags::from_tags(tags.to_vec()).strip(name)
-}
-
-/// The new name a rename format produces, or `None` when it would be empty.
+/// The new name a rename format produces, or `None` when it would be blank.
 ///
-/// `format.replace('{name}', name)` (3508): every `{name}` becomes the base name, and any
-/// other brace token is left exactly as written — the plugin only ever replaces this one.
-pub fn render_format(format: &str, name: &str) -> Option<String> {
-    let rendered = format.trim().replace("{name}", name);
+/// Step 9: [`naming::render_channel`] (one template engine). Output changes for formats
+/// carrying `{group}`/`{number}`/`{epg}`/`{id}` (substituted with the channel's values
+/// now, literal before). The format is trimmed first, as the plugin's `.strip()` does
+/// (3508): surrounding whitespace in a settings value is never meant to land in a
+/// channel name. A format that renders blank is never written.
+pub fn render_format(
+    format: &str,
+    values: &crosstalk_core::naming::ChannelValues,
+) -> Option<String> {
+    let rendered = crosstalk_core::naming::render_channel(format.trim(), values);
     if rendered.trim().is_empty() {
         None
     } else {
         Some(rendered)
     }
+}
+
+/// What a rename format substitutes for one channel: the name the check saw, plus the
+/// channel's group, number, EPG name and id — the same values channel ops' templates read.
+/// `{epg}` reads the EPG listing, which a run loads only when a format names it
+/// ([`formats_name_epg`]); a channel with no EPG reads `No EPG`, as channel ops does.
+fn channel_values(
+    world: &World,
+    channel: &Channel,
+    name: &str,
+) -> crosstalk_core::naming::ChannelValues {
+    crosstalk_core::naming::ChannelValues {
+        name: name.to_string(),
+        group: world.group_name(channel.channel_group_id),
+        number: channel
+            .display_number()
+            .map(|number| format!("{number}"))
+            .unwrap_or_default(),
+        epg: channel
+            .current_epg_id()
+            .and_then(|id| world.entries.iter().find(|entry| entry.id == id))
+            .map(|entry| entry.name.clone())
+            .unwrap_or_else(|| "No EPG".to_string()),
+        id: channel.id.to_string(),
+    }
+}
+
+/// Whether any rename format substitutes `{epg}`, so the run must load the EPG listing.
+fn formats_name_epg(settings: &StreamsSettings) -> bool {
+    [
+        &settings.dead_rename_format,
+        &settings.low_framerate_rename_format,
+        &settings.black_screen_rename_format,
+    ]
+    .iter()
+    .any(|format| format.contains("{epg}"))
 }
 
 /// The switches this settings file has on, in words. Empty means triage would do nothing.
@@ -606,7 +574,6 @@ pub fn plan(
         .iter()
         .map(|channel| (channel.id, channel))
         .collect();
-    let tags = FormatTags::of(settings);
 
     let mut outcome = TriageOutcome {
         judged: verdicts.len(),
@@ -620,9 +587,9 @@ pub fn plan(
             .or_insert(0) += 1;
         plan_channel(
             &mut outcome,
+            world,
             settings,
             &suffixes,
-            &tags,
             channels.get(&verdict.channel_id).copied(),
             verdict,
         );
@@ -640,9 +607,9 @@ pub fn plan(
 /// Plan one channel's rename, suffix and move.
 fn plan_channel(
     outcome: &mut TriageOutcome,
+    world: &World,
     settings: &StreamsSettings,
     suffixes: &[String],
-    tags: &FormatTags,
     channel: Option<&Channel>,
     verdict: &RecordedVerdict,
 ) {
@@ -663,7 +630,12 @@ fn plan_channel(
             let format = class.rename_format(settings);
             let label_tags = format_tags(format);
             let base = verdict.channel_name.clone();
-            if let Some(label) = label_tags.iter().find(|label| ends_with_tag(&base, label)) {
+            // Step 9: the shared vocabulary's trailing-tag check (parens and literal
+            // affixes count now; the plugin's regex only read `[...]`).
+            if let Some(label) = label_tags
+                .iter()
+                .find(|label| crosstalk_matching::tags::has_trailing(&base, label))
+            {
                 // The one deliberate divergence: the plugin would append the tag again.
                 outcome.skipped.push(Skip {
                     channel_id: verdict.channel_id,
@@ -673,7 +645,7 @@ fn plan_channel(
                          (IPTV Checker would append a second one)"
                     ),
                 });
-            } else if let Some(to) = render_format(format, &base) {
+            } else if let Some(to) = render_format(format, &channel_values(world, channel, &base)) {
                 if to == base {
                     outcome.skipped.push(Skip {
                         channel_id: verdict.channel_id,
@@ -725,7 +697,7 @@ fn plan_channel(
         }
         // The plugin strips the applied format tags off the CURRENT name (it re-reads every
         // channel for this action), which in the same run is the name the rename above wrote.
-        let base = tags.strip(&current);
+        let base = strip_format_tags(&current, settings);
         let to = format!("{base} [{}]", format.to_uppercase());
         if to == current {
             outcome.skipped.push(Skip {
@@ -881,6 +853,9 @@ pub async fn run(
     let mut kinds = WorldKinds::only(WorldKind::Channels) | WorldKind::Groups;
     if !scope.profiles.trim().is_empty() {
         kinds = kinds | WorldKind::Profiles;
+    }
+    if formats_name_epg(settings) {
+        kinds = kinds | WorldKind::EpgEntries;
     }
     context.progress(&crosstalk_core::jobs::ProgressEvent::new(
         "streams.triage",
@@ -1292,33 +1267,70 @@ mod tests {
             format_tags("{name} [DEAD").is_empty(),
             "an unclosed bracket"
         );
-        assert!(ends_with_tag("ESPN [DEAD]", "DEAD"));
-        assert!(ends_with_tag("ESPN [dead]", "DEAD"), "case-insensitive");
-        assert!(ends_with_tag("ESPN [DEAD] ", "DEAD"));
-        assert!(!ends_with_tag("[DEAD] ESPN", "DEAD"));
-        assert!(!ends_with_tag("ESPN [DEAD] News", "DEAD"));
+        // Step 9: the shared vocabulary's trailing-tag check (`tags::has_trailing`).
+        use crosstalk_matching::tags::has_trailing;
+        assert!(has_trailing("ESPN [DEAD]", "DEAD"));
+        assert!(has_trailing("ESPN [dead]", "DEAD"), "case-insensitive");
+        assert!(has_trailing("ESPN [DEAD] ", "DEAD"));
+        assert!(!has_trailing("[DEAD] ESPN", "DEAD"));
+        assert!(!has_trailing("ESPN [DEAD] News", "DEAD"));
+        // Output change: parens and literal affixes count now.
+        assert!(has_trailing("ESPN (DEAD)", "DEAD"));
     }
 
     #[test]
     fn the_format_suffix_strips_every_known_tag_before_appending() {
-        let tags = known_format_tags(&configured_suffixes(&StreamsSettings::default()));
-        assert_eq!(strip_format_tags("ESPN [HD] [SD]", &tags), "ESPN");
-        assert_eq!(strip_format_tags("ESPN [unknown]", &tags), "ESPN");
-        assert_eq!(strip_format_tags("ESPN", &tags), "ESPN");
+        // Step 9: the shared parser (`tags::strip_with`): parens strip, stacked mixed
+        // runs strip in one pass; the set stays the plugin's.
+        let settings = StreamsSettings::default();
+        assert_eq!(strip_format_tags("ESPN [HD] [SD]", &settings), "ESPN");
+        assert_eq!(strip_format_tags("ESPN [unknown]", &settings), "ESPN");
+        assert_eq!(strip_format_tags("ESPN", &settings), "ESPN");
+        assert_eq!(strip_format_tags("ESPN (HD)", &settings), "ESPN");
+        // A provider quality tag triage never appends is not a format tag.
+        assert_eq!(strip_format_tags("ESPN [1080p]", &settings), "ESPN [1080p]");
+        assert_eq!(
+            strip_format_tags("ESPN [HEVC] [HD]", &settings),
+            "ESPN [HEVC]"
+        );
         // A status tag is not a FORMAT tag: the suffix step does not touch it.
-        assert_eq!(strip_format_tags("ESPN [DEAD]", &tags), "ESPN [DEAD]");
-        // A tag in the middle is not trailing, so it stays (the plugin's regex is `$`-anchored).
-        assert_eq!(strip_format_tags("[HD] ESPN", &tags), "[HD] ESPN");
+        assert_eq!(strip_format_tags("ESPN [DEAD]", &settings), "ESPN [DEAD]");
+        // A tag in the middle is not trailing, so it stays.
+        assert_eq!(strip_format_tags("[HD] ESPN", &settings), "[HD] ESPN");
     }
 
     #[test]
-    fn a_formats_rendering_leaves_other_braces_alone() {
+    fn a_formats_rendering_substitutes_every_channel_token() {
+        // Step 9: one template engine (`naming::render_channel`): `{group}` and friends
+        // substitute the channel's own values now (literal before).
+        let world = World {
+            groups: vec![ChannelGroup {
+                id: 7,
+                name: "US: Sports".to_string(),
+            }],
+            ..World::default()
+        };
+        let channel = Channel {
+            id: 42,
+            name: "ESPN".to_string(),
+            channel_group_id: Some(7),
+            channel_number: Some(serde_json::json!(12)),
+            ..Channel::default()
+        };
+        let values = channel_values(&world, &channel, "ESPN");
         assert_eq!(
-            render_format("{name} [DEAD] {group}", "ESPN").as_deref(),
-            Some("ESPN [DEAD] {group}")
+            render_format("{name} [DEAD] {group} #{number} {id} {epg}", &values).as_deref(),
+            Some("ESPN [DEAD] US: Sports #12 42 No EPG")
         );
-        assert_eq!(render_format("   ", "ESPN"), None);
-        assert_eq!(render_format("{name}", "ESPN").as_deref(), Some("ESPN"));
+        assert_eq!(render_format("{name}", &values).as_deref(), Some("ESPN"));
+        assert_eq!(
+            render_format("  {name} [DEAD]  ", &values).as_deref(),
+            Some("ESPN [DEAD]")
+        );
+        // A blank rendering is never written: no channel is renamed to whitespace.
+        assert_eq!(render_format("   ", &values), None);
+        assert_eq!(render_format("", &values), None);
+        assert!(!formats_name_epg(&StreamsSettings::default()));
     }
 
     // ---------------------------------------------------------------------------------

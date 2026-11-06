@@ -5,7 +5,8 @@
 //!   * `run`     — run one sub-app action once, without the daemon
 //!   * `validate` — check configuration against Dispatcharr
 //!   * `exports clear` — delete the CSV reports the sub-apps wrote
-//!   * `simulate-streams` — offline stream-to-channel match simulation (the parity oracle)
+//!   * `simulate-streams` — offline stream-to-channel match simulation (the unified engine;
+//!     the Janitor oracle with `--features oracle --oracle janitor`)
 //!   * `bench` — time the parts of a run, to decide whether REST is fast enough
 
 mod registry;
@@ -43,7 +44,7 @@ enum Command {
     Exports(ExportsArgs),
     /// Time the parts of a sub-app's run: the plan phases, and the writes they would issue.
     Bench(BenchArgs),
-    /// Offline stream-to-channel match simulation.
+    /// Offline stream-to-channel match simulation, on the unified engine.
     #[command(name = "simulate-streams")]
     SimulateStreams(SimulateArgs),
 }
@@ -166,8 +167,9 @@ struct SimulateArgs {
     /// Provider M3U.
     #[arg(long)]
     streams: PathBuf,
-    /// Score a candidate must reach to count as passed.
-    #[arg(long, default_value_t = 80)]
+    /// The decision cut: a stream passes as a member of the channel's best identity
+    /// family at this score (the `[matching]` cut; 95 is `strict`, the default).
+    #[arg(long, default_value_t = crosstalk_matching::DEFAULT_THRESHOLD)]
     threshold: u8,
     /// Rows written per stream to top_n.csv.
     #[arg(long = "top-n", default_value_t = 5)]
@@ -202,6 +204,12 @@ struct SimulateArgs {
     /// Do not strip miscellaneous parenthesised tags before comparing.
     #[arg(long = "no-ignore-misc")]
     no_ignore_misc: bool,
+    /// Oracle builds only (`--features oracle`): run a retired plugin pipeline instead
+    /// of the unified engine. `janitor` is EPG Janitor's `tools/match_sim.py`, ported
+    /// byte for byte, for `scripts/sim_parity.sh`.
+    #[cfg(feature = "oracle")]
+    #[arg(long, value_parser = ["janitor"])]
+    oracle: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -228,6 +236,13 @@ fn main() -> Result<()> {
                 countries: args.countries,
                 out: args.out,
                 tags,
+                #[cfg(feature = "oracle")]
+                matching: match args.oracle.as_deref() {
+                    Some("janitor") => simulate::Matching::Janitor,
+                    _ => simulate::Matching::Unified,
+                },
+                #[cfg(not(feature = "oracle"))]
+                matching: simulate::Matching::Unified,
             };
             match simulate::run(&options) {
                 Ok(out) => {
@@ -1402,5 +1417,205 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+/// Cross-app consistency (phase 3 goal reset, step 9): one name must yield the same
+/// identity and the same family in guide, streams and the shared cache, and match and
+/// visibility must group the same channels together.
+#[cfg(test)]
+mod cross_app_consistency_tests {
+    use super::Store;
+    use crosstalk_matching::engine::UnifiedEngine;
+    use crosstalk_matching::identity::ResolveContext;
+
+    fn matching_config() -> crosstalk_core::config::MatchingConfig {
+        crosstalk_core::config::MatchingConfig::default()
+    }
+
+    fn world(channels: &[&str], streams: &[&str]) -> crosstalk_core::World {
+        use crosstalk_core::dispatcharr::{Channel, Stream, World};
+        use serde_json::json;
+        World {
+            channels: channels
+                .iter()
+                .enumerate()
+                .map(|(i, name)| Channel {
+                    id: i as i64 + 1,
+                    name: (*name).to_string(),
+                    channel_number: Some(json!(i as i64 + 1)),
+                    channel_group_id: Some(100),
+                    streams: Vec::new(),
+                    ..Channel::default()
+                })
+                .collect(),
+            streams: streams
+                .iter()
+                .enumerate()
+                .map(|(i, name)| Stream {
+                    id: 20000 + i as i64,
+                    name: (*name).to_string(),
+                    m3u_account: Some(1),
+                    channel_group: Some(100),
+                    stream_stats: json!({"width": 1920, "height": 1080}),
+                    ..Stream::default()
+                })
+                .collect(),
+            groups: vec![crosstalk_core::dispatcharr::ChannelGroup {
+                id: 100,
+                name: "TVE".to_string(),
+            }],
+            m3u_accounts: vec![crosstalk_core::dispatcharr::M3uAccount {
+                id: 1,
+                name: "Main".to_string(),
+                is_active: true,
+                ..Default::default()
+            }],
+            ..World::default()
+        }
+    }
+
+    #[test]
+    fn one_name_resolves_to_one_identity_through_every_app_cache() {
+        // Guide and streams share the host run engine and one store: the same input
+        // resolves to the same identity no matter who asks, and the store row is one
+        // version-keyed entry both apps read.
+        let store = Store::in_memory().expect("store");
+        let matching = matching_config();
+        let guide_engine =
+            crosstalk_core::engine_run::RunEngine::for_config(&matching, Some(store.clone()));
+        let streams_engine =
+            crosstalk_core::engine_run::RunEngine::for_config(&matching, Some(store.clone()));
+        let ctx = ResolveContext::default();
+        for name in ["US: ESPN HD", "BBC One", "Cinemax (WNCF)", "HBO West"] {
+            assert_eq!(
+                guide_engine.resolve(name, &ctx),
+                streams_engine.resolve(name, &ctx),
+                "{name}: guide and streams disagree"
+            );
+            assert_eq!(
+                guide_engine.resolve(name, &ctx),
+                crosstalk_matching::identity::resolve_with(
+                    &UnifiedEngine::new(&matching.engine_config()),
+                    name,
+                    &ctx
+                ),
+                "{name}: the cache disagrees with a fresh resolve"
+            );
+        }
+    }
+
+    #[test]
+    fn one_name_gets_the_same_epg_entry_family_and_stream_family() {
+        // Identical candidate pools on both sides: guide's engine family over the
+        // EPG-entry names and streams' attached stream family over the same names
+        // must pick the same family (canonical names, in rank order).
+        let matching = matching_config();
+        let engine = UnifiedEngine::new(&matching.engine_config());
+        let names: Vec<String> = ["ESPN", "ESPN HD", "ESPN 2", "CNN"]
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        let index = crosstalk_matching::engine::EngineIndex::build(
+            &names,
+            &engine,
+            &ResolveContext::default(),
+        );
+        let guide_family: Vec<String> = engine
+            .rank_index("US: ESPN HD", &index)
+            .iter()
+            .map(|member| names[member.index].clone())
+            .collect();
+
+        let world = world(&["US: ESPN HD"], &["ESPN", "ESPN HD", "ESPN 2", "CNN"]);
+        let settings = crosstalk_streams::settings::StreamsSettings::default();
+        let options = crosstalk_streams::matching::MatchOptions::new(&settings, &matching);
+        let throughput = crosstalk_streams::quality::MemoryThroughputSource::new();
+        let outcome = crosstalk_streams::matching::plan(
+            &world,
+            &crosstalk_core::config::ScopeConfig::default(),
+            &settings,
+            &options,
+            &throughput,
+        )
+        .expect("plan");
+        let by_name: std::collections::HashMap<i64, String> = world
+            .streams
+            .iter()
+            .map(|stream| (stream.id, stream.name.clone()))
+            .collect();
+        let assignment = outcome
+            .assignments
+            .iter()
+            .find(|row| row.channel_name == "US: ESPN HD")
+            .expect("the channel is assigned");
+        let stream_family: Vec<String> = assignment
+            .after
+            .iter()
+            .map(|id| by_name[id].clone())
+            .collect();
+        assert_eq!(guide_family, stream_family, "guide and streams disagree");
+    }
+
+    #[test]
+    fn match_and_visibility_group_the_same_channels_together() {
+        // One grouping function serves both apps: the same inputs group the same
+        // channels together in `match` and in `visibility`.
+        let matching = matching_config();
+        let world = world(
+            &["ESPN", "ESPN HD", "CNN", "US: ESPN"],
+            &["ESPN", "ESPN HD", "CNN"],
+        );
+        let settings = crosstalk_streams::settings::StreamsSettings::default();
+        let options = crosstalk_streams::matching::MatchOptions::new(&settings, &matching);
+        let throughput = crosstalk_streams::quality::MemoryThroughputSource::new();
+        let outcome = crosstalk_streams::matching::plan(
+            &world,
+            &crosstalk_core::config::ScopeConfig::default(),
+            &settings,
+            &options,
+            &throughput,
+        )
+        .expect("plan");
+        let mut match_groups: Vec<Vec<i64>> = outcome
+            .gate_groups
+            .iter()
+            .map(|group| {
+                let mut members = group.member_ids.clone();
+                members.sort_unstable();
+                members
+            })
+            .collect();
+        match_groups.sort();
+        // Visibility groups through the same `build_groups`: rebuild it here over the
+        // same channels and compare member sets.
+        let engine = UnifiedEngine::new(&matching.engine_config());
+        let mut groups = crosstalk_streams::matching::build_groups(
+            &world.channels,
+            &options.database,
+            options.engine.normalizer(),
+            &[],
+            false,
+            &std::collections::HashMap::new(),
+            &engine,
+        );
+        for group in &mut groups {
+            group.members.sort_unstable();
+        }
+        let mut members: Vec<Vec<i64>> = groups
+            .iter()
+            .map(|group| {
+                group
+                    .members
+                    .iter()
+                    .map(|position| world.channels[*position].id)
+                    .collect()
+            })
+            .collect();
+        for set in &mut members {
+            set.sort_unstable();
+        }
+        members.sort();
+        assert_eq!(match_groups, members, "match and visibility disagree");
     }
 }

@@ -539,6 +539,51 @@ pub fn split_tags(name: &str) -> (String, Vec<Tag>) {
     (rest, tags)
 }
 
+/// Strip the trailing tags of the given kinds plus operator-configured labels.
+///
+/// The vocabulary knows the plugin-standard tags; an operator's own suffixes
+/// (`video_format_suffixes`) and custom rename-format labels are not in it, so they
+/// arrive as `extra` and strip as trailing bracket groups (case-insensitive),
+/// interleaved with the kind run: with kinds `[Quality]` and `extra = ["MyTag"]`,
+/// `ESPN [HD] [MyTag]` strips to `ESPN`. Output changes vs one regex per tag set:
+/// parens strip, and stacked mixed runs strip in one pass.
+///
+/// With no `kinds` only `extra` strips: an app whose strip set is its own (triage's
+/// format labels, restore's status + format labels) names it all in `extra` and the
+/// vocabulary decides nothing else.
+pub fn strip_with(name: &str, kinds: &[TagKind], extra: &[String]) -> String {
+    let strip = |name: &str| -> String {
+        if kinds.is_empty() {
+            name.trim().to_string()
+        } else {
+            strip(name, kinds)
+        }
+    };
+    let mut rest = strip(name);
+    loop {
+        let trimmed = rest.trim_end().to_string();
+        let mut peeled = trimmed.clone();
+        if let Some((open, inner, _)) = trailing_bracket(&trimmed) {
+            let inner = inner.trim();
+            if !inner.contains('[')
+                && !inner.contains(']')
+                && !inner.contains('(')
+                && !inner.contains(')')
+                && extra
+                    .iter()
+                    .any(|label| label.trim().eq_ignore_ascii_case(inner))
+            {
+                peeled.truncate(open);
+                peeled = peeled.trim_end().to_string();
+            }
+        }
+        if peeled == trimmed {
+            return trimmed;
+        }
+        rest = strip(&peeled);
+    }
+}
+
 /// Strip the trailing tags of the given kinds off a name.
 ///
 /// Only the trailing RUN strips, and only while its kind is wanted: with

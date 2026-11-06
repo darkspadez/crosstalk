@@ -69,10 +69,8 @@ ignore_tags = ""
 # How a channel's stream list is decided. With overwrite_streams on, Match & Assign REPLACES
 # the channel's whole list, so preview first and read the CSV.
 
-# How closely a stream name must match a channel name: relaxed (70) accepts more matches with
-# more false positives, normal (80) is balanced, strict (90) wants high confidence, exact (95)
-# is near-exact only.
-match_sensitivity = "normal"
+# NOTE (step 9): the match cut is `[matching] sensitivity` in crosstalk.toml (one ranker,
+# one cut, D02/T10). A `match_sensitivity` key here fails at load with a pointer there.
 # On: remove every existing stream and replace it with the matched ones, so a channel can end
 # a run with fewer streams than it started with. Off: add matches to what is there.
 overwrite_streams = true

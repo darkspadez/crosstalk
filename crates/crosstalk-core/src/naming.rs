@@ -215,6 +215,29 @@ fn tokens(template: &str) -> Vec<&str> {
     out
 }
 
+/// The bracket labels a rename format carries: the plugin's `_extract_format_tags`
+/// (3393), one parser for every app that reads rename/template suffix rules.
+///
+/// `{name} [DEAD]` yields `["DEAD"]`, and `[X] {name} [DEAD]` yields `["X", "DEAD"]`.
+/// An unclosed bracket yields nothing, which is what the plugin's `findall` does too.
+/// Step 9 moved this beside `naming` from streams' triage so lineup's suffix rules read
+/// the same parser; streams' `triage::format_tags` delegates here.
+pub fn format_tags(format: &str) -> Vec<String> {
+    let mut tags = Vec::new();
+    let mut rest = format;
+    while let Some(open) = rest.find('[') {
+        let Some(close) = rest[open + 1..].find(']') else {
+            break;
+        };
+        let tag = &rest[open + 1..open + 1 + close];
+        if !tag.contains('[') {
+            tags.push(tag.to_string());
+        }
+        rest = &rest[open + 1 + close + 1..];
+    }
+    tags
+}
+
 /// Render a per-channel template (channel-ops' `RenameKind::Template`).
 ///
 /// One pass, so a channel literally named `{group}` is not substituted twice.

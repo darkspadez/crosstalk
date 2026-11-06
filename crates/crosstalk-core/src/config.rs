@@ -486,6 +486,9 @@ impl MatchingConfig {
     ///
     /// `crosstalk-matching` cannot depend on this crate (the dependency runs the other way),
     /// so the host hands its values over rather than the matcher reading the file.
+    ///
+    /// Oracle tooling only (streams' Stream-Mapparr profile, under `cfg(test)` /
+    /// `--features oracle`): production builds its engine from [`Self::engine_config`].
     pub fn matcher_config(&self) -> crosstalk_matching::MatcherConfig {
         crosstalk_matching::MatcherConfig {
             flags: self.normalize_flags(),
@@ -524,17 +527,6 @@ impl MatchingConfig {
                 .collect(),
             flags: self.normalize_flags(),
         }
-    }
-
-    /// Build the matcher a sub-app runs with.
-    ///
-    /// Every app builds its matcher here, so the flags, aliases and callsigns a run uses are
-    /// the ones the host file states and the profile's parity sweep guards.
-    pub fn matcher(
-        &self,
-        profile: crosstalk_matching::MatchProfile,
-    ) -> crosstalk_matching::Matcher {
-        crosstalk_matching::Matcher::from_config(&self.matcher_config(), profile)
     }
 
     /// Which country databases to load.

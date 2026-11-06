@@ -1053,6 +1053,8 @@ impl UnifiedEngine {
         // The country rule (G03) over EVERY shortlisted candidate — probe hits and
         // fuzzy-block hits alike, as Lineuparr filters all of `all_matches` — then
         // score each survivor once, at the cut.
+        // The query's own identity key, for the tie-break below.
+        let query_key = norm_q.to_lowercase();
         let mut scored: Vec<(EngineRanked, usize)> = Vec::new();
         for i in probe {
             if !self.country_keep_index(query_country, qn, index, i, &mut count) {
@@ -1069,7 +1071,7 @@ impl UnifiedEngine {
                         score,
                         method,
                     },
-                    overlap,
+                    tie_rank(index.identity_keys[i].key == query_key, overlap),
                 ));
             }
         }
@@ -1563,6 +1565,22 @@ fn ascii_tokens(name_lower: &str) -> HashSet<String> {
     tokens
 }
 
+/// The tie-break among equal scores (step 9 review): a candidate whose identity key IS
+/// the query's comes first, then T12's original-token overlap.
+///
+/// Without the first half the overlap alone picks the top, and the top fixes the
+/// family: `US: beIN Sports Spanish in English` scores 100 against its own
+/// `beIN Sports Spanish in English` (exact) AND against
+/// `US: beIN Sports English in Spanish` (token-sort fuzzy, the same words reordered),
+/// and the shared `US` token made the OTHER channel the top — so streams attached the
+/// wrong channel's whole family and guide assigned its entry. An identity-equal
+/// candidate never loses a tie to a different identity. Pair verdicts (`same`/`score`,
+/// the corpus gate) are untouched: only the order among equal scores changes.
+fn tie_rank(identity_equal: bool, overlap: usize) -> usize {
+    const IDENTITY: usize = 1 << 20;
+    usize::from(identity_equal) * IDENTITY + overlap.min(IDENTITY - 1)
+}
+
 fn token_overlap_count(query_tokens: &HashSet<String>, candidate: &str) -> usize {
     let candidate_lower = candidate.to_lowercase();
     ascii_tokens(&candidate_lower)
@@ -1697,5 +1715,38 @@ mod tests {
         assert_eq!((shortlist[1].index, shortlist[1].score), (0, 90));
         // The family at the low cut still holds one identity only.
         assert_eq!(low.rank_index("Sky Cinema Premiere", &index).len(), 1);
+    }
+
+    #[test]
+    fn an_identity_equal_candidate_wins_a_tie_against_a_reordered_name() {
+        // Step 9 review: the same words reordered are a different channel. Both score
+        // 100 (exact vs token-sort), and the query's `US` token used to make the OTHER
+        // channel the top — and with it the family.
+        let engine = UnifiedEngine::decided();
+        let candidates: Vec<String> = [
+            "US: CL beIN Sports English SD in Spanish FHD",
+            "CL beIN Sports English SD in Spanish",
+            "CL beIN Sports Spanish HD in English (Backup)",
+            "CL beIN Sports Spanish HD in English",
+        ]
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
+        let family = engine.rank_in(
+            "US: CL beIN Sports Spanish HD in English",
+            None,
+            &candidates,
+        );
+        let names: Vec<&str> = family
+            .iter()
+            .map(|r| candidates[r.index].as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "CL beIN Sports Spanish HD in English (Backup)",
+                "CL beIN Sports Spanish HD in English"
+            ]
+        );
     }
 }

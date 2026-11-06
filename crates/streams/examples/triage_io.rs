@@ -258,20 +258,15 @@ fn class_of(class: &str) -> Class {
     }
 }
 
-/// A format tier, as the probe records it, mapped to the `&'static str` it stores.
+/// A format tier, as the probe records it, read off the shared quality model
+/// (`QualityTier::parse_label` over `IC_FORMAT_LABELS`) so the harness stores what the
+/// run reads.
 fn format_tier(format: Option<&str>) -> &'static str {
-    match format
+    use crosstalk_core::quality::QualityTier;
+    format
+        .and_then(QualityTier::parse_label)
+        .map(|tier| tier.ic_label())
         .unwrap_or("Unknown")
-        .trim()
-        .to_ascii_uppercase()
-        .as_str()
-    {
-        "UHD" => "UHD",
-        "FHD" => "FHD",
-        "HD" => "HD",
-        "SD" => "SD",
-        _ => "Unknown",
-    }
 }
 
 fn main() -> anyhow::Result<()> {

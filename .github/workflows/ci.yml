@@ -41,6 +41,15 @@ jobs:
       - name: Test
         run: cargo test --locked --workspace
 
+      # One matcher in the binary: no retired plugin-profile matcher symbol links into
+      # the production `crosstalk` (they stay as `--features oracle` tooling).
+      - name: One matcher in the binary
+        run: ./scripts/one_matcher_check.sh
+
+      # The oracle build (`simulate-streams --oracle janitor`) must keep compiling.
+      - name: Clippy (oracle build)
+        run: cargo clippy --locked -p crosstalk --features oracle --all-targets -- -D warnings
+
 
   docker:
     # Namespace runners hand the build to a Remote Builder (no setup-buildx needed);
@@ -129,10 +138,13 @@ jobs:
       # Needs the reference/ submodules checked out (this job's checkout does).
       - name: Merged data set reproduces byte for byte
         run: python3 -I scripts/data/build_merged.py --check
-      # Step 8: guide runs the unified engine, so the Janitor-profile simulator is a
-      # report (exit 0), not a gate. The streams gate is `match_parity.py` below.
-      - name: Simulate oracle vs the Python tool (report)
-        run: ./scripts/sim_parity.sh --quick --report
+      # The Janitor ORACLE (`--features oracle`, `simulate-streams --oracle janitor`)
+      # must stay byte-identical to the Python tool: a gate. The production simulator
+      # runs the unified engine; its difference from the tool is the script's
+      # `[unified]` report line. Step 9: streams runs the unified engine too, so
+      # `match_parity.py` and `visibility_parity.py` below are reports.
+      - name: Simulate oracle vs the Python tool
+        run: ./scripts/sim_parity.sh --quick
       - name: Primitive sweep vs the Python matcher
         run: |
           python3 scripts/parity_sweep.py --kinds normalize,callsign,location,network --limit 300
@@ -188,15 +200,17 @@ jobs:
       # `crates/streams/examples/sort_io`. ~10s over 840 cases, 1500 channels.
       - name: Streams sort vs the plugin's quality model
         run: python3 -I scripts/sort_parity.py
-      # The streams match pipeline is Stream-Mapparr's Match & Assign, ported. The harness
-      # drives the plugin's REAL `_build_channel_groups`, `_match_streams_to_channel`,
+      # Phase 3 step 9: streams runs the unified matching layer, so the plugin's
+      # collector is an oracle, not a gate. The harness drives the plugin's REAL
+      # `_build_channel_groups`, `_match_streams_to_channel`,
       # `_channels_to_update_for_group`, `_streams_to_assign`, `_same_country_ids_for` and
       # `_write_channel_streams` (with the Django stubs its own tests install, plus a fake
       # ChannelStream table) and compares every channel's final stream list with
-      # `crates/streams/examples/match_io`. ~20s over 1,800 swept cases plus randomised ones,
-      # EPG placeholder fixtures included.
-      - name: Streams match vs the plugin's collector
-        run: python3 -I scripts/match_parity.py
+      # `crates/streams/examples/match_io` in report mode (exit 0; diffs are attributed
+      # in `docs/oracle-reports/streams.md`). ~20s over 1,800 swept cases plus
+      # randomised ones, EPG placeholder fixtures included.
+      - name: Streams match vs the plugin's collector (report)
+        run: python3 -I scripts/match_parity.py --report
       # The three read-only streams tools, against the plugin's own code: its
       # `check_stream_countries_action` and `test_regex_rules_action` driven end to end, and
       # `placeholder_scan.py` imported directly (it is plain Python). The EPG placeholder path
@@ -218,12 +232,20 @@ jobs:
       # stats merge and the per-channel verdicts with `crates/streams/examples/probe_io`.
       - name: Streams probe vs the plugin's stream check
         run: python3 -I scripts/probe_parity.py
-      # Channel visibility is Stream-Mapparr's Manage Channel Visibility, ported: it drives the
-      # plugin's REAL `manage_channel_visibility_action` (with `ChannelProfileMembership` faked
-      # as a table) plus the shared `_build_channel_groups`, and compares the resulting
-      # membership per channel with `crates/streams/examples/visibility_io`.
-      - name: Streams visibility vs the plugin's own action
-        run: python3 -I scripts/visibility_parity.py
+      # Phase 3 step 9: match and visibility group by the same identity family key, so
+      # the plugin's visibility action is an oracle, not a gate. The harness drives the
+      # plugin's REAL `manage_channel_visibility_action` (with `ChannelProfileMembership`
+      # faked as a table) plus the shared grouping, and compares the resulting
+      # membership per channel with `crates/streams/examples/visibility_io` in report
+      # mode (exit 0; diffs are attributed in `docs/oracle-reports/streams.md`).
+      - name: Streams visibility vs the plugin's own action (report)
+        run: python3 -I scripts/visibility_parity.py --report
+      # Phase 3 step 9: the streams oracle diff report (docs/oracle-reports/streams.md)
+      # is generated, and --check verifies it reproduces byte for byte. The report
+      # itself never fails on differences (reports are not gates); the corpus and
+      # cross-app consistency gates are the gate.
+      - name: Streams oracle diff report reproduces
+        run: python3 -I scripts/oracle_report_streams.py --check
       # Triage and restore are IPTV Checker's seven post-actions and its Restore Recovered
       # Channels, ported. The harness runs the plugin's REAL rename/move/suffix actions in its
       # own scheduled order (with the channel table faked as a dict and the real

@@ -32,8 +32,10 @@ use crosstalk_core::subapp::{
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-/// Stream-Mapparr's `SENSITIVITY_MAP`: the preset name the operator picks, and the fuzzy score
-/// it stands for (plugin.py, `PluginConfig.SENSITIVITY_MAP`).
+/// Stream-Mapparr's `SENSITIVITY_MAP`, retired in step 9 (D02/T10: one cut in `[matching]`
+/// sensitivity): the preset name the operator used to pick, and the fuzzy score it stood for
+/// (plugin.py, `PluginConfig.SENSITIVITY_MAP`). Kept as oracle tooling for the parity
+/// examples, which map a case's preset onto the host `[matching]` sensitivity.
 pub const SENSITIVITY: [(&str, u8); 4] = [
     ("relaxed", 70),
     ("normal", 80),
@@ -41,15 +43,22 @@ pub const SENSITIVITY: [(&str, u8); 4] = [
     ("exact", 95),
 ];
 
-/// The preset a missing or unrecognized `match_sensitivity` resolves to.
+/// The preset a missing or unrecognized retired `match_sensitivity` resolves to.
 ///
-/// `normal` rather than Stream-Mapparr's own fallback: the plugin's
-/// `_get_fuzzy_match_threshold` falls back to its `fuzzy_match_threshold` default of 85 when
-/// the preset is unusable, which is not one of the four presets. A form that renders `normal`
-/// and a run that scores at 85 would be two different answers, so an unusable preset is
-/// rejected by [`validate`] and a run refuses it; this is only what a scan of the map yields
-/// when someone asks without checking.
+/// Oracle tooling only (parity examples): production reads the cut from `[matching]`
+/// sensitivity, and a `match_sensitivity` key in `streams.toml` fails at load with a
+/// pointer to it (see [`RETIRED_MATCH_CUT`]).
 pub const DEFAULT_SENSITIVITY: &str = "normal";
+
+/// Retired per-app cuts: the one threshold lives in `[matching]` sensitivity in
+/// `crosstalk.toml` (goal reset, D02/T10 `janitor-95`). Like guide's retired
+/// `match_confidence_threshold` / `heal_confidence_threshold`, an old file naming the key
+/// fails at load with a pointer to the host setting instead of running at a cut the run
+/// ignores.
+const RETIRED_MATCH_CUT: [(&str, &str); 1] = [(
+    "match_sensitivity",
+    "[matching] sensitivity in crosstalk.toml",
+)];
 
 /// The two group-filter modes, as Stream-Mapparr spells them (`GROUP_FILTER_MODES`).
 pub const FILTER_MODES: [&str; 2] = ["include", "exclude"];
@@ -137,9 +146,9 @@ pub struct StreamsSettings {
     pub ignore_tags: String,
 
     // --- Match --------------------------------------------------------------------------
-    /// `relaxed` / `normal` / `strict` / `exact`, which is 70 / 80 / 90 / 95.
-    /// Stream-Mapparr's `match_sensitivity`.
-    pub match_sensitivity: String,
+    // NOTE (step 9): `match_sensitivity` is retired — the one cut is `[matching]`
+    // sensitivity in `crosstalk.toml` (D02/T10). An old file fails at load (see
+    // `RETIRED_MATCH_CUT`); the parity examples map a case preset onto the host cut.
     /// Replace a channel's stream list instead of appending to it.
     /// Stream-Mapparr's `overwrite_streams`.
     pub overwrite_streams: bool,
@@ -339,7 +348,6 @@ impl Default for StreamsSettings {
             stream_name_regex_rules: String::new(),
             ignore_tags: String::new(),
 
-            match_sensitivity: DEFAULT_SENSITIVITY.to_string(),
             overwrite_streams: true,
             keep_custom_streams: true,
             allow_same_name_streams: false,
@@ -431,11 +439,6 @@ pub const EPG_CHANNEL_SCHEDULE_CLEANUP_RULES: &str =
     r#"[["(?i)\\s*\\|\\s*\\w+\\s*@\\s*\\d{1,2}(?::\\d{2})?\\s*[AP]?M?\\s*$", ""]]"#;
 
 impl StreamsSettings {
-    /// The fuzzy score `match_sensitivity` stands for.
-    pub fn match_threshold(&self) -> u8 {
-        threshold_for(&self.match_sensitivity)
-    }
-
     /// The parsed `ignore_tags` list, quotes removed.
     pub fn ignore_tag_list(&self) -> Vec<String> {
         crate::selection::parse_ignore_tags(&self.ignore_tags)
@@ -450,7 +453,9 @@ impl StreamsSettings {
     }
 }
 
-/// The threshold one preset name stands for, or `normal`'s when the name is not a preset.
+/// The threshold one retired preset name stands for, or `normal`'s when the name is not
+/// a preset. Oracle tooling only: the parity examples map a case's `match_sensitivity`
+/// onto the host `[matching]` sensitivity through this table.
 pub fn threshold_for(sensitivity: &str) -> u8 {
     let wanted = sensitivity.trim().to_lowercase();
     SENSITIVITY
@@ -464,6 +469,19 @@ pub fn threshold_for(sensitivity: &str) -> u8 {
                 .map(|(_, threshold)| *threshold)
                 .expect("the default preset exists")
         })
+}
+
+/// The host `[matching]` sensitivity one retired preset name stands for, as the parity
+/// examples set it: `relaxed`/`normal`/`strict`/`exact` are cut names there too
+/// (`low`/`medium`/`high`/`strict` = 70/80/90/95), and `exact` is the same 95 as `strict`.
+pub fn sensitivity_for_preset(preset: &str) -> String {
+    match preset.trim().to_lowercase().as_str() {
+        "relaxed" => "low".to_string(),
+        "normal" => "medium".to_string(),
+        "strict" => "high".to_string(),
+        "exact" => "strict".to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// Settings that are no longer read from this file, and where each went.
@@ -639,7 +657,7 @@ const MOVED: [(&str, &str); 45] = [
 /// A hint naming the new home for every retired setting the file still mentions.
 fn moved_settings_hint(text: &str) -> Option<String> {
     let mut moved: Vec<String> = Vec::new();
-    for (old, new) in MOVED {
+    for (old, new) in MOVED.iter().chain(RETIRED_MATCH_CUT.iter()) {
         let names_it = text.lines().map(str::trim).any(|line| {
             !line.starts_with('#')
                 && line.starts_with(old)
@@ -757,19 +775,8 @@ pub fn schema() -> SettingsSchema {
              & Assign REPLACES a channel's whole stream list, so preview first and read the \
              CSV.",
         ),
-        FieldSpec::new(
-            "match_sensitivity",
-            SECTION_MATCH,
-            "Match Sensitivity",
-            FieldKind::Text,
-            FieldValue::Text(DEFAULT_SENSITIVITY.to_string()),
-        )
-        .with_placeholder("relaxed, normal, strict or exact")
-        .with_help(
-            "How closely a stream name must match a channel name: relaxed (70) accepts more \
-             matches with more false positives, normal (80) is balanced, strict (90) wants \
-             high confidence, exact (95) is near-exact.",
-        ),
+        // NOTE (step 9): no `match_sensitivity` row — the one cut is `[matching]`
+        // sensitivity in `crosstalk.toml` (D02/T10). The form points at the host setting.
         FieldSpec::new(
             "overwrite_streams",
             SECTION_MATCH,
@@ -1545,7 +1552,6 @@ pub fn to_values(settings: &StreamsSettings) -> SettingsValues {
         ),
         ("stream_name_regex_rules", &settings.stream_name_regex_rules),
         ("ignore_tags", &settings.ignore_tags),
-        ("match_sensitivity", &settings.match_sensitivity),
         ("stream_prefix_countries", &settings.stream_prefix_countries),
         (
             "epg_placeholder_name_patterns",
@@ -1753,9 +1759,6 @@ pub fn apply_values(settings: &mut StreamsSettings, values: &SettingsValues) -> 
     if let Some(text) = values.text("ignore_tags") {
         settings.ignore_tags = text.to_string();
     }
-    if let Some(text) = values.text("match_sensitivity") {
-        settings.match_sensitivity = text.to_string();
-    }
     if let Some(text) = values.text("stream_prefix_countries") {
         settings.stream_prefix_countries = text.to_string();
     }
@@ -1939,20 +1942,8 @@ pub fn save(path: &Path, settings: &StreamsSettings) -> Result<()> {
 pub fn validate(settings: &StreamsSettings) -> Vec<String> {
     let mut errors = Vec::new();
 
-    if !SENSITIVITY
-        .iter()
-        .any(|(name, _)| *name == settings.match_sensitivity.trim().to_lowercase())
-    {
-        errors.push(format!(
-            "match_sensitivity must be one of {}, got {:?}",
-            SENSITIVITY
-                .iter()
-                .map(|(name, _)| *name)
-                .collect::<Vec<_>>()
-                .join(", "),
-            settings.match_sensitivity
-        ));
-    }
+    // NOTE (step 9): no `match_sensitivity` check — the cut is `[matching]` sensitivity
+    // (D02/T10). A file still naming the key fails at load (`RETIRED_MATCH_CUT`).
     if !FILTER_MODES
         .iter()
         .any(|mode| *mode == settings.stream_group_filter_mode.trim().to_lowercase())
@@ -2112,17 +2103,6 @@ pub fn warnings(settings: &StreamsSettings) -> Vec<String> {
             }
         }
     }
-    if !SENSITIVITY
-        .iter()
-        .any(|(name, _)| *name == settings.match_sensitivity.trim().to_lowercase())
-    {
-        warnings.push(format!(
-            "match_sensitivity {:?} is not a preset; a run will use {} ({})",
-            settings.match_sensitivity,
-            DEFAULT_SENSITIVITY,
-            threshold_for(DEFAULT_SENSITIVITY)
-        ));
-    }
     if !FILTER_MODES
         .iter()
         .any(|mode| *mode == settings.stream_group_filter_mode.trim().to_lowercase())
@@ -2229,7 +2209,6 @@ mod tests {
             stream_group_filter_mode: "exclude".to_string(),
             stream_name_regex_rules: r#"[["\\s+", " "]]"#.to_string(),
             ignore_tags: "4K, \" East\"".to_string(),
-            match_sensitivity: "strict".to_string(),
             overwrite_streams: false,
             keep_custom_streams: false,
             allow_same_name_streams: true,
@@ -2346,7 +2325,7 @@ mod tests {
         assert_eq!(settings.selected_m3us, "");
         assert_eq!(settings.selected_stream_groups, "");
         assert_eq!(settings.stream_group_filter_mode, "include");
-        assert_eq!(settings.match_sensitivity, "normal");
+        // NOTE (step 9): no `match_sensitivity` — the cut is `[matching]` sensitivity.
         assert!(settings.overwrite_streams);
         assert!(settings.keep_custom_streams);
         assert!(!settings.allow_same_name_streams);
@@ -2443,22 +2422,28 @@ mod tests {
         let mut settings = StreamsSettings::default();
         assert!(validate(&settings).is_empty());
 
-        settings.match_sensitivity = "lenient".to_string();
         settings.stream_group_filter_mode = "skip".to_string();
         let errors = validate(&settings);
-        assert_eq!(errors.len(), 2, "{errors:?}");
-        assert!(errors[0].contains("match_sensitivity"));
-        assert!(errors[1].contains("stream_group_filter_mode"));
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("stream_group_filter_mode"));
         // A run still proceeds on the documented fallbacks, and says so.
         let warnings = warnings(&settings);
-        assert!(
-            warnings.iter().any(|w| w.contains("normal (80)")),
-            "{warnings:?}"
-        );
         assert!(
             warnings.iter().any(|w| w.contains("include")),
             "{warnings:?}"
         );
+    }
+
+    #[test]
+    fn a_retired_match_sensitivity_fails_at_load_naming_the_host_cut() {
+        // Step 9 (D02/T10): the per-app cut is gone; an old file fails loudly instead of
+        // running at a cut the run ignores.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("streams.toml");
+        std::fs::write(&path, "match_sensitivity = \"strict\"\n").expect("seed");
+        let error = format!("{:#}", load(&path).expect_err("rejects the old key"));
+        assert!(error.contains("match_sensitivity"), "{error}");
+        assert!(error.contains("[matching] sensitivity"), "{error}");
     }
 
     #[test]
@@ -2673,6 +2658,8 @@ mod tests {
             "scheduled_sort_streams",
             "scheduled_fill_mirror_backups",
             "enable_scheduled_csv_export",
+            // Step 9: the per-app cut lives in `[matching]` now (D02/T10).
+            "match_sensitivity",
             // IPTV Checker settings that live elsewhere now.
             "channel_groups",
             "channel_groups_mode",
@@ -2700,7 +2687,11 @@ mod tests {
             "ffprobe_analysis_duration",
             "share_usage_counts",
         ];
-        let moved: std::collections::HashSet<&str> = MOVED.iter().map(|(old, _)| *old).collect();
+        let moved: std::collections::HashSet<&str> = MOVED
+            .iter()
+            .chain(RETIRED_MATCH_CUT.iter())
+            .map(|(old, _)| *old)
+            .collect();
         // `scheduled_times` is one key both plugins grew; it needs one entry, not two.
         let mut missing: Vec<&&str> = retired
             .iter()

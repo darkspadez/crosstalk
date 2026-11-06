@@ -24,5 +24,6 @@ tracing.workspace = true
 rayon.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 tempfile.workspace = true
 wiremock.workspace = true

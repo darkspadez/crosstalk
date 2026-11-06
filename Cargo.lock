@@ -600,6 +600,7 @@ name = "crosstalk-streams"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "chrono-tz",
  "crosstalk-core",

@@ -29,5 +29,11 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 serde_json.workspace = true
 
+[features]
+# Oracle tooling: `simulate-streams --oracle janitor`, the retired EPG Janitor pipeline
+# ported from `tools/match_sim.py`, which `scripts/sim_parity.sh` pins against the
+# Python tool. A production build has one matcher: the unified engine.
+oracle = []
+
 [dev-dependencies]
 tempfile.workspace = true

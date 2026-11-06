@@ -188,7 +188,10 @@ def python_family(engine: ablate.Engine, threshold: int, query: str,
     pair verdict: ``match_all_streams`` on that one candidate plus the
     post-filters), kept at the cut, ranked as ``match_all_streams`` ranks
     (score desc, then original-token overlap with the query, stable in
-    candidate order -- T12 `lu`), then the identity family cut.
+    candidate order -- T12 `lu`) with the step-9 tie-break in front of the
+    overlap (a candidate whose identity key IS the query's wins a tie, so a
+    reordered name scoring 100 by token sort cannot become the top), then the
+    identity family cut.
 
     Not one ``match_all_streams`` call over the whole set: the base patches
     leave LU's regionless branch in place, which over a SET drops West/Pacific
@@ -196,13 +199,15 @@ def python_family(engine: ablate.Engine, threshold: int, query: str,
     (ZONE is the post-filter), not part of the decided configuration.
     """
     query_tokens = set(re.findall(r"[a-z0-9]+", (query or "").lower()))
+    query_key = engine.normalize(query).lower()
     scored = []
     for position, name in enumerate(candidates):
         hit = engine.score(query, name)
         if hit is None or hit[0] < threshold:
             continue
         overlap = len(query_tokens & set(re.findall(r"[a-z0-9]+", name.lower())))
-        scored.append((-hit[0], -overlap, position, name, hit[0], hit[1]))
+        equal = engine.normalize(name).lower() == query_key
+        scored.append((-hit[0], -int(equal), -overlap, position, name, hit[0], hit[1]))
     scored.sort()
     family = [(name, score, method) for *_key, name, score, method in scored]
     if not family:

@@ -749,7 +749,7 @@ fn phases(
 
 /// The notes every report carries: the build profile, and the settings that decide what a
 /// plan writes.
-fn common_notes(settings: &StreamsSettings) -> Vec<String> {
+fn common_notes(settings: &StreamsSettings, matching_config: &MatchingConfig) -> Vec<String> {
     let mut notes = Vec::new();
     if cfg!(debug_assertions) {
         notes.push(
@@ -761,11 +761,11 @@ fn common_notes(settings: &StreamsSettings) -> Vec<String> {
     }
     notes.push(format!(
         "settings: overwrite_streams={}, keep_custom_streams={}, visible_channel_limit={}, \
-         match threshold {}, throughput sorting {}",
+         [matching] cut {}, throughput sorting {}",
         settings.overwrite_streams,
         settings.keep_custom_streams,
         settings.visible_channel_limit,
-        settings.match_threshold(),
+        matching_config.threshold(),
         if settings.enable_throughput_sorting {
             "on"
         } else {
@@ -804,7 +804,7 @@ pub fn synthetic(
     let throughput = MemoryThroughputSource::new();
     let phases = phases(&world, &scope, settings, matching_config, &throughput);
 
-    let mut notes = common_notes(settings);
+    let mut notes = common_notes(settings, matching_config);
     notes.push(
         "scope: every channel, in the synthetic world's only profile (\"All\"); [scope] in \
          crosstalk.toml is not applied to a synthetic world"
@@ -882,7 +882,7 @@ pub async fn live(
         None => None,
     };
 
-    let mut notes = common_notes(settings);
+    let mut notes = common_notes(settings, &config.matching);
     notes.push(format!(
         "read-only: nothing was written by the plans; measured against {}",
         config.dispatcharr.api_root()

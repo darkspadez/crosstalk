@@ -107,7 +107,6 @@ use crosstalk_core::dispatcharr::{World, WorldKind, WorldKinds};
 use crosstalk_core::jobs::JobContext;
 use crosstalk_core::store::{RunRow, Subject};
 use crosstalk_core::subapp::{JobOutcome, OutcomeBuilder, SubApp};
-use regex::Regex;
 use std::collections::{HashMap, HashSet};
 
 /// The report's title, without the preview/applied suffix.
@@ -246,61 +245,50 @@ impl RestoreOutcome {
     }
 }
 
-/// The trailing-tag regex the plugin compiles for a set of labels (`_compile_trailing_tag_re`,
-/// 3398): one or more ` [TAG]` groups at the end, case-insensitively.
-fn trailing_tag_pattern(labels: &[String]) -> Option<Regex> {
-    let mut labels: Vec<String> = labels
-        .iter()
-        .map(|label| label.trim().to_string())
-        .filter(|label| !label.is_empty())
-        .collect();
-    labels.sort_by_key(|label| std::cmp::Reverse(label.len()));
-    labels.dedup();
-    if labels.is_empty() {
-        return None;
-    }
-    let alternation = labels
-        .iter()
-        .map(|label| regex::escape(label))
-        .collect::<Vec<_>>()
-        .join("|");
-    Regex::new(&format!(r"(?i)(?:\s*\[(?:{alternation})\])+\s*$")).ok()
-}
-
-/// The compiled matchers one restore run uses: what makes a channel eligible for the tag strip
-/// and what the strip removes.
+/// The tag sets one restore run strips with: what makes a channel eligible for the tag
+/// strip and what the strip removes.
 ///
-/// Compiled once, like the plugin's `strip_re`/`status_re` (3888-3889): at 20k recovered
-/// channels a per-channel compile would be 40 000 regex compilations.
+/// Step 9: the plugin's compiled `strip_re`/`status_re` (3888-3889) become the shared
+/// trailing-tag parser ([`tags::strip_with`] / [`tags::has_trailing`]), which compiles
+/// nothing — so the one-matcher-per-run shape costs nothing per channel either.
+///
+/// Strip-set decision: restore strips exactly what triage can have written — the
+/// IC-source `status` rows (`[DEAD]`/`[Slow]`/`[Blank]`), the five IC format labels, the
+/// rename-format labels and the configured suffixes ([`strippable_tags`], the plugin's
+/// `_derive_strippable_tags`) — never the rest of the vocabulary. CM `Unk` is lineup's
+/// mark and guide `BadEPG` is guide's, and the vocabulary's other quality rows
+/// (`[1080p]`, `[HEVC]`, `[RAW]`, ...) are provider tags triage never appends: stripping
+/// any of them would undo another app's (or the provider's) name. The parser change
+/// alone is the output change: parens strip and stacked mixed runs strip in one pass.
 #[derive(Debug, Clone)]
 pub struct Tagger {
-    status: Option<Regex>,
-    strippable: Option<Regex>,
-    format: crate::triage::FormatTags,
+    status: Vec<String>,
+    strippable: Vec<String>,
 }
 
 impl Tagger {
-    /// The matchers of this settings file.
+    /// The tag sets of this settings file.
     pub fn of(settings: &StreamsSettings) -> Self {
         Self {
-            status: trailing_tag_pattern(&status_tags(settings)),
-            strippable: trailing_tag_pattern(&strippable_tags(settings)),
-            format: crate::triage::FormatTags::of(settings),
+            status: status_tags(settings),
+            strippable: strippable_tags(settings),
         }
     }
 
     /// Whether the name carries a trailing STATUS tag — the plugin's `status_re.search` (3442).
+    ///
+    /// Step 9: the shared trailing-tag check (parens and literal affixes count now).
     pub fn is_eligible(&self, name: &str) -> bool {
-        self.status
-            .as_ref()
-            .is_some_and(|pattern| pattern.is_match(name))
+        use crosstalk_matching::tags::has_trailing;
+        self.status.iter().any(|label| has_trailing(name, label))
     }
 
     /// The name with every known tag stripped, or `None` when nothing would change or the
     /// result would be empty (the plugin's `if base and base != name`, 3448-3451).
+    ///
+    /// Step 9 output changes: parens strip and stacked mixed runs strip in one pass.
     pub fn strip(&self, name: &str) -> Option<String> {
-        let pattern = self.strippable.as_ref()?;
-        let base = pattern.replace(name, "").trim_end().to_string();
+        let base = crosstalk_matching::tags::strip_with(name, &[], &self.strippable);
         if base.is_empty() || base == name {
             None
         } else {
@@ -308,15 +296,18 @@ impl Tagger {
         }
     }
 
-    /// The format-tag matcher, for [`is_format_suffix`].
-    pub fn format(&self) -> &crate::triage::FormatTags {
-        &self.format
+    /// The format-tag strip, for [`is_format_suffix`]: the standard five plus the
+    /// configured suffixes.
+    pub fn strip_format(&self, name: &str, settings: &StreamsSettings) -> String {
+        crate::triage::strip_format_tags(name, settings)
     }
 }
 
 /// The bracket labels of a rename format — the plugin's `_extract_format_tags` (3393).
+///
+/// Step 9: one parser beside `naming`; this delegates there.
 pub fn format_tags(format: &str) -> Vec<String> {
-    crate::triage::format_tags(format)
+    crosstalk_core::naming::format_tags(format)
 }
 
 /// Every tag this settings file can strip: the standard status and quality tags, the labels of
@@ -357,22 +348,22 @@ pub fn status_tags(settings: &StreamsSettings) -> Vec<String> {
 }
 
 /// Whether the name ends with one of the STATUS tags — the plugin's eligibility test.
+///
+/// Step 9: the shared trailing-tag check over the unified vocabulary.
 pub fn has_status_tag(name: &str, settings: &StreamsSettings) -> bool {
-    trailing_tag_pattern(&status_tags(settings)).is_some_and(|pattern| pattern.is_match(name))
+    use crosstalk_matching::tags::has_trailing;
+    status_tags(settings)
+        .iter()
+        .any(|label| has_trailing(name, label))
 }
 
 /// Strip every known tag from the name — `strip_re.sub('', name).rstrip()` (3448).
 ///
 /// `None` when nothing would change, or when the result is empty: a name that is ONLY a tag
-/// keeps it, which is the plugin's `if base and base != name`.
+/// keeps it, which is the plugin's `if base and base != name`. Step 9: the shared parser
+/// (parens strip; stacked mixed runs strip in one pass) over the plugin's own set.
 pub fn strip_tags(name: &str, settings: &StreamsSettings) -> Option<String> {
-    let pattern = trailing_tag_pattern(&strippable_tags(settings))?;
-    let base = pattern.replace(name, "").trim_end().to_string();
-    if base.is_empty() || base == name {
-        None
-    } else {
-        Some(base)
-    }
+    Tagger::of(settings).strip(name)
 }
 
 /// One recorded change to one field of one channel.
@@ -390,8 +381,9 @@ pub struct Change {
 /// suffix, which is applied to channels that play rather than to ones that failed"), and
 /// undoing it nightly would flap against the next triage run. A MARK ([DEAD], [Slow], [Blank],
 /// or a custom label) leaves `after` minus a format tag unequal to `before`, so it stays.
-fn is_format_suffix(before: &str, after: &str, tags: &crate::triage::FormatTags) -> bool {
-    after != before && tags.strip(after).trim_end() == before.trim_end()
+fn is_format_suffix(before: &str, after: &str, settings: &StreamsSettings) -> bool {
+    after != before
+        && crate::triage::strip_format_tags(after, settings).trim_end() == before.trim_end()
 }
 
 /// The recorded changes per (channel, field), oldest first.
@@ -400,10 +392,7 @@ fn is_format_suffix(before: &str, after: &str, tags: &crate::triage::FormatTags)
 /// this restore reverses. A skip row (a no-op, an already-tagged channel) is not a change, and
 /// neither is a `planned` row from a preview or a `failed` one — and a recorded format suffix
 /// is left out of the name chain on purpose (see [`is_format_suffix`]).
-fn chains(
-    history: &[RunRow],
-    format_tags: &crate::triage::FormatTags,
-) -> HashMap<(i64, Field), Vec<Change>> {
+fn chains(history: &[RunRow], settings: &StreamsSettings) -> HashMap<(i64, Field), Vec<Change>> {
     let mut chains: HashMap<(i64, Field), Vec<Change>> = HashMap::new();
     for row in history {
         if row.subject != Subject::Channel || row.status != "ok" {
@@ -419,7 +408,7 @@ fn chains(
         else {
             continue;
         };
-        if field == Field::Name && is_format_suffix(&before, &after, format_tags) {
+        if field == Field::Name && is_format_suffix(&before, &after, settings) {
             continue;
         }
         chains
@@ -480,7 +469,7 @@ pub fn plan(
     history: &[RunRow],
 ) -> RestoreOutcome {
     let tagger = Tagger::of(settings);
-    let chains = chains(history, tagger.format());
+    let chains = chains(history, settings);
     // One index over the channel list: a `find` per recovered channel would be quadratic at
     // 20k channels, which is exactly the shape this app exists to avoid.
     let by_id: HashMap<i64, &crosstalk_core::dispatcharr::Channel> = world
@@ -524,7 +513,7 @@ pub fn plan(
         // plugin's tag strip removes that trailing run along with the mark, so the chain is
         // followed from the name with the format run stripped — and the restore drops it too,
         // exactly as the plugin's does.
-        let stripped = tagger.format().strip(&channel.name);
+        let stripped = tagger.strip_format(&channel.name, settings);
         let effective = unwind(&channel.name, name_changes).or_else(|| {
             if stripped == channel.name {
                 return None;
@@ -1036,6 +1025,32 @@ mod tests {
         assert_eq!(outcome.renames[0].to, "ESPN");
         assert_eq!(outcome.renames[0].source, Source::Tags);
         assert_eq!(outcome.by_source(), (0, 1));
+    }
+
+    #[test]
+    fn the_tag_strip_never_removes_another_apps_mark_or_a_provider_tag() {
+        // Restore strips only what triage can have written: guide's `[BadEPG]`, CM's
+        // `[Unk]` and a provider's `[1080p]` stay; the status tag (bracketed or in
+        // parens, the shared parser) goes.
+        let settings = StreamsSettings::default();
+        assert_eq!(
+            strip_tags("ESPN [BadEPG] [DEAD]", &settings).as_deref(),
+            Some("ESPN [BadEPG]")
+        );
+        assert_eq!(
+            strip_tags("ESPN [1080p] [DEAD]", &settings).as_deref(),
+            Some("ESPN [1080p]")
+        );
+        assert_eq!(
+            strip_tags("ESPN [Unk] (DEAD)", &settings).as_deref(),
+            Some("ESPN [Unk]")
+        );
+        assert_eq!(strip_tags("ESPN [BadEPG]", &settings), None);
+        assert!(!has_status_tag("ESPN [BadEPG]", &settings));
+        assert_eq!(
+            strip_tags("ESPN [HD] [DEAD]", &settings).as_deref(),
+            Some("ESPN")
+        );
     }
 
     #[test]

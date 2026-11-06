@@ -18,11 +18,13 @@
 //!
 //! Two properties of the plugin matter for a port:
 //!
-//!   * **the grouping is Match & Assign's** (`_build_channel_groups`), not a copy: with the
-//!     country filter on, `cnn@@US` and `cnn@@UK` are two groups, and collapsing them would
-//!     enable one country's channel and disable the other's (bug-158 review I1). The grouping
-//!     is reused here through [`crate::matching::build_groups`], the same function a match
-//!     run groups with;
+//!   * **the grouping is Match & Assign's** (one identity family key per group), not a
+//!     copy: with the country filter on, two countries never share a group, and
+//!     collapsing them would enable one country's channel and disable the other's
+//!     (bug-158 review I1). The grouping is reused here through
+//!     [`crate::matching::build_groups`], the same function a match run groups with; step
+//!     9 keys it by identity family, so visibility and match group the same channels
+//!     together.
 //!   * **the channel set is the profile(s) loaded by the plugin's own load step**, which is the
 //!     channels ENABLED in the selected profiles. So a channel a previous run disabled is not
 //!     in the set any more and cannot be re-enabled by a later run: crosstalk reads the same
@@ -248,16 +250,17 @@ pub fn plan_with_options(
         .collect();
     let tags: Vec<String> = options.ignore_tags.clone();
     let tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
-    // `_build_channel_groups(channels, channels_data, logger, ignore_tags, ignore_q,
-    // ignore_r, ignore_g, ignore_m, restrict_matching_to_country)` — the same call Match &
-    // Assign makes, through the same function.
+    // One grouping for match and visibility (step 9): the identity family key — the same
+    // call Match & Assign makes, through the same function. The normalizer is the
+    // unified engine's (one normalizer), not the retired SM profile's.
     let groups = matching::build_groups(
         &scoped.channels,
         &options.database,
-        options.matcher.normalizer(),
+        options.engine.normalizer(),
         &tag_refs,
         options.restrict_matching_to_country,
         &group_names,
+        &options.engine,
     );
 
     // One set, not a `Vec::contains` per channel: at 20k channels the vector scan would be a
