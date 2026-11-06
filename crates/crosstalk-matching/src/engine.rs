@@ -31,7 +31,7 @@
 //! | D09 `sm-both` | `extract_zone` beside `extract_tags` | [`extract_zone_noguard`] + [`extract_tags`] both available |
 //! | D10 `cm` | channel-naming target selection | step 15 (lineup names); not in this module |
 //! | G01 `lu` | country vocabulary | [`Lineuparr`] detector |
-//! | G02 `lu` | detection entry points | [`lineuparr_stream_country`], [`lineuparr_name_country_prefix`], group scan |
+//! | G02 `lu` | detection entry points | [`lineuparr_stream_country`], [`lineuparr_name_country_prefix`], [`crate::country::lineuparr_category_country`] (lineup files), group scan |
 //! | G03 `lu-strict` | strict cross-border + US<->MX shared feeds | [`lineuparr_cross_border_ok`] |
 //! | G04 `lu-counter` | filter accounting | [`CountryFilterCount`] |
 //! | N01 `core-strip` | core quality table (HDR/HEVC strip) | `core_pipeline: true` |

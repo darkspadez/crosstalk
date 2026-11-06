@@ -2,12 +2,18 @@
 
 A Rust daemon that hosts tools for [Dispatcharr](https://github.com/Dispatcharr/Dispatcharr).
 One binary, one config directory, one scheduler and one web UI serve several sub-apps, each
-defined by what it manages rather than by the plugin it replaces. Two ship today:
+defined by what it manages rather than by the plugin it replaces. Three ship today
+(lineup as a skeleton: settings, lineup files and validate/status; its action pairs
+land through the rest of phase 3):
 
 - **guide** — a fast, multi-threaded EPG matcher that assigns guides to channels, repairs or
   removes assignments that carry no programme data, and keeps the EPG sources themselves fresh.
 - **streams** — which streams a channel has, the order they play in, and whether they work:
   match & assign, sort alternates, fill mirror backups, probe, triage and restore.
+- **lineup** — the channel list itself: names, numbers, groups, logos, creation. Step 13
+  skeleton (settings, the 29 embedded lineup files with Lineuparr's loader semantics,
+  `validate`/`status`); the clean, names, categorize, logos, create, sync and tidy pairs
+  land through the rest of phase 3.
 
 They replace three Python plugins — EPG Janitor, Stream-Mapparr and IPTV Checker — which run
 inside Dispatcharr and read its database through the Django ORM. crosstalk is a separate process

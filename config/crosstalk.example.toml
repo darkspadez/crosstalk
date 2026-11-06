@@ -38,7 +38,8 @@ password_env = "CROSSTALK_DISPATCHARR_PASSWORD"
 # Per-request timeout in seconds.
 timeout_secs = 30
 # Cap on concurrent requests. The public TypeSafe endpoint rate-limits around eight
-# concurrent requests; Dispatcharr itself is usually fine with more.
+# concurrent requests; Dispatcharr itself is usually fine with more. Lineup's channel,
+# group and logo writes are paced by this cap too (it replaces Lineuparr's rate_limiting).
 concurrency = 8
 
 # AI providers. The endpoint, the key and the concurrency cap live here, so several

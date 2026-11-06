@@ -23,6 +23,12 @@
 //! one. [`StreamMapparr`] is the port below; [`classify`] and the `parse_*`/`*_overrides`
 //! helpers are shared by every detector.
 //!
+//! Decided since (G01/G02 = `lu`): the unified engine reads ONE vocabulary,
+//! [`LINEUPARR_KNOWN_CODES`], through the `lineuparr_*` entry points — stream names
+//! ([`lineuparr_stream_country`]), lineup-file `CC_` names ([`lineuparr_name_country_prefix`])
+//! and lineup categories ([`lineuparr_category_country`]). The SM functions above stay for
+//! streams' operator prefix overrides (`stream_prefix_countries`) and the oracle harnesses.
+//!
 //! The zone helpers ([`extract_zone`]) live here too because the one-timezone country
 //! guard is a country question: `BBC One West` is one of the BBC's English regions, not a
 //! time-shifted feed, because the UK has a single time zone.
@@ -937,6 +943,55 @@ pub fn lineuparr_name_country_prefix(channel_name: &str) -> (Option<&'static str
     (None, channel_name)
 }
 
+/// Lineuparr's `detect_category_country`: country from a lineup category name.
+///
+/// Port of `detect_category_country` in
+/// `reference/Dispatcharr-Lineuparr-Plugin/Lineuparr/fuzzy_matcher.py`.
+/// Single-country lineups carry one country code in the filename and use plain theme
+/// categories (`News`, `Sports`); mixed-country lineups encode each channel's country in
+/// the category name (`AU| AUSTRALIA VIP`, `UK: Sports`, `NZ Movies`). Returns a
+/// whitelisted ISO-2 code, or `None` for ordinary theme categories so the caller falls
+/// back to the lineup-level code.
+///
+/// Two branches with deliberately different breadth, as in the plugin:
+///   - delimiter branch (`XX:`/`XX-`/`XX|`): accepts ANY code in the full
+///     [`LINEUPARR_KNOWN_CODES`] set;
+///   - bare-space branch (`XX Movies`): restricted to the curated set below, so a plain
+///     word cannot be eaten by a space-separated token.
+///
+/// The token vocabulary is Lineuparr's (decided G01=lu): `AR` is absent (it tags
+/// Arabic-language channels, not Argentina), and `QA`/`VN`/`PK`/`SI`/`ET` are present.
+pub fn lineuparr_category_country(category_name: &str) -> Option<&'static str> {
+    if category_name.is_empty() {
+        return None;
+    }
+    static DELIM_RE: std::sync::OnceLock<fancy_regex::Regex> = std::sync::OnceLock::new();
+    static BARE_RE: std::sync::OnceLock<fancy_regex::Regex> = std::sync::OnceLock::new();
+    // `re.match(r'^\s*([A-Za-z]{2,3})\s*[-:|┃│]', ...)`.
+    let delim = DELIM_RE.get_or_init(|| {
+        fancy_regex::Regex::new(&crate::pyre::pythonize(
+            r"^\s*([A-Za-z]{2,3})\s*[-:|\u{2503}\u{2502}]",
+        ))
+        .expect("static regex")
+    });
+    if let Ok(Some(caps)) = delim.captures(category_name) {
+        if let Some(group) = caps.get(1) {
+            return lineuparr_normalize_token(group.as_str());
+        }
+    }
+    // `re.match(r'^\s*(US|UK|CA|AU|NZ|FR|DE|MX|MEX|FRA|GER)\s+', ..., re.IGNORECASE)`.
+    let bare = BARE_RE.get_or_init(|| {
+        fancy_regex::Regex::new(&ci(r"^\s*(US|UK|CA|AU|NZ|FR|DE|MX|MEX|FRA|GER)\s+"))
+            .expect("static regex")
+    });
+    if let Ok(Some(caps)) = bare.captures(category_name) {
+        if let Some(group) = caps.get(1) {
+            return lineuparr_normalize_token(group.as_str());
+        }
+    }
+    None
+}
+
 /// Accent-fold, lowercase, strip to alphanumerics (Lineuparr's `_fold_key`).
 pub fn lineuparr_fold_key(name: &str) -> String {
     use unicode_normalization::UnicodeNormalization;
@@ -1149,6 +1204,38 @@ pub fn extract_tags(name: &str, user_ignored_tags: &[&str]) -> NameTags {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lineuparr_category_country_matches_the_plugin() {
+        // Mixed-country lineups encode the country in the category name; theme
+        // categories fall back to the lineup-level code (None here).
+        for (category, expected) in [
+            ("AU| AUSTRALIA VIP", Some("AU")),
+            ("UK: Sports", Some("UK")),
+            ("NZ Movies", Some("NZ")),
+            ("US News", Some("US")),
+            ("MEX Bein Sports", Some("MX")),
+            ("News", None),
+            ("Sports", None),
+            // Theme words a delimiter must not eat: not whitelisted codes.
+            ("Sci-Fi", None),
+            ("On-Demand", None),
+            ("German", None),
+            ("IT Crowd", None),
+            ("", None),
+        ] {
+            assert_eq!(
+                lineuparr_category_country(category),
+                expected,
+                "{category:?}"
+            );
+        }
+        // `AR` is deliberately absent: it tags Arabic, not Argentina.
+        assert_eq!(lineuparr_category_country("AR: beIN DRAMA"), None);
+        // Lineuparr's newer batch resolves too.
+        assert_eq!(lineuparr_category_country("QA: beIN Sports"), Some("QA"));
+        assert_eq!(lineuparr_category_country("VN Movies"), None);
+    }
 
     #[test]
     fn lineuparr_pluto_marker_is_case_insensitive() {

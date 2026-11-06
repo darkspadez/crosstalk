@@ -511,3 +511,30 @@ Step 10 review (2026-11-06):
   `?name=` + exact URL. Channel POSTs stay single-attempt.
 - `run_concurrent` publishes progress per answer; an unanswered post that was not cancelled
   says so instead of "cancelled".
+
+Step 13 review (2026-11-06):
+- **One place per setting.** Lineup settings hold only what lineup does. Retired at load,
+  each naming its new home (`settings::MOVED`): `epg_sources` → guide's
+  `epg_sources_to_match`; `refresh_epg_after_match` → a `guide.watchdog_apply` workflow
+  step; `preserve_existing_streams` → streams' `overwrite_streams` (inverted; the
+  replace-mode delete is the `lineup.tidy_apply` step); CM `m3u_sources` → streams'
+  `selected_m3us`; `single_channel_name` → a workflow step scope; NC `test_name` → the
+  `test_name` action's own input (step 14 needs an action input, not a saved setting);
+  `rate_limiting` → `[dispatcharr] concurrency` (lineup has no `write_concurrency`).
+  Never-shipped `tidy_after_sync` and `write_concurrency` removed outright (tidy is a
+  workflow step after `streams.match_apply`, per the decision). LEFT for a later call:
+  streams' own `write_concurrency` beside the host cap.
+- Named scope `lineup` = channel ids owned under `lineup:<full filename>:` for the
+  CONFIGURED `lineup_file` (`lineup::owner_key_prefix`; either spelling of the setting).
+  Switching files leaves the old lineup's channels owned but out of scope. Empty before
+  any sync → the step touches nothing (the bound replaces the host scope). A settings
+  file that fails to load or names an unknown lineup fails the step.
+  `SubApp::resolve_named_scope` now receives the run's `CrosstalkConfig`.
+- Step 18: the key tail after `lineup:<file>:` must not include the folded category, or
+  changing `category_detail` re-keys (and re-creates) every channel.
+- Loader: category order comes from an order-keeping serde visitor (`OrderedObject`,
+  first position / last value like `json.load`), not a text scanner; serde_json's
+  `preserve_order` would reorder every map the workspace serializes. Filename country is
+  LU's `^([A-Z]{2})_(.+)_lineup\.json$` exactly; a missing `package` gives no auto prefix.
+- Country: `lineuparr_category_country` is a new G02 entry point on the decided `lu`
+  vocabulary; no guide/streams caller changes.

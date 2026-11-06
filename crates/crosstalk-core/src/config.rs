@@ -109,7 +109,8 @@ pub struct DispatcharrConfig {
     pub password_env: String,
     /// Per-request timeout.
     pub timeout_secs: u64,
-    /// Cap on concurrent HTTP requests, for the programme-data checks and the AI calls.
+    /// Cap on concurrent HTTP requests, for the programme-data checks, the AI calls and
+    /// lineup's channel writes (lineup has no write-concurrency knob of its own).
     pub concurrency: usize,
 }
 

@@ -1,0 +1,177 @@
+# Lineup settings.
+#
+# This file holds what the lineup app decides for itself: how names are cleaned and
+# written, which categories and logos it manages, what it creates, and which provider
+# lineup it mirrors. The decision cut is the ONE threshold every app shares --
+# [matching] sensitivity in crosstalk.toml (strict/high/medium/low or a 0-100 number);
+# Lineuparr's and Channel-Mapparr's match_sensitivity presets are retired and refuse to
+# load, with a pointer to the host setting. Anything else shared with the other
+# sub-apps -- the channel scope (profiles, groups, ignored groups) under [scope], the
+# CSV retention under [exports] and the AI matching policy under [ai.verify] -- lives
+# in crosstalk.toml, and so does write pacing: [dispatcharr] concurrency caps lineup's
+# writes (it replaces Lineuparr's rate_limiting).
+#
+# Settings another app owns are not repeated here. Lineuparr's matcher is not ported:
+# its EPG half is guide.match (EPG sources = epg_sources_to_match in guide.toml; the
+# refresh after matching = a guide.watchdog_apply workflow step) and its stream half is
+# streams.match in lineup mode (preserve_existing_streams = overwrite_streams = false in
+# streams.toml; M3U accounts = selected_m3us there). Lineuparr's replace-mode delete is
+# the lineup.tidy_apply step a workflow lists after streams.match_apply, and
+# single_channel_name is a workflow step's scope. Each old key refuses to load, naming
+# its new home.
+#
+# The daemon writes back to this file when a setting is changed in the web UI,
+# preserving comments. Step 13 registers only validate and status; the clean, names,
+# categorize, logos, create, sync and tidy pairs land with steps 14-18.
+
+# --- Clean ------------------------------------------------------------------
+#
+# Channel Name Cleaner's fixed rule order: pipe and bracket junk first, then the
+# riskier normalizations, each gated by its own switch. Only the first three are on by
+# default, as in the plugin. A preview (clean_preview) writes a CSV and changes
+# nothing; the apply half renames, honoring the protect lists and the collision
+# strategy below.
+
+# Split on '|', drop empty and quality-only segments. 'Rte One +1 | HD |' -> 'Rte One +1'.
+strip_pipe_junk = true
+# Remove (1080p), (720p), [VIP], [Multi] etc. -- only when the brackets contain nothing
+# but junk tokens, so '(Moldova)' survives.
+strip_bracketed_junk = true
+# Remove superscript marks like 'ᴴᴰ'. '007 ᴴᴰ' -> '007'.
+strip_unicode_quality = true
+# Fold stylised/full-width characters to plain ASCII. OFF by default, as in the plugin.
+unicode_nfkc = false
+# How remaining pipe segments are rejoined. 'Sky Sports+ | Event 03' -> 'Sky Sports+
+# Event 03' (space) or '... - Event 03'.
+join_separator = " "
+# Collapse multiple spaces and trim.
+normalize_whitespace = true
+# 'Channel 4+1' -> 'Channel 4 +1'. OFF -- it can mangle channels named like
+# '1+1 International'.
+normalize_plus_one = false
+# Title-case names. OFF -- it fights broadcaster acronyms (BBC, ITV, RTE).
+fix_casing = false
+# When a cleaned name would duplicate another channel: 'suffix' keeps a clean quality
+# suffix (Sky Cinema Disney FHD), 'numeric' appends a number (Sky Cinema Disney (2)),
+# 'skip' leaves the original name.
+collision_strategy = "suffix"
+# Comma-separated group names to skip entirely.
+protected_groups = "Todays Live Events, Info | Service Status"
+# Skip names with Cyrillic/Greek/Arabic/Hebrew/Devanagari/CJK/Hangul text.
+protect_foreign_scripts = true
+# Skip channels like '&TV', '&flix'.
+protect_leading_symbol = true
+# Any channel name matching this regex is left untouched.
+protect_regex = ""
+# Extra find/replace, one 'regex => replacement' per line. e.g. '\bRte\b => RTE'.
+custom_rules = ""
+# Rows listed on screen. The full set is always written to the CSV.
+max_preview_rows = 400
+
+# --- Names ------------------------------------------------------------------
+#
+# Channel-Mapparr's naming: the OTA template for broadcast stations, the unknown suffix
+# for channels no database recognises, and the AI gate for borderline premium renames
+# (off by default).
+
+# Template for US over-the-air channel names, from the callsign ladder and the station
+# table. The callsign suffix is stripped.
+ota_format = "{NETWORK} - {STATE} {CITY} ({CALLSIGN})"
+# Fall back to the market when a channel has no callsign.
+ota_market_fallback = false
+# Suffix appended to a channel no database recognises. The leading space is part of the
+# value: without it the name reads 'ESPN[Unk]'.
+unknown_suffix = " [Unk]"
+# Tag channels no database recognises with the suffix above. With it off, unmatched
+# channels are left alone.
+tag_unmatched_channels = true
+# Ask the [ai.verify] chain about borderline premium renames. Off by default: a
+# borderline rename is left alone rather than guessed.
+ai_gate_enabled = false
+
+# --- Categorize ----------------------------------------------------------------
+#
+# Channel-Mapparr's organize step: the category group names it manages.
+
+# Category group names the organize step manages. Empty means none.
+category_groups = ""
+
+# --- Logos ---------------------------------------------------------------------
+#
+# The unified logo resolver: Lineuparr's tier order (EPG icon, Logo Manager name,
+# tv-logos) as one source list, Channel-Mapparr's default logo, and whether a channel
+# that already has a logo is left alone.
+
+# Logo assigned to a channel with no better match, by name.
+default_logo = ""
+# Where a logo may come from, in priority order: the EPG icon, the Logo Manager name,
+# then tv-logos.
+logo_sources = "epg, logo_manager, tv-logos"
+# Also replace a logo a channel already has when the resolver finds a match. With it
+# off, channels with a logo are left alone.
+replace_existing = false
+# Country codes whose tv-logos directories the per-channel logo step searches. Empty
+# means the lineup file's own country.
+tv_logos_countries = ""
+
+# --- Create ----------------------------------------------------------------------
+#
+# Channel-Mapparr's two creation modes. 'streams' makes one channel per matched stream
+# (and links it); 'stations' makes one channel per OTA station from unattached streams
+# in the source groups, and attaches no streams.
+
+# 'streams': one channel per matched stream. 'stations': one channel per OTA station
+# from unattached streams.
+create_mode = "streams"
+# Comma-separated M3U group titles to import from, applied BEFORE matching. Leave empty
+# to read every group. Which M3U accounts are read is selected_m3us in streams.toml.
+m3u_group_filter = ""
+# Comma-separated category names from the channel database, applied AFTER matching.
+# Leave empty to keep every category.
+m3u_category_filter = ""
+# Put every imported channel in this one group instead of sorting them into groups by
+# category.
+m3u_custom_group_name = ""
+# Stations mode: comma-separated stream groups to scan. Only streams in these groups
+# that are not attached to any channel are considered. Leave empty to do nothing.
+seed_source_groups = ""
+# Stations mode: the existing channel group the new channels are created in.
+seed_target_group = ""
+# Stations mode: the first channel number to assign. Numbers already in use are skipped.
+# Leave empty to start above the highest channel number on the system.
+seed_start_number = ""
+# Stations mode: comma-separated network names. A station carrying one of them is
+# reported and skipped rather than created.
+seed_exclude_networks = ""
+
+# --- Sync --------------------------------------------------------------------------
+#
+# Lineuparr's sync: the provider lineup to mirror, how its categories fold into groups,
+# and how each new channel gets its number. The numbers come from the lineup file itself
+# by default, which is why two lineups can disagree about what channel 206 is.
+
+# The provider channel lineup to mirror. Channels, groups, and numbering are based on
+# this file; its two-letter filename prefix is also what the country filter compares a
+# stream against.
+lineup_file = "US_DirecTV-Premier_lineup.json"
+# Blank = auto from the lineup package name. 'none' = no prefix, category names only.
+# Add a trailing separator to control the format (e.g. 'US ' gives 'US News', not
+# 'US: News').
+group_prefix = ""
+# How lineup categories fold into groups. 'refined' merges into 6 broad groups (News,
+# Sports, Movies, Family, Foreign, Entertainment), 'simple' into 7 (News & Info, Sports
+# & Outdoors, etc.), 'none' merges everything into the prefix alone, 'normal' keeps all
+# original categories.
+category_detail = "normal"
+# How each new channel gets its number. 'lineup' takes the number from the lineup file
+# (and sets no number when the file has none). The two auto modes fill free slots, from
+# 1 upwards or above the highest existing channel. 'specific' counts up from Starting
+# Channel Number below.
+channel_numbering = "lineup"
+# The first number to use when Channel Numbering is 'specific'. Every other mode ignores
+# this setting.
+starting_channel_number = ""
+# Channel profile(s) to enable the synced channels in. Leave blank to leave profiles
+# alone. Separate several with commas; names are not case-sensitive. Whether a named
+# profile exists is only checked at run time, when Dispatcharr can be reached.
+channel_profiles = ""

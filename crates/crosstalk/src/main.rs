@@ -781,8 +781,17 @@ fn bench_streams(args: StreamsBenchArgs) -> Result<()> {
 ///
 /// Every writing action is a `<verb>_preview` / `<verb>_apply` pair, so `--dry-run` on an apply
 /// is redirected to its preview rather than trusting the apply to honour the flag.
+/// The lineup pairs are listed before their steps land, so a `--dry-run` on a future
+/// apply already finds its preview.
 fn preview_counterpart(action: &str) -> Option<&'static str> {
     match action {
+        "clean_apply" => Some("clean_preview"),
+        "names_apply" => Some("names_preview"),
+        "categorize_apply" => Some("categorize_preview"),
+        "logos_apply" => Some("logos_preview"),
+        "create_apply" => Some("create_preview"),
+        "sync_apply" => Some("sync_preview"),
+        "tidy_apply" => Some("tidy_preview"),
         "match_apply" => Some("match_preview"),
         "heal_apply" => Some("heal_preview"),
         "tag_missing_apply" => Some("tag_missing_preview"),

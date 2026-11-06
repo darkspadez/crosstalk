@@ -198,6 +198,7 @@ impl SubApp for ScopeApp {
     fn resolve_named_scope(
         &self,
         name: &str,
+        _config: &crate::config::CrosstalkConfig,
         _world: &World,
         _store: &crate::store::Store,
     ) -> Option<Result<NamedScopeResolution>> {

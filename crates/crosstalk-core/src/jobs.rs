@@ -408,7 +408,7 @@ impl JobContext {
                          needs the run store"
                     )
                 })?;
-                match registry.resolve_named_scope(name, world, store)? {
+                match registry.resolve_named_scope(name, &self.config, world, store)? {
                     crate::subapp::NamedScopeResolution::Scope(scope) => Ok(ResolvedScope {
                         tables: scope,
                         limit: None,

@@ -713,14 +713,17 @@ pub trait SubApp: Send + Sync {
     ///
     /// `None` means "not mine"; the registry asks every app in turn. `Some(Err)` is a
     /// real failure (the store could not be read), which fails the step rather than
-    /// silently scoping it to nothing.
+    /// silently scoping it to nothing. `config` is the run's host configuration, so an
+    /// app can read its own settings file (`config.config_dir`) to say which of its
+    /// objects the name means.
     fn resolve_named_scope(
         &self,
         name: &str,
+        config: &CrosstalkConfig,
         world: &World,
         store: &Store,
     ) -> Option<Result<NamedScopeResolution>> {
-        let _ = (name, world, store);
+        let _ = (name, config, world, store);
         None
     }
 }
@@ -883,12 +886,13 @@ impl Registry {
     pub fn resolve_named_scope(
         &self,
         name: &str,
+        config: &CrosstalkConfig,
         world: &World,
         store: &Store,
     ) -> Result<NamedScopeResolution> {
         let wanted = name.trim();
         for app in &self.apps {
-            if let Some(resolved) = app.resolve_named_scope(wanted, world, store) {
+            if let Some(resolved) = app.resolve_named_scope(wanted, config, world, store) {
                 return resolved;
             }
         }
@@ -1204,6 +1208,7 @@ mod tests {
         fn resolve_named_scope(
             &self,
             name: &str,
+            _config: &CrosstalkConfig,
             _world: &World,
             _store: &Store,
         ) -> Option<Result<NamedScopeResolution>> {
@@ -1281,7 +1286,7 @@ mod tests {
         let world = World::default();
         let store = Store::in_memory().expect("store");
         let error = scoped_registry()
-            .resolve_named_scope("nope", &world, &store)
+            .resolve_named_scope("nope", &CrosstalkConfig::default(), &world, &store)
             .expect_err("unknown");
         assert!(format!("{error:#}").contains("\"nope\""), "{error:#}");
         assert!(
@@ -1290,7 +1295,7 @@ mod tests {
         );
 
         let resolved = scoped_registry()
-            .resolve_named_scope("fakescope", &world, &store)
+            .resolve_named_scope("fakescope", &CrosstalkConfig::default(), &world, &store)
             .expect("served");
         assert_eq!(resolved, NamedScopeResolution::Channels(vec![7]));
     }

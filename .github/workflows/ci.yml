@@ -256,6 +256,13 @@ jobs:
       # recorded — and both are documented divergences.
       - name: Streams triage and restore vs the plugin's own actions
         run: python3 -I scripts/triage_parity.py
+      # Phase 3 step 13: the lineup loader is Lineuparr's `_load_lineup` pipeline,
+      # ported entry for entry (CC_ prefix rewrite, entry/category/filename country,
+      # detail folding, group names, numbers). The harness drives the plugin's REAL
+      # methods over all 29 files x 4 detail modes x 4 group prefixes (464 cases) and
+      # compares each entry with `crates/lineup/examples/lineup_dump`. A gate.
+      - name: Lineup files vs Lineuparr's own loader
+        run: python3 -I scripts/lineup_file_parity.py
       # Informational, never failing: what upstream changed since each pinned reference
       # commit in the files crosstalk ports from it. Covers every reference submodule
       # (EPG Janitor, Stream-Mapparr, IPTV Checker, Channel-Mapparr, Lineuparr, Channel

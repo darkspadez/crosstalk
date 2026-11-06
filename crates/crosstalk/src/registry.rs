@@ -12,6 +12,7 @@ pub fn builtin() -> Registry {
     Registry::new(vec![
         Arc::new(crosstalk_guide::GuideApp::new()),
         Arc::new(crosstalk_streams::StreamsApp::new()),
+        Arc::new(crosstalk_lineup::LineupApp::new()),
     ])
 }
 
@@ -26,6 +27,30 @@ mod tests {
         assert_eq!(app.name(), "Guide");
         assert!(!app.actions().is_empty());
         assert!(!app.schema().fields().is_empty());
+    }
+
+    #[test]
+    fn lineup_is_linked_in() {
+        // Step 13: the skeleton registers only `validate` and `status`; the pairs land
+        // with steps 14-18.
+        let registry = builtin();
+        let app = registry.get("lineup").expect("lineup is linked");
+        assert_eq!(app.name(), "Lineup");
+        assert!(app.description().contains("channel list"));
+        let ids: Vec<&str> = app.actions().iter().map(|action| action.id).collect();
+        assert_eq!(ids, vec!["validate", "status"]);
+        // Every section of the plan's settings layout is in the form.
+        let sections: Vec<&str> = app.schema().sections().map(|s| s.label).collect();
+        assert_eq!(
+            sections,
+            vec!["Clean", "Names", "Categorize", "Logos", "Create", "Sync",]
+        );
+        assert_eq!(
+            app.settings_path(std::path::Path::new("/config")),
+            std::path::Path::new("/config/lineup.toml")
+        );
+        // The named scope workflow steps scope to: `scope = "lineup"`.
+        assert!(registry.provides_named_scope("lineup"));
     }
 
     #[test]

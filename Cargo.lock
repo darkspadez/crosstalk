@@ -519,6 +519,7 @@ dependencies = [
  "clap",
  "crosstalk-core",
  "crosstalk-guide",
+ "crosstalk-lineup",
  "crosstalk-matching",
  "crosstalk-streams",
  "crosstalk-web",
@@ -579,6 +580,21 @@ dependencies = [
  "toml",
  "tracing",
  "wiremock",
+]
+
+[[package]]
+name = "crosstalk-lineup"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crosstalk-core",
+ "crosstalk-matching",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
 ]
 
 [[package]]
