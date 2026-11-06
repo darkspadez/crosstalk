@@ -1833,3 +1833,208 @@ async fn a_step_run_page_links_the_workflow_it_belongs_to() {
         "the step links its workflow: {body}"
     );
 }
+
+/// A finished apply run with `ok` channel rows, for the undo button and routes.
+fn seed_undo_target(store: &Store, dry_run: bool) -> i64 {
+    let run_id = store.start_run("echo", "poke", dry_run).expect("run");
+    store
+        .append_rows(
+            run_id,
+            &[crosstalk_core::store::RunRow {
+                ordinal: 0,
+                channel_id: 1,
+                channel_name: "ESPN".to_string(),
+                field: "name".to_string(),
+                before_value: Some("ESPN".to_string()),
+                after_value: Some("ESPN HD".to_string()),
+                method: "rename".to_string(),
+                status: "ok".to_string(),
+                ..Default::default()
+            }],
+        )
+        .expect("rows");
+    store
+        .finish_run(
+            run_id,
+            crosstalk_core::store::RunStatus::Succeeded,
+            Some("renamed 1 channel"),
+            &serde_json::json!({"renamed": 1}),
+            None,
+        )
+        .expect("finish");
+    run_id
+}
+
+async fn wait_for_undo(store: &Store, target: i64) -> crosstalk_core::store::RunRecord {
+    for _ in 0..200 {
+        if let Some(run) = store
+            .recent_runs_for("echo", 100)
+            .expect("runs")
+            .into_iter()
+            .find(|run| {
+                run.action == crosstalk_core::undo::ACTION_UNDO
+                    && run.parent_run_id == Some(target)
+                    && !run.status.is_running()
+            })
+        {
+            return run;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("expected an undo run of #{target}");
+}
+
+#[tokio::test]
+async fn a_finished_apply_run_page_offers_undo() {
+    let (state, store, _dir) = state(None);
+    let run_id = seed_undo_target(&store, false);
+
+    let (status, body) = get(&state, &format!("/runs/{run_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Undo this run"), "{body}");
+    // The confirm names the run, so the dialog says what it is about to preview.
+    assert!(
+        body.contains(&format!("Undo run #{run_id} (echo poke)")),
+        "{body}"
+    );
+    assert!(body.contains(&format!("/runs/{run_id}/undo")), "{body}");
+    // The token rides along: the browser submits it, scripts send the header.
+    assert!(body.contains(r#"name="csrf_token""#), "{body}");
+}
+
+#[tokio::test]
+async fn a_preview_run_page_offers_no_undo() {
+    let (state, store, _dir) = state(None);
+    // A preview wrote nothing, so there is nothing to reverse.
+    let run_id = seed_undo_target(&store, true);
+
+    let (status, body) = get(&state, &format!("/runs/{run_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body.contains("Undo this run"), "{body}");
+}
+
+#[tokio::test]
+async fn undoing_starts_a_preview_run_of_the_same_app() {
+    let (state, store, _dir) = state(None);
+    let run_id = seed_undo_target(&store, false);
+
+    // No confirm: the preview half, which changes nothing. (No Dispatcharr is configured
+    // here, so the background run fails at connect — the redirect and the record are what
+    // this proves.)
+    let status = post_form(&state, &format!("/runs/{run_id}/undo"), "").await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let undo = wait_for_undo(&store, run_id).await;
+    assert!(undo.dry_run, "without confirm the undo is a preview");
+    assert_eq!(undo.app, "echo");
+    assert_eq!(undo.parent_run_id, Some(run_id));
+}
+
+#[tokio::test]
+async fn applying_an_undo_needs_the_server_side_confirmation() {
+    let (state, store, _dir) = state(None);
+    let run_id = seed_undo_target(&store, false);
+
+    // The apply half without confirm=true is a preview, never a write.
+    let status = post_form(&state, &format!("/runs/{run_id}/undo"), "confirm=true").await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let undo = wait_for_undo(&store, run_id).await;
+    assert!(!undo.dry_run, "with confirm the undo is an apply");
+}
+
+#[tokio::test]
+async fn an_undo_preview_page_offers_to_apply_it() {
+    let (state, store, _dir) = state(None);
+    let run_id = seed_undo_target(&store, false);
+    let status = post_form(&state, &format!("/runs/{run_id}/undo"), "").await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let undo = wait_for_undo(&store, run_id).await;
+
+    // The preview changed nothing; its page offers the apply half, naming the target run in
+    // the confirm the server also checks.
+    let (status, body) = get(&state, &format!("/runs/{}", undo.id)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Apply undo"), "{body}");
+    assert!(
+        body.contains(&format!(
+            "Apply the undo of run #{run_id} (echo poke)? This writes channel data."
+        )),
+        "{body}"
+    );
+    assert!(
+        body.contains(&format!("action=\"/runs/{run_id}/undo\"")),
+        "the apply posts back at the target run: {body}"
+    );
+}
+
+#[tokio::test]
+async fn an_undone_run_lists_the_runs_that_undid_it() {
+    let (state, store, _dir) = state(None);
+    let run_id = seed_undo_target(&store, false);
+    let status = post_form(&state, &format!("/runs/{run_id}/undo"), "").await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let undo = wait_for_undo(&store, run_id).await;
+
+    let (status, body) = get(&state, &format!("/runs/{run_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Undone by"), "{body}");
+    assert!(
+        body.contains(&format!("/runs/{}", undo.id)),
+        "the original links its undo: {body}"
+    );
+}
+
+#[tokio::test]
+async fn undoing_an_unknown_run_is_a_404() {
+    let (state, _store, _dir) = state(None);
+    let status = post_form(&state, "/runs/9999/undo", "").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn undoing_an_ineligible_run_is_refused_and_starts_nothing() {
+    // A preview wrote nothing: refused for the preview half too, before any run is
+    // reserved, and the page offers no button.
+    let (state, store, _dir) = state(None);
+    let run_id = seed_undo_target(&store, true);
+    let (status, body) = get(&state, &format!("/runs/{run_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body.contains(&format!("/runs/{run_id}/undo")), "{body}");
+    for form in ["", "confirm=true"] {
+        let status = post_form(&state, &format!("/runs/{run_id}/undo"), form).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(store.run_count().expect("count"), 1, "nothing started");
+}
+
+#[tokio::test]
+async fn an_undo_post_without_the_csrf_token_is_rejected() {
+    let (state, store, _dir) = state(None);
+    let run_id = seed_undo_target(&store, false);
+    assert_eq!(
+        post_form_with_csrf(&state, &format!("/runs/{run_id}/undo"), "", false).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(store.run_count().expect("count"), 1, "nothing started");
+}
+
+#[tokio::test]
+async fn undoing_needs_a_token_when_one_is_configured() {
+    let (state, store, _dir) = state(Some("s3cret"));
+    let run_id = seed_undo_target(&store, false);
+
+    // No credential at all.
+    let response = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri(format!("/runs/{run_id}/undo"))
+                .method("POST")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header(crate::csrf::CSRF_HEADER, state.csrf_token())
+                .body(Body::from(String::new()))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(store.run_count().expect("count"), 1, "nothing started");
+}

@@ -29,6 +29,7 @@ pub fn router(state: AppState) -> Router {
         .route("/runs/:id/rows", get(run_rows))
         .route("/runs/:id/csv", get(run_csv))
         .route("/runs/:id/cancel", post(cancel_run))
+        .route("/runs/:id/undo", post(start_undo))
         .route("/exports/clear", post(clear_exports))
         .route("/settings", get(settings_page))
         .route("/settings/host", post(save_host_settings))
@@ -130,6 +131,15 @@ struct RunTemplate {
     is_workflow: bool,
     /// The workflow run this run is a step of, when it is one.
     parent: Option<RunRecord>,
+    /// Whether the page offers "Undo this run": a finished, non-preview run with `ok`
+    /// channel rows left to reverse.
+    undo_eligible: bool,
+    /// The undo runs that reversed this run, newest first. An undone run lists them so an
+    /// operator can follow the chain in either direction.
+    undo_runs: Vec<RunRecord>,
+    /// Whether this run is an undo PREVIEW whose target can still be undone, so the page
+    /// offers "Apply undo".
+    apply_undo_offered: bool,
 }
 
 #[derive(Template)]
@@ -622,6 +632,14 @@ async fn run_page(State(state): State<AppState>, Path(id): Path<i64>) -> Respons
             steps: state::steps_of(&state.store, &run),
             is_workflow: run.app == crosstalk_core::workflow::APP_ID,
             parent: state::parent_of(&state.store, &run),
+            undo_eligible: state::undo_eligible(&state.registry, &state.store, &run),
+            undo_runs: state::undo_runs(&state.store, &run),
+            apply_undo_offered: state::is_undo_run(&run)
+                && run.dry_run
+                && run.parent_run_id.is_some_and(|target| {
+                    crosstalk_core::undo::check_target(&state.store, &state.registry, target)
+                        .is_ok()
+                }),
             run,
         }
         .into_response(),
@@ -713,6 +731,54 @@ async fn run_csv(State(state): State<AppState>, Path(id): Path<i64>) -> Response
 async fn cancel_run(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
     state.runner.cancel(id);
     Redirect::to(&format!("/runs/{id}")).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct UndoForm {
+    /// Server-side confirmation for the APPLY half, mirroring the CLI's `--yes`: without it
+    /// the request starts a preview instead. The browser's confirm dialog is convenience,
+    /// not protection.
+    #[serde(default)]
+    confirm: Option<String>,
+}
+
+/// `POST /runs/:id/undo`: start undoing one run.
+///
+/// Without `confirm=true` this starts a PREVIEW (a dry run that changes nothing) and the
+/// undo button's page says so; the preview run's page offers "Apply undo", which posts
+/// back here with `confirm=true`. The undo is recorded under the target run's app with
+/// `parent_run_id` set to the undone run, so undoing an undo restores the applied state.
+async fn start_undo(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Form(form): Form<UndoForm>,
+) -> Response {
+    let Some(target) = load_run(&state, id).await else {
+        return (StatusCode::NOT_FOUND, "no such run\n").into_response();
+    };
+    let dry_run = form.confirm.as_deref() != Some("true");
+    // Preview and apply alike: a refused target starts no run, and the answer says why.
+    if let Err(error) = crosstalk_core::undo::check_target(&state.store, &state.registry, target.id)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("this run cannot be undone: {error:#}\n"),
+        )
+            .into_response();
+    }
+    match state.runner.start_undo_with(
+        &target.app,
+        id,
+        dry_run,
+        crosstalk_core::runner::RunOptions::default(),
+    ) {
+        Ok(started) => Redirect::to(&format!("/runs/{}", started.run_id)).into_response(),
+        Err(error) => (
+            StatusCode::CONFLICT,
+            format!("could not start the undo: {error:#}\n"),
+        )
+            .into_response(),
+    }
 }
 
 async fn settings_page(

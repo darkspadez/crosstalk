@@ -253,6 +253,38 @@ pub fn parent_of(store: &Store, run: &RunRecord) -> Option<RunRecord> {
     store.run(parent).ok().flatten()
 }
 
+/// Whether this run is itself an undo (preview or apply).
+pub fn is_undo_run(run: &RunRecord) -> bool {
+    run.action == crosstalk_core::undo::ACTION_UNDO
+}
+
+/// Whether the run page offers "Undo this run".
+///
+/// Exactly the host's own refusal check ([`crosstalk_core::undo::check_target`]): a
+/// finished, non-preview run of a known app with `ok` channel rows. Previews, live and
+/// paused runs, workflow runs (their steps are undone one by one), probes and other runs
+/// with no channel write never qualify. Failed and cancelled runs do, row by row, for the
+/// rows that landed. This is the eligibility check, not the chain rule: a run whose rows
+/// have all been superseded still offers the button, and its preview reports every row
+/// left alone. Undo runs qualify too, so undoing an undo (the redo) is one more click.
+pub fn undo_eligible(registry: &Registry, store: &Store, run: &RunRecord) -> bool {
+    crosstalk_core::undo::check_target(store, registry, run.id).is_ok()
+}
+
+/// The undo runs that reversed this run, newest first.
+///
+/// An undone run lists them so an operator can follow the chain in either direction: the
+/// undo run's page links back through its parent, this lists the other way.
+pub fn undo_runs(store: &Store, run: &RunRecord) -> Vec<RunRecord> {
+    store
+        .child_runs(run.id)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(is_undo_run)
+        .rev()
+        .collect()
+}
+
 /// One setting field, ready to render.
 #[derive(Debug, Clone)]
 pub struct UiField {

@@ -42,6 +42,8 @@ enum Command {
     Validate(ConfigArgs),
     /// Manage the CSV reports the sub-apps write.
     Exports(ExportsArgs),
+    /// Undo a finished apply run: reverse the rows that are still in effect.
+    Undo(UndoArgs),
     /// Time the parts of a sub-app's run: the plan phases, and the writes they would issue.
     Bench(BenchArgs),
     /// Offline stream-to-channel match simulation, on the unified engine.
@@ -80,6 +82,21 @@ struct RunArgs {
     /// the scope, for instance.
     #[arg(long)]
     fresh: bool,
+}
+
+#[derive(Args, Debug)]
+struct UndoArgs {
+    /// The run to undo, for example `crosstalk undo 42`.
+    run_id: i64,
+    /// Change nothing; write the report only. `--preview` is accepted as a synonym.
+    #[arg(long = "dry-run", alias = "preview")]
+    dry_run: bool,
+    /// Confirm an undo that changes data. Without it, an apply is refused.
+    #[arg(long, short = 'y')]
+    yes: bool,
+    /// Directory holding the configuration files.
+    #[arg(long, default_value = "config", env = "CROSSTALK_CONFIG_DIR")]
+    config: PathBuf,
 }
 
 #[derive(Args, Debug)]
@@ -262,6 +279,7 @@ fn main() -> Result<()> {
             BenchTarget::Streams(args) => bench_streams(args),
         },
         Command::Validate(args) => validate(args),
+        Command::Undo(args) => undo_once(args),
         Command::Exports(args) => match args.command {
             ExportsCommand::Clear(args) => clear_exports(args),
         },
@@ -637,6 +655,67 @@ fn run_once(args: RunArgs) -> Result<()> {
     }
     if let Some(path) = &outcome.report_path {
         println!("  report: {}", path.display());
+    }
+    Ok(())
+}
+
+/// `undo <run-id>`: reverse a finished apply run's rows that are still in effect.
+///
+/// A preview (`--dry-run`/`--preview`) plans and reports without writing; an apply needs
+/// `--yes`, like every other write. The undo is itself a recorded, undoable run under the
+/// target run's app with `parent_run_id` set to the undone run.
+fn undo_once(args: UndoArgs) -> Result<()> {
+    let config = CrosstalkConfig::load(&args.config)?;
+    let registry = registry::builtin();
+
+    // `open_shared`, never `open`: this is a second process on the daemon's file, and a plain
+    // open would retire the daemon's live `running` rows out from under it (see `run_once`).
+    let store = Store::open_shared(config.data_dir().join("crosstalk.db"))?;
+    // The host's refusals first (a preview, a workflow run, a probe, a pruned run...): they
+    // say why nothing can be undone, which beats asking for --yes on a run that can't be.
+    let target = crosstalk_core::undo::check_target(&store, &registry, args.run_id)?;
+    if !args.dry_run && !args.yes {
+        println!(
+            "undoing run #{} ({} {}) reverses its rows that are still in effect.",
+            target.id, target.app, target.action
+        );
+        anyhow::bail!(
+            "refusing to undo run #{} without --yes: it changes data. Add --yes to proceed, \
+             or --dry-run to preview what it would reverse",
+            args.run_id
+        );
+    }
+
+    let live = store.running_runs(&target.app)?;
+    if let Some(current) = live.first() {
+        anyhow::bail!(
+            "{} already has {} #{} in progress (started {}); wait for it to finish or cancel \
+             it. If no daemon is running, this row is stale from a crash and clears when the \
+             daemon next starts.",
+            target.app,
+            current.action,
+            current.id,
+            current.started_at,
+        );
+    }
+    let runner = JobRunner::new(registry, SharedConfig::new(config), store);
+    let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
+    let outcome = runtime.block_on(runner.run_undo_to_completion_with(
+        &target.app,
+        args.run_id,
+        args.dry_run,
+        crosstalk_core::runner::RunOptions::default(),
+    ))?;
+
+    println!("{}", outcome.summary);
+    for (key, value) in &outcome.counts {
+        println!("  {key}: {value}");
+    }
+    if let Some(path) = &outcome.report_path {
+        println!("  report: {}", path.display());
+    }
+    if args.dry_run {
+        println!("preview only: rerun with --yes to apply the undo");
     }
     Ok(())
 }
@@ -1166,6 +1245,87 @@ mod cli_tests {
             }) => args,
             other => panic!("expected a bench streams command, got {other:?}"),
         }
+    }
+
+    fn undo_args(args: &[&str]) -> UndoArgs {
+        match parse(args).command {
+            Command::Undo(args) => args,
+            other => panic!("expected an undo command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn undo_takes_a_run_id_and_defaults_to_applying() {
+        // `crosstalk undo 42` reverses run 42; without --yes it is refused, like every
+        // other write, and --preview/--dry-run previews instead.
+        let args = undo_args(&["crosstalk", "undo", "42"]);
+        assert_eq!(args.run_id, 42);
+        assert!(!args.dry_run);
+        assert!(!args.yes, "an undo is never the default");
+        assert_eq!(args.config, Path::new("config"));
+
+        let args = undo_args(&["crosstalk", "undo", "42", "--preview", "--yes"]);
+        assert!(args.dry_run);
+        let args = undo_args(&["crosstalk", "undo", "7", "--dry-run"]);
+        assert!(args.dry_run);
+        assert_eq!(args.run_id, 7);
+    }
+
+    #[test]
+    fn undo_without_yes_is_refused_and_records_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("crosstalk.toml"), "").expect("seed");
+        let seed = Store::open_shared(dir.path().join("data").join("crosstalk.db")).expect("store");
+        let run_id = seed
+            .start_run("guide", "match_apply", false)
+            .expect("start");
+        seed.finish_run(
+            run_id,
+            crosstalk_core::store::RunStatus::Succeeded,
+            None,
+            &serde_json::json!({}),
+            None,
+        )
+        .expect("finish");
+        seed.append_rows(
+            run_id,
+            &[crosstalk_core::store::RunRow {
+                channel_id: 1,
+                field: "epg_data_id".to_string(),
+                before_value: Some("none".to_string()),
+                after_value: Some("4".to_string()),
+                status: "ok".to_string(),
+                ..crosstalk_core::store::RunRow::default()
+            }],
+        )
+        .expect("rows");
+        let error = undo_once(UndoArgs {
+            run_id,
+            dry_run: false,
+            yes: false,
+            config: dir.path().to_path_buf(),
+        })
+        .expect_err("refused");
+        assert!(format!("{error}").contains("--yes"), "{error}");
+        assert_eq!(
+            seed.run_count().expect("count"),
+            1,
+            "the target run is the only record: nothing started"
+        );
+    }
+
+    #[test]
+    fn undo_of_an_unknown_run_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("crosstalk.toml"), "").expect("seed");
+        let error = undo_once(UndoArgs {
+            run_id: 9999,
+            dry_run: true,
+            yes: true,
+            config: dir.path().to_path_buf(),
+        })
+        .expect_err("fails");
+        assert!(format!("{error}").contains("no run"), "{error:#}");
     }
 
     fn bare_bench_args(config: std::path::PathBuf) -> StreamsBenchArgs {

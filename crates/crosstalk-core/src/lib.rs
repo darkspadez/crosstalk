@@ -28,6 +28,7 @@ pub mod status;
 pub mod store;
 pub mod subapp;
 pub mod target;
+pub mod undo;
 pub mod wildcard;
 pub mod window;
 pub mod workflow;

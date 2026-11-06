@@ -1781,15 +1781,16 @@ mod tests {
         assert_eq!(applied.counts.get("groups_created"), Some(&3));
 
         // The groups the moves named, then one edit/bulk payload carrying every rename and move.
-        let created: Vec<String> = server
+        let mut created: Vec<String> = server
             .bodies("POST", "/api/channels/groups/")
             .await
             .iter()
             .map(|body| body["name"].as_str().unwrap_or_default().to_string())
             .collect();
-        // In the order the moves name them (channel id), which is the order the groups are
-        // created in.
-        assert_eq!(created, vec!["Graveyard", "Black Screens", "Slow"]);
+        // The create stage posts groups concurrently, so their arrival order is not fixed;
+        // what matters is that each group the moves name is created exactly once.
+        created.sort();
+        assert_eq!(created, vec!["Black Screens", "Graveyard", "Slow"]);
 
         let bodies = server
             .bodies("PATCH", "/api/channels/channels/edit/bulk/")

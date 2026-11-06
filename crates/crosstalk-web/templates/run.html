@@ -9,10 +9,17 @@
 </section>
 
 {% if let Some(parent) = parent %}
+{% if parent.app == "workflow" %}
 <p class="muted">
   This run is a step of <a href="/runs/{{ parent.id }}">workflow run #{{ parent.id }}</a>
   (<code>workflow.{{ parent.action }}</code>).
 </p>
+{% else %}
+<p class="muted">
+  This run undoes <a href="/runs/{{ parent.id }}">run #{{ parent.id }}</a>
+  (<code>{{ parent.app }}.{{ parent.action }}</code>).
+</p>
+{% endif %}
 {% endif %}
 
 {% if !steps.is_empty() %}
@@ -20,6 +27,50 @@
   <h2>Steps</h2>
   {% include "_steps_table.html" %}
 </section>
+{% endif %}
+
+{% if undo_eligible %}
+<section class="card">
+  <h2>Undo</h2>
+  <p class="muted">
+    Reverse the rows of this run that are still in effect — a value changed since is left
+    alone. Starts a preview; nothing is written until you apply it.
+  </p>
+  <form method="post" action="/runs/{{ run.id }}/undo"
+        data-confirm="Undo run #{{ run.id }} ({{ run.app }} {{ run.action }})? This starts a preview; nothing is written until you apply it.">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit" class="action-write">Undo this run</button>
+  </form>
+</section>
+{% endif %}
+
+{% if !undo_runs.is_empty() %}
+<section class="card">
+  <h2>Undone by</h2>
+  <p class="muted">
+    {% for undo in undo_runs %}
+    <a href="/runs/{{ undo.id }}">run #{{ undo.id }}</a>{% if undo.dry_run %} (preview){% else %} (applied){% endif %}{% if !loop.last %}, {% endif %}
+    {% endfor %}
+  </p>
+</section>
+{% endif %}
+
+{% if apply_undo_offered %}
+{% if let Some(target) = parent %}
+<section class="card">
+  <h2>Apply this undo</h2>
+  <p class="muted">
+    This preview changed nothing. Applying reverses run #{{ target.id }}'s rows that are
+    still in effect, as run #{{ target.id }}'s app.
+  </p>
+  <form method="post" action="/runs/{{ target.id }}/undo"
+        data-confirm="Apply the undo of run #{{ target.id }} ({{ target.app }} {{ target.action }})? This writes channel data.">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="confirm" value="true">
+    <button type="submit" class="action-destructive">Apply undo</button>
+  </form>
+</section>
+{% endif %}
 {% endif %}
 
 {% if is_workflow %}

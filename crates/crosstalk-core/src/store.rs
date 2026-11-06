@@ -612,9 +612,10 @@ impl Store {
     /// Insert one run row: the one place the column list and the slot flags live, so a new column
     /// cannot be forgotten by one of the callers.
     ///
-    /// `parent_run_id` is the workflow run a step belongs to (see [`crate::workflow`]); the
-    /// runner passes it from [`crate::runner::RunOptions::parent_run`], which is how a step run
-    /// stays an ordinary run of its own app with an ordinary slot rule.
+    /// `parent_run_id` is the workflow run a step belongs to (see [`crate::workflow`]), or
+    /// the run an undo reverses (see [`crate::undo`]); the runner passes it from
+    /// [`crate::runner::RunOptions::parent_run`], which is how a step run stays an ordinary
+    /// run of its own app with an ordinary slot rule.
     pub(crate) fn insert_run(
         &self,
         app: &str,
