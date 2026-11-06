@@ -105,7 +105,8 @@ pub struct RunRecord {
 /// measures provider streams, and the guide's watchdog checks EPG sources. Rather than reuse
 /// `channel_id` for an id from another table (which made a row impossible to read without
 /// knowing which action wrote it, and could aim a restore at whatever channel carried that
-/// number), the row says what its id belongs to.
+/// number), the row says what its id belongs to. Creates add groups and logos to the set:
+/// a create row's `channel_id` carries the new group's or logo's id.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Subject {
@@ -116,6 +117,10 @@ pub enum Subject {
     Stream,
     /// An EPG source, as the watchdog records (`channel_id` carries the source id).
     EpgSource,
+    /// A channel group, as create rows record (`channel_id` carries the group id).
+    Group,
+    /// A logo, as create rows record (`channel_id` carries the logo id).
+    Logo,
 }
 
 impl Subject {
@@ -125,6 +130,8 @@ impl Subject {
             Self::Channel => "channel",
             Self::Stream => "stream",
             Self::EpgSource => "epg_source",
+            Self::Group => "group",
+            Self::Logo => "logo",
         }
     }
 
@@ -135,6 +142,8 @@ impl Subject {
             Self::Channel => "Channel",
             Self::Stream => "Stream",
             Self::EpgSource => "EPG source",
+            Self::Group => "Group",
+            Self::Logo => "Logo",
         }
     }
 
@@ -144,6 +153,8 @@ impl Subject {
         match text {
             "stream" => Self::Stream,
             "epg_source" => Self::EpgSource,
+            "group" => Self::Group,
+            "logo" => Self::Logo,
             _ => Self::Channel,
         }
     }
@@ -153,6 +164,26 @@ impl std::fmt::Display for Subject {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
+}
+
+/// A create about to be sent, recorded before its POST (the `ownership_intent` table).
+///
+/// What was posted is what the next run's reconcile looks the object up by: `name` for a
+/// group, `url` for a logo, `name` + `group_id` + `number` for a channel, and only among
+/// objects with an id above `after_id` (the highest id of that kind in the world the plan
+/// was made from), so a user's own same-named object is never mistaken for it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateIntent {
+    /// `group`, `logo` or `channel`.
+    pub kind: String,
+    pub app: String,
+    pub owner_key: String,
+    pub name: String,
+    pub group_id: Option<i64>,
+    pub number: Option<f64>,
+    pub url: Option<String>,
+    pub after_id: i64,
+    pub run_id: i64,
 }
 
 /// One row of a run: what it is about (a channel, a stream, an EPG source) and what was
@@ -180,6 +211,12 @@ pub struct RunRow {
     pub reason: String,
     /// What the model said, when it was asked. Empty when it was not.
     pub ai_decision: Option<String>,
+    /// The app-defined ownership key of a created object (`lineup:<file>:<category>:<name>`),
+    /// written by create rows alongside the new id. A later run planning the same key finds
+    /// the object it already made instead of creating a duplicate. `None` for every row that
+    /// is not about a created object.
+    #[serde(default)]
+    pub owner_key: Option<String>,
     /// The channel field a channel operation wrote (`name`, `channel_group_id`, `epg_data_id`,
     /// `hidden_from_output`, `profile_membership:<id>`), empty for a matching row.
     ///
@@ -445,6 +482,47 @@ impl Store {
                     PRIMARY KEY (input_key, data_version)
                 );
                 CREATE INDEX IF NOT EXISTS identity_cache_version ON identity_cache(data_version);
+
+                -- Which objects crosstalk created (or explicitly adopted): one row per object,
+                -- keyed by what it is and its Dispatcharr id. The key is app-defined
+                -- (`lineup:<file>:<category>:<name>`): a later run planning the same key finds
+                -- the object it already made instead of creating a duplicate, and hide/renumber
+                -- passes touch only what their app owns. A pre-existing same-named object an
+                -- app adopts for matching is recorded here too, so adoption and creation share
+                -- the one query. Idempotent: the table is created on every open and never
+                -- altered, and `record_ownership` inserts `OR IGNORE`, so a repeat records
+                -- nothing new and the first owner wins.
+                CREATE TABLE IF NOT EXISTS ownership (
+                    kind       TEXT NOT NULL,
+                    object_id  INTEGER NOT NULL,
+                    app        TEXT NOT NULL,
+                    owner_key  TEXT NOT NULL,
+                    run_id     INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (kind, object_id)
+                );
+                CREATE INDEX IF NOT EXISTS ownership_app_key ON ownership(app, owner_key);
+
+                -- A create that was SENT but whose answer has not been recorded yet: written
+                -- before the POST goes out, turned into an `ownership` row when the answer
+                -- lands. A process that dies in between leaves the intent behind, and the next
+                -- run's reconcile looks the object up by what was posted (exact name + group
+                -- + number for a channel, name for a group, URL for a logo, newer than
+                -- `after_id`) and adopts it — or drops the intent when nothing landed — so a
+                -- crash can neither duplicate a channel nor orphan one.
+                CREATE TABLE IF NOT EXISTS ownership_intent (
+                    kind       TEXT NOT NULL,
+                    app        TEXT NOT NULL,
+                    owner_key  TEXT NOT NULL,
+                    name       TEXT NOT NULL,
+                    group_id   INTEGER,
+                    number     REAL,
+                    url        TEXT,
+                    after_id   INTEGER NOT NULL,
+                    run_id     INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (kind, app, owner_key)
+                );
                 "#,
             )?;
             // A run left `running` by a crash or a restart can never finish, and pruning
@@ -604,9 +682,9 @@ impl Store {
                     "INSERT OR REPLACE INTO run_rows (run_id, ordinal, channel_id, channel_name, \
                      channel_group, channel_number, current_epg_name, epg_data_id, epg_name, \
                      epg_source, score, method, status, reason, ai_decision, field, \
-                     before_value, after_value, subject) \
+                     before_value, after_value, subject, owner_key) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
-                     ?16, ?17, ?18, ?19)",
+                     ?16, ?17, ?18, ?19, ?20)",
                 )?;
                 for row in rows {
                     statement.execute(params![
@@ -629,6 +707,7 @@ impl Store {
                         row.before_value,
                         row.after_value,
                         row.subject.as_str(),
+                        row.owner_key,
                     ])?;
                 }
             }
@@ -1135,6 +1214,221 @@ impl Store {
         })
     }
 
+    /// Record that this app created (or explicitly adopted) an object under its key.
+    ///
+    /// Idempotent: `INSERT OR IGNORE` on `(kind, object_id)`, so re-recording the same object
+    /// — a retried apply, a re-run over the same plan — changes nothing, and the first owner
+    /// wins when two apps claim one object. `created_at` is the first recording, RFC 3339.
+    ///
+    /// Answers whether `app` owns the object afterwards: `false` means another app already
+    /// did, and this claim was NOT recorded — an adopter must not then treat it as its own.
+    pub fn record_ownership(
+        &self,
+        kind: &str,
+        object_id: i64,
+        app: &str,
+        owner_key: &str,
+        run_id: i64,
+    ) -> Result<bool> {
+        let created = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        self.with_connection(|connection| {
+            connection.execute(
+                "INSERT OR IGNORE INTO ownership (kind, object_id, app, owner_key, run_id, \
+                 created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![kind, object_id, app, owner_key, run_id, created],
+            )?;
+            let owner: String = connection.query_row(
+                "SELECT app FROM ownership WHERE kind = ?1 AND object_id = ?2",
+                params![kind, object_id],
+                |row| row.get(0),
+            )?;
+            Ok(owner == app)
+        })
+    }
+
+    /// Record intents for creates about to be sent, in one transaction.
+    ///
+    /// Written before the POSTs go out (see the `ownership_intent` table): a replace, so a
+    /// rerun's fresh intent supersedes a stale one for the same key.
+    pub fn record_intents(&self, intents: &[CreateIntent]) -> Result<()> {
+        if intents.is_empty() {
+            return Ok(());
+        }
+        let created = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        self.with_connection(|connection| {
+            let transaction = connection.unchecked_transaction()?;
+            {
+                let mut statement = transaction.prepare(
+                    "INSERT OR REPLACE INTO ownership_intent (kind, app, owner_key, name, \
+                     group_id, number, url, after_id, run_id, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                )?;
+                for intent in intents {
+                    statement.execute(params![
+                        intent.kind,
+                        intent.app,
+                        intent.owner_key,
+                        intent.name,
+                        intent.group_id,
+                        intent.number,
+                        intent.url,
+                        intent.after_id,
+                        intent.run_id,
+                        created,
+                    ])?;
+                }
+            }
+            transaction.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Turn an intent into ownership: record the object and drop the intent, atomically.
+    ///
+    /// The ownership insert is [`Self::record_ownership`]'s `OR IGNORE` (first owner wins).
+    pub fn settle_intent(
+        &self,
+        kind: &str,
+        object_id: i64,
+        app: &str,
+        owner_key: &str,
+        run_id: i64,
+    ) -> Result<()> {
+        let created = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        self.with_connection(|connection| {
+            let transaction = connection.unchecked_transaction()?;
+            transaction.execute(
+                "INSERT OR IGNORE INTO ownership (kind, object_id, app, owner_key, run_id, \
+                 created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![kind, object_id, app, owner_key, run_id, created],
+            )?;
+            transaction.execute(
+                "DELETE FROM ownership_intent WHERE kind = ?1 AND app = ?2 AND owner_key = ?3",
+                params![kind, app, owner_key],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Forget an intent whose object never landed.
+    pub fn drop_intent(&self, kind: &str, app: &str, owner_key: &str) -> Result<()> {
+        self.with_connection(|connection| {
+            connection.execute(
+                "DELETE FROM ownership_intent WHERE kind = ?1 AND app = ?2 AND owner_key = ?3",
+                params![kind, app, owner_key],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Every intent one app left unsettled, oldest first.
+    pub fn pending_intents(&self, app: &str) -> Result<Vec<CreateIntent>> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT kind, app, owner_key, name, group_id, number, url, after_id, run_id \
+                 FROM ownership_intent WHERE app = ?1 ORDER BY created_at, kind, owner_key",
+            )?;
+            let rows = statement.query_map(params![app], |row| {
+                Ok(CreateIntent {
+                    kind: row.get(0)?,
+                    app: row.get(1)?,
+                    owner_key: row.get(2)?,
+                    name: row.get(3)?,
+                    group_id: row.get(4)?,
+                    number: row.get(5)?,
+                    url: row.get(6)?,
+                    after_id: row.get(7)?,
+                    run_id: row.get(8)?,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
+    }
+
+    /// Drop the ownership of an object that no longer exists in Dispatcharr.
+    ///
+    /// Ids are never reused upstream (Postgres sequences), so a missing id is gone for good:
+    /// keeping its row would make a create plan believe its key is still made.
+    pub fn forget_ownership(&self, kind: &str, object_id: i64) -> Result<()> {
+        self.with_connection(|connection| {
+            connection.execute(
+                "DELETE FROM ownership WHERE kind = ?1 AND object_id = ?2",
+                params![kind, object_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Whether any app owns this object.
+    ///
+    /// What hide/renumber passes ask before touching a channel: an object nobody owns is a
+    /// user's own, never crosstalk's to renumber or hide.
+    pub fn is_owned(&self, kind: &str, object_id: i64) -> Result<bool> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT 1 FROM ownership WHERE kind = ?1 AND object_id = ?2",
+                    params![kind, object_id],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map(|found| found.is_some())
+                .map_err(Into::into)
+        })
+    }
+
+    /// Who owns this object, if anyone: `(app, owner_key, run_id)`.
+    pub fn owner_of(&self, kind: &str, object_id: i64) -> Result<Option<(String, String, i64)>> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT app, owner_key, run_id FROM ownership WHERE kind = ?1 AND object_id = ?2",
+                    params![kind, object_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+                .map_err(Into::into)
+        })
+    }
+
+    /// Every object id one app owns under one key, with what each id is.
+    ///
+    /// The create plan's dedup query: planning an object with a key that is already owned
+    /// finds the object the earlier run made instead of creating a duplicate.
+    pub fn owned_ids(&self, app: &str, owner_key: &str) -> Result<Vec<(String, i64)>> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT kind, object_id FROM ownership WHERE app = ?1 AND owner_key = ?2 \
+                 ORDER BY kind, object_id",
+            )?;
+            let rows = statement.query_map(params![app, owner_key], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
+    }
+
+    /// Everything one app owns: `(kind, object_id, owner_key)`.
+    ///
+    /// What hide/renumber passes list before they run: the owned channels of one lineup, the
+    /// owned groups of one triage config.
+    pub fn owned_keys(&self, app: &str) -> Result<Vec<(String, i64, String)>> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT kind, object_id, owner_key FROM ownership WHERE app = ?1 \
+                 ORDER BY kind, object_id",
+            )?;
+            let rows = statement.query_map(params![app], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
+    }
+
     /// Record one stream's probe outcome, replacing whatever was there.
     ///
     /// Written by `probe` once per stream and read by `sort`, so the row is the stream's whole
@@ -1332,6 +1626,9 @@ fn add_run_row_columns(connection: &Connection) -> Result<()> {
         // The DEFAULT is the backfill for every ordinary row: before this column existed all
         // of them were about a channel. The watchdog's rows are the exception, below.
         ("subject", "TEXT NOT NULL DEFAULT 'channel'"),
+        // The ownership key of a created object. Nullable, so every row written before it
+        // existed reads back as "not a created object", which is what it was.
+        ("owner_key", "TEXT"),
     ] {
         if !existing.contains(name) {
             // Same lost-race tolerance as `add_run_columns`: two processes migrating together
@@ -1452,7 +1749,7 @@ fn map_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
 /// The `run_rows` columns a [`RunRow`] is built from, in the order [`map_run_row`] reads them.
 const RUN_ROW_COLUMNS: &str = "ordinal, channel_id, channel_name, channel_group, \
      channel_number, current_epg_name, epg_data_id, epg_name, epg_source, score, method, \
-     status, reason, ai_decision, field, before_value, after_value, subject";
+     status, reason, ai_decision, field, before_value, after_value, subject, owner_key";
 
 /// One `run_rows` row, from the columns [`RUN_ROW_COLUMNS`] selects.
 fn map_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRow> {
@@ -1476,6 +1773,7 @@ fn map_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRow> {
         field: row.get(14)?,
         before_value: row.get(15)?,
         after_value: row.get(16)?,
+        owner_key: row.get(18)?,
     })
 }
 
@@ -1824,6 +2122,7 @@ mod tests {
             field: String::new(),
             before_value: None,
             after_value: None,
+            owner_key: None,
         }
     }
 

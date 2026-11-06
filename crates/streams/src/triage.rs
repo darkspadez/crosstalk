@@ -109,9 +109,7 @@ use crate::settings::StreamsSettings;
 use anyhow::{bail, Result};
 use crosstalk_core::channel_ops::{self, Field, Op, ReportSpec, Selection, SetValue};
 use crosstalk_core::csv_report;
-use crosstalk_core::dispatcharr::{
-    Channel, ChannelGroup, DispatcharrClient, World, WorldKind, WorldKinds,
-};
+use crosstalk_core::dispatcharr::{Channel, ChannelGroup, World, WorldKind, WorldKinds};
 use crosstalk_core::jobs::JobContext;
 use crosstalk_core::subapp::{JobOutcome, OutcomeBuilder, SubApp};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -739,29 +737,25 @@ fn alive_rows(verdict: ChannelVerdict) -> bool {
 
 /// The groups a run's moves target, resolved to ids.
 ///
-/// A preview must not create anything, so an apply and a preview differ only here: an apply
-/// calls `POST /channels/groups/` (upstream `get_or_create`, 2666) for a missing group, while
-/// a preview plans against a NEGATIVE placeholder id that carries the real name, so the CSV
-/// says "Graveyard" rather than "No Group" and nothing is written. A placeholder id can never
-/// collide with a real one, and no write is ever attempted with one.
+/// Missing groups resolve to a NEGATIVE placeholder id that carries the real name, so the
+/// plan prints "Graveyard" rather than "No Group" and nothing is written yet. A placeholder
+/// id can never collide with a real one, and no write is ever attempted with one: on an
+/// apply the create stage replaces every placeholder with the created group's real id (or
+/// refuses the moves that lost their group) before the edit stage runs. Group creation
+/// itself lives on the create stage now — previewed, recorded as a row, owned by streams —
+/// instead of a direct `create_group` call.
 #[derive(Debug, Clone, Default)]
 pub struct GroupTargets {
-    /// Group name -> id (a real id on an apply, a placeholder on a preview).
+    /// Group name -> id (a real id, or a placeholder for a group the create stage makes).
     pub ids: HashMap<String, i64>,
     /// Groups that did not exist when the run started.
     pub missing: Vec<String>,
-    /// Groups this run created (apply only).
-    pub created: Vec<String>,
 }
 
 impl GroupTargets {
-    /// Resolve (and, unless `dry_run`, create) every group the moves name.
-    pub async fn resolve(
-        client: Option<&DispatcharrClient>,
-        world: &World,
-        moves: &[Move],
-        dry_run: bool,
-    ) -> Result<Self> {
+    /// Resolve every group the moves name, without creating anything: missing groups get a
+    /// placeholder id (see above), which the create stage replaces on an apply.
+    pub fn resolve(world: &World, moves: &[Move]) -> Self {
         let mut targets = GroupTargets::default();
         let mut wanted: Vec<String> = Vec::new();
         for movement in moves {
@@ -782,27 +776,15 @@ impl GroupTargets {
                 continue;
             }
             targets.missing.push(group.clone());
-            if dry_run {
-                loop {
-                    placeholder -= 1;
-                    if !world.groups.iter().any(|group| group.id == placeholder) {
-                        break;
-                    }
+            loop {
+                placeholder -= 1;
+                if !world.groups.iter().any(|group| group.id == placeholder) {
+                    break;
                 }
-                targets.ids.insert(group, placeholder);
-                continue;
             }
-            let Some(client) = client else {
-                bail!(
-                    "this run has no Dispatcharr session, so it cannot create the channel group \
-                     {group:?} the moves need"
-                );
-            };
-            let created = client.create_group(&group).await?;
-            targets.ids.insert(group.clone(), created.id);
-            targets.created.push(group);
+            targets.ids.insert(group, placeholder);
         }
-        Ok(targets)
+        targets
     }
 
     /// The world to PLAN against: the loaded one, plus a named entry for every group the run
@@ -827,6 +809,66 @@ impl GroupTargets {
         }
         plan_world
     }
+}
+
+/// Replace placeholder group ids in an edit plan with the ids the create stage made.
+///
+/// A group the create stage failed (or never attempted, on a cancelled run) refuses the
+/// moves that needed it: the change is dropped and a skip names the lost group. Placeholders
+/// are negative by construction, so a non-negative id is never touched; a dry run never
+/// calls this, and its placeholders stay named by `plan_world`.
+fn remap_created_groups(
+    op_plan: &mut channel_ops::Plan,
+    targets: &GroupTargets,
+    report: &channel_ops::CreateReport,
+) {
+    use channel_ops::{CreatedOutcome, RowStatus};
+    let by_name: HashMap<&str, &CreatedOutcome> = report
+        .groups
+        .iter()
+        .map(|outcome| (outcome.name.as_str(), outcome))
+        .collect();
+    let mut kept = Vec::with_capacity(op_plan.changes.len());
+    for mut change in op_plan.changes.drain(..) {
+        let placeholder = match (&change.field, &change.after) {
+            (channel_ops::Field::Group, channel_ops::Value::Group(Some((id, _)))) if *id < 0 => *id,
+            _ => {
+                kept.push(change);
+                continue;
+            }
+        };
+        let name = targets
+            .ids
+            .iter()
+            .find_map(|(name, pid)| (*pid == placeholder).then_some(name));
+        let outcome = name.and_then(|name| by_name.get(name.as_str()).copied());
+        match outcome {
+            Some(outcome) if outcome.status == RowStatus::Ok && outcome.id.is_some() => {
+                let id = outcome.id.unwrap_or(0);
+                change.after = channel_ops::Value::Group(Some((id, outcome.name.clone())));
+                kept.push(change);
+            }
+            _ => {
+                let reason = match outcome {
+                    Some(outcome) if !outcome.reason.is_empty() => format!(
+                        "its group {:?} could not be created: {}",
+                        outcome.name, outcome.reason
+                    ),
+                    _ => "its group could not be created, so the move is refused".to_string(),
+                };
+                op_plan.skipped.push(channel_ops::Skip {
+                    channel_id: change.channel_id,
+                    channel_name: change.channel_name.clone(),
+                    channel_number: change.channel_number,
+                    channel_group: change.channel_group.clone(),
+                    op: Some(change.op),
+                    field: Some(change.field),
+                    reason,
+                });
+            }
+        }
+    }
+    op_plan.changes = kept;
 }
 
 /// The action: preview (a read and a CSV) or apply (the writes).
@@ -873,13 +915,12 @@ pub async fn run(
     let in_scope: HashSet<i64> = scoped.channels.iter().map(|channel| channel.id).collect();
     outcome.retain_in_scope(&in_scope);
 
-    // 3. The destination groups: created here on an apply, named by a placeholder on a
-    //    preview, so a preview writes nothing at all.
-    //    A run cancelled before this point creates no group either: its rows are all marked
-    //    cancelled by the apply, and an empty destination group would be its only trace.
-    let create_groups = !dry_run && !context.is_cancelled();
-    let targets =
-        GroupTargets::resolve(Some(client), &world, &outcome.moves, !create_groups).await?;
+    // 3. The destination groups: missing ones go through the channel-ops create stage, so a
+    //    preview plans (and records) them without writing anything, and an apply creates them
+    //    first and moves channels onto the real ids. A run cancelled before this point
+    //    creates no group: the create stage checks cancellation before every POST, so nothing
+    //    goes out and every row says why.
+    let targets = GroupTargets::resolve(&world, &outcome.moves);
     let plan_world = targets.plan_world(&world);
 
     // 4. One per-channel value map per field, through `channel_ops`: the same selection, scope
@@ -926,7 +967,50 @@ pub async fn run(
         channel_ids: Some(outcome.target_ids()),
         ..Selection::in_scope(&scope)
     };
-    let op_plan = channel_ops::plan(&plan_world, &selection, &operations)?;
+    let mut op_plan = channel_ops::plan(&plan_world, &selection, &operations)?;
+
+    // The missing groups go through the create stage: planned (and, on a preview, recorded)
+    // even when the run writes nothing else, created first on an apply so the moves below
+    // land on real ids. Owned by streams under `streams:triage:<group>`.
+    let create_request = channel_ops::CreateRequest {
+        app: "streams".to_string(),
+        groups: targets
+            .missing
+            .iter()
+            .map(|name| channel_ops::NewGroup {
+                name: name.clone(),
+                key: format!("streams:triage:{name}"),
+            })
+            .collect(),
+        logos: Vec::new(),
+        channels: Vec::new(),
+    };
+    // Groups dedup by exact name against the world; the owned state is still loaded on an
+    // apply, so a group an interrupted run posted (an unsettled intent) becomes streams'.
+    let owned = if dry_run {
+        channel_ops::OwnedState::default()
+    } else {
+        channel_ops::load_owned(context, &world, "streams")?
+    };
+    let create_plan = channel_ops::plan_creates(
+        &world,
+        &owned.channels,
+        &create_request,
+        &channel_ops::PlanOptions::default(),
+    )?;
+    let create_applied = if dry_run || create_plan.is_empty() {
+        None
+    } else {
+        let creator: std::sync::Arc<dyn channel_ops::ChannelCreator> =
+            std::sync::Arc::new(channel_ops::RestChannelCreator::new(
+                client.clone(),
+                settings.write_concurrency.max(1) as usize,
+            ));
+        Some(channel_ops::apply_creates(creator, &create_plan, context, &action_id).await)
+    };
+    if let Some(report) = create_applied.as_ref() {
+        remap_created_groups(&mut op_plan, &targets, report);
+    }
 
     let applied = if dry_run || op_plan.changes.is_empty() {
         None
@@ -972,7 +1056,16 @@ pub async fn run(
         spec = spec.note("Left alone", skips);
     }
     let report = channel_ops::write_ops_report(context, &spec, &op_plan, applied.as_ref())?;
-    context.record_rows(&channel_ops::run_rows(&op_plan, applied.as_ref()))?;
+    // Create rows first (the groups were made before the moves), then the edit rows shifted
+    // past them: `run_id` + `ordinal` is the row's key, so the two sequences must not overlap.
+    let mut rows = channel_ops::create_run_rows(&create_plan, create_applied.as_ref());
+    let mut edit_rows = channel_ops::run_rows(&op_plan, applied.as_ref());
+    let base = rows.len() as i64;
+    for row in &mut edit_rows {
+        row.ordinal += base;
+    }
+    rows.extend(edit_rows);
+    context.record_rows(&rows)?;
 
     let name = report
         .file_name()
@@ -984,6 +1077,10 @@ pub async fn run(
         name.as_deref(),
     );
 
+    let groups_created = create_applied
+        .as_ref()
+        .map(|report| report.created())
+        .unwrap_or(0);
     let mut builder = OutcomeBuilder::new(if dry_run {
         format!(
             "Dry run complete. {} channel(s) would change: {} renamed, {} suffixed, {} moved.",
@@ -1006,7 +1103,7 @@ pub async fn run(
     .count("moved", outcome.moves.len() as i64)
     .count("skipped", outcome.skipped.len() as i64)
     .count("changes", op_plan.changes.len() as i64)
-    .count("groups_created", targets.created.len() as i64);
+    .count("groups_created", groups_created as i64);
     for (verdict, count) in &outcome.verdicts {
         builder = builder.count(format!("verdict_{verdict}"), *count as i64);
     }
@@ -1337,8 +1434,8 @@ mod tests {
     // Group resolution
     // ---------------------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn an_apply_creates_a_missing_group_and_a_preview_does_not() {
+    #[test]
+    fn resolve_names_a_missing_group_with_a_placeholder_and_writes_nothing() {
         let world = world();
         let moves = vec![Move {
             channel_id: 1,
@@ -1346,27 +1443,75 @@ mod tests {
             group: "Parked".to_string(),
         }];
 
-        let preview = GroupTargets::resolve(None, &world, &moves, true)
-            .await
-            .expect("a preview resolves without a client");
-        assert_eq!(preview.missing, vec!["Parked".to_string()]);
-        assert!(preview.created.is_empty());
-        let placeholder = preview.ids["Parked"];
+        // Resolve is pure now: no client, no POSTs, just placeholders for the create stage.
+        let targets = GroupTargets::resolve(&world, &moves);
+        assert_eq!(targets.missing, vec!["Parked".to_string()]);
+        let placeholder = targets.ids["Parked"];
         assert!(placeholder < 0, "a placeholder id must not be a real id");
         // The plan prints the group's NAME for a placeholder, not "No Group".
-        let plan_world = preview.plan_world(&world);
+        let plan_world = targets.plan_world(&world);
         assert_eq!(plan_world.group_name(Some(placeholder)), "Parked");
+    }
+
+    #[tokio::test]
+    async fn the_create_stage_creates_a_missing_group_and_records_it() {
+        use crosstalk_core::channel_ops;
+        let world = world();
+        let moves = vec![Move {
+            channel_id: 1,
+            class: TriageClass::Dead,
+            group: "Parked".to_string(),
+        }];
+        let targets = GroupTargets::resolve(&world, &moves);
 
         let server = ServerFixture::start(&world).await;
         let client = server.client();
-        let applied = GroupTargets::resolve(Some(&client), &world, &moves, false)
-            .await
-            .expect("an apply creates it");
-        assert_eq!(applied.created, vec!["Parked".to_string()]);
-        assert_eq!(applied.ids["Parked"], 700);
+        let request = channel_ops::CreateRequest {
+            app: "streams".to_string(),
+            groups: targets
+                .missing
+                .iter()
+                .map(|name| channel_ops::NewGroup {
+                    name: name.clone(),
+                    key: format!("streams:triage:{name}"),
+                })
+                .collect(),
+            logos: Vec::new(),
+            channels: Vec::new(),
+        };
+        let plan = channel_ops::plan_creates(
+            &world,
+            &HashMap::new(),
+            &request,
+            &channel_ops::PlanOptions::default(),
+        )
+        .expect("plans");
+        assert_eq!(plan.groups.len(), 1);
+        assert!(plan.groups[0].existing_id.is_none());
+
+        let creator: std::sync::Arc<dyn channel_ops::ChannelCreator> =
+            std::sync::Arc::new(channel_ops::RestChannelCreator::new(client, 4));
+        let context = crosstalk_core::jobs::JobContext::for_tests(
+            crosstalk_core::config::CrosstalkConfig::default(),
+        );
+        let report =
+            channel_ops::apply_creates(creator, &plan, &context, "streams.triage_apply").await;
+        assert!(report.all_ok(), "{report:#?}");
+        assert_eq!(report.groups.len(), 1);
+        assert_eq!(report.groups[0].id, Some(700));
         let bodies = server.bodies("POST", "/api/channels/groups/").await;
         assert_eq!(bodies.len(), 1);
         assert_eq!(bodies[0]["name"], serde_json::json!("Parked"));
+        // One row per created object, with the new id and the owner key.
+        let rows = channel_ops::create_run_rows(&plan, Some(&report));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].subject, crosstalk_core::store::Subject::Group);
+        assert_eq!(rows[0].after_value.as_deref(), Some("700"));
+        assert_eq!(
+            rows[0].owner_key.as_deref(),
+            Some("streams:triage:Parked"),
+            "the create row carries the owner key"
+        );
     }
 
     #[tokio::test]
@@ -1378,10 +1523,7 @@ mod tests {
             group: "US: Cable".to_string(),
         }];
         let server = ServerFixture::start(&world).await;
-        let client = server.client();
-        let targets = GroupTargets::resolve(Some(&client), &world, &moves, false)
-            .await
-            .expect("resolve");
+        let targets = GroupTargets::resolve(&world, &moves);
         assert_eq!(targets.ids["US: Cable"], 100);
         assert!(targets.missing.is_empty());
         assert_eq!(

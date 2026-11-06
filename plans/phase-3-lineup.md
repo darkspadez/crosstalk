@@ -197,7 +197,8 @@ Decided:
 - **Improvements**: one cached tv-logos recursive-tree fetch (24 h) for every country (CM
   fetched per country, LU's contents API truncates at ~1000 files); Name Cleaner's collision
   strategy guards every rename/create (no two same-named channels in a group); sync/create
-  never assign a number already used in the group (reported); every apply plans from live
+  never assign a number already used by any channel (reported; numbers are global, step 10
+  review); every apply plans from live
   state (CM replays a saved JSON).
 - **Creates**: one POST per channel over REST with bounded concurrency behind a
   `ChannelCreator` seam (bridge-ready), timed by `crosstalk bench`.
@@ -221,7 +222,7 @@ Decided:
   rows; queries "owned channels of lineup X".
 - **Name collision guard** in channel_ops: one shared resolver (NC's suffix / numeric / skip)
   over the plan's resulting names per group; used by every rename and create.
-- **Number conflict check** for creates/renumbers within a group.
+- **Number conflict check** for creates/renumbers, global (step 10 review).
 - **Undo** (`core::undo`): reads a run's rows, keeps rows still in effect (current == after),
   builds `Op::Set` per field + hide for created channels, previewed and applied as a normal
   run (`app = <app>`, action `undo`, parent link to the undone run). CLI `crosstalk undo
@@ -485,3 +486,28 @@ Step 9 review (2026-11-05):
   matches Rust byte for byte over 79,807 corpus/merged/synthetic names. The Z08 coherence
   check also requires Z02 `none`. `UnifiedEngine::cached` (used in production via
   `MatchOptions::new`) is bounded to 8 most-recently-used configs.
+
+Step 10 review (2026-11-06):
+- **Changed decision: channel numbers are GLOBAL, not per group.** Dispatcharr's only per-group
+  check is `Channel.clean`, which REST/bulk writes never call. Everything else is global:
+  `get_next_available_channel_number` → `compact_numbering.build_reserved_set` (every channel
+  + override pins), `channel_number_is_reserved`, the auto-sync `used_numbers` seed, and the
+  outputs (HDHomeRun `GuideNumber`, M3U `tvg-chno`, default `tvg_id` = number). The conflict
+  check (edits and creates) and `next_free_numbers` (no group argument) are global. A refused
+  renumber keeps its old number (the pass repeats until stable), so a swap is legal but a
+  claim on a number whose holder could not move is refused.
+- **Crash safety**: `apply_creates` records an `ownership_intent` row per POST (what was posted
+  + the plan world's highest id of that kind) before each stage, and settles it into
+  `ownership` in one transaction when the answer lands. `channel_ops::load_owned` (run before
+  planning) adopts an unsettled intent's object — exact name (+ group + number for channels,
+  URL for logos), id above the floor, unowned, newest — or drops the intent; intents of a
+  still-running run are left alone. It also forgets owned ids missing from a loaded slice
+  (deleted upstream; ids are never reused), so their keys are created again; hidden channels
+  stay owned (undo). `plan_creates` ignores an owned id not in the world and requires the
+  slices it dedups against.
+- Group creates: `POST /channels/groups/` answers 400 for an existing name (DRF
+  `UniqueValidator` on `TextField(unique=True)`, exact, case-sensitive) — not get_or_create.
+  The client recovers a failed group create by exact-name lookup, a failed logo create by
+  `?name=` + exact URL. Channel POSTs stay single-attempt.
+- `run_concurrent` publishes progress per answer; an unanswered post that was not cancelled
+  says so instead of "cancelled".

@@ -116,33 +116,68 @@ impl DispatcharrClient {
     ///
     /// `name` and `url` are the only writable columns. Not retried: `url` is unique, so a
     /// re-sent create answers 400 "A logo with this URL already exists" and would read as a
-    /// failure for a create that worked.
+    /// failure for a create that worked. A failed create (that 400 after a lost answer, or
+    /// any other error) is checked against the logos named like it (`?name=` is upstream's
+    /// `icontains` filter): a logo with this exact URL is the one that landed, and comes back
+    /// as the answer.
     pub async fn create_logo(&self, name: &str, url: &str) -> Result<Logo> {
         let body = serde_json::json!({ "name": name, "url": url });
-        self.write_json(
-            &reqwest::Method::POST,
-            "/channels/logos/",
-            Some(&body),
-            Retry::Once,
-        )
-        .await
-        .context("creating a logo")
+        let created = self
+            .write_json(
+                &reqwest::Method::POST,
+                "/channels/logos/",
+                Some(&body),
+                Retry::Once,
+            )
+            .await;
+        match created {
+            Ok(logo) => Ok(logo),
+            Err(error) => {
+                let landed: Option<Logo> = self
+                    .get_list(
+                        "/channels/logos/",
+                        &[("name", name.to_string())],
+                        "listing logos",
+                    )
+                    .await
+                    .ok()
+                    .and_then(|logos: Vec<Logo>| logos.into_iter().find(|logo| logo.url == url));
+                landed.ok_or(error).context("creating a logo")
+            }
+        }
     }
 
     /// Create a channel group.
     ///
-    /// Upstream creates it with `get_or_create`, so re-sending is safe and an existing group
-    /// of that name comes back unchanged.
+    /// Names are unique upstream and compared exactly (case-sensitive). The serializer's
+    /// `create` is a get_or_create, but DRF's `UniqueValidator` on `name` runs first, so an
+    /// existing name answers 400 "channel group with this name already exists" rather than
+    /// the group: a retry after a lost answer would read as a failure for a create that
+    /// worked. A failed create is therefore checked against the group list, and a group with
+    /// this exact name comes back as the answer.
     pub async fn create_group(&self, name: &str) -> Result<ChannelGroup> {
         let body = serde_json::json!({ "name": name });
-        self.write_json(
-            &reqwest::Method::POST,
-            "/channels/groups/",
-            Some(&body),
-            Retry::Idempotent,
-        )
-        .await
-        .with_context(|| format!("creating the channel group {name:?}"))
+        let created = self
+            .write_json(
+                &reqwest::Method::POST,
+                "/channels/groups/",
+                Some(&body),
+                Retry::Idempotent,
+            )
+            .await;
+        match created {
+            Ok(group) => Ok(group),
+            Err(error) => {
+                let landed = self
+                    .groups()
+                    .await
+                    .ok()
+                    .and_then(|groups| groups.into_iter().find(|group| group.name == name));
+                landed
+                    .ok_or(error)
+                    .with_context(|| format!("creating the channel group {name:?}"))
+            }
+        }
     }
 
     /// Rename a channel group.

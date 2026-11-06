@@ -892,6 +892,64 @@ async fn creating_a_logo_posts_its_name_and_url() {
 }
 
 #[tokio::test]
+async fn a_create_answered_400_for_an_existing_name_or_url_returns_the_landed_object() {
+    // DRF's UniqueValidator answers 400 before the serializer's get_or_create runs: the
+    // shape a retry after a lost answer meets. The client looks the exact name/URL up.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/channels/groups/"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(
+            serde_json::json!({"name": ["channel group with this name already exists."]}),
+        ))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/channels/groups/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {"id": 4, "name": "news"},
+            {"id": 5, "name": "News"},
+        ])))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/channels/logos/"))
+        .respond_with(
+            ResponseTemplate::new(400)
+                .set_body_json(serde_json::json!({"url": ["logo with this url already exists."]})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/channels/logos/"))
+        .and(query_param("name", "CNN"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": [
+                {"id": 8, "name": "CNN HD", "url": "http://logo/cnn-hd.png"},
+                {"id": 9, "name": "CNN", "url": "http://logo/cnn.png"},
+            ],
+            "next": null,
+        })))
+        .mount(&server)
+        .await;
+
+    let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+    // Exact, case-sensitive: "news" is a different group upstream.
+    assert_eq!(client.create_group("News").await.expect("group").id, 5);
+    assert!(
+        client.create_group("Sports").await.is_err(),
+        "nothing landed"
+    );
+    assert_eq!(
+        client
+            .create_logo("CNN", "http://logo/cnn.png")
+            .await
+            .expect("logo")
+            .id,
+        9
+    );
+}
+
+#[tokio::test]
 async fn a_group_is_created_and_renamed() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
