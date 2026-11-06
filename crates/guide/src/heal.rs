@@ -5,13 +5,22 @@
 //! working is never moved, and a channel for which no replacement is found is left exactly as
 //! it was rather than cleared.
 //!
+//! Step 8 (goal reset): heal searches the channel's identity FAMILY (the unified engine's
+//! `rank`, at the ONE `[matching]` cut) instead of the plugin's full ranked list. The
+//! family's first member that carries programme data (excluding the entry already
+//! assigned) is the replacement; below-cut candidates never enter the family, so the run
+//! path no longer proposes `SkippedLowConfidence` replacements (D02/T10: one cut). Janitor's
+//! standalone structural score (D06) is retired along with it: callsign agreement decides
+//! at family level (C06/D04).
+//!
 //! Heal never consults the AI gate — it is heuristic-only by design (owner Q4), so every
-//! replacement above carries the matcher's own score and method, with no model in the loop.
+//! replacement above carries the engine's own score and method, with no model in the loop.
 //!
 //! The order mirrors the plugin: find the broken channels, search replacements (excluding the
-//! one already assigned), take the first candidate that clears the threshold AND has
-//! programmes, then apply only those.
+//! one already assigned), take the first family member that has programmes, then apply.
 
+use crate::engine::RunEngine;
+use crate::matching::to_scored;
 use crate::scope::ScopedEntries;
 use crate::settings::GuideSettings;
 use anyhow::{Context, Result};
@@ -22,8 +31,6 @@ use crosstalk_core::match_run::{self, ConfidenceBand};
 use crosstalk_core::scope::ScopedChannels;
 use crosstalk_core::store::RunRow;
 use crosstalk_core::subapp::{JobOutcome, OutcomeBuilder, SubApp};
-use crosstalk_matching::pipeline::{CandidateIndex, Scored};
-use crosstalk_matching::MatchProfile;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -136,7 +143,8 @@ pub async fn run(
 ) -> Result<HealOutcome> {
     let client = context.dispatcharr()?;
     let window = ProgramWindow::ahead(settings.check_hours);
-    let threshold = settings.heal_confidence_threshold;
+    // The ONE cut (D02/T10): `[matching]` sensitivity via the run engine below.
+    // Heal's own threshold is retired (step 8).
     let allow_without_programs = settings.allow_epg_without_programs;
 
     let entry_by_id: HashMap<i64, &EpgEntry> = world
@@ -245,101 +253,109 @@ pub async fn run(
     let scanned = scoped_channels.channels.len();
 
     // Step 2: search a replacement for each broken channel.
-    let matcher = Arc::new(context.config().matching.matcher(MatchProfile::EpgJanitor));
+    // The unified stack: engine + identity cache at the ONE host cut. `threshold` is
+    // `[matching]` sensitivity, never the retired `heal_confidence_threshold`.
+    let run_engine = RunEngine::for_config(&context.config().matching, context.store().cloned());
+    let threshold = run_engine.threshold();
     let names: Vec<String> = scoped_entries
         .entries
         .iter()
         .map(|entry| entry.name.clone())
         .collect();
-    let index = Arc::new(CandidateIndex::build(&names, &matcher));
-    let tags = matcher.tags();
+    let index = Arc::new(run_engine.build_index(&names));
 
-    // Step 2a: score every broken channel off the async runtime (P3), through the shared
-    // scoring stage: no progress bar, because only the broken channels are scored.
-    // `scored_all[i]` is `broken[i]`.
+    // Step 2a: score every broken channel's identity family off the async runtime (P3),
+    // through the shared family stage: no progress bar, because only the broken channels
+    // are scored. `families_all[i]` is `broken[i]`'s best family, in rank order, at the cut.
     let broken_names: Vec<String> = broken.iter().map(|channel| channel.name.clone()).collect();
-    let scored_all: Vec<Vec<Scored>> = match_run::score_names(
+    let families_all = match_run::score_families(
         &broken_names,
-        Arc::clone(&matcher),
+        Arc::clone(run_engine.engine()),
         Arc::clone(&index),
-        &tags,
         None,
     )
     .await?;
+    // The query identities resolve through the shared cache, so the store holds the
+    // identity any other app resolves the same name to.
+    run_engine
+        .warm_families(&broken_names, &families_all, &names, &[])
+        .await;
 
-    // Step 2b: walk each broken channel's ranked list serially, concurrently across
+    // Exclude the entry already assigned from each family: proposing the same broken
+    // guide is not a fix. Positions below are into these searched lists, not the raw
+    // families.
+    let searched: Vec<Vec<crosstalk_matching::pipeline::Scored>> = broken
+        .iter()
+        .zip(families_all.iter())
+        .map(|(channel, family)| {
+            let original_id = channel.current_epg_id().unwrap_or(0);
+            let kept: Vec<crosstalk_matching::engine::EngineRanked> = family
+                .iter()
+                .filter(|member| {
+                    scoped_entries
+                        .entries
+                        .get(member.index)
+                        .is_some_and(|entry| entry.id != original_id)
+                })
+                .cloned()
+                .collect();
+            to_scored(&kept)
+        })
+        .collect();
+
+    // Step 2b: walk each broken channel's searched family serially, concurrently across
     // channels (P1). Picks resolve by channel order below. Work runs in batches so
     // a cancel is honoured between them and progress is published per batch.
-    // Shared borrows for the `async move` futures: capturing the vecs themselves would
-    // move them on the first poll.
-    let broken_ref = &broken;
-    let scored_ref = &scored_all;
+    // The shared walk (same as auto-match): the first family member that carries
+    // programme data wins. Below-cut candidates never entered the family (D02/T10: one
+    // cut), so the run path no longer proposes sub-threshold SkippedLowConfidence
+    // replacements the way the plugin's full-list walk did.
+    let rules = crosstalk_core::match_run::WalkRules {
+        threshold,
+        validate: !allow_without_programs,
+    };
+    let probe = crate::matching::EpgProbe {
+        client,
+        window: ProgramWindow::ahead(settings.check_hours),
+    };
+    let probe_ref = &probe;
+    let searched_ref = &searched;
     let entries_ref = &scoped_entries.entries;
     let mut picks: Vec<Option<usize>> = (0..broken.len()).map(|_| None).collect();
-    for batch_start in (0..broken_ref.len()).step_by(BATCH_CHANNELS) {
+    for batch_start in (0..broken.len()).step_by(BATCH_CHANNELS) {
         if context.is_cancelled() {
             anyhow::bail!("cancelled by the operator");
         }
-        let batch_end = (batch_start + BATCH_CHANNELS).min(broken_ref.len());
+        let batch_end = (batch_start + BATCH_CHANNELS).min(broken.len());
         {
             use futures::{stream, StreamExt};
-            let resolved: Vec<(usize, Option<usize>)> =
+            let resolved: Vec<(usize, match_run::WalkResult)> =
                 stream::iter((batch_start..batch_end).map(|ordinal| {
                     let cancel = context.clone();
                     async move {
-                        let channel = &broken_ref[ordinal];
-                        let original_id = channel.current_epg_id().unwrap_or(0);
-                        let candidates = &scored_ref[ordinal];
-                        // Exclude the entry already assigned: proposing the same broken guide is
-                        // not a fix. Walk every ranked candidate and remember the first one that
-                        // carries programme data, regardless of score (mirroring the plugin's
-                        // `_find_best_epg_match`): the threshold decides Healed vs
-                        // SkippedLowConfidence below, never whether the replacement is recorded.
-                        let mut picked = None;
-                        for (rank_position, candidate) in candidates.iter().enumerate() {
-                            if cancel.is_cancelled() {
-                                break;
-                            }
-                            let Some(entry) = entries_ref.get(candidate.index) else {
-                                continue;
-                            };
-                            if entry.id == original_id {
-                                continue;
-                            }
-                            if allow_without_programs {
-                                picked = Some(rank_position);
-                                break;
-                            }
-                            let Some(source) = entry.epg_source else {
-                                continue;
-                            };
-                            if cancel.is_cancelled() {
-                                break;
-                            }
-                            if client
-                                .has_programs(&entry.tvg_id, source, window_ref)
-                                .await
-                                .unwrap_or(HasPrograms::No)
-                                == HasPrograms::Yes
-                            {
-                                picked = Some(rank_position);
-                                break;
-                            }
-                        }
-                        (ordinal, picked)
+                        let walked = match_run::walk(
+                            &cancel,
+                            entries_ref,
+                            &searched_ref[ordinal],
+                            None,
+                            rules,
+                            probe_ref,
+                        )
+                        .await;
+                        (ordinal, walked)
                     }
                 }))
                 .buffer_unordered(validation_bound)
                 .collect()
                 .await;
-            for (ordinal, picked) in resolved {
-                picks[ordinal] = picked;
+            for (ordinal, walked) in resolved {
+                picks[ordinal] = walked.chosen;
             }
         }
         context.progress(&ProgressEvent::new(
             "guide.heal",
             batch_end as u64,
-            broken_ref.len() as u64,
+            broken.len() as u64,
             "searching replacements",
         ));
         if context.is_cancelled() {
@@ -370,9 +386,9 @@ pub async fn run(
             reason: String::new(),
         };
 
-        // The concurrent walk above already chose the first ranked candidate carrying
-        // programme data (same order as the old inline walk); this only maps it back.
-        let candidates = &scored_all[position];
+        // The concurrent walk above already chose the first searched family member
+        // carrying programme data; this only maps it back.
+        let candidates = &searched[position];
         let mut chosen = None;
         if let Some(rank_position) = picks[position] {
             if let Some(candidate) = candidates.get(rank_position) {
@@ -388,16 +404,17 @@ pub async fn run(
             row.new_epg_source = Some(source_name(entry.epg_source));
             row.confidence = candidate.score;
             row.method = candidate.method_label();
-            // A preview records every replacement it found, whatever the score, exactly
-            // as the plugin does: the threshold only decides what an APPLY writes.
-            // Only an apply splits Healed (>= threshold) from SkippedLowConfidence.
+            // A preview records every replacement it found. Every family member clears
+            // the ONE cut by construction (D02/T10), so an apply heals whatever the walk
+            // found; SkippedLowConfidence survives only as a status word (the plugin's
+            // vocabulary) for rows constructed elsewhere, never from this run path.
             row.status = if dry_run {
                 HealStatus::ReplacementPreview
             } else if candidate.score >= threshold {
                 HealStatus::Healed
             } else {
-                // Recorded with its real score, but never applied: only Healed rows are
-                // written in step 3 below.
+                // Unreachable through the family cut, kept so the reason text still
+                // names the cut that would have rejected it.
                 HealStatus::SkippedLowConfidence
             };
         }
@@ -523,6 +540,7 @@ fn write_report(
         .count();
 
     let exports_dir = context.exports_dir();
+    let cut = crate::engine::cut_setting(&context.config().matching);
     let report = csv_report::Report::new(
         &exports_dir,
         app,
@@ -547,7 +565,8 @@ fn write_report(
         } else {
             applied.to_string()
         },
-    );
+    )
+    .setting(cut.0, cut.1);
 
     let path = report.write(
         context.config(),
@@ -979,9 +998,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_sub_threshold_replacement_is_recorded_but_never_applied() {
-        // "KOMO News" against "KOMO 4 News Seattle" scores a structural-only 50: a
-        // working replacement that clears nothing near the default 95 threshold.
+    async fn a_below_cut_replacement_never_enters_the_family() {
+        // Step 8 (D02/T10 one cut + the unified selection rule + D06 retired): "KOMO
+        // News" against "KOMO 4 News Seattle" scored a structural-only 50 under Janitor
+        // and was recorded-but-skipped as SkippedLowConfidence. The unified engine scores
+        // the pair below the cut, so it never enters the identity family and heal reports
+        // NoReplacementFound instead of a recorded-but-unapplied replacement.
         let (_server, world, context) = fixture_with_names(
             "KOMO News",
             "KOMO (broken)",
@@ -993,7 +1015,8 @@ mod tests {
         .await;
         let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
-        assert!(settings.heal_confidence_threshold > 50);
+        // The ONE cut (D02/T10 `janitor-95`): `[matching] sensitivity` ships at strict.
+        assert_eq!(context.config().matching.threshold(), 95);
 
         let result = run(
             &GuideApp::new(),
@@ -1008,23 +1031,13 @@ mod tests {
         .expect("apply");
         assert_eq!(result.broken, 1);
         let row = &result.rows[0];
-        assert_eq!(row.status, HealStatus::SkippedLowConfidence);
-        assert_eq!(row.new_epg_id, Some(8), "the replacement is recorded");
-        assert_eq!(row.new_epg_name.as_deref(), Some("KOMO 4 News Seattle"));
-        assert!(
-            row.confidence < settings.heal_confidence_threshold && row.confidence > 0,
-            "the real sub-threshold score is kept, got {}",
-            row.confidence
-        );
-        assert_eq!(
-            result.applied, 0,
-            "a low-confidence replacement is not written"
-        );
-        assert_eq!(result.replacements, 1, "it still counts as found");
-        assert!(row.reason.contains("below threshold"), "{}", row.reason);
+        assert_eq!(row.status, HealStatus::NoReplacementFound);
+        assert_eq!(row.new_epg_id, None, "nothing below the cut is recorded");
+        assert_eq!(result.applied, 0, "a below-cut replacement is not written");
+        assert_eq!(result.replacements, 0, "it never counts as found");
+        assert_eq!(row.reason, "No working replacement EPG found");
 
-        // A preview records the replacement too, whatever the score: only an apply
-        // splits Healed from SkippedLowConfidence.
+        // A preview finds nothing either: the family cut, not the dry run, decides.
         let preview = run(
             &GuideApp::new(),
             &context,
@@ -1036,11 +1049,11 @@ mod tests {
         )
         .await
         .expect("preview");
-        assert_eq!(preview.rows[0].status, HealStatus::ReplacementPreview);
-        assert_eq!(preview.rows[0].new_epg_id, Some(8));
+        assert_eq!(preview.rows[0].status, HealStatus::NoReplacementFound);
+        assert_eq!(preview.rows[0].new_epg_id, None);
         assert_eq!(preview.applied, 0);
-        let recorded = outcome(&preview, true, settings.heal_confidence_threshold);
-        assert_eq!(recorded.counts.get("replacements"), Some(&1));
+        let recorded = outcome(&preview, true, context.config().matching.threshold());
+        assert_eq!(recorded.counts.get("replacements"), Some(&0));
         assert_eq!(recorded.counts.get("applied"), Some(&0));
     }
 

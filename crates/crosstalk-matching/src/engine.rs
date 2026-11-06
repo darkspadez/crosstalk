@@ -92,7 +92,10 @@ pub use crate::country::{extract_zone_noguard, is_group_header};
 /// Version of this engine's rule encoding. Bumped whenever a decided row's
 /// implementation changes; part of the identity cache's `data_version`, so a rule
 /// change invalidates cached identities.
-pub const ENGINE_VERSION: &str = "1";
+///
+/// Step 8 moved identity tag extraction onto the shared vocabulary (`tags::split_tags`
+/// instead of SM's `country::extract_tags` beside it): `2`.
+pub const ENGINE_VERSION: &str = "2";
 
 /// The decided default decision threshold (D02/T10 `janitor-95`).
 ///
@@ -935,6 +938,53 @@ impl UnifiedEngine {
         country_hint: Option<&str>,
         index: &EngineIndex,
     ) -> Vec<EngineRanked> {
+        let ranked = self.ranked_survivors(query, country_hint, index);
+        // The identity-side country (hint, else the name's stream marker): the same
+        // notion `Identity::country` carries, so the family cut and `same_family`
+        // agree.
+        let query_identity_country = country_hint.or_else(|| lineuparr_stream_country(query));
+        self.family_cut(ranked, query_identity_country, index)
+    }
+
+    /// The same ranker WITHOUT the family cut: every candidate at or above this
+    /// engine's cut whose country is compatible with the query's, best first.
+    ///
+    /// The head is the family's top ([`rank_index_in`](Self::rank_index_in)`[0]`), so
+    /// this never disagrees with the family on who leads; it only keeps the runners-up
+    /// of OTHER identities. Apps use it, on an engine built with
+    /// [`with_threshold`](Self::with_threshold) at the AI rescue floor, to shortlist the
+    /// candidates a borderline channel offers the `[ai.verify]` chain: one ranker,
+    /// one code path, only the cut is a parameter.
+    pub fn shortlist_index_in(
+        &self,
+        query: &str,
+        country_hint: Option<&str>,
+        index: &EngineIndex,
+    ) -> Vec<EngineRanked> {
+        let mut ranked = self.ranked_survivors(query, country_hint, index);
+        let query_identity_country = country_hint.or_else(|| lineuparr_stream_country(query));
+        ranked.retain(|(r, _)| family_compatible(query_identity_country, r.index, index));
+        ranked.into_iter().map(|(r, _)| r).collect()
+    }
+
+    /// The engine with a different decision cut and everything else shared: same
+    /// normalizer, aliases, allowlist and identity version (the cut never affects an
+    /// identity), so an [`EngineIndex`] built by either serves both.
+    pub fn with_threshold(&self, threshold: u8) -> Self {
+        Self {
+            threshold,
+            ..self.clone()
+        }
+    }
+
+    /// Score, country rule (G03) and cut, ranked best first with the original-token
+    /// overlap tie-break: the ranker's list before the family cut.
+    fn ranked_survivors(
+        &self,
+        query: &str,
+        country_hint: Option<&str>,
+        index: &EngineIndex,
+    ) -> Vec<(EngineRanked, usize)> {
         if is_group_header(query) {
             return Vec::new();
         }
@@ -944,7 +994,7 @@ impl UnifiedEngine {
         let query_base = query_cs.as_deref().map(normalize_callsign);
         // Anchor-only path for names that normalize away.
         if norm_q.is_empty() {
-            return self.anchor_family(
+            return self.anchor_ranked(
                 query,
                 country_hint,
                 query_base.as_deref(),
@@ -957,10 +1007,6 @@ impl UnifiedEngine {
         };
         let query_nospace = nospace(&prep.lower);
         let query_country = country_hint.or_else(|| self.country_of(query));
-        // The identity-side country (hint, else the name's stream marker): the same
-        // notion `Identity::country` carries, so the family cut and `same_family`
-        // agree.
-        let query_identity_country = country_hint.or_else(|| lineuparr_stream_country(query));
         let mut count = CountryFilterCount::default();
         let query_tokens = ascii_tokens(&query.to_lowercase());
         let qn = prep.lower.as_str();
@@ -1028,7 +1074,7 @@ impl UnifiedEngine {
             }
         }
         scored.sort_by(|a, b| b.0.score.cmp(&a.0.score).then_with(|| b.1.cmp(&a.1)));
-        self.family_cut(scored, query_identity_country, index)
+        scored
     }
 
     /// The family cut over ranked, country-ruled, cut survivors (best first).
@@ -1046,15 +1092,7 @@ impl UnifiedEngine {
         query_country: Option<&str>,
         index: &EngineIndex,
     ) -> Vec<EngineRanked> {
-        let compatible = |country: Option<&str>, i: usize| {
-            let key = &index.identity_keys[i];
-            countries_compatible(
-                country,
-                index.identity_country(i),
-                key.callsign.is_some(),
-                &key.key,
-            )
-        };
+        let compatible = |country: Option<&str>, i: usize| family_compatible(country, i, index);
         ranked.retain(|(r, _)| compatible(query_country, r.index));
         let Some((top, _)) = ranked.first() else {
             return Vec::new();
@@ -1075,15 +1113,15 @@ impl UnifiedEngine {
             .collect()
     }
 
-    /// Anchor-only family for queries that normalize away (`(KING)`).
-    fn anchor_family(
+    /// Anchor-only ranked list for queries that normalize away (`(KING)`).
+    fn anchor_ranked(
         &self,
         query: &str,
         country_hint: Option<&str>,
         query_base: Option<&str>,
         query_high: bool,
         index: &EngineIndex,
-    ) -> Vec<EngineRanked> {
+    ) -> Vec<(EngineRanked, usize)> {
         let Some(base) = query_base else {
             return Vec::new();
         };
@@ -1094,7 +1132,6 @@ impl UnifiedEngine {
             return Vec::new();
         };
         let query_country = country_hint.or_else(|| self.country_of(query));
-        let query_identity_country = country_hint.or_else(|| lineuparr_stream_country(query));
         let mut count = CountryFilterCount::default();
         let query_tokens = ascii_tokens(&query.to_lowercase());
         let mut ranked: Vec<(EngineRanked, usize)> = Vec::new();
@@ -1116,7 +1153,7 @@ impl UnifiedEngine {
             ));
         }
         ranked.sort_by(|a, b| b.0.score.cmp(&a.0.score).then_with(|| b.1.cmp(&a.1)));
-        self.family_cut(ranked, query_identity_country, index)
+        ranked
     }
 
     /// Score one indexed candidate through the ONE scoring path.
@@ -1131,6 +1168,18 @@ impl UnifiedEngine {
     ) -> Option<(u8, EngineMethod)> {
         self.score_core(prep, &index.views[i])
     }
+}
+
+/// Whether indexed candidate `i` may share a family whose ONE country is `country`
+/// (callsign identities ignore country, bug-161; see [`countries_compatible`]).
+fn family_compatible(country: Option<&str>, i: usize, index: &EngineIndex) -> bool {
+    let key = &index.identity_keys[i];
+    countries_compatible(
+        country,
+        index.identity_country(i),
+        key.callsign.is_some(),
+        &key.key,
+    )
 }
 
 /// One candidate's precomputed scoring state (built once per candidate set).
@@ -1616,5 +1665,37 @@ mod tests {
         assert_eq!(sensitivity_preset("medium"), 80);
         assert_eq!(sensitivity_preset("80"), 80);
         assert_eq!(sensitivity_preset("nonsense"), 95);
+    }
+
+    #[test]
+    fn the_shortlist_is_the_same_ranker_without_the_family_cut() {
+        // One ranker: at the decision cut the shortlist leads with the family's top;
+        // re-cut lower, it keeps the sub-cut candidates the AI gate offers.
+        let engine = UnifiedEngine::decided();
+        let candidates: Vec<String> = ["Sky Cinema Premiere HD 2", "Sky Cinema Premiere"]
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        let index = EngineIndex::build(
+            &candidates,
+            &engine,
+            &crate::identity::ResolveContext::default(),
+        );
+        let family = engine.rank_index("Sky Cinema Premiere", &index);
+        let shortlist = engine.shortlist_index_in("Sky Cinema Premiere", None, &index);
+        assert_eq!(
+            family.first().map(|r| (r.index, r.score)),
+            shortlist.first().map(|r| (r.index, r.score))
+        );
+        assert!(shortlist.iter().all(|r| r.score >= 95));
+
+        let low = engine.with_threshold(60);
+        assert_eq!(low.identity_version(), engine.identity_version());
+        let shortlist = low.shortlist_index_in("Sky Cinema Premiere", None, &index);
+        assert_eq!(shortlist.len(), 2, "{shortlist:?}");
+        assert_eq!(shortlist[0].index, 1);
+        assert_eq!((shortlist[1].index, shortlist[1].score), (0, 90));
+        // The family at the low cut still holds one identity only.
+        assert_eq!(low.rank_index("Sky Cinema Premiere", &index).len(), 1);
     }
 }

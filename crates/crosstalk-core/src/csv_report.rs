@@ -210,6 +210,7 @@ pub struct Report<'a> {
     title: &'a str,
     channels_processed: usize,
     results: Vec<(String, String)>,
+    settings: Vec<(String, String)>,
 }
 
 impl<'a> Report<'a> {
@@ -226,6 +227,7 @@ impl<'a> Report<'a> {
             title,
             channels_processed: 0,
             results: Vec::new(),
+            settings: Vec::new(),
         }
     }
 
@@ -238,6 +240,14 @@ impl<'a> Report<'a> {
     /// One `Label: value` line saying what the run DID, printed above the settings.
     pub fn result(mut self, label: &str, value: impl std::fmt::Display) -> Self {
         self.results.push((label.to_string(), value.to_string()));
+        self
+    }
+
+    /// One extra `Label: value` line under "Settings used", for a value the run read
+    /// from outside its own file and the shared sections (guide's decision cut lives in
+    /// `[matching]`, for example).
+    pub fn setting(mut self, label: &str, value: impl std::fmt::Display) -> Self {
+        self.settings.push((label.to_string(), value.to_string()));
         self
     }
 
@@ -262,7 +272,7 @@ impl<'a> Report<'a> {
             .iter()
             .map(|(label, value)| (label.as_str(), value.clone()))
             .collect();
-        let preamble = preamble(
+        let mut preamble = preamble(
             host,
             &self.app.report_title(self.title),
             schema,
@@ -270,6 +280,11 @@ impl<'a> Report<'a> {
             self.channels_processed,
             &results,
         );
+        // The preamble closes with a lone `#`; extra settings go just above it.
+        let closing = preamble.len().saturating_sub(1);
+        for (offset, (label, value)) in self.settings.iter().enumerate() {
+            preamble.insert(closing + offset, format!("#   {label}: {value}"));
+        }
         write_report(&path, &preamble, header, rows)?;
         Ok(path)
     }

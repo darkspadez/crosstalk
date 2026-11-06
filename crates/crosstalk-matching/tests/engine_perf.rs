@@ -186,7 +186,22 @@ fn perf_full_scale() {
         .sum();
     let rank_time = start.elapsed();
 
-    println!("perf_full_scale: resolve 50k in {resolve_time:?}, index 50k in {build_time:?}, rank 20kx50k in {rank_time:?} ({members} members)");
+    // The AI shortlist pass (guide step 8): the same ranker re-cut at the default
+    // rescue floor, no family cut. Runs only for channels with an empty family; timed
+    // here over all 20k as the worst case.
+    let low = engine.with_threshold(60);
+    let start = Instant::now();
+    let shortlisted: usize = queries
+        .par_iter()
+        .map(|q| low.shortlist_index_in(q, None, &index).len())
+        .sum();
+    let shortlist_time = start.elapsed();
+
+    println!("perf_full_scale: resolve 50k in {resolve_time:?}, index 50k in {build_time:?}, rank 20kx50k in {rank_time:?} ({members} members), shortlist@60 20kx50k in {shortlist_time:?} ({shortlisted} candidates)");
+    assert!(
+        shortlist_time < Duration::from_secs(300),
+        "shortlist budget: {shortlist_time:?}"
+    );
     assert!(
         resolve_time < Duration::from_secs(120),
         "resolve budget: {resolve_time:?}"

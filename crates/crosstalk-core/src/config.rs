@@ -449,6 +449,11 @@ pub struct MatchingConfig {
     /// Custom aliases, a table of `name -> [aliases]`. An entry REPLACES the built-in list
     /// for that key rather than adding to it.
     pub custom_aliases: BTreeMap<String, Vec<String>>,
+    /// The one decision cut every app matches at (goal reset, D02/T10 `janitor-95`):
+    /// a sensitivity preset (`strict`/`high`/`medium`/`low` = 95/90/80/70) or a bare
+    /// number (`"80"`). Guide's own `match_confidence_threshold` /
+    /// `heal_confidence_threshold` are retired in favour of this: one ranker, one cut.
+    pub sensitivity: String,
 }
 
 impl Default for MatchingConfig {
@@ -460,6 +465,7 @@ impl Default for MatchingConfig {
             ignore_misc_tags: true,
             enabled_databases: Vec::new(),
             custom_aliases: BTreeMap::new(),
+            sensitivity: "strict".to_string(),
         }
     }
 }
@@ -486,6 +492,37 @@ impl MatchingConfig {
             databases: self.databases(),
             custom_aliases: self.custom_aliases.clone(),
             alias_country: None,
+        }
+    }
+
+    /// The decision cut in force: the `[matching] sensitivity` preset resolved to 0-100
+    /// (unknown names fall back to the decided 95; see `sensitivity_preset`).
+    pub fn threshold(&self) -> u8 {
+        crosstalk_matching::engine::sensitivity_preset(&self.sensitivity)
+    }
+
+    /// Whether `sensitivity` names a preset or a bare 0-100 number.
+    pub fn sensitivity_is_valid(sensitivity: &str) -> bool {
+        let trimmed = sensitivity.trim().to_lowercase();
+        if ["low", "medium", "high", "strict"].contains(&trimmed.as_str()) {
+            return true;
+        }
+        trimmed.parse::<u8>().is_ok_and(|cut| cut <= 100)
+    }
+
+    /// The unified engine a migrated sub-app runs with (goal reset, step 8+):
+    /// the one normalizer, ladder, alias set and country rule, deciding at
+    /// [`threshold`](Self::threshold).
+    pub fn engine_config(&self) -> crosstalk_matching::engine::EngineConfig {
+        crosstalk_matching::engine::EngineConfig {
+            threshold: self.threshold(),
+            enabled_countries: self.databases(),
+            custom_aliases: self
+                .custom_aliases
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+            flags: self.normalize_flags(),
         }
     }
 
@@ -1133,6 +1170,15 @@ impl CrosstalkConfig {
             }
         }
 
+        if !MatchingConfig::sensitivity_is_valid(&self.matching.sensitivity) {
+            report.errors.push(format!(
+                "matching.sensitivity is {:?}, which is not a preset (strict/high/medium/low) \
+                 or a 0-100 number; the matcher would silently decide at 95. Pick one of the \
+                 presets or write the cut as a number, e.g. sensitivity = \"high\"",
+                self.matching.sensitivity
+            ));
+        }
+
         let available = crosstalk_matching::data::available_database_codes();
         for code in &self.matching.enabled_databases {
             let upper = code.trim().to_uppercase();
@@ -1647,6 +1693,25 @@ fn matching_fields() -> Vec<crate::subapp::FieldSpec> {
 
     vec![
         FieldSpec::section(
+            "_section_threshold",
+            "Decision Threshold",
+            "The ONE cut every app matches at (guide assigns, streams attaches, lineup \
+             names). A sensitivity preset — strict/high/medium/low (95/90/80/70) — or a \
+             bare number. Guide's own per-action thresholds are retired in favour of this.",
+        ),
+        FieldSpec::new(
+            "matching.sensitivity",
+            "_section_threshold",
+            "Matching Sensitivity",
+            FieldKind::Text,
+            FieldValue::Text("strict".to_string()),
+        )
+        .with_placeholder("strict")
+        .with_help(
+            "strict/high/medium/low (95/90/80/70) or a 0-100 number. Higher is stricter: \
+             candidates below the cut never match, whatever the AI says.",
+        ),
+        FieldSpec::section(
             "_section_normalization",
             "Normalization Toggles",
             "Which kinds of tag are stripped from channel and guide names before they are \
@@ -1763,6 +1828,10 @@ pub fn host_values(config: &CrosstalkConfig) -> crate::subapp::SettingsValues {
     values.insert(
         "matching.ignore_misc_tags",
         crate::subapp::FieldValue::Boolean(config.matching.ignore_misc_tags),
+    );
+    values.insert(
+        "matching.sensitivity",
+        crate::subapp::FieldValue::Text(config.matching.sensitivity.clone()),
     );
     values.insert(
         "matching.enabled_databases",
@@ -1901,6 +1970,9 @@ pub fn apply_host_values(
         config.ai.verify.min_confidence = clamp_unit(number)?;
     }
 
+    if let Some(text) = values.text("matching.sensitivity") {
+        config.matching.sensitivity = text.to_string();
+    }
     if let Some(value) = values.bool("matching.ignore_quality_tags") {
         config.matching.ignore_quality_tags = value;
     }
@@ -3331,6 +3403,7 @@ chain = [{provider = "typesafe", model = "jev-latest"}, {provider = "llm", model
         let schema = host_schema();
         let ids: Vec<&str> = schema.editable().map(|field| field.id).collect();
         for expected in [
+            "matching.sensitivity",
             "matching.ignore_quality_tags",
             "matching.ignore_regional_tags",
             "matching.ignore_geographic_tags",
@@ -3434,6 +3507,7 @@ min_confidence = 0.6
         assert_eq!(rebuilt.scope, config.scope);
         assert_eq!(rebuilt.exports, config.exports);
         assert_eq!(rebuilt.ai.verify, config.ai.verify);
+        assert_eq!(rebuilt.matching.sensitivity, config.matching.sensitivity);
         assert_eq!(
             rebuilt.matching.custom_aliases,
             config.matching.custom_aliases
@@ -3450,6 +3524,62 @@ min_confidence = 0.6
         assert_eq!(config.ai.verify.verify_band_high, 88);
         // A field the form did not submit is left alone.
         assert_eq!(config.ai.verify.verify_band_low, 80);
+    }
+
+    #[test]
+    fn the_sensitivity_names_the_one_decision_cut() {
+        // D02/T10 `janitor-95`: the default cut is strict (95); presets and bare numbers
+        // resolve through the engine's ladder.
+        let config = CrosstalkConfig::default();
+        assert_eq!(config.matching.sensitivity, "strict");
+        assert_eq!(config.matching.threshold(), 95);
+        assert!(
+            CrosstalkConfig::default()
+                .validate()
+                .errors
+                .iter()
+                .all(|error| !error.contains("matching.sensitivity")),
+            "{:?}",
+            CrosstalkConfig::default().validate().errors
+        );
+
+        for (sensitivity, cut) in [
+            ("strict", 95),
+            ("high", 90),
+            ("medium", 80),
+            ("low", 70),
+            ("80", 80),
+        ] {
+            let mut config = CrosstalkConfig::default();
+            config.matching.sensitivity = sensitivity.to_string();
+            // (The default config has no Dispatcharr credentials, so scope this to the
+            // setting under test rather than the whole report.)
+            assert!(
+                config
+                    .validate()
+                    .errors
+                    .iter()
+                    .all(|error| !error.contains("matching.sensitivity")),
+                "{sensitivity}"
+            );
+            assert_eq!(config.matching.threshold(), cut, "{sensitivity}");
+            assert_eq!(config.matching.engine_config().threshold, cut);
+        }
+        // Unknown names and out-of-range numbers fail validation instead of silently
+        // deciding at 95.
+        for bad in ["fuzzy", "150"] {
+            let mut config = CrosstalkConfig::default();
+            config.matching.sensitivity = bad.to_string();
+            let report = config.validate();
+            assert!(!report.is_ok());
+            assert!(
+                report
+                    .errors
+                    .iter()
+                    .any(|error| error.contains("matching.sensitivity")),
+                "{bad}: {report:?}"
+            );
+        }
     }
 
     #[test]

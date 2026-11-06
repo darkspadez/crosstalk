@@ -425,9 +425,15 @@ pub enum RenameKind {
 impl RenameKind {
     /// Whether the name already carries this rename, in which case the plugin skips the
     /// channel instead of adding it twice (2503, `current_name.endswith(bad_epg_suffix)`).
+    ///
+    /// Step 8 (migration list): the suffix check is the shared vocabulary rule
+    /// ([`has_trailing`](crosstalk_matching::tags::has_trailing): case-insensitive and
+    /// bracket-aware), not the plugin's exact `ends_with`. `CNN [badepg]` and
+    /// `CNN (BadEPG)` already count as tagged, which changes Janitor parity for those
+    /// case/bracket variants (oracle diff, not a gate). The append itself stays verbatim.
     fn already(&self, current: &str) -> bool {
         match self {
-            Self::Suffix(text) => current.ends_with(text.as_str()),
+            Self::Suffix(text) => crosstalk_matching::tags::has_trailing(current, text),
             Self::Prefix(text) => current.starts_with(text.as_str()),
             Self::Template(_) => false,
         }
@@ -436,7 +442,8 @@ impl RenameKind {
     /// The new name, or `None` when it would be empty (a blank name is not a rename).
     ///
     /// Templates render through the shared engine ([`crate::naming::render_channel`]);
-    /// suffix/prefix keep their own exact-match guards (the guide's `tag_missing` parity).
+    /// the suffix/prefix append stays verbatim. The presence check above is the shared
+    /// vocabulary rule, so a rename never double-appends.
     fn produce(&self, current: &str, values: &crate::naming::ChannelValues) -> Option<String> {
         let name = match self {
             Self::Suffix(text) => format!("{current}{text}"),
@@ -2898,6 +2905,40 @@ mod tests {
         )
         .expect("plans");
         assert!(plan.changes.is_empty());
+    }
+
+    #[test]
+    fn a_suffix_check_is_case_insensitive_and_bracket_aware() {
+        // Step 8 (migration list): the shared rule is `tags::has_trailing`, not the
+        // plugin's exact `ends_with`. `CNN [badepg]` (case) and `CNN (BadEPG)` (brackets)
+        // already count as tagged — a Janitor-parity change for those variants (oracle
+        // diff, not a gate). The append itself stays verbatim.
+        let mut tagged = world();
+        tagged.channels[0].name = "CNN [badepg]".to_string();
+        tagged.channels[2].name = "CNN (BadEPG)".to_string();
+        let plan = plan_ops(
+            &tagged,
+            &Selection::default(),
+            &[Op::Rename {
+                kind: RenameKind::Suffix(" [BadEPG]".to_string()),
+            }],
+        )
+        .expect("plans");
+        for id in [1, 3] {
+            assert!(
+                plan.skipped
+                    .iter()
+                    .any(|skip| skip.channel_id == id && skip.reason.contains("already ends with")),
+                "channel {id} is skipped as tagged: {:#?}",
+                plan.skipped
+            );
+        }
+        assert!(
+            plan.changes.iter().all(|change| change.field != Field::Name
+                || (change.channel_id != 1 && change.channel_id != 3)),
+            "{:#?}",
+            plan.changes
+        );
     }
 
     #[test]

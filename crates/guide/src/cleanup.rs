@@ -545,6 +545,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tag_missing_skips_case_and_bracket_variants_of_the_suffix() {
+        // Step 8 (migration list): the suffix check is the shared vocabulary rule
+        // (`tags::has_trailing`), not the plugin's exact `ends_with`. A channel the scan
+        // found but already carrying `(BadEPG)` or `[badepg]` is skipped as tagged — a
+        // Janitor-parity change for those variants (oracle diff, not a gate).
+        let mut world = test_support::world();
+        world.channels[3].name = "Télé-Québec (BadEPG)".to_string();
+        let fixture = Fixture::start(&world, &[ESPN_HD]).await;
+        let (_store, context) = recorded_scan(&fixture, &world, "tag_missing_preview");
+        let settings = GuideSettings::default();
+
+        let outcome = run(
+            &GuideApp::new(),
+            &context,
+            &settings,
+            Cleanup::TagMissing,
+            true,
+        )
+        .await
+        .expect("preview");
+
+        // Both scan channels selected, both skipped as already tagged, nothing renamed.
+        assert_eq!(outcome.counts.get("selected"), Some(&2));
+        assert_eq!(outcome.counts.get("tagged"), Some(&0));
+        assert_eq!(outcome.counts.get("skipped"), Some(&2));
+        assert!(channel_edits(&fixture).await.is_empty());
+        let text = std::fs::read_to_string(outcome.report_path.expect("report")).expect("read");
+        assert!(text.contains("already ends with"), "{text}");
+    }
+
+    #[tokio::test]
     async fn tag_missing_refuses_a_blank_suffix() {
         let world = test_support::world();
         let fixture = Fixture::start(&world, &[ESPN_HD]).await;

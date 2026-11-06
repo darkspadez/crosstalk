@@ -11,10 +11,13 @@
 # tools de-duplicate by name before matching.
 #
 # Usage:
-#   scripts/sim_parity.sh [--quick] [--keep]
+#   scripts/sim_parity.sh [--quick] [--keep] [--report]
 #
 #   --quick   smaller corpus, for a fast local check (default is the full corpus)
 #   --keep    keep the work directory and print its path
+#   --report  report mode (step 8): print the per-file summary and exit 0 whatever is
+#             found, for the guide oracle report. The simulator still runs the retired
+#             EpgJanitor profile as oracle tooling; the guide runs the unified engine.
 #
 # Requires python3 and the reference checkout at reference/Dispatcharr-EPG-Janitor-Plugin.
 set -euo pipefail
@@ -27,10 +30,12 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PLUGIN="$REPO/reference/Dispatcharr-EPG-Janitor-Plugin"
 QUICK=0
 KEEP=0
+REPORT=0
 for arg in "$@"; do
   case "$arg" in
     --quick) QUICK=1 ;;
     --keep) KEEP=1 ;;
+    --report) REPORT=1 ;;
     *) echo "unknown argument: $arg" >&2; exit 2 ;;
   esac
 done
@@ -176,5 +181,12 @@ if [ "$status" -eq 0 ]; then
   echo "==> parity OK"
 else
   echo "==> parity FAILED" >&2
+fi
+if [ "$REPORT" -eq 1 ]; then
+  # Report mode (step 8, guide oracle report): the per-file lines above are the
+  # summary; never fail.
+  echo "[report] sim_parity differing-files exit was $status (oracle tooling: the " \
+    "simulator still runs the retired profile; see docs/oracle-reports/guide.md)"
+  exit 0
 fi
 exit "$status"

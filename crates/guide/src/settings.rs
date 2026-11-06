@@ -16,21 +16,35 @@ use crosstalk_core::subapp::{
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// The `bad_epg_suffix` default, derived from the shared tag vocabulary
+/// (`tags.json` `status`/`BadEPG`, the token guide appends) rather than a literal:
+/// step 8 (migration list) moves the literal onto the vocabulary row.
+pub fn bad_epg_default() -> String {
+    let token =
+        crosstalk_matching::tags::tokens_from(crosstalk_matching::tags::TagKind::Status, "guide")
+            .into_iter()
+            .next()
+            .unwrap_or("BadEPG");
+    format!(" [{token}]")
+}
+
 /// Everything `guide.toml` holds.
 ///
 /// The `Default` impl is written out rather than derived: `#[serde(default)]` fills
 /// missing fields from it, so a derived one would silently default every threshold to 0,
 /// which is a valid-looking configuration that rejects nothing.
+///
+/// Step 8 retired `match_confidence_threshold` and `heal_confidence_threshold` (goal
+/// reset: ONE threshold in `[matching] sensitivity`): they are gone from the struct, so
+/// an old file fails at load with a pointer to the host setting (see [`load`]).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct GuideSettings {
     pub epg_sources_to_match: String,
     /// How far ahead programme data must exist for a match to count.
     pub check_hours: u32,
-    pub match_confidence_threshold: u8,
     pub allow_epg_without_programs: bool,
     pub heal_fallback_sources: String,
-    pub heal_confidence_threshold: u8,
     /// Appended to the name of a channel the scan found without programme data.
     /// The leading space is part of the value, exactly as in the plugin.
     pub bad_epg_suffix: String,
@@ -60,12 +74,11 @@ impl Default for GuideSettings {
             epg_sources_to_match: String::new(),
             // The plugin's shipped defaults.
             check_hours: 12,
-            match_confidence_threshold: 95,
             allow_epg_without_programs: false,
             heal_fallback_sources: String::new(),
-            heal_confidence_threshold: 95,
-            // The plugin's shipped defaults, leading space and empty pattern included.
-            bad_epg_suffix: " [BadEPG]".to_string(),
+            // The plugin's shipped default, leading space included — derived from the
+            // shared vocabulary's `status`/`BadEPG` row (step 8, migration list).
+            bad_epg_suffix: bad_epg_default(),
             remove_epg_with_suffix: false,
             epg_regex_to_remove: String::new(),
             // The plugin's shipped defaults, minus the two the schedule replaces
@@ -127,6 +140,47 @@ fn moved_settings_hint(text: &str) -> Option<String> {
     }
 }
 
+/// Settings retired in step 8 (goal reset: one threshold in `[matching] sensitivity`),
+/// as `(what a guide.toml line looks like, where the cut lives now)`.
+///
+/// Unlike [`MOVED`], there is no per-setting host equivalent to point at: the cut is one
+/// shared value. The load rejection names it, so an old file fails loudly instead of
+/// running at a threshold the run ignores.
+const RETIRED: [(&str, &str); 2] = [
+    (
+        "match_confidence_threshold",
+        "[matching] sensitivity in crosstalk.toml",
+    ),
+    (
+        "heal_confidence_threshold",
+        "[matching] sensitivity in crosstalk.toml",
+    ),
+];
+
+/// A hint naming the host setting for every retired threshold the file still mentions.
+fn retired_settings_hint(text: &str) -> Option<String> {
+    let mut retired: Vec<String> = Vec::new();
+    for (old, new) in RETIRED {
+        let names_it = text.lines().map(str::trim).any(|line| {
+            !line.starts_with('#')
+                && line.starts_with(old)
+                && line[old.len()..].trim_start().starts_with('=')
+        });
+        if names_it {
+            retired.push(format!("{old} -> {new}"));
+        }
+    }
+    if retired.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "retired settings (the one decision cut is the host's; a preset \
+             strict/high/medium/low or the old number, e.g. sensitivity = \"95\"): {}",
+            retired.join("; ")
+        ))
+    }
+}
+
 /// Section ids, so a field never points at a section that does not exist.
 pub const SECTION_SCOPE: &str = "_section_scope";
 pub const SECTION_MATCH: &str = "_section_match";
@@ -169,20 +223,11 @@ pub fn schema() -> SettingsSchema {
             SECTION_MATCH,
             "Auto-Match",
             "Apply Auto-Match is not additive: it OVERWRITES an existing assignment whenever \
-             a new match scores above the threshold, so a channel already on the right guide \
-             can be moved. Preview first and read the CSV. The AI policy that verifies a \
+             a new match scores above the cut, so a channel already on the right guide \
+             can be moved. Preview first and read the CSV. The cut is the ONE threshold \
+             every app shares: [matching] sensitivity in crosstalk.toml (guide's own \
+             match_confidence_threshold is retired). The AI policy that verifies a \
              borderline score lives under [ai.verify] in crosstalk.toml.",
-        ),
-        FieldSpec::new(
-            "match_confidence_threshold",
-            SECTION_MATCH,
-            "Auto-Match Confidence Threshold",
-            FieldKind::Number,
-            FieldValue::Number(95.0),
-        )
-        .with_help(
-            "0-100. Matches below this score are rejected. 95 is strict; lower values accept \
-             more matches at higher false-positive risk.",
         ),
         FieldSpec::new(
             "allow_epg_without_programs",
@@ -202,7 +247,9 @@ pub fn schema() -> SettingsSchema {
             "Scan & Heal",
             "Find channels whose existing assignment carries no programme data and replace it \
              with one that does. Heal only touches assignments it can prove are empty, and \
-             it never consults the model.",
+             it never consults the model. Replacements must clear the same ONE cut as \
+             auto-match: [matching] sensitivity in crosstalk.toml (guide's own \
+             heal_confidence_threshold is retired).",
         ),
         FieldSpec::new(
             "heal_fallback_sources",
@@ -216,14 +263,6 @@ pub fn schema() -> SettingsSchema {
             "Sources heal may pick replacements from. Empty means the channel's current \
              source only.",
         ),
-        FieldSpec::new(
-            "heal_confidence_threshold",
-            SECTION_HEAL,
-            "Heal Confidence Threshold",
-            FieldKind::Number,
-            FieldValue::Number(95.0),
-        )
-        .with_help("Minimum score for a replacement EPG to be applied during heal."),
         FieldSpec::section(
             SECTION_CLEANUP,
             "Cleanup & Maintenance",
@@ -340,20 +379,12 @@ pub fn to_values(settings: &GuideSettings) -> SettingsValues {
         FieldValue::Number(f64::from(settings.check_hours)),
     );
     values.insert(
-        "match_confidence_threshold",
-        FieldValue::Number(f64::from(settings.match_confidence_threshold)),
-    );
-    values.insert(
         "allow_epg_without_programs",
         FieldValue::Boolean(settings.allow_epg_without_programs),
     );
     values.insert(
         "heal_fallback_sources",
         FieldValue::Text(settings.heal_fallback_sources.clone()),
-    );
-    values.insert(
-        "heal_confidence_threshold",
-        FieldValue::Number(f64::from(settings.heal_confidence_threshold)),
     );
     values.insert(
         "bad_epg_suffix",
@@ -421,12 +452,6 @@ pub fn apply_values(settings: &mut GuideSettings, values: &SettingsValues) -> Re
         settings.watchdog_refresh_timeout_minutes =
             whole_number("watchdog_refresh_timeout_minutes", number, 0, 1_440)?;
     }
-    if let Some(number) = values.number("match_confidence_threshold") {
-        settings.match_confidence_threshold = crosstalk_core::subapp::clamp_u8(number)?;
-    }
-    if let Some(number) = values.number("heal_confidence_threshold") {
-        settings.heal_confidence_threshold = crosstalk_core::subapp::clamp_u8(number)?;
-    }
     if let Some(value) = values.bool("allow_epg_without_programs") {
         settings.allow_epg_without_programs = value;
     }
@@ -443,10 +468,13 @@ pub fn load(path: &Path) -> Result<GuideSettings> {
     match toml::from_str::<GuideSettings>(&text) {
         Ok(settings) => Ok(settings),
         Err(error) => {
-            // Name the file's new home for a value that moved to crosstalk.toml: the
-            // rejection itself is intended, but "unknown key" alone would not say where the
-            // setting went.
-            match moved_settings_hint(&text) {
+            // Name the file's new home for a value that moved to crosstalk.toml, or the
+            // host cut for a retired threshold: the rejection itself is intended, but
+            // "unknown key" alone would not say where the setting went.
+            let mut hints: Vec<String> = Vec::new();
+            hints.extend(moved_settings_hint(&text));
+            hints.extend(retired_settings_hint(&text));
+            match (!hints.is_empty()).then(|| hints.join("; ")) {
                 Some(hint) => Err(anyhow::anyhow!(
                     "parsing {}: {error}; {hint}",
                     path.display()
@@ -464,15 +492,12 @@ pub fn save(path: &Path, settings: &GuideSettings) -> Result<()> {
 }
 
 /// Problems an operator needs to fix, as human-readable strings.
-pub fn validate(settings: &GuideSettings) -> Vec<String> {
-    let mut errors = Vec::new();
-    if settings.match_confidence_threshold == 0 {
-        errors.push("match_confidence_threshold must be at least 1".to_string());
-    }
-    if settings.heal_confidence_threshold == 0 {
-        errors.push("heal_confidence_threshold must be at least 1".to_string());
-    }
-    errors
+///
+/// Step 8 retired both confidence thresholds (the cut is `[matching] sensitivity` in
+/// `crosstalk.toml`), so a parsed file is valid by construction: the retired keys never
+/// survive [`load`].
+pub fn validate(_settings: &GuideSettings) -> Vec<String> {
+    Vec::new()
 }
 
 #[cfg(test)]
@@ -511,6 +536,9 @@ mod tests {
             "ai.enabled",
             "ai.provider",
             "ai.model",
+            // Step 8 (goal reset, D02/T10): one host cut, not two guide thresholds.
+            "match_confidence_threshold",
+            "heal_confidence_threshold",
         ]) {
             assert!(schema.field(id).is_none(), "{id} is still in guide.toml");
         }
@@ -528,8 +556,11 @@ mod tests {
     #[test]
     fn the_cleanup_defaults_are_the_plugins() {
         // plugin.json: bad_epg_suffix default " [BadEPG]" (leading space), the removal flag
-        // off, no REGEX. The leading space is a value, not formatting.
+        // off, no REGEX. The leading space is a value, not formatting. Step 8
+        // (migration list): the default is derived from the vocabulary's
+        // `status`/`BadEPG` row, so it stays the plugin's value via the shared table.
         let settings = GuideSettings::default();
+        assert_eq!(settings.bad_epg_suffix, bad_epg_default());
         assert_eq!(settings.bad_epg_suffix, " [BadEPG]");
         assert!(!settings.remove_epg_with_suffix);
         assert!(settings.epg_regex_to_remove.is_empty());
@@ -618,10 +649,8 @@ mod tests {
         let settings = GuideSettings {
             epg_sources_to_match: "C".to_string(),
             check_hours: 5,
-            match_confidence_threshold: 70,
             allow_epg_without_programs: true,
             heal_fallback_sources: "D".to_string(),
-            heal_confidence_threshold: 75,
             bad_epg_suffix: " (no guide)".to_string(),
             remove_epg_with_suffix: true,
             epg_regex_to_remove: "^XYZ_".to_string(),
@@ -648,22 +677,28 @@ mod tests {
     fn apply_rejects_out_of_range_numbers() {
         let mut settings = GuideSettings::default();
         let mut values = SettingsValues::new();
-        values.insert("match_confidence_threshold", FieldValue::Number(120.0));
-        assert!(apply_values(&mut settings, &values).is_err());
-
-        let mut values = SettingsValues::new();
         values.insert("check_hours", FieldValue::Number(6.5));
         assert!(apply_values(&mut settings, &values).is_err());
     }
 
     #[test]
-    fn validate_catches_a_zero_threshold() {
-        let mut settings = GuideSettings::default();
-        assert!(validate(&settings).is_empty());
-
-        settings.match_confidence_threshold = 0;
-        settings.heal_confidence_threshold = 0;
-        assert_eq!(validate(&settings).len(), 2);
+    fn the_retired_thresholds_fail_at_load_with_a_pointer_to_the_host_cut() {
+        // Step 8 (goal reset, D02/T10): one threshold in `[matching] sensitivity`. The
+        // old keys are unknown fields now, and the error says where the cut lives.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("guide.toml");
+        for retired in ["match_confidence_threshold", "heal_confidence_threshold"] {
+            std::fs::write(&path, format!("{retired} = 80\n")).expect("seed");
+            let error = format!("{:#}", load(&path).expect_err("rejects the retired key"));
+            assert!(error.contains(retired), "{error}");
+            assert!(error.contains("[matching] sensitivity"), "{error}");
+            assert!(error.contains("crosstalk.toml"), "{error}");
+        }
+        // And they are gone from the form, the values and validation alike.
+        let schema = schema();
+        assert!(schema.field("match_confidence_threshold").is_none());
+        assert!(schema.field("heal_confidence_threshold").is_none());
+        assert!(validate(&GuideSettings::default()).is_empty());
     }
 
     #[test]

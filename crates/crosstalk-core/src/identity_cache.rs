@@ -70,6 +70,60 @@ impl CachedIdentities {
         identity
     }
 
+    /// Resolve many names at once and leave them memoized and persisted: one store
+    /// read pass for the names this run has not seen, the misses resolved on rayon, and
+    /// ONE write transaction for what was computed. The batch twin of
+    /// [`resolve`](Self::resolve) (same keys, same rows, same identities) for a run
+    /// warming every channel and family member: per-name autocommits would cost one
+    /// fsync each, serialized on the store's connection. Blocking: call it off the
+    /// async runtime.
+    pub fn warm<'a>(&self, names: impl IntoIterator<Item = (&'a str, &'a ResolveContext)>) {
+        use rayon::prelude::*;
+        let mut seen = std::collections::HashSet::new();
+        let pending: Vec<(String, &str, &ResolveContext)> = names
+            .into_iter()
+            .filter_map(|(name, ctx)| {
+                let key = IdentityCache::input_key(name, ctx);
+                (self.cache.memoized(&key).is_none() && seen.insert(key.clone()))
+                    .then_some((key, name, ctx))
+            })
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+        let keys: Vec<String> = pending.iter().map(|(key, _, _)| key.clone()).collect();
+        let stored = self
+            .store
+            .identity_cache_get_many(&keys, self.cache.data_version())
+            .unwrap_or_default();
+        let computed: Vec<(String, Identity, bool)> = pending
+            .par_iter()
+            .map(|(key, name, ctx)| {
+                if let Some(identity) = stored
+                    .get(key)
+                    .and_then(|json| IdentityCache::identity_from_json(json))
+                {
+                    return (key.clone(), identity, false);
+                }
+                (
+                    key.clone(),
+                    resolve_with(self.cache.engine(), name, ctx),
+                    true,
+                )
+            })
+            .collect();
+        let mut writes = Vec::new();
+        for (key, identity, fresh) in computed {
+            if fresh {
+                writes.push((key.clone(), IdentityCache::identity_json(&identity)));
+            }
+            self.cache.memoize(key, identity);
+        }
+        let _ = self
+            .store
+            .identity_cache_put_many(&writes, self.cache.data_version());
+    }
+
     /// Rank candidates into the best identity family: the family from the engine's
     /// one ranker, each member's identity through [`CachedIdentities::resolve`]
     /// (`ctx` describes the query, as in `crosstalk_matching::identity::rank_with`).
@@ -109,6 +163,32 @@ mod tests {
         let dir = tempfile::tempdir().expect("dir");
         let store = Arc::new(Store::open(dir.path().join("test.db")).expect("store"));
         (CachedIdentities::new(engine, store), dir)
+    }
+
+    #[test]
+    fn warming_in_bulk_writes_the_same_rows_resolve_reads() {
+        let (cached, _dir) = setup();
+        let ctx = ResolveContext::default();
+        cached.resolve("CNN", &ctx);
+        let names = ["ESPN HD", "US: ESPN", "CNN", "ESPN HD"];
+        cached.warm(names.iter().map(|name| (*name, &ctx)));
+        for name in names {
+            let key = IdentityCache::input_key(name, &ctx);
+            let json = cached
+                .store
+                .identity_cache_get(&key, cached.data_version())
+                .expect("read")
+                .expect("row");
+            let direct = resolve_with(cached.cache.engine(), name, &ctx);
+            assert_eq!(
+                IdentityCache::identity_from_json(&json),
+                Some(direct.clone())
+            );
+            // A fresh resolver on the same store reads the warmed row.
+            let rerun =
+                CachedIdentities::new(Arc::clone(cached.cache.engine()), Arc::clone(&cached.store));
+            assert_eq!(rerun.resolve(name, &ctx), direct);
+        }
     }
 
     #[test]

@@ -1,9 +1,13 @@
 # Guide settings.
 #
 # This file holds what the guide app decides for itself: which EPG sources are in scope, the
-# confidence thresholds, and the heal fallback list. Anything shared with the other sub-apps
-# -- the channel scope (profiles, groups, ignored groups), the CSV retention and the AI
-# matching policy -- lives in crosstalk.toml under [scope], [exports] and [ai.verify].
+# programme-data policy, and the heal fallback list. The decision cut is the ONE threshold
+# every app shares -- [matching] sensitivity in crosstalk.toml (strict/high/medium/low or a
+# 0-100 number); guide's old match_confidence_threshold / heal_confidence_threshold are
+# retired and refuse to load, with a pointer to the host setting. Anything else shared with
+# the other sub-apps -- the channel scope (profiles, groups, ignored groups), the CSV
+# retention and the AI matching policy -- lives in crosstalk.toml under [scope], [exports]
+# and [ai.verify].
 #
 # The daemon writes back to this file when a setting is changed in the web UI, preserving
 # comments. The matcher's own defaults are the Python plugin's.
@@ -16,17 +20,14 @@ epg_sources_to_match = ""
 # How far ahead programme data must exist for a match to count.
 check_hours = 12
 
-# 0-100. Matches below this are rejected. 95 is strict; lower values accept more matches at
-# higher false-positive risk.
-match_confidence_threshold = 95
 # Accept an EPG entry with no current schedule. Usually off, but needed for the first
 # auto-match against a freshly added source: Dispatcharr only imports programmes for
 # channels already mapped, so a new source starts empty.
 allow_epg_without_programs = false
 
 # Sources heal may pick replacements from. Empty means the channel's current source only.
+# Replacements must clear the same host cut as auto-match ([matching] sensitivity).
 heal_fallback_sources = ""
-heal_confidence_threshold = 95
 
 # --- Cleanup & Maintenance -------------------------------------------------------------
 #

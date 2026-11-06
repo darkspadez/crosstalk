@@ -129,12 +129,20 @@ jobs:
       # Needs the reference/ submodules checked out (this job's checkout does).
       - name: Merged data set reproduces byte for byte
         run: python3 -I scripts/data/build_merged.py --check
-      - name: Simulate oracle vs the Python tool
-        run: ./scripts/sim_parity.sh --quick
+      # Step 8: guide runs the unified engine, so the Janitor-profile simulator is a
+      # report (exit 0), not a gate. The streams gate is `match_parity.py` below.
+      - name: Simulate oracle vs the Python tool (report)
+        run: ./scripts/sim_parity.sh --quick --report
       - name: Primitive sweep vs the Python matcher
         run: |
           python3 scripts/parity_sweep.py --kinds normalize,callsign,location,network --limit 300
-          python3 scripts/parity_sweep.py --kinds match,score --limit 300 --pool 60
+          python3 scripts/parity_sweep.py --kinds match,score --limit 300 --pool 60 --report
+      # Phase 3 step 8: the guide oracle diff report (docs/oracle-reports/guide.md) is
+      # generated, and --check verifies it reproduces byte for byte. The report itself
+      # never fails on differences (reports are not gates); the corpus/consistency gates
+      # below are the gate.
+      - name: Guide oracle diff report reproduces
+        run: python3 -I scripts/oracle_report_guide.py --check
       # Stream-Mapparr is the same engine under different flags, so it keeps its own sweep
       # against its own fuzzy_matcher.py and country.py. The first run covers the
       # adversarial corpus (zones, designators, alias folding, Unicode); the second walks

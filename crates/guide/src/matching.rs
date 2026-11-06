@@ -1,26 +1,35 @@
 //! Auto-match: score every in-scope channel, validate the winner, and (when applying) write it.
 //!
-//! Port of `Plugin._auto_match_channels` plus the scoring half of `_find_best_epg_match`. The
-//! pipeline is split in two stages because they have different bottlenecks:
+//! Step 8 (goal reset): one ranker, one selection rule. Queries (channels) and candidates
+//! (EPG entries) resolve through the unified engine + identity cache (`engine::RunEngine`:
+//! store-backed, version-keyed); ranking is the engine's `rank` — the best identity FAMILY
+//! per channel, in rank order, at the ONE `[matching]` cut — and selection is the family's
+//! first member that carries programme data. Janitor's `_find_best_epg_match` scoring half
+//! (standalone structural callsign/state/city/network score, D06) is retired: callsign
+//! agreement now decides at family level through the engine's anchor (C06/D04).
 //!
-//!   1. **Scoring** is pure CPU over strings: every channel against every candidate. It runs on
-//!      a rayon pool, so the work scales with cores.
-//!   2. **Validation** is IO: does this candidate actually carry programmes? It runs only for
-//!      the head of each channel's ranked list, through the client's own concurrency cap, and
-//!      the answers are memoised, so a thousand channels considering the same ESPN entry cost
-//!      one request.
+//! The pipeline is split in two stages because they have different bottlenecks:
 //!
-//! Both stages stay faithful to the plugin's order: the highest-scoring candidate that both
-//! clears the threshold and has programmes is the one that wins.
+//!   1. **Scoring** is pure CPU over strings: every channel's family against one shared
+//!      engine index. It runs on a rayon pool, so the work scales with cores.
+//!   2. **Validation** is IO: does this family member actually carry programmes? It runs in
+//!      family order, through the client's own concurrency cap, and the answers are
+//!      memoised, so a thousand channels considering the same ESPN entry cost one request.
 //!
-//! Only the EPG half lives here. The scoring stage, the validation walk and the AI gate are in
-//! `crosstalk_core` (`match_run`, `ai_gate`), because streams and lineup run the same loop
-//! against their own candidates. So is the report writer; what stays local is the EPG row, the
-//! EPG reason wording, and the write itself.
+//! Both stages keep the plugin's order within the family: the first family member that both
+//! clears the cut AND has programmes is the one that wins.
+//!
+//! Only the EPG half lives here. The family scoring stage, the validation walk and the AI
+//! gate are in `crosstalk_core` (`match_run`, `ai_gate`), because streams and lineup run the
+//! same loop against their own candidates. So is the report writer; what stays local is the
+//! EPG row, the EPG reason wording, and the write itself.
 //!
 //! AI contract (owner Q4): the model may PROMOTE a candidate inside the verify band or above
-//! the rescue floor, and never re-checks or vetoes a heuristic result at or above
-//! `match_confidence_threshold` — a confident match never reaches the model at all.
+//! the rescue floor, and never re-checks or vetoes a heuristic result at or above the
+//! `[matching]` cut — a confident match never reaches the model at all. Because every
+//! family member clears the cut, a channel with an EMPTY family is the borderline case:
+//! it is re-ranked by the same engine and index at the gate's floor
+//! (`RunEngine::shortlist_engine`), and those sub-cut candidates are what the gate offers.
 //! An AI-accepted pick replaces the heuristic order for same-name guide entries only: every
 //! same-name copy is tried in ranked order, and when none carries programme data the
 //! channel is left unmatched with a reason saying so. There is deliberately no fallback
@@ -28,6 +37,7 @@
 //! candidate cleared the threshold, so falling back would contradict the threshold itself.
 //! Heal never consults the model.
 
+use crate::engine::RunEngine;
 use crate::scope::ScopedEntries;
 use crate::settings::GuideSettings;
 use anyhow::{Context, Result};
@@ -39,11 +49,38 @@ use crosstalk_core::match_run::{self, CandidateProbe, ConfidenceBand, ScoreProgr
 use crosstalk_core::scope::ScopedChannels;
 use crosstalk_core::store::RunRow;
 use crosstalk_core::subapp::{JobOutcome, OutcomeBuilder, SubApp};
-use crosstalk_matching::pipeline::{CandidateIndex, Scored};
-use crosstalk_matching::MatchProfile;
+use crosstalk_matching::engine::EngineRanked;
+use crosstalk_matching::pipeline::Scored;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+
+/// The walk, the gate and the report all speak the profile `Scored` shape, while the
+/// unified engine ranks families of [`EngineRanked`]. This is the one adapter between
+/// them: the score and the order carry over untouched, and the engine method maps onto
+/// the profile's coarse components (`Alias`/`Exact`/`Substring`/`Fuzzy`/`Callsign`).
+/// Janitor's structural components (`Callsign + State`, D06 retired) never appear: the
+/// anchor decides callsign agreement at family level (C06/D04) instead of scoring it.
+pub fn to_scored(family: &[EngineRanked]) -> Vec<Scored> {
+    use crosstalk_matching::engine::EngineMethod;
+    family
+        .iter()
+        .map(|member| {
+            let components = match member.method {
+                EngineMethod::Alias => vec!["Alias"],
+                EngineMethod::Exact => vec!["Exact"],
+                EngineMethod::Substring => vec!["Substring"],
+                EngineMethod::Fuzzy(_) => vec!["Fuzzy"],
+                EngineMethod::Callsign => vec!["Callsign"],
+            };
+            Scored {
+                index: member.index,
+                score: member.score,
+                components,
+            }
+        })
+        .collect()
+}
 
 /// The columns the auto-match report carries.
 pub const COLUMNS: [&str; 15] = [
@@ -149,14 +186,19 @@ pub async fn run(
     let client = context.dispatcharr()?;
     let config = context.config();
 
-    // The candidate side: names, normalised once, shared with every thread.
+    // The unified stack for this run: engine + identity cache (store-backed when the run
+    // has a store), deciding at the ONE `[matching]` cut. Threshold, families and the
+    // cache are all this object's; `settings` only carries the programme-data policy.
+    let run_engine = RunEngine::for_config(&config.matching, context.store().cloned());
+    let engine = Arc::clone(run_engine.engine());
+
+    // The candidate side: names, normalised once into one shared engine index.
     let names: Vec<String> = scoped_entries
         .entries
         .iter()
         .map(|entry| entry.name.clone())
         .collect();
-    let matcher = Arc::new(config.matching.matcher(MatchProfile::EpgJanitor));
-    let index = Arc::new(CandidateIndex::build(&names, &matcher));
+    let index = Arc::new(run_engine.build_index(&names));
 
     let total = scoped_channels.channels.len() as u64;
     context.progress(&ProgressEvent::new(
@@ -166,20 +208,19 @@ pub async fn run(
         "scoring channels",
     ));
 
-    // Stage 1: scoring, in parallel. Progress comes from the shared stage, which publishes
-    // every 500 channels (P7): at 20k channels the stage runs ~10 s, which is long enough to
-    // go silent otherwise. Rayon preserves order on collect, so the results stay in channel
-    // order.
+    // Stage 1: family scoring, in parallel. Progress comes from the shared stage, which
+    // publishes every 500 channels (P7): at 20k channels the stage runs ~10 s, which is
+    // long enough to go silent otherwise. Rayon preserves order on collect, so the
+    // results stay in channel order.
     let channel_names: Vec<String> = scoped_channels
         .channels
         .iter()
         .map(|channel| channel.name.clone())
         .collect();
-    let scored: Vec<Vec<Scored>> = match_run::score_names(
+    let families: Vec<Vec<EngineRanked>> = match_run::score_families(
         &channel_names,
-        Arc::clone(&matcher),
+        Arc::clone(&engine),
         Arc::clone(&index),
-        &matcher.tags(),
         Some(ScoreProgress {
             context,
             action: "guide.match",
@@ -187,6 +228,9 @@ pub async fn run(
         }),
     )
     .await?;
+    // The walk, the gate and the report speak `Scored`; the adapter is the only place
+    // the two shapes meet (scores and order carry over untouched).
+    let scored: Vec<Vec<Scored>> = families.iter().map(|family| to_scored(family)).collect();
 
     context.progress(&ProgressEvent::new(
         "guide.match",
@@ -195,9 +239,11 @@ pub async fn run(
         "validating candidates",
     ));
 
-    // Stage 2: validation, in score order, memoised by the client.
+    // Stage 2: validation, in family order, memoised by the client.
     let ai_settings = &config.ai.verify;
-    let threshold = settings.match_confidence_threshold;
+    // The ONE cut (D02/T10 `janitor-95`): `[matching]` sensitivity, never a guide file
+    // value — the retired `match_confidence_threshold` cannot even parse any more.
+    let threshold = run_engine.threshold();
     // The walk only asks Dispatcharr when the operator has not waived the programme check.
     let rules = WalkRules {
         threshold,
@@ -213,6 +259,40 @@ pub async fn run(
         .iter()
         .map(|(id, source)| (*id, source.name.clone()))
         .collect();
+
+    // Stage 1b: the AI shortlist. A channel with no family at the cut is exactly the
+    // borderline case the `[ai.verify]` chain exists for, but the decision cut has
+    // discarded its sub-cut candidates. Re-rank those channels with the SAME engine
+    // and index at the gate's floor (verify band / rescue floor): one ranker, only the
+    // cut is a parameter. Every candidate there scores below the decision cut, so the
+    // heuristic walk still accepts nothing from it — only a model accept can.
+    let mut scored = scored;
+    if let Some(shortlist_engine) = run_engine.shortlist_engine(ai_settings) {
+        let borderline: Vec<usize> = (0..scored.len())
+            .filter(|&ordinal| {
+                !scoped_channels.channels[ordinal].has_epg_override()
+                    && match_run::needs_gate(
+                        scored[ordinal].first().map(|entry| entry.score),
+                        threshold,
+                    )
+            })
+            .collect();
+        if !borderline.is_empty() {
+            let borderline_names: Vec<String> = borderline
+                .iter()
+                .map(|&ordinal| channel_names[ordinal].clone())
+                .collect();
+            let shortlists = match_run::score_shortlists(
+                &borderline_names,
+                shortlist_engine,
+                Arc::clone(&index),
+            )
+            .await?;
+            for (ordinal, shortlist) in borderline.into_iter().zip(shortlists) {
+                scored[ordinal] = to_scored(&shortlist);
+            }
+        }
+    }
 
     // Stage 2 prep (serial, CPU): which channels need the model. The gate decision is
     // pure scoring, so it stays serial; the requests that follow fan out.
@@ -239,6 +319,12 @@ pub async fn run(
             },
         );
     }
+
+    // Every non-skipped query and its family persist through the identity cache in one
+    // batch, so the store holds the identity any other app resolves the same name to.
+    run_engine
+        .warm_families(&channel_names, &families, &names, &skipped)
+        .await;
 
     // The AI gate fans out (P2), bounded by the provider's own cap; the programme
     // validation walk fans out per channel (P1), bounded by the Dispatcharr concurrency
@@ -275,7 +361,7 @@ pub async fn run(
                     let channel = &scoped_channels.channels[ordinal];
                     let cancel = context.clone();
                     let model = ai_settings.model.clone();
-                    let known = matcher.known();
+                    let known = engine.known();
                     Some(async move {
                         // Checked inside the future so a cancel lands within one
                         // in-flight round instead of after the whole batch. The
@@ -377,10 +463,9 @@ pub async fn run(
             channel_group: String::new(),
             current_epg_id: channel.current_epg_id(),
             current_epg_name: None,
-            callsign: crosstalk_matching::callsign::extract_callsign(
-                &channel.name,
-                matcher.known(),
-            ),
+            // The shared-core ladder over the merged allowlist (C01/C02), through the
+            // run's engine rather than the retired profile matcher.
+            callsign: engine.callsign_of(&channel.name),
             ..MatchRow::default()
         };
 
@@ -557,10 +642,11 @@ pub async fn run(
 /// Whether a scoped EPG entry carries programme data in the run's window.
 ///
 /// The one EPG-specific half of the shared walk. A failed check is "no", never an error: one
-/// broken entry must not fail a run that can still match the rest.
-struct EpgProbe<'a> {
-    client: &'a DispatcharrClient,
-    window: ProgramWindow,
+/// broken entry must not fail a run that can still match the rest. Shared with heal, which
+/// walks the same family shape.
+pub(crate) struct EpgProbe<'a> {
+    pub(crate) client: &'a DispatcharrClient,
+    pub(crate) window: ProgramWindow,
 }
 
 #[async_trait::async_trait]
@@ -636,6 +722,7 @@ fn write_report(
     dry_run: bool,
 ) -> Result<Option<PathBuf>> {
     let exports_dir = context.exports_dir();
+    let cut = crate::engine::cut_setting(&context.config().matching);
     let report = csv_report::Report::new(
         &exports_dir,
         app,
@@ -664,7 +751,8 @@ fn write_report(
         } else {
             matched.len().to_string()
         },
-    );
+    )
+    .setting(cut.0, cut.1);
 
     let path = report.write(
         context.config(),
@@ -815,8 +903,9 @@ mod tests {
         fixture_named(programs_for, "ESPN").await
     }
 
-    /// Same fixture, with the guide entry named so a test can land in the verify band: `ESPN`
-    /// scores 100 against `ESPN HD`, while `ESPNX` scores 80.
+    /// Same fixture, with the guide entry named by the caller. The default pair
+    /// (`ESPN HD` against `ESPN`) resolves through the unified engine's alias table at
+    /// 100 — a confident family, so the model is never asked.
     async fn fixture_named(
         programs_for: &str,
         entry_name: &str,
@@ -1229,6 +1318,15 @@ mod tests {
         .await
         .expect("preview");
         assert_eq!(calls.load(Ordering::SeqCst), 0, "the heuristics were sure");
+        // The cut lives in `[matching]`, so the report names it explicitly.
+        let text =
+            std::fs::read_to_string(result.report.as_ref().expect("report")).expect("read report");
+        assert!(
+            text.contains(
+                "#   Matching Sensitivity ([matching] in crosstalk.toml): strict, cut 95"
+            ),
+            "{text}"
+        );
         let espn = result
             .rows
             .iter()
@@ -1238,13 +1336,160 @@ mod tests {
         assert!(espn.ai_decision.is_none());
     }
 
+    /// The verify-band pair at the default cut: the unified engine scores
+    /// `Sky Cinema Premiere` against `Sky Cinema Premiere HD 2` at 90 (substring) — inside
+    /// `[ai.verify]`'s 80-94 band and below the strict 95 cut, so the family is empty and
+    /// only the model can promote the entry.
+    const BAND_CHANNEL: &str = "Sky Cinema Premiere";
+    const BAND_ENTRY: &str = "Sky Cinema Premiere HD 2";
+
+    async fn band_fixture() -> (MockServer, World, JobContext) {
+        fixture_full("espn.us", BAND_ENTRY, BAND_CHANNEL).await
+    }
+
     #[tokio::test]
-    async fn a_borderline_match_is_verified_by_the_model() {
-        // `ESPNX` scores 80 against `ESPN HD`: inside the verify band and below the threshold,
-        // which is exactly the case the model exists for.
-        // A shared but LOW-confidence callsign (mid-name, no parentheses) plus a shared state
-        // scores 80: inside the band, below the 95 threshold, and exactly what the model is
-        // for. A parenthesised callsign would anchor at 95 and never reach the model.
+    async fn a_verify_band_match_reaches_the_model_at_the_default_cut() {
+        // Step 8 + owner Q4: the decision family is empty at the strict cut, so the run
+        // re-ranks the channel with the same engine at the gate's floor and asks the
+        // model about the 90. An accept promotes it; the heuristics alone would not.
+        let (_server, world, context) = band_fixture().await;
+        assert_eq!(context.config().matching.threshold(), 95, "the default cut");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = ai_settings(0.95, Arc::clone(&calls));
+        let context = gate_on(&context);
+        let settings = GuideSettings::default();
+        let (channels, entries) = scoped(&world);
+
+        let result = run(
+            &GuideApp::new(),
+            &context,
+            &settings,
+            Some(&service),
+            &world,
+            &channels,
+            &entries,
+            true,
+        )
+        .await
+        .expect("preview");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the model was asked once");
+        let row = result
+            .rows
+            .iter()
+            .find(|row| row.channel_name == BAND_CHANNEL)
+            .expect("row");
+        assert_eq!(row.epg_data_id, Some(7), "the model's pick was accepted");
+        assert_eq!(row.score, 90, "the row keeps the heuristic score");
+        assert!(row.method.contains("+ AI"), "{}", row.method);
+        let decision = row.ai_decision.as_deref().unwrap_or_default();
+        assert!(decision.contains("verify"), "{decision}");
+        assert!(decision.contains("accept"), "{decision}");
+    }
+
+    #[tokio::test]
+    async fn without_the_gate_a_verify_band_match_stays_unmatched() {
+        // The control for the test above: the same channel with the gate off is left
+        // unmatched, so the accept is what changed the outcome.
+        let (_server, world, context) = band_fixture().await;
+        let settings = GuideSettings::default();
+        let (channels, entries) = scoped(&world);
+        let result = run(
+            &GuideApp::new(),
+            &context,
+            &settings,
+            None,
+            &world,
+            &channels,
+            &entries,
+            true,
+        )
+        .await
+        .expect("preview");
+        let row = result
+            .rows
+            .iter()
+            .find(|row| row.channel_name == BAND_CHANNEL)
+            .expect("row");
+        assert_eq!(row.epg_data_id, None);
+        assert!(row.ai_decision.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_model_that_says_no_leaves_the_channel_unmatched() {
+        let (_server, world, context) = band_fixture().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = ai_settings(0.05, Arc::clone(&calls));
+        let context = gate_on(&context);
+        let settings = GuideSettings::default();
+        let (channels, entries) = scoped(&world);
+
+        let result = run(
+            &GuideApp::new(),
+            &context,
+            &settings,
+            Some(&service),
+            &world,
+            &channels,
+            &entries,
+            true,
+        )
+        .await
+        .expect("preview");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the model was asked");
+        let row = result
+            .rows
+            .iter()
+            .find(|row| row.channel_name == BAND_CHANNEL)
+            .expect("row");
+        assert_eq!(row.epg_data_id, None);
+        assert!(
+            row.ai_decision.is_some(),
+            "the decision is recorded even when it is no"
+        );
+        assert!(!row.method.contains("+ AI"), "{}", row.method);
+    }
+
+    #[tokio::test]
+    async fn a_rescue_candidate_reaches_the_model_below_the_band() {
+        // `Science Channel` against `Science Channel Live` scores 75: under the verify
+        // band, above the 60 rescue floor. Rescue offers it and an accept promotes it.
+        let (_server, world, context) =
+            fixture_full("espn.us", "Science Channel Live", "Science Channel").await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = ai_settings(0.95, Arc::clone(&calls));
+        let context = gate_on(&context);
+        let settings = GuideSettings::default();
+        let (channels, entries) = scoped(&world);
+
+        let result = run(
+            &GuideApp::new(),
+            &context,
+            &settings,
+            Some(&service),
+            &world,
+            &channels,
+            &entries,
+            true,
+        )
+        .await
+        .expect("preview");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the model was asked");
+        let row = result
+            .rows
+            .iter()
+            .find(|row| row.channel_name == "Science Channel")
+            .expect("row");
+        assert_eq!(row.epg_data_id, Some(7));
+        assert_eq!(row.score, 75);
+        let decision = row.ai_decision.as_deref().unwrap_or_default();
+        assert!(decision.contains("rescue"), "{decision}");
+    }
+
+    #[tokio::test]
+    async fn a_pair_the_engine_cannot_score_never_reaches_the_model() {
+        // The WABC pair scored a structural 80 under Janitor (D06, retired); the unified
+        // engine gives it no score at any cut, so there is nothing to offer and the
+        // model is never asked.
         let (_server, world, context) = fixture_full(
             "espn.us",
             "XYZ WABC - IL Shelbyville",
@@ -1269,29 +1514,23 @@ mod tests {
         )
         .await
         .expect("preview");
-        assert!(calls.load(Ordering::SeqCst) >= 1, "the model was asked");
-        let espn = result
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "the model was not asked");
+        let row = result
             .rows
             .iter()
             .find(|row| row.channel_name == "ABC WABC - IL Springfield")
             .expect("row");
-        assert_eq!(espn.epg_data_id, Some(7), "the model's pick was accepted");
-        assert!(espn.method.contains("+ AI"), "{}", espn.method);
-        assert!(espn
-            .ai_decision
-            .as_deref()
-            .unwrap_or_default()
-            .contains("accept"));
+        assert_eq!(row.epg_data_id, None);
+        assert!(row.ai_decision.is_none());
+        assert_eq!(row.reason, "No matching EPG found");
     }
 
     #[tokio::test]
-    async fn a_model_that_says_no_leaves_the_channel_unmatched() {
-        let (_server, world, context) = fixture_full(
-            "espn.us",
-            "XYZ WABC - IL Shelbyville",
-            "ABC WABC - IL Springfield",
-        )
-        .await;
+    async fn a_confident_family_is_never_vetoed_even_by_a_rejecting_model() {
+        // Owner Q4 + D02/T10: the model may promote inside the band, never veto a family
+        // at or above the cut. `ESPN HD` resolves to `ESPN` at 100, so a model that
+        // would reject is never even asked and the confident match stands.
+        let (_server, world, context) = fixture("espn.us").await;
         let calls = Arc::new(AtomicUsize::new(0));
         let service = ai_settings(0.05, Arc::clone(&calls));
         let context = gate_on(&context);
@@ -1310,16 +1549,14 @@ mod tests {
         )
         .await
         .expect("preview");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "the model was not asked");
         let espn = result
             .rows
             .iter()
-            .find(|row| row.channel_name == "ABC WABC - IL Springfield")
+            .find(|row| row.channel_name == "ESPN HD")
             .expect("row");
-        assert_eq!(espn.epg_data_id, None);
-        assert!(
-            espn.ai_decision.is_some(),
-            "the decision is recorded even when it is no"
-        );
+        assert_eq!(espn.epg_data_id, Some(7));
+        assert!(espn.ai_decision.is_none());
     }
 
     /// A decider whose endpoint is down, so the audit-on-failure path is exercised.
@@ -1345,16 +1582,10 @@ mod tests {
 
     #[tokio::test]
     async fn each_gated_channel_records_exactly_one_ai_decision() {
-        // The Springfield channel lands in the verify band and is answered; the other
-        // channel never reaches the model. One gated channel must mean one row — the
-        // ask-time record covers answered and failed alike, with no second write in
-        // the resolve loop.
-        let (_server, world, base_context) = fixture_full(
-            "espn.us",
-            "XYZ WABC - IL Shelbyville",
-            "ABC WABC - IL Springfield",
-        )
-        .await;
+        // The band channel is answered; the other channel never reaches the model. One
+        // gated channel must mean one row — the ask-time record covers answered and
+        // failed alike, with no second write in the resolve loop.
+        let (_server, world, base_context) = band_fixture().await;
         let calls = Arc::new(AtomicUsize::new(0));
         let service = ai_settings(0.95, Arc::clone(&calls));
         let settings = GuideSettings::default();
@@ -1393,7 +1624,7 @@ mod tests {
         )
         .await
         .expect("preview");
-        assert!(calls.load(Ordering::SeqCst) >= 1, "the model was asked");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the model was asked");
         assert_eq!(
             store.ai_decision_count(run_id).expect("count"),
             1,
@@ -1407,12 +1638,12 @@ mod tests {
             store.ai_decision(run_id, 1).expect("load").is_none(),
             "the ungated channel records nothing"
         );
-        let espn = result
+        let row = result
             .rows
             .iter()
-            .find(|row| row.channel_name == "ABC WABC - IL Springfield")
+            .find(|row| row.channel_name == BAND_CHANNEL)
             .expect("row");
-        assert!(espn
+        assert!(row
             .ai_decision
             .as_deref()
             .unwrap_or_default()
@@ -1421,12 +1652,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_ai_request_is_still_audited_exactly_once() {
-        let (_server, world, base_context) = fixture_full(
-            "espn.us",
-            "XYZ WABC - IL Shelbyville",
-            "ABC WABC - IL Springfield",
-        )
-        .await;
+        let (_server, world, base_context) = band_fixture().await;
         let service =
             crosstalk_core::ai::AiService::with_decider("typesafe", Arc::new(FailingDecider));
         let settings = GuideSettings::default();
@@ -1470,21 +1696,21 @@ mod tests {
             1,
             "the failed request is audited, once"
         );
-        let espn = result
+        let row = result
             .rows
             .iter()
-            .find(|row| row.channel_name == "ABC WABC - IL Springfield")
+            .find(|row| row.channel_name == BAND_CHANNEL)
             .expect("row");
         assert!(
-            espn.ai_decision
+            row.ai_decision
                 .as_deref()
                 .unwrap_or_default()
                 .contains("request failed"),
             "the row says the request failed: {:?}",
-            espn.ai_decision
+            row.ai_decision
         );
         assert_eq!(
-            espn.epg_data_id, None,
+            row.epg_data_id, None,
             "an unanswered channel stays unmatched"
         );
     }
@@ -1493,12 +1719,7 @@ mod tests {
     async fn an_undecided_first_link_escalates_and_the_row_says_who_decided() {
         // Jev answers 0.5 (between the thresholds, so undecided) and the LLM answers 0.95:
         // the channel matches on the second link, and the row reason names the trail.
-        let (_server, world, base_context) = fixture_full(
-            "espn.us",
-            "XYZ WABC - IL Shelbyville",
-            "ABC WABC - IL Springfield",
-        )
-        .await;
+        let (_server, world, base_context) = band_fixture().await;
         let first_calls = Arc::new(AtomicUsize::new(0));
         let second_calls = Arc::new(AtomicUsize::new(0));
         let service = crosstalk_core::ai::AiService::with_deciders(vec![
@@ -1559,29 +1780,21 @@ mod tests {
         .expect("preview");
         assert_eq!(first_calls.load(Ordering::SeqCst), 1);
         assert_eq!(second_calls.load(Ordering::SeqCst), 1, "Jev was undecided");
-        let espn = result
+        let row = result
             .rows
             .iter()
-            .find(|row| row.channel_name == "ABC WABC - IL Springfield")
+            .find(|row| row.channel_name == BAND_CHANNEL)
             .expect("row");
         assert_eq!(
-            espn.epg_data_id,
+            row.epg_data_id,
             Some(7),
             "the second link's pick was accepted"
         );
         assert!(
-            espn.reason
+            row.reason
                 .contains("AI verified (llm/stub-llm after typesafe/stub undecided)"),
             "the row reason names the trail: {:?}",
-            espn.reason
-        );
-        assert!(
-            espn.ai_decision
-                .as_deref()
-                .unwrap_or_default()
-                .contains("after"),
-            "{:?}",
-            espn.ai_decision
+            row.reason
         );
         let stored = (0..32)
             .filter_map(|ordinal| store.ai_decision(run_id, ordinal).expect("load"))
@@ -1593,14 +1806,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn an_ai_accept_falls_through_to_a_live_same_name_duplicate() {
-        // Two guide entries share one name; the picked (first-ranked) entry is empty but
-        // the duplicate carries programmes. The channel must match the duplicate, not be
-        // left alone because the exact picked entry is empty.
+    /// Two guide entries share one name; the first-ranked is empty and the duplicate
+    /// carries programmes. Returns the model's call count and the channel's row.
+    async fn same_name_duplicate_case(channel_name: &str, entry_name: &str) -> (usize, MatchRow) {
         let server = MockServer::start().await;
-        let channel_name = "ABC WABC - IL Springfield";
-        let entry_name = "XYZ WABC - IL Shelbyville";
         Mock::given(method("GET"))
             .and(path("/api/channels/channels/"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
@@ -1722,12 +1931,35 @@ mod tests {
         )
         .await
         .expect("preview");
-        assert!(calls.load(Ordering::SeqCst) >= 1, "the model was asked");
         let row = result
             .rows
             .iter()
             .find(|row| row.channel_name == channel_name)
-            .expect("row");
+            .expect("row")
+            .clone();
+        (calls.load(Ordering::SeqCst), row)
+    }
+
+    #[tokio::test]
+    async fn a_confident_family_falls_through_to_a_live_same_name_duplicate() {
+        // Step 8 (the unified selection rule): the family's first member is empty, so the
+        // walk takes the next one with programmes — no model in the loop.
+        let (calls, row) = same_name_duplicate_case("ESPN HD", "ESPN").await;
+        assert_eq!(calls, 0, "the model was not asked");
+        assert_eq!(
+            row.epg_data_id,
+            Some(8),
+            "the live duplicate wins over the empty first family member"
+        );
+        assert!(!row.method.contains("+ AI"), "{}", row.method);
+    }
+
+    #[tokio::test]
+    async fn an_ai_accept_falls_through_to_a_live_same_name_duplicate() {
+        // The verify-band variant: the model accepts the name, the picked entry is empty
+        // and its same-name duplicate is live, so the duplicate wins.
+        let (calls, row) = same_name_duplicate_case(BAND_CHANNEL, BAND_ENTRY).await;
+        assert_eq!(calls, 1, "the model was asked");
         assert_eq!(
             row.epg_data_id,
             Some(8),

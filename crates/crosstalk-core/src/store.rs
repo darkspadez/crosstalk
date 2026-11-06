@@ -1047,6 +1047,59 @@ impl Store {
         })
     }
 
+    /// [`identity_cache_get`](Self::identity_cache_get) for many keys under one lock:
+    /// the rows that exist, by key. A run warms thousands of identities at once, and
+    /// one statement per key through the shared connection would serialize them.
+    pub fn identity_cache_get_many(
+        &self,
+        input_keys: &[String],
+        data_version: &str,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare_cached(
+                "SELECT identity_json FROM identity_cache WHERE input_key = ?1 AND data_version = ?2",
+            )?;
+            let mut found = std::collections::HashMap::new();
+            for key in input_keys {
+                let json: Option<String> = statement
+                    .query_row(params![key, data_version], |row| row.get(0))
+                    .optional()?;
+                if let Some(json) = json {
+                    found.insert(key.clone(), json);
+                }
+            }
+            Ok(found)
+        })
+    }
+
+    /// [`identity_cache_put`](Self::identity_cache_put) for many rows in ONE
+    /// transaction (one commit, not one fsync per identity).
+    pub fn identity_cache_put_many(
+        &self,
+        rows: &[(String, String)],
+        data_version: &str,
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let cached_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        self.with_connection(|connection| {
+            let transaction = connection.unchecked_transaction()?;
+            {
+                let mut statement = transaction.prepare_cached(
+                    "INSERT INTO identity_cache (input_key, data_version, identity_json, cached_at) \
+                     VALUES (?1, ?2, ?3, ?4) ON CONFLICT(input_key, data_version) DO UPDATE SET \
+                     identity_json = excluded.identity_json, cached_at = excluded.cached_at",
+                )?;
+                for (key, json) in rows {
+                    statement.execute(params![key, data_version, json, cached_at])?;
+                }
+            }
+            transaction.commit()?;
+            Ok(())
+        })
+    }
+
     /// Store one resolved identity, replacing any row for the same key + version.
     pub fn identity_cache_put(
         &self,

@@ -386,22 +386,38 @@ arithmetic freed a name another channel still held) and a `skip` loser's old nam
 occupied (cascade to a fixpoint). Step 10's create stage and step 14/15 use it as is.
 
 Step 8 (guide):
-- `channel_ops::RenameKind::Suffix` presence check is exact `ends_with`
+- [x] `channel_ops::RenameKind::Suffix` presence check is exact `ends_with`
   (`crates/crosstalk-core/src/channel_ops.rs`, `RenameKind::already`); the shared rule is
   `naming::apply_suffix` / `tags::has_trailing` (case-insensitive, bracket-aware: `CNN
   [badepg]` and `CNN (BadEPG)` count as tagged). Moving guide's `tag_missing` onto it changes
   Janitor parity for case/bracket variants.
-- `crates/guide/src/settings.rs` `bad_epg_suffix` default `" [BadEPG]"` is a literal; the
+- [x] `crates/guide/src/settings.rs` `bad_epg_suffix` default `" [BadEPG]"` is a literal; the
   token is the vocabulary's `status`/`BadEPG` row. Derive the default from it.
-- `crosstalk-matching::identity` builds identity tags with `country::extract_tags` (SM's,
+- [x] `crosstalk-matching::identity` builds identity tags with `country::extract_tags` (SM's,
   D09) — a second tag extractor beside `tags::split_tags`. They differ on bare
   `Central`/`Atlantic` (SM strips `Comedy Central` → `Comedy`; the vocabulary does not), on
   `Middle East`/`Far East`, on `+N` shifts and on bracket-only quality. Move identity onto
   `tags` (bump `ENGINE_VERSION` / identity cache version; the corpus gate must still pass,
   so D09's regional choice may need a decision row) — this is cross-app, do it first.
-- Not to migrate: the normalizer's comparison tables (`normalize.rs` quality pattern incl.
+- [x] Not to migrate: the normalizer's comparison tables (`normalize.rs` quality pattern incl.
   `FD`/`Backup`, `country.rs` `NON_COUNTRY_PREFIXES`) — decided rows N01–N14, comparison
   only; `tags` is the writing vocabulary and must not feed the match path.
+
+Step 8 review (2026-11-05):
+- The default cut stays `strict` = 95 (D02/T10 `janitor-95`; presets low/medium/high/strict
+  = 70/80/90/95).
+- AI gate kept live at the defaults: every family member clears the cut, so a channel
+  with an EMPTY family is re-ranked by the same engine and index at the gate's floor
+  (`UnifiedEngine::with_threshold` + `shortlist_index_in`, the ranker without the family
+  cut; `match_run::score_shortlists`; `RunEngine::shortlist_engine`, cut =
+  min(rescue_floor, verify_band_low) when `[ai.verify]` is enabled). Verify band and
+  rescue reach the chain; only a model accept can promote (the walk still accepts nothing
+  below the cut). Streams adopts the same in step 9.
+- Identities persist in one batch per run (`CachedIdentities::warm`: one read pass, one
+  write transaction, rayon, off the runtime) instead of one autocommit per name.
+- Guide's CSV preamble names the `[matching]` cut (`Report::setting`).
+- Retired `match_confidence_threshold` / `heal_confidence_threshold` fail at load naming
+  `[matching] sensitivity` (same clean-break rule as the phase-1 moved settings).
 
 Step 9 (streams):
 - `triage::ends_with_tag` (`crates/streams/src/triage.rs`) → `tags::has_trailing`

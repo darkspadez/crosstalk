@@ -111,6 +111,10 @@ ignore_groups = ""
 retention_days = 0
 
 [matching]
+# The ONE decision cut every app matches at (guide assigns, streams attaches, lineup
+# names): a sensitivity preset -- strict/high/medium/low (95/90/80/70) -- or a bare
+# number. Guide's old per-action thresholds are retired in favour of this.
+sensitivity = "strict"
 # These four toggles live here rather than in a sub-app file, because every sub-app that
 # compares channel names must agree on them: two apps disagreeing about whether "[HD]" is
 # stripped would give two different answers for the same channel.

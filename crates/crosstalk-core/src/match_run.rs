@@ -16,6 +16,7 @@
 use crate::dispatcharr::{EpgEntry, Stream};
 use crate::jobs::{JobContext, ProgressEvent};
 use anyhow::{Context, Result};
+use crosstalk_matching::engine::{EngineIndex, EngineRanked, UnifiedEngine};
 use crosstalk_matching::pipeline::{CandidateIndex, Matcher, Scored};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -345,6 +346,98 @@ pub async fn score_names(
     })
     .await
     .context("the scoring stage panicked")
+}
+
+/// Score every query name against one shared engine index, in parallel, returning the
+/// best identity FAMILY per query (the unified selection rule: the top's family, in
+/// rank order, at the engine's cut).
+///
+/// The family-stage twin of [`score_names`]: every migrated app scores one candidate
+/// list per run and fans the queries out over rayon, so a big scope never stalls the
+/// async runtime. Order is preserved on collect, so the result is in query order.
+/// `progress` is optional because a short stage (heal scores only the broken channels)
+/// is not worth a progress bar.
+pub async fn score_families(
+    names: &[String],
+    engine: Arc<UnifiedEngine>,
+    index: Arc<EngineIndex>,
+    progress: Option<ScoreProgress<'_>>,
+) -> Result<Vec<Vec<EngineRanked>>> {
+    rank_all(names, engine, index, progress, |engine, name, index| {
+        engine.rank_index(name, index)
+    })
+    .await
+    .context("the family scoring stage panicked")
+}
+
+/// The AI shortlist twin of [`score_families`]: the same ranker without the family cut
+/// ([`UnifiedEngine::shortlist_index_in`]), for queries whose family came back empty at
+/// the decision cut. `engine` is the run's engine re-cut at the `[ai.verify]` floor
+/// ([`UnifiedEngine::with_threshold`]), so the borderline candidates the decision cut
+/// discards are still there to offer the model; the index is the run's own.
+pub async fn score_shortlists(
+    names: &[String],
+    engine: Arc<UnifiedEngine>,
+    index: Arc<EngineIndex>,
+) -> Result<Vec<Vec<EngineRanked>>> {
+    rank_all(names, engine, index, None, |engine, name, index| {
+        engine.shortlist_index_in(name, None, index)
+    })
+    .await
+    .context("the AI shortlist stage panicked")
+}
+
+/// Rank every name with `rank` on a rayon pool, in query order, publishing progress.
+async fn rank_all<F>(
+    names: &[String],
+    engine: Arc<UnifiedEngine>,
+    index: Arc<EngineIndex>,
+    progress: Option<ScoreProgress<'_>>,
+    rank: F,
+) -> std::result::Result<Vec<Vec<EngineRanked>>, tokio::task::JoinError>
+where
+    F: Fn(&UnifiedEngine, &str, &EngineIndex) -> Vec<EngineRanked> + Send + Sync + 'static,
+{
+    let total = names.len();
+    let names = names.to_vec();
+    let progress = progress.map(|progress| {
+        (
+            progress.context.clone(),
+            progress.action.to_string(),
+            progress.phase.to_string(),
+        )
+    });
+
+    tokio::task::spawn_blocking(move || {
+        use rayon::prelude::*;
+        let counter = AtomicUsize::new(0);
+        // Published `current` must be monotonic: rayon workers finish out of order, so a
+        // later-finishing worker with a smaller `done` must not move the bar backwards. Only
+        // the largest value so far is published.
+        let max_sent = AtomicUsize::new(0);
+        names
+            .par_iter()
+            .map(|name| {
+                let family = rank(&engine, name, &index);
+                if let Some((context, action, phase)) = progress.as_ref() {
+                    let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if done % PROGRESS_EVERY == 0 || done == total {
+                        let prev = max_sent.fetch_max(done, Ordering::Relaxed);
+                        if done > prev {
+                            context.progress(&ProgressEvent::new(
+                                action.as_str(),
+                                done as u64,
+                                total as u64,
+                                phase.as_str(),
+                            ));
+                        }
+                    }
+                }
+                family
+            })
+            .collect()
+    })
+    .await
 }
 
 /// Whether an AI gate would ask the model about this channel's best candidate.

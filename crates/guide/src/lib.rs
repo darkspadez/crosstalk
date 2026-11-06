@@ -17,6 +17,7 @@
 //! each app does not carry its own copy.
 
 pub mod cleanup;
+pub mod engine;
 pub mod heal;
 pub mod matching;
 pub mod scan;
@@ -515,7 +516,8 @@ impl GuideApp {
         )
         .await?;
         // Same rule as auto-match: whatever healed stays recorded, and the run says cancelled.
-        let mut outcome = heal::outcome(&result, dry_run, settings.heal_confidence_threshold);
+        // The cut is the ONE host cut (D02/T10): heal's own threshold is retired.
+        let mut outcome = heal::outcome(&result, dry_run, context.config().matching.threshold());
         if context.is_cancelled() {
             outcome = outcome.with_cancelled();
         }
@@ -870,11 +872,16 @@ mod tests {
 
     #[test]
     fn validate_settings_catches_a_hand_edited_file() {
+        // Step 8 (D02/T10): the guide thresholds are retired, so a hand-edited file that
+        // still holds one fails at load with a pointer to the host cut.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = app().settings_path(dir.path());
         std::fs::write(&path, "match_confidence_threshold = 0\n").expect("seed");
         let error = app().validate_settings(&path).expect_err("rejects");
-        assert!(format!("{error}").contains("at least 1"));
+        assert!(
+            format!("{error:#}").contains("[matching] sensitivity"),
+            "{error:#}"
+        );
     }
 
     #[test]

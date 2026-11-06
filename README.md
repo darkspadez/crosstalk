@@ -451,9 +451,12 @@ prose. Two things happen only:
 
 The contract, precisely:
 
-- A heuristic result at or above `match_confidence_threshold` (default 95) never
+- A heuristic result at or above the `[matching]` cut (default strict = 95) never
   reaches the model. The model may promote inside the band, but it never re-checks or
-  vetoes a heuristic win.
+  vetoes a heuristic win. Guide's identity families all clear the cut or are empty, so
+  a channel with an empty family is re-ranked by the same engine at the gate's floor
+  (`rescue_floor`, or `verify_band_low` with rescue off) and those sub-cut candidates
+  are what the model sees.
 - Promotion happens only inside the verify band or above the rescue floor — nowhere else.
 - An AI-accepted pick is still validated for programme data. When every same-name copy
   of the pick is empty, the channel is left unmatched and the reason says so
@@ -771,10 +774,10 @@ a host feature every app shares (`Clear exports`, CSV quoting) says so instead.
 | The read-only tools write a CSV, not a text readout | The plugin wrote a `.txt` into its own readout directory and put a clipped headline in a toast. crosstalk writes `<app>_<tool>_<timestamp>.csv` into `[exports]` under the same retention rule as every other app, and the headline is the run summary. |
 | `streams.match_apply`'s append mode renumbers the channel's list | The plugin's append gives the new rows order values that collide with the existing rows; crosstalk writes the same membership in the same playback order, numbered from zero. |
 | `guide.match_apply` skips a channel whose guide was set by hand | A channel whose guide was set by hand in Dispatcharr keeps it; the plugin re-matches and overwrites. Skipping is safer, and the CSV reason says so. |
-| AI may promote inside the verify band | With the AI gate on, an AI-accepted candidate can be assigned while its heuristic score (60–94) sits below `match_confidence_threshold` (default 95). The threshold still gates every heuristic assignment: the model never re-checks or vetoes one, and heal never asks it at all. |
-| Heal reports a below-threshold replacement without applying it | The row keeps the plugin's `SKIPPED_LOW_CONFIDENCE` / `REPLACEMENT_PREVIEW` wording and the real score, so a preview shows what was nearly a match; the write still needs the threshold. |
+| AI may promote inside the verify band | With the AI gate on, an AI-accepted candidate can be assigned while its heuristic score sits below the `[matching]` cut. The cut still gates every heuristic assignment: the model never re-checks or vetoes one, and heal never asks it at all. A channel whose identity family is empty at the cut (default strict = 95) is re-ranked by the same engine at the gate's floor, so the verify band and rescue candidates still reach the `[ai.verify]` chain. |
+| Heal reports a below-threshold replacement without applying it | Step 8 retired this: below-cut candidates never enter the identity family, so heal reports `NO_REPLACEMENT_FOUND` instead of recording a `SKIPPED_LOW_CONFIDENCE` row. The status word survives in the vocabulary and the reason text, never from a run. |
 | Candidates with no EPG source are never replacements | Heal validates by `tvg_id` and source, so an entry without a source cannot be checked; the plugin validates by EPG id alone and can accept one. |
-| Match reports only walk candidates at or above the threshold | When nothing is applied, the row still carries the top-ranked candidate's score and method: “below threshold” when no candidate qualified for a programme check, “carries no programme data” when a checked one was empty. The plugin checks every scored candidate and reports the first programme-carrying one whatever its score, so the same channel can show a lower score with programmes behind it. |
+| Match walks the identity family, not the full ranked list | Guide ranks the channel's identity family (unified engine, `[matching]` cut) and assigns the first member with programme data. When nothing is applied, the row still carries the top family member's score and method: “below threshold” when the family is empty, “carries no programme data” when a checked member was empty. The plugin checks every scored candidate and reports the first programme-carrying one whatever its score, so the same channel can show a lower score with programmes behind it — see the oracle report (`docs/oracle-reports/guide.md`). |
 | Programme data that cannot be read is “unknown”, never “missing” | The plugin's check is one SQL query and cannot fail per channel; over REST one can. A channel the scan could not check is left out of the result set (counted as `unchecked` in the summary and the CSV), so no cleanup can tag or clear it. |
 | Cleanup selections come from the run store, not a results file | `scan` stores its result set as run rows: queryable, kept with its CSV, and not overwritten by an unrelated run. There is no age limit for the same reason, and no `export_results` action — every run already writes its CSV. |
 | Every selection is intersected with `[scope]` again at apply time | The plugin applied the ids its scan had stored, so a settings change in between could reach a channel outside the scope. An id that is gone or out of scope is reported as skipped. |

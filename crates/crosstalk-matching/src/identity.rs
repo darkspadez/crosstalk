@@ -40,10 +40,9 @@
 //! `ESPN 2`, `X` vs `X +1` and `X` vs `X West` never share a family: their keys
 //! differ (number/designator/zone tokens survive normalisation by decision).
 
-use crate::country::{
-    extract_tags, lineuparr_cross_border_ok, lineuparr_stream_country, FeedZone, NameTags,
-};
+use crate::country::{lineuparr_cross_border_ok, lineuparr_stream_country, FeedZone};
 use crate::engine::{is_time_shift, EngineMethod, UnifiedEngine};
+use crate::tags::{split_tags, TagKind};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -154,13 +153,28 @@ pub fn resolve_with(engine: &UnifiedEngine, name: &str, ctx: &ResolveContext) ->
     let network = crate::callsign::network_keyword(name);
     let detected = lineuparr_stream_country(name).map(str::to_string);
     let country = ctx.country_hint.clone().or(detected);
-    let NameTags {
-        regional,
-        extra_tags,
-        quality_tags,
-    } = extract_tags(name, &[]);
-    let mut tags = extra_tags;
-    tags.extend(quality_tags);
+    // Step 8 (migration list): the ONE tag extractor is the shared vocabulary
+    // (`tags::split_tags`), not SM's `country::extract_tags` (D09) beside it. The
+    // trailing run classifies by kind: the first region word is the display region,
+    // every other tag is carried verbatim in brackets (shifts keep their `+N` shape).
+    // This differs from SM on bare `Central`/`Atlantic` (real names: `Comedy Central`,
+    // `Sky Atlantic` — bracketed only here), on `Middle`/`Far`/`Wild`-led place names
+    // (`Middle East` is a place, not a feed region), on `+N` shifts (tags, not core)
+    // and on bracket-only quality — none of which the family key, the zone or the
+    // country rule reads, so the corpus gate is unaffected.
+    let (_core, split) = split_tags(name);
+    let regional = split
+        .iter()
+        .find(|tag| tag.kind == TagKind::Regional)
+        .map(|tag| tag.canonical.clone());
+    let mut tags = Vec::with_capacity(split.len());
+    for tag in &split {
+        match tag.kind {
+            TagKind::Regional => {}
+            TagKind::Timeshift => tags.push(tag.canonical.clone()),
+            _ => tags.push(format!("[{}]", tag.canonical)),
+        }
+    }
     let canonical_name = engine
         .alias_canonical(name)
         .unwrap_or_else(|| name.to_string());
