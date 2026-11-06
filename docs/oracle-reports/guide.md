@@ -45,7 +45,7 @@ migration diff.
 
 - 20 file comparisons, 0 differing
 - the comparisons above pin the Janitor ORACLE (`--features oracle`, `simulate-streams --oracle janitor`); the production simulator runs the unified engine:
-  - `[unified] 3172 stream(s): 2410 take the same channel as match_sim.py, 156 only the Python tool passes, 0 only the unified engine passes, 72 pass to a different channel (report; the migration diff)`
+  - `[unified] 3172 stream(s): 2412 take the same channel as match_sim.py, 154 only the Python tool passes, 0 only the unified engine passes, 72 pass to a different channel (report; the migration diff)`
 
 ## 3. guide end-to-end, representative world: unified engine vs Janitor
 

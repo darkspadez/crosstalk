@@ -418,6 +418,73 @@ fn trailing_bracket(name: &str) -> Option<(usize, &str, u8)> {
     None
 }
 
+/// Strip the trailing tags writers append — quality, junk and status kinds — plus
+/// time-shift markers, for feed-zone detection (decided Z08).
+///
+/// A zone word followed by a trailing tag is still a zone word: `HBO West (Backup)`,
+/// `HBO West [4K]` and `HBO (West) [HD]` read West; `ITV1 (Central West) HD` reads
+/// West; `ESPN West +1` reads West (and stays timeshift: the shift is stripped for the
+/// zone read only, [`crate::engine::is_time_shift`] still reads the original name).
+/// Regional words are never stripped here — a bare `West` stops the run, so the zone
+/// patterns see it — and neither are unknown groups (`CNN (Moldova)` is untouched) or
+/// country markers. The run never eats the whole name (`West` alone stays `West`).
+/// Only the trailing RUN strips, exactly like [`split_tags`]: the first group that is
+/// not a strippable tag stops the peel.
+pub fn strip_zone_ignorable(name: &str) -> &str {
+    let mut rest = name.trim_end();
+    loop {
+        let next = if let Some(start) = trailing_shift(rest) {
+            Some(rest[..start].trim_end())
+        } else if let Some((open, inner, _)) = trailing_bracket(rest) {
+            if inner.contains('[')
+                || inner.contains(']')
+                || inner.contains('(')
+                || inner.contains(')')
+            {
+                None
+            } else {
+                match classify_token(inner).map(|tag| tag.kind) {
+                    Some(
+                        TagKind::Quality | TagKind::Junk | TagKind::Status | TagKind::Timeshift,
+                    ) => Some(rest[..open].trim_end()),
+                    _ => None,
+                }
+            }
+        } else {
+            match trailing_bare_word(rest) {
+                Some((start, word)) => match classify_token(word).map(|tag| tag.kind) {
+                    Some(TagKind::Quality | TagKind::Junk | TagKind::Status) => {
+                        Some(rest[..start].trim_end())
+                    }
+                    _ => None,
+                },
+                None => None,
+            }
+        };
+        match next {
+            Some(peeled) if !peeled.is_empty() => rest = peeled,
+            _ => return rest,
+        }
+    }
+}
+
+/// The last whitespace-separated token and its byte start, when it is a plain word.
+///
+/// A token glued to punctuation (`West-Ham`, `HD!`) is prose, not a tag; the bracket
+/// and shift shapes have their own peelers above.
+fn trailing_bare_word(name: &str) -> Option<(usize, &str)> {
+    let trimmed = name.trim_end();
+    let word = trimmed.split_whitespace().last()?;
+    if !word.chars().all(|c| c.is_alphanumeric()) {
+        return None;
+    }
+    // Never eat the whole name: a lone tag-looking word is a name, not a tag.
+    if word.len() == trimmed.len() {
+        return None;
+    }
+    Some((trimmed.len() - word.len(), word))
+}
+
 fn trailing_shift(name: &str) -> Option<usize> {
     let bytes = name.trim_end();
     let mut end = bytes.len();

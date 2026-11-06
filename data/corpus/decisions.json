@@ -428,6 +428,10 @@
     },
     {
       "holds": true,
+      "statement": "Trailing tags strip before the zone read (Z08 `strip-tags`) only under SM's unguarded routing (Z01 `sm-zone`, Z02 `none`: `sm_zone_noguard` is the one zone read that strips) with no post-match filter reading original names (Z04 `none`)."
+    },
+    {
+      "holds": true,
       "statement": "The prefix order fits the prefix table (N12 `first` with the core's N04)."
     },
     {
@@ -487,11 +491,11 @@
         "tp": 6369
       },
       "engine": {
-        "cost": 856,
-        "fn": 788,
+        "cost": 853,
+        "fn": 785,
         "fp": 34,
         "tn": 7416,
-        "tp": 12712
+        "tp": 12715
       },
       "janitor": {
         "cost": 3242,
@@ -743,7 +747,7 @@
     "pairs": 28450,
     "rows_decided": {
       "no-evidence": 31,
-      "orchestrator": 1,
+      "orchestrator": 2,
       "strong": 6,
       "weak": 20
     }
@@ -1270,50 +1274,50 @@
       "confidence": "weak",
       "evidence_pairs": 20950,
       "method": "threshold sweep",
-      "reason": "Cut sweep of the final engine over every construction pair, cost 2*FP+FN: 70: 833 (FP 35, FN 763), 75: 834 (FP 35, FN 764), 80: 856 (FP 34, FN 788), 85: 859 (FP 24, FN 811), 90: 847 (FP 11, FN 825), 95: 847 (FP 8, FN 831). Best cut 70; of the shipped defaults `janitor-95` is cheapest (runner-up `cm-lu-80` by 9). The cut is on the base engine's score (Janitor's 95 is on its own confidence scale with structural bonuses), so step 6 sets the one `[matching]` threshold on this sweep; the row only rules out the cuts that cost most.",
+      "reason": "Cut sweep of the final engine over every construction pair, cost 2*FP+FN: 70: 830 (FP 35, FN 760), 75: 831 (FP 35, FN 761), 80: 853 (FP 34, FN 785), 85: 856 (FP 24, FN 808), 90: 844 (FP 11, FN 822), 95: 844 (FP 8, FN 828). Best cut 70; of the shipped defaults `janitor-95` is cheapest (runner-up `cm-lu-80` by 9). The cut is on the base engine's score (Janitor's 95 is on its own confidence scale with structural bonuses), so step 6 sets the one `[matching]` threshold on this sweep; the row only rules out the cuts that cost most.",
       "strictest": "janitor-95",
       "sweep": {
         "70": {
-          "cost": 833,
-          "fn": 763,
+          "cost": 830,
+          "fn": 760,
           "fp": 35,
           "tn": 7415,
-          "tp": 12737
+          "tp": 12740
         },
         "75": {
-          "cost": 834,
-          "fn": 764,
+          "cost": 831,
+          "fn": 761,
           "fp": 35,
           "tn": 7415,
-          "tp": 12736
+          "tp": 12739
         },
         "80": {
-          "cost": 856,
-          "fn": 788,
+          "cost": 853,
+          "fn": 785,
           "fp": 34,
           "tn": 7416,
-          "tp": 12712
+          "tp": 12715
         },
         "85": {
-          "cost": 859,
-          "fn": 811,
+          "cost": 856,
+          "fn": 808,
           "fp": 24,
           "tn": 7426,
-          "tp": 12689
+          "tp": 12692
         },
         "90": {
-          "cost": 847,
-          "fn": 825,
+          "cost": 844,
+          "fn": 822,
           "fp": 11,
           "tn": 7439,
-          "tp": 12675
+          "tp": 12678
         },
         "95": {
-          "cost": 847,
-          "fn": 831,
+          "cost": 844,
+          "fn": 828,
           "fp": 8,
           "tn": 7442,
-          "tp": 12669
+          "tp": 12672
         }
       },
       "variant": "janitor-95"
@@ -1464,25 +1468,25 @@
             "fn": 0,
             "fp": 914,
             "tn": 0,
-            "tp": 74
+            "tp": 71
           },
           "janitor": {
             "cost": 445,
             "fn": 63,
             "fp": 191,
             "tn": 723,
-            "tp": 11
+            "tp": 8
           },
           "lu": {
             "cost": 169,
             "fn": 63,
             "fp": 53,
             "tn": 861,
-            "tp": 11
+            "tp": 8
           },
           "sm-both": {
-            "cost": 11,
-            "fn": 11,
+            "cost": 8,
+            "fn": 8,
             "fp": 0,
             "tn": 914,
             "tp": 63
@@ -1494,35 +1498,35 @@
             "fn": 0,
             "fp": 912,
             "tn": 0,
-            "tp": 74
+            "tp": 71
           },
           "janitor": {
             "cost": 445,
             "fn": 63,
             "fp": 191,
             "tn": 721,
-            "tp": 11
+            "tp": 8
           },
           "lu": {
             "cost": 169,
             "fn": 63,
             "fp": 53,
             "tn": 859,
-            "tp": 11
+            "tp": 8
           },
           "sm-both": {
-            "cost": 11,
-            "fn": 11,
+            "cost": 8,
+            "fn": 8,
             "fp": 0,
             "tn": 912,
             "tp": 63
           }
         }
       },
-      "evidence_pairs": 988,
-      "evidenced_share": 0.752,
+      "evidence_pairs": 985,
+      "evidenced_share": 0.7523,
       "method": "ablation via ZONE",
-      "reason": "Ablation on the base engine: 988 discriminating construction pairs; cost (2*FP+FN) 11 vs 169 for runner-up `lu`; same winner at cut 90; 75% of the deciding pairs on evidenced forms. Capped at weak: Read off the zone rule for coherence; display re-attachment itself is not measured. Each variant is its cheapest `ZONE` configuration (`cm` = `ZONE=none`, `janitor` = `ZONE=janitor`, `lu` = `ZONE=lu`, `sm-both` = `ZONE=sm-zone-noguard`). Coherence, not a measurement of display re-attachment: the split follows the zone rule chosen in ZONE (SM's routing reads `extract_zone`; LU's and JAN's filters read original names).",
+      "reason": "Ablation on the base engine: 985 discriminating construction pairs; cost (2*FP+FN) 8 vs 169 for runner-up `lu`; same winner at cut 90; 75% of the deciding pairs on evidenced forms. Capped at weak: Read off the zone rule for coherence; display re-attachment itself is not measured. Each variant is its cheapest `ZONE` configuration (`cm` = `ZONE=none`, `janitor` = `ZONE=janitor`, `lu` = `ZONE=lu`, `sm-both` = `ZONE=sm-zone-noguard`). Coherence, not a measurement of display re-attachment: the split follows the zone rule chosen in ZONE (SM's routing reads `extract_zone`; LU's and JAN's filters read original names).",
       "strictest": "lu",
       "variant": "sm-both"
     },
@@ -2676,50 +2680,50 @@
       "confidence": "weak",
       "evidence_pairs": 20950,
       "method": "threshold sweep",
-      "reason": "Cut sweep of the final engine over every construction pair, cost 2*FP+FN: 70: 833 (FP 35, FN 763), 75: 834 (FP 35, FN 764), 80: 856 (FP 34, FN 788), 85: 859 (FP 24, FN 811), 90: 847 (FP 11, FN 825), 95: 847 (FP 8, FN 831). Best cut 70; of the shipped defaults `janitor-95` is cheapest (runner-up `cm-lu-80` by 9). The cut is on the base engine's score (Janitor's 95 is on its own confidence scale with structural bonuses), so step 6 sets the one `[matching]` threshold on this sweep; the row only rules out the cuts that cost most.",
+      "reason": "Cut sweep of the final engine over every construction pair, cost 2*FP+FN: 70: 830 (FP 35, FN 760), 75: 831 (FP 35, FN 761), 80: 853 (FP 34, FN 785), 85: 856 (FP 24, FN 808), 90: 844 (FP 11, FN 822), 95: 844 (FP 8, FN 828). Best cut 70; of the shipped defaults `janitor-95` is cheapest (runner-up `cm-lu-80` by 9). The cut is on the base engine's score (Janitor's 95 is on its own confidence scale with structural bonuses), so step 6 sets the one `[matching]` threshold on this sweep; the row only rules out the cuts that cost most.",
       "strictest": "janitor-95",
       "sweep": {
         "70": {
-          "cost": 833,
-          "fn": 763,
+          "cost": 830,
+          "fn": 760,
           "fp": 35,
           "tn": 7415,
-          "tp": 12737
+          "tp": 12740
         },
         "75": {
-          "cost": 834,
-          "fn": 764,
+          "cost": 831,
+          "fn": 761,
           "fp": 35,
           "tn": 7415,
-          "tp": 12736
+          "tp": 12739
         },
         "80": {
-          "cost": 856,
-          "fn": 788,
+          "cost": 853,
+          "fn": 785,
           "fp": 34,
           "tn": 7416,
-          "tp": 12712
+          "tp": 12715
         },
         "85": {
-          "cost": 859,
-          "fn": 811,
+          "cost": 856,
+          "fn": 808,
           "fp": 24,
           "tn": 7426,
-          "tp": 12689
+          "tp": 12692
         },
         "90": {
-          "cost": 847,
-          "fn": 825,
+          "cost": 844,
+          "fn": 822,
           "fp": 11,
           "tn": 7439,
-          "tp": 12675
+          "tp": 12678
         },
         "95": {
-          "cost": 847,
-          "fn": 831,
+          "cost": 844,
+          "fn": 828,
           "fp": 8,
           "tn": 7442,
-          "tp": 12669
+          "tp": 12672
         }
       },
       "variant": "janitor-95"
@@ -2792,11 +2796,11 @@
             "fn": 63,
             "fp": 53,
             "tn": 0,
-            "tp": 11
+            "tp": 8
           },
           "sm-zone": {
-            "cost": 11,
-            "fn": 11,
+            "cost": 8,
+            "fn": 8,
             "fp": 0,
             "tn": 53,
             "tp": 63
@@ -2808,21 +2812,21 @@
             "fn": 63,
             "fp": 53,
             "tn": 0,
-            "tp": 11
+            "tp": 8
           },
           "sm-zone": {
-            "cost": 11,
-            "fn": 11,
+            "cost": 8,
+            "fn": 8,
             "fp": 0,
             "tn": 53,
             "tp": 63
           }
         }
       },
-      "evidence_pairs": 127,
-      "evidenced_share": 0.7244,
+      "evidence_pairs": 124,
+      "evidenced_share": 0.7258,
       "method": "ablation via ZONE",
-      "reason": "Ablation on the base engine: 127 discriminating construction pairs; cost (2*FP+FN) 11 vs 169 for runner-up `none`; same winner at cut 90; 72% of the deciding pairs on evidenced forms. Each variant is its cheapest `ZONE` configuration (`none` = `ZONE=lu`, `sm-zone` = `ZONE=sm-zone-noguard`).",
+      "reason": "Ablation on the base engine: 124 discriminating construction pairs; cost (2*FP+FN) 8 vs 169 for runner-up `none`; same winner at cut 90; 73% of the deciding pairs on evidenced forms. Each variant is its cheapest `ZONE` configuration (`none` = `ZONE=lu`, `sm-zone` = `ZONE=sm-zone-noguard`).",
       "strictest": "none",
       "variant": "sm-zone"
     },
@@ -2835,11 +2839,11 @@
             "fn": 0,
             "fp": 0,
             "tn": 14,
-            "tp": 33
+            "tp": 36
           },
           "sm-guard": {
-            "cost": 61,
-            "fn": 33,
+            "cost": 64,
+            "fn": 36,
             "fp": 14,
             "tn": 0,
             "tp": 0
@@ -2851,21 +2855,21 @@
             "fn": 0,
             "fp": 0,
             "tn": 14,
-            "tp": 33
+            "tp": 36
           },
           "sm-guard": {
-            "cost": 61,
-            "fn": 33,
+            "cost": 64,
+            "fn": 36,
             "fp": 14,
             "tn": 0,
             "tp": 0
           }
         }
       },
-      "evidence_pairs": 47,
-      "evidenced_share": 0.5532,
+      "evidence_pairs": 50,
+      "evidenced_share": 0.56,
       "method": "ablation via ZONE",
-      "reason": "Ablation on the base engine: 47 discriminating construction pairs; cost (2*FP+FN) 0 vs 61 for runner-up `sm-guard`; same winner at cut 90; 55% of the deciding pairs on evidenced forms. Capped at weak: The evidence rests on the corpus labelling a single-time-zone region (`UK: BBC One West`) as its own channel, the semantic SM's guard was written against (its comment: the plain BBC One channel carrying both regions is fine). Each variant is its cheapest `ZONE` configuration (`none` = `ZONE=sm-zone-noguard`, `sm-guard` = `ZONE=sm-zone`). Measured as SM's routing with and without `_country_has_one_timezone`.",
+      "reason": "Ablation on the base engine: 50 discriminating construction pairs; cost (2*FP+FN) 0 vs 64 for runner-up `sm-guard`; same winner at cut 90; 56% of the deciding pairs on evidenced forms. Capped at weak: The evidence rests on the corpus labelling a single-time-zone region (`UK: BBC One West`) as its own channel, the semantic SM's guard was written against (its comment: the plain BBC One channel carrying both regions is fine). Each variant is its cheapest `ZONE` configuration (`none` = `ZONE=sm-zone-noguard`, `sm-guard` = `ZONE=sm-zone`). Measured as SM's routing with and without `_country_has_one_timezone`.",
       "strictest": "none",
       "variant": "none"
     },
@@ -2909,18 +2913,18 @@
             "fn": 63,
             "fp": 191,
             "tn": 0,
-            "tp": 11
+            "tp": 8
           },
           "lu": {
             "cost": 169,
             "fn": 63,
             "fp": 53,
             "tn": 138,
-            "tp": 11
+            "tp": 8
           },
           "none": {
-            "cost": 11,
-            "fn": 11,
+            "cost": 8,
+            "fn": 8,
             "fp": 0,
             "tn": 191,
             "tp": 63
@@ -2932,28 +2936,28 @@
             "fn": 63,
             "fp": 191,
             "tn": 0,
-            "tp": 11
+            "tp": 8
           },
           "lu": {
             "cost": 169,
             "fn": 63,
             "fp": 53,
             "tn": 138,
-            "tp": 11
+            "tp": 8
           },
           "none": {
-            "cost": 11,
-            "fn": 11,
+            "cost": 8,
+            "fn": 8,
             "fp": 0,
             "tn": 191,
             "tp": 63
           }
         }
       },
-      "evidence_pairs": 265,
-      "evidenced_share": 0.7132,
+      "evidence_pairs": 262,
+      "evidenced_share": 0.7137,
       "method": "ablation via ZONE",
-      "reason": "Ablation on the base engine: 265 discriminating construction pairs; cost (2*FP+FN) 11 vs 169 for runner-up `lu`; same winner at cut 90; 71% of the deciding pairs on evidenced forms. Each variant is its cheapest `ZONE` configuration (`janitor` = `ZONE=janitor`, `lu` = `ZONE=lu`, `none` = `ZONE=sm-zone-noguard`).",
+      "reason": "Ablation on the base engine: 262 discriminating construction pairs; cost (2*FP+FN) 8 vs 169 for runner-up `lu`; same winner at cut 90; 71% of the deciding pairs on evidenced forms. Each variant is its cheapest `ZONE` configuration (`janitor` = `ZONE=janitor`, `lu` = `ZONE=lu`, `none` = `ZONE=sm-zone-noguard`).",
       "strictest": "lu",
       "variant": "none"
     },
@@ -3003,6 +3007,14 @@
       "reason": "Orchestrator decision (phase 3 step 6, Appendix C): `(P)` is NOT a Pacific zone marker (Stream-Mapparr's stricter reading; SM `_ZONE_PACIFIC_RE` matches bare PACIFIC and `(Pacific)`/`(PT)` only). The normalizer strips `(P)` as misc noise, so `Sportsnet (P)` == `Sportsnet` and != `Sportsnet Pacific`; Lineuparr's `(P)` = Pacific test expectations are a known conflict (Appendix C).",
       "strictest": "sm-strict",
       "variant": "sm-strict"
+    },
+    "Z08": {
+      "confidence": "orchestrator",
+      "evidence_pairs": 0,
+      "method": "orchestrated",
+      "reason": "Orchestrator decision (phase 3 step 9, step-9 review): the zone is read AFTER stripping the trailing run of writer tags (`tags::strip_zone_ignorable` over the shared `tags.json` vocabulary: quality, junk and status brackets and bare words, plus `+N`, which stays a timeshift; regional words, unknown groups and country markers stop the run) in the engine's routing zone only: Rust `extract_zone_noguard` and the decided Python `sm_zone_noguard` (byte-identical over every corpus and merged-channel name). SM's guarded `extract_zone` transcription is unchanged. Evidence: the step-9 review's open issue — `HBO West (Backup)`, `HBO West [4K]` and `ITV1 (Central West) HD` read as zone Default, so `score(\"HBO\", \"HBO West (Backup)\") = 100` and ten West feeds join the default family in `docs/oracle-reports/streams.md` (the only unattributed row). No plugin variant strips trailing tags before zone detection (SM's own `_ZONE_*_RE` tails cover only its quality list), so there is no variant to ablate. Corpus effect of the strip under the decided configuration: engine cost 856 -> 853 (FN 788 -> 785, FP 34 unchanged); four corpus names change zone, all toward their marker (`Antenna TV Pacific [HD]`, `FanDuel Sports West [HD]`, `Nickelodeon East [FHD]`, `US: STARZ WEST HD [FHD]`). `West Ham TV` / `Westworld` stay Default (no word boundary).",
+      "strictest": "no-strip",
+      "variant": "strip-tags"
     }
   }
 }

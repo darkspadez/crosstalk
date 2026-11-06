@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Decide every matching-rules inventory row on the labelled corpus (step 5).
 
-For each of the 57 rows in ``docs/matching-rules-inventory.md``:
+For each row in ``docs/matching-rules-inventory.md`` (one per inventory row):
 
 * rows a single rule swap can isolate are decided by ABLATION
   (``ablate.py``): the row's variants are swapped one at a time into one base
@@ -154,6 +154,8 @@ VARIANTS: dict[str, tuple[dict[str, list[str]], str, str]] = {
             "lu-skip", "M3U group-header skip"),
     "Z07": ({"sm-strict": [SM], "lu-pacific": [LU]},
             "sm-strict", "Bare (P) Pacific reading"),
+    "Z08": ({"strip-tags": [], "no-strip": ALL},
+            "no-strip", "Zone word followed by a trailing tag"),
     "Z06": ({"lu-twins": [LU], "none": [JAN, SM, CM]},
             "none", "Upgrade-quality channel/stream segregation"),
     "G01": ({"sm": [SM], "lu": [LU], "none": [JAN, CM]},
@@ -236,6 +238,26 @@ INACTIVE: dict[str, str] = {
 #: Orchestrator-settled conflicts (Appendix C): decided by the orchestrator,
 #: recorded here so decide.py --check reproduces them. Row -> (variant, reason).
 ORCHESTRATED: dict[str, tuple[str, str]] = {
+    "Z08": ("strip-tags", "Orchestrator decision (phase 3 step 9, step-9 review): "
+            "the zone is read AFTER stripping the trailing run of writer tags "
+            "(`tags::strip_zone_ignorable` over the shared `tags.json` vocabulary: "
+            "quality, junk and status brackets and bare words, plus `+N`, which stays "
+            "a timeshift; regional words, unknown groups and country markers stop the "
+            "run) in the engine's routing zone only: Rust `extract_zone_noguard` and "
+            "the decided Python `sm_zone_noguard` (byte-identical over every corpus "
+            "and merged-channel name). SM's guarded `extract_zone` transcription is "
+            "unchanged. Evidence: the step-9 review's open issue — "
+            "`HBO West (Backup)`, `HBO West [4K]` and `ITV1 (Central West) HD` read as "
+            "zone Default, so `score(\"HBO\", \"HBO West (Backup)\") = 100` and ten "
+            "West feeds join the default family in `docs/oracle-reports/streams.md` "
+            "(the only unattributed row). No plugin variant strips trailing tags "
+            "before zone detection (SM's own `_ZONE_*_RE` tails cover only its "
+            "quality list), so there is no variant to ablate. Corpus effect of the "
+            "strip under the decided configuration: engine cost 856 -> 853 (FN "
+            "788 -> 785, FP 34 unchanged); four corpus names change zone, all "
+            "toward their marker (`Antenna TV Pacific [HD]`, `FanDuel Sports West "
+            "[HD]`, `Nickelodeon East [FHD]`, `US: STARZ WEST HD [FHD]`). "
+            "`West Ham TV` / `Westworld` stay Default (no word boundary)."),
     "Z07": ("sm-strict", "Orchestrator decision (phase 3 step 6, Appendix C): "
             "`(P)` is NOT a Pacific zone marker (Stream-Mapparr's stricter reading; "
             "SM `_ZONE_PACIFIC_RE` matches bare PACIFIC and `(Pacific)`/`(PT)` only). "
@@ -400,6 +422,12 @@ COHERENCE_CHECKS = [
      "`sm-zone`) with no post-match filter reading `(p)` (Z04 `none`).",
      lambda r: r.get("Z07") != "sm-strict"
      or (r["Z01"] == "sm-zone" and r["Z04"] == "none")),
+    ("Trailing tags strip before the zone read (Z08 `strip-tags`) only under SM's "
+     "unguarded routing (Z01 `sm-zone`, Z02 `none`: `sm_zone_noguard` is the one "
+     "zone read that strips) with no post-match filter reading original names "
+     "(Z04 `none`).",
+     lambda r: r.get("Z08") != "strip-tags"
+     or (r["Z01"] == "sm-zone" and r["Z02"] == "none" and r["Z04"] == "none")),
     ("The prefix order fits the prefix table (N12 `first` with the core's N04).",
      lambda r: r["N04"] != "core" or r["N12"] == "first"),
     ("Designator repair (N08) exactly when the digit guard (T07) reads "

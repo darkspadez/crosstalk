@@ -270,16 +270,139 @@ def _zone_lu_like(query: str, candidate: str, pacific_or_west: bool,
     return True
 
 
+#: The shared tag vocabulary (`data/merged/tags.json`, the ONE definition step 7
+#: built): token -> kind, uppercased. The zone read strips trailing tags of the
+#: writer kinds through this table, mirroring `tags::strip_zone_ignorable` in Rust.
+_ZONE_STRIP_KINDS = ("quality", "junk", "status", "timeshift")
+_ZONE_VOCAB: dict = {}
+#: Rust's whitespace (`char::is_whitespace`, the Unicode White_Space property):
+#: Python's `str.isspace` also counts U+001C..U+001F, which Rust's `trim_end` /
+#: `split_whitespace` keep, so the mirror trims and splits on this set instead.
+_RUST_WS = "".join(c for c in map(chr, range(0x3001))
+                   if c.isspace() and c not in "\x1c\x1d\x1e\x1f")
+_RUST_WS_RUN = re.compile("[" + re.escape(_RUST_WS) + "]+")
+
+
+def _zone_vocab() -> dict:
+    """Upper-cased token -> kind for the writer tags the zone read strips."""
+    global _ZONE_VOCAB
+    if not _ZONE_VOCAB:
+        with open(os.path.join(MERGED, "tags.json"), encoding="utf-8") as handle:
+            data = json.load(handle)
+        for entry in (data.get("tags") or []):
+            token = (entry.get("token") or "").upper()
+            if token and token not in _ZONE_VOCAB:
+                _ZONE_VOCAB[token] = entry.get("kind")
+    return _ZONE_VOCAB
+
+
+def _zone_token_kind(token: str):
+    """Kind of one token, mirroring `tags::classify_token` (Rust).
+
+    Shift (`+1`, `+ 2`), one bracket layer (`[HD]`/`(HD)`), `\\d{3,4}p` resolutions,
+    `FHD\\d+`, `H.265`/`H.264` spellings, else the `tags.json` table. Prose,
+    callsigns and bare numbers are not tags."""
+    trimmed = token.strip(_RUST_WS)
+    if not trimmed:
+        return None
+    if trimmed.startswith("+"):
+        digits = "".join(_RUST_WS_RUN.split(trimmed[1:]))
+        if digits and len(digits) <= 2 and all("0" <= c <= "9" for c in digits):
+            return "timeshift"
+        return None
+    bare = trimmed
+    if len(trimmed) >= 2 and ((trimmed[0] == "[" and trimmed[-1] == "]")
+                              or (trimmed[0] == "(" and trimmed[-1] == ")")):
+        bare = trimmed[1:-1].strip(_RUST_WS)
+        if not bare:
+            return None
+    upper = bare.upper()
+    if upper.endswith("P") and 3 <= len(upper) - 1 <= 4 \
+            and all("0" <= c <= "9" for c in upper[:-1]):
+        return "quality"
+    if upper.startswith("FHD") and len(upper) > 3 \
+            and all("0" <= c <= "9" for c in upper[3:]):
+        return "quality"
+    compact = re.sub(r"[^A-Za-z0-9]", "", upper)
+    if compact in ("H265", "H264"):
+        return "quality"
+    return _zone_vocab().get(upper)
+
+
+def _peel_zone_shift(text: str):
+    """Prefix before a trailing `+N` shift marker, else None (mirrors Rust)."""
+    end = len(text)
+    start = end
+    while start > 0 and "0" <= text[start - 1] <= "9":
+        start -= 1
+    if start == end or end - start > 2:
+        return None
+    while start > 0 and text[start - 1] == " ":
+        start -= 1
+    if start == 0 or text[start - 1] != "+":
+        return None
+    if start - 1 != 0 and text[start - 2] not in (" ", "]", ")"):
+        return None
+    return text[:start - 1]
+
+
+def strip_zone_ignorable(name: str) -> str:
+    """Strip trailing writer tags for the zone read, mirroring Rust's
+    `tags::strip_zone_ignorable` (decided Z08, the ONE shared definition: the
+    vocabulary comes from `data/merged/tags.json`).
+
+    Peels the trailing run of quality/junk/status bracket groups and bare words
+    plus `+N` shifts (which stay shifts: the flag reads the original name), never
+    regional words and never the whole name."""
+    rest = (name or "").rstrip(_RUST_WS)
+    while rest:
+        shifted = _peel_zone_shift(rest)
+        if shifted is not None:
+            if not shifted.rstrip(_RUST_WS):
+                return rest
+            rest = shifted.rstrip(_RUST_WS)
+            continue
+        if rest.endswith(("]", ")")):
+            close = rest[-1]
+            opener = "[" if close == "]" else "("
+            opening = rest.rfind(opener, 0, len(rest) - 1)
+            if opening != -1:
+                inner = rest[opening + 1:-1].strip(_RUST_WS)
+                if inner and not any(c in inner for c in "[]()") \
+                        and _zone_token_kind(inner) in _ZONE_STRIP_KINDS:
+                    peeled = rest[:opening].rstrip(_RUST_WS)
+                    if not peeled:
+                        return rest
+                    rest = peeled
+                    continue
+            return rest
+        words = [w for w in _RUST_WS_RUN.split(rest) if w]
+        word = words[-1] if words else ""
+        if word and all(c.isalnum() for c in word) and len(word) != len(rest) \
+                and _zone_token_kind(word) in ("quality", "junk", "status"):
+            # A peel that leaves only whitespace keeps the name (` HD` stays).
+            peeled = rest[:len(rest) - len(word)].rstrip(_RUST_WS)
+            if not peeled:
+                return rest
+            rest = peeled
+            continue
+        return rest
+    return rest
+
+
 def sm_zone_noguard(mods, name) -> str:
     """extract_zone (SM :524-543) without the single-time-zone guard (Z02).
 
     The decided ZONE (`sm-zone-noguard`) routes on this; the Rust identity's
-    `zone` is the same function (`extract_zone_noguard`)."""
+    `zone` is the same function (`extract_zone_noguard`). Decided Z08: the zone
+    word may carry trailing writer tags (`HBO West (Backup)` is West), so SM's
+    patterns read the name with those stripped (`strip_zone_ignorable`, the
+    `tags.json` vocabulary)."""
     sm = mods["sm"]
-    name = name or ""
-    if sm._ZONE_WEST_RE.search(name) or sm._ZONE_PACIFIC_RE.search(name):
+    core = strip_zone_ignorable(name or "")
+    if sm._ZONE_WEST_RE.search(core) or sm._ZONE_PACIFIC_RE.search(core):
         return "WEST"
-    if sm._ZONE_EAST_RE.search(name):
+    if sm._ZONE_EAST_RE.search(core):
         return "EAST"
     return "DEFAULT"
 
@@ -1102,6 +1225,23 @@ def self_test() -> int:
     check("N08 rejoin keeps F1", norm({"N08": "sm-rejoin"}, "Sky Sports F1"),
           "Sky Sports F1")
     engine = Engine({}, 80, alias_map)
+    routed = Engine({"ZONE": "sm-zone-noguard"}, 80, alias_map)
+    for name, zone in [("HBO West (Backup)", "WEST"),
+                        ("HBO West [4K]", "WEST"),
+                        ("ITV1 (Central West) HD", "WEST"),
+                        ("HBO (West) [HD]", "WEST"),
+                        ("ESPN West +1", "WEST"),
+                        ("West Ham TV", "DEFAULT"),
+                        ("Westworld", "DEFAULT")]:
+        check(f"zone strip {name}", sm_zone_noguard(engine.mods, name), zone)
+    for name, core in [(" HD", " HD"), ("[HD]", "[HD]"), ("HD (Backup)", "HD"),
+                       ("HBO West ᴴᴰ", "HBO West"), ("CNN (Moldova)", "CNN (Moldova)"),
+                       ("HBO West\x1cHD", "HBO West\x1cHD")]:
+        check(f"zone strip core {name!r}", strip_zone_ignorable(name), core)
+    check("zone strip routes HBO/HBO West (Backup) apart",
+          routed.same("HBO", "HBO West (Backup)"), False)
+    check("zone strip keeps HBO West/HBO West (Backup) together",
+          routed.same("HBO West", "HBO West (Backup)"), True)
     check("base same HBO/HBO HD", engine.same("HBO", "HBO HD"), True)
     check("base +1 shift rejects", engine.same("Zorblax Movies", "Zorblax Movies +1"),
           False)

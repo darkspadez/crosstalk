@@ -52,42 +52,31 @@ parsing, sort key, mirror plan, tools) and stay gates at 0.
 ## 2a. streams end-to-end, representative world, country filter off: unified engine vs Stream-Mapparr
 
 - channels: 222, streams: 621
-- plugin matched: 176, unified matched: 176
+- plugin matched: 176, unified matched: 177
 - agreement (identical after-lists): 143/222 (64.4%)
-- direction: 3 channel(s) where unified attaches extra streams (24 stream(s)); 68 where it attaches fewer (104 stream(s))
+- direction: 3 channel(s) where unified attaches extra streams (14 stream(s)); 68 where it attaches fewer (105 stream(s))
 - attribution:
   - `alias+selection`: 3
-  - `cut-or-family`: 3
+  - `cut-or-family`: 2
   - `decided-rows`: 64
   - `order`: 8
-  - `unattributed`: 1
+  - `zone-routing`: 2
 
 Against the known answer (streams of the channel's own database name, no contradicting country):
 
 | | Stream-Mapparr | unified |
 |---|---|---|
-| right streams attached (of 676) | 611 | 540 |
-| wrong streams attached | 31 | 22 |
+| right streams attached (of 676) | 611 | 543 |
+| wrong streams attached | 31 | 8 |
 
-- extra (only unified): 14 right, 10 wrong
-- fewer (only Stream-Mapparr): 85 right (missed), 19 wrong (dropped)
+- extra (only unified): 14 right, 0 wrong
+- fewer (only Stream-Mapparr): 82 right (missed), 23 wrong (dropped)
 - reading it: a family holds ONE country (G03, `identity.rs`), so
   for a channel whose own country is unknown the unified engine keeps
   the unmarked feeds plus ONE country's and drops the other countries'
   duplicates the plugin piles on — most of the right streams missed
   are those (a write of fewer streams, never of a wrong one). Any wrong
   extra is listed here and in section 4.
-- wrong extras (the write-safety surface):
-  - `UK: ITV1 (Central East)` <- `ITV1 (Central West) (Backup)` (Identity family match (exact, score: 100))
-  - `UK: ITV1 (Central East)` <- `ITV1 (Central) HD` (Identity family match (exact, score: 100))
-  - `UK: ITV1 (Central East)` <- `ITV1 (Central West) HD` (Identity family match (exact, score: 100))
-  - `UK: ITV1 (Central East)` <- `ITV1 (Central) [4K]` (Identity family match (exact, score: 100))
-  - `UK: ITV1 (Central East)` <- `ITV1 (Border) (Backup)` (Identity family match (exact, score: 100))
-  - `UK: ITV1 (Central East)` <- `ITV1 (Border) FHD` (Identity family match (exact, score: 100))
-  - `UK: ITV1 (Central East)` <- `UK: ITV1 (Central)` (Identity family match (exact, score: 100))
-  - `UK: ITV1 (Central East)` <- `ITV1 (Central) (Backup)` (Identity family match (exact, score: 100))
-  - `UK: ITV1 (Central East)` <- `ITV1 (Border)` (Identity family match (exact, score: 100))
-  - `UK: ITV1 (Central East)` <- `ITV1 (Border) HD` (Identity family match (exact, score: 100))
 
 ### differences (showing up to 10 per bucket)
 
@@ -106,16 +95,12 @@ Against the known answer (streams of the channel's own database name, no contrad
   - unified: ['Sky Sports Football HD', 'US: Sky Sports Football (Backup)', 'Sky Sports Football [4K]']
   - reason: Identity family match (alias, score: 100)
 
-#### `cut-or-family` (3)
+#### `cut-or-family` (2)
 
 - channel `AMC Canada HD`
   - plugin: ['AMC CANADA', 'AMC Canada HD (Backup)', 'AMC CANADA [4K]', 'AMC Canada HD [4K]', 'US: AMC Canada HD', 'CA: AMC Canada HD']
   - unified: []
   - reason: Identity family match (exact, score: 100)
-- channel `ITV1 (CENTRAL WEST)`
-  - plugin: ['ITV1 (Central West) (Backup)', 'ITV1 (Central) HD', 'ITV1 (Central West) HD', 'ITV1 (Central East) [4K]', 'ITV1 (Border) (Backup)', 'ITV1 (Border) FHD', 'ITV1 (Central) [4K]', 'ITV1 (Central East) (Backup)', 'UK: ITV1 (Central)', 'ITV1 (Central) (Backup)', 'ITV1 (Border)', 'ITV1 (Border) HD']
-  - unified: []
-  - reason: No identity family match
 - channel `Radio Bremen HD HD`
   - plugin: ['RADIO BREMEN [4K]', 'Radio Bremen HD FHD', 'RADIO BREMEN (Backup)', 'Radio Bremen HD', 'Radio Bremen HD [4K]', 'RADIO BREMEN FHD']
   - unified: []
@@ -199,34 +184,39 @@ Against the known answer (streams of the channel's own database name, no contrad
   - unified: ['RADIO BREMEN [4K]', 'RADIO BREMEN (Backup)', 'Radio Bremen HD FHD', 'Radio Bremen HD', 'Radio Bremen HD [4K]', 'RADIO BREMEN FHD']
   - reason: Identity family match (exact, score: 100)
 
-#### `unattributed` (1)
+#### `zone-routing` (2)
 
-- channel `UK: ITV1 (Central East)`
-  - plugin: []
-  - unified: ['ITV1 (Central East) [4K]', 'ITV1 (Central West) (Backup)', 'ITV1 (Central) HD', 'ITV1 (Central West) HD', 'ITV1 (Central) [4K]', 'ITV1 (Border) (Backup)', 'ITV1 (Border) FHD', 'ITV1 (Central East) (Backup)', 'UK: ITV1 (Central)', 'ITV1 (Central) (Backup)', 'ITV1 (Border)', 'ITV1 (Border) HD']
+- channel `ITV1 (BORDER)`
+  - plugin: ['ITV1 (Central West) (Backup)', 'ITV1 (Central) HD', 'ITV1 (Central West) HD', 'ITV1 (Central East) [4K]', 'ITV1 (Border) (Backup)', 'ITV1 (Border) FHD', 'ITV1 (Central) [4K]', 'ITV1 (Central East) (Backup)', 'UK: ITV1 (Central)', 'ITV1 (Central) (Backup)', 'ITV1 (Border)', 'ITV1 (Border) HD']
+  - unified: ['ITV1 (Central) HD', 'ITV1 (Border) (Backup)', 'ITV1 (Border) FHD', 'ITV1 (Central) [4K]', 'ITV1 (Border)', 'ITV1 (Central) (Backup)', 'ITV1 (Border) HD']
+  - reason: Identity family match (exact, score: 100)
+- channel `ITV1 (CENTRAL WEST)`
+  - plugin: ['ITV1 (Central West) (Backup)', 'ITV1 (Central) HD', 'ITV1 (Central West) HD', 'ITV1 (Central East) [4K]', 'ITV1 (Border) (Backup)', 'ITV1 (Border) FHD', 'ITV1 (Central) [4K]', 'ITV1 (Central East) (Backup)', 'UK: ITV1 (Central)', 'ITV1 (Central) (Backup)', 'ITV1 (Border)', 'ITV1 (Border) HD']
+  - unified: ['ITV1 (Central West) (Backup)', 'ITV1 (Central West) HD']
   - reason: Identity family match (exact, score: 100)
 
 ## 2b. streams end-to-end, representative world, country filter on: unified engine vs Stream-Mapparr
 
 - channels: 222, streams: 621
-- plugin matched: 178, unified matched: 175
+- plugin matched: 178, unified matched: 176
 - agreement (identical after-lists): 158/222 (71.2%)
-- direction: 0 channel(s) where unified attaches extra streams (0 stream(s)); 55 where it attaches fewer (86 stream(s))
+- direction: 0 channel(s) where unified attaches extra streams (0 stream(s)); 56 where it attaches fewer (97 stream(s))
 - attribution:
   - `alias+selection`: 3
-  - `cut-or-family`: 3
-  - `decided-rows`: 49
-  - `order`: 9
+  - `cut-or-family`: 2
+  - `decided-rows`: 48
+  - `order`: 8
+  - `zone-routing`: 3
 
 Against the known answer (streams of the channel's own database name, no contradicting country):
 
 | | Stream-Mapparr | unified |
 |---|---|---|
-| right streams attached (of 670) | 610 | 539 |
-| wrong streams attached | 37 | 22 |
+| right streams attached (of 670) | 610 | 542 |
+| wrong streams attached | 37 | 8 |
 
 - extra (only unified): 0 right, 0 wrong
-- fewer (only Stream-Mapparr): 71 right (missed), 15 wrong (dropped)
+- fewer (only Stream-Mapparr): 68 right (missed), 29 wrong (dropped)
 - reading it: a family holds ONE country (G03, `identity.rs`), so
   for a channel whose own country is unknown the unified engine keeps
   the unmarked feeds plus ONE country's and drops the other countries'
@@ -251,22 +241,18 @@ Against the known answer (streams of the channel's own database name, no contrad
   - unified: ['Sky Sports Football HD', 'US: Sky Sports Football (Backup)', 'Sky Sports Football [4K]']
   - reason: Identity family match (alias, score: 100)
 
-#### `cut-or-family` (3)
+#### `cut-or-family` (2)
 
 - channel `AMC Canada HD`
   - plugin: ['AMC CANADA', 'AMC Canada HD (Backup)', 'AMC CANADA [4K]', 'AMC Canada HD [4K]', 'CA: AMC Canada HD']
   - unified: []
   - reason: Identity family match (exact, score: 100)
-- channel `ITV1 (CENTRAL WEST)`
-  - plugin: ['ITV1 (Central West) (Backup)', 'ITV1 (Central) HD', 'ITV1 (Central West) HD', 'ITV1 (Central East) [4K]', 'ITV1 (Border) (Backup)', 'ITV1 (Border) FHD', 'ITV1 (Central) [4K]', 'ITV1 (Central East) (Backup)', 'UK: ITV1 (Central)', 'ITV1 (Central) (Backup)', 'ITV1 (Border)', 'ITV1 (Border) HD']
-  - unified: []
-  - reason: No identity family match
 - channel `Radio Bremen HD HD`
   - plugin: ['RADIO BREMEN [4K]', 'Radio Bremen HD FHD', 'RADIO BREMEN (Backup)', 'Radio Bremen HD', 'Radio Bremen HD [4K]', 'RADIO BREMEN FHD']
   - unified: []
   - reason: Identity family match (exact, score: 100)
 
-#### `decided-rows` (49)
+#### `decided-rows` (48)
 
 - channel `Adult Swim HD HD`
   - plugin: ['CA: Adult Swim HD (Backup)', 'Adult Swim HD HD', 'Adult Swim HD FHD', 'Adult Swim HD [4K]']
@@ -309,7 +295,7 @@ Against the known answer (streams of the channel's own database name, no contrad
   - unified: ['Eurosport 6: Basketball (Backup)', 'Eurosport 6: Basketball']
   - reason: Identity family match (exact, score: 100)
 
-#### `order` (9)
+#### `order` (8)
 
 - channel `Bally Sports San Diego HD`
   - plugin: ['US: Bally Sports San Diego [4K]', 'Bally Sports San Diego HD', 'Bally Sports San Diego', 'Bally Sports San Diego FHD']
@@ -343,9 +329,20 @@ Against the known answer (streams of the channel's own database name, no contrad
   - plugin: ['RADIO BREMEN [4K]', 'Radio Bremen HD FHD', 'RADIO BREMEN (Backup)', 'Radio Bremen HD', 'Radio Bremen HD [4K]', 'RADIO BREMEN FHD']
   - unified: ['RADIO BREMEN [4K]', 'RADIO BREMEN (Backup)', 'Radio Bremen HD FHD', 'Radio Bremen HD', 'Radio Bremen HD [4K]', 'RADIO BREMEN FHD']
   - reason: Identity family match (exact, score: 100)
+
+#### `zone-routing` (3)
+
+- channel `ITV1 (BORDER)`
+  - plugin: ['ITV1 (Central West) (Backup)', 'ITV1 (Central) HD', 'ITV1 (Central West) HD', 'ITV1 (Central East) [4K]', 'ITV1 (Border) (Backup)', 'ITV1 (Border) FHD', 'ITV1 (Central) [4K]', 'ITV1 (Central East) (Backup)', 'UK: ITV1 (Central)', 'ITV1 (Central) (Backup)', 'ITV1 (Border)', 'ITV1 (Border) HD']
+  - unified: ['ITV1 (Central) HD', 'ITV1 (Border) (Backup)', 'ITV1 (Border) FHD', 'ITV1 (Central) [4K]', 'ITV1 (Border)', 'ITV1 (Central) (Backup)', 'ITV1 (Border) HD']
+  - reason: Identity family match (exact, score: 100)
+- channel `ITV1 (CENTRAL WEST)`
+  - plugin: ['ITV1 (Central West) (Backup)', 'ITV1 (Central) HD', 'ITV1 (Central West) HD', 'ITV1 (Central East) [4K]', 'ITV1 (Border) (Backup)', 'ITV1 (Border) FHD', 'ITV1 (Central) [4K]', 'ITV1 (Central East) (Backup)', 'UK: ITV1 (Central)', 'ITV1 (Central) (Backup)', 'ITV1 (Border)', 'ITV1 (Border) HD']
+  - unified: ['ITV1 (Central West) (Backup)', 'ITV1 (Central West) HD']
+  - reason: Identity family match (exact, score: 100)
 - channel `UK: ITV1 (Central East)`
   - plugin: ['UK: ITV1 (Central)', 'ITV1 (Central West) (Backup)', 'ITV1 (Central) HD', 'ITV1 (Central West) HD', 'ITV1 (Central East) [4K]', 'ITV1 (Border) (Backup)', 'ITV1 (Border) FHD', 'ITV1 (Central) [4K]', 'ITV1 (Central East) (Backup)', 'ITV1 (Central) (Backup)', 'ITV1 (Border)', 'ITV1 (Border) HD']
-  - unified: ['UK: ITV1 (Central)', 'ITV1 (Central East) [4K]', 'ITV1 (Central West) (Backup)', 'ITV1 (Central) HD', 'ITV1 (Central West) HD', 'ITV1 (Central) [4K]', 'ITV1 (Border) (Backup)', 'ITV1 (Border) FHD', 'ITV1 (Central East) (Backup)', 'ITV1 (Central) (Backup)', 'ITV1 (Border)', 'ITV1 (Border) HD']
+  - unified: ['ITV1 (Central East) [4K]', 'ITV1 (Central East) (Backup)']
   - reason: Identity family match (exact, score: 100)
 
 ## 3. streams end-to-end, disputed world: unified engine vs Stream-Mapparr
@@ -436,5 +433,6 @@ Against the known answer (streams of the channel's own database name, no contrad
 
 ## 4. unattributed (review surface)
 
-- channel `UK: ITV1 (Central East)`: plugin [] vs unified ['ITV1 (Central East) [4K]', 'ITV1 (Central West) (Backup)', 'ITV1 (Central) HD', 'ITV1 (Central West) HD', 'ITV1 (Central) [4K]', 'ITV1 (Border) (Backup)', 'ITV1 (Border) FHD', 'ITV1 (Central East) (Backup)', 'UK: ITV1 (Central)', 'ITV1 (Central) (Backup)', 'ITV1 (Border)', 'ITV1 (Border) HD'] (Identity family match (exact, score: 100))
+Empty: every difference traces to a bucket above, and no extra stream
+contradicts the known answer.
 

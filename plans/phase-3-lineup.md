@@ -469,3 +469,19 @@ Step 9 review (2026-11-05):
   followed by a trailing tag (`HBO West (Backup)`, `HBO West [4K]`, `ITV1 (Central West)
   HD` → zone Default), so West feeds join the default family in guide and streams. The
   streams oracle report lists it as unattributed.
+- RESOLVED (follow-up fix): new orchestrator row Z08 — the zone is read AFTER stripping
+  trailing writer tags with the shared tag vocabulary (`tags::strip_zone_ignorable`:
+  quality/junk/status + `+1`, which stays a timeshift; regional words never strip), in
+  both the Rust engine (`extract_zone_noguard`) and the decided Python configuration
+  (`sm_zone_noguard` over the `data/merged/tags.json` vocabulary, the one shared
+  definition). `ENGINE_VERSION` 2 → 3 (identity cache invalidation); `decide.py`
+  re-run (engine cost 856 → 853, FP unchanged); streams report section 4 now empty
+  (10 wrong extras gone, `ITV1 (Central East/West)` families separate); guide report
+  +2 agreements. `West Ham TV` / `Westworld` stay Default. Coherence checks hold.
+- Follow-up review: the strip was reverted out of the guarded `extract_zone` (SM's
+  transcription, the `parity_sweep_sm.py` zone oracle; it disagreed with SM on
+  `Antenna TV Pacific [HD]`, and the CI sample only missed it by chance). The Python mirror
+  now trims/splits on Rust's whitespace and never peels to whitespace-only (` HD`), and
+  matches Rust byte for byte over 79,807 corpus/merged/synthetic names. The Z08 coherence
+  check also requires Z02 `none`. `UnifiedEngine::cached` (used in production via
+  `MatchOptions::new`) is bounded to 8 most-recently-used configs.

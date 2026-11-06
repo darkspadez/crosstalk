@@ -672,6 +672,8 @@ pub fn extract_zone(name: &str) -> FeedZone {
     if !maybe_zoned(name) {
         return FeedZone::Default;
     }
+    // The Stream-Mapparr transcription (the SM parity sweep's oracle): the raw name,
+    // NOT the Z08 tag strip — that is the engine's [`extract_zone_noguard`] alone.
     let west = zone_west_re().is_match(name).unwrap_or(false)
         || zone_pacific_re().is_match(name).unwrap_or(false);
     let east = !west && zone_east_re().is_match(name).unwrap_or(false);
@@ -692,7 +694,8 @@ pub fn extract_zone(name: &str) -> FeedZone {
 ///
 /// Same markers as [`extract_zone`] — parenthesized `(W)`/`(E)`/`(WEST)`/`(EAST)`,
 /// standalone bare `WEST`/`EAST`, Pacific (`PACIFIC`/`(Pacific)`/`(PT)`) folding into
-/// `WEST` — but no `_country_has_one_timezone` escape: the corpus labels a
+/// `WEST` — read after stripping trailing writer tags (decided Z08: `HBO West (Backup)`
+/// is West), but no `_country_has_one_timezone` escape: the corpus labels a
 /// single-time-zone region (`UK: BBC One West`) as its own channel, the semantic the
 /// guard was written against. A bare `(P)` is NOT Pacific (decided Z07=sm-strict:
 /// SM's `_ZONE_PACIFIC_RE` matches bare `PACIFIC` and `(Pacific)`/`(PT)` only).
@@ -702,9 +705,15 @@ pub fn extract_zone_noguard(name: &str) -> FeedZone {
     if !maybe_zoned(name) {
         return FeedZone::Default;
     }
-    let west = zone_west_re().is_match(name).unwrap_or(false)
-        || zone_pacific_re().is_match(name).unwrap_or(false);
-    let east = !west && zone_east_re().is_match(name).unwrap_or(false);
+    // Decided Z08: the zone word may carry trailing writer tags (`HBO West (Backup)`
+    // is still West), so the patterns read the name with those stripped. The strip only
+    // peels quality/junk/status tags and `+N` shifts (which stay shifts: the timeshift
+    // flag is read off the original name), never regional words, so the zone itself is
+    // always still in the core when one is reported.
+    let core = crate::tags::strip_zone_ignorable(name);
+    let west = zone_west_re().is_match(core).unwrap_or(false)
+        || zone_pacific_re().is_match(core).unwrap_or(false);
+    let east = !west && zone_east_re().is_match(core).unwrap_or(false);
     if west {
         FeedZone::West
     } else if east {
@@ -1325,6 +1334,61 @@ mod tests {
         assert_eq!(extract_zone("HBO East"), FeedZone::East);
         assert_eq!(extract_zone("HBO Pacific"), FeedZone::West);
         assert_eq!(extract_zone("Café (W)"), FeedZone::West);
+    }
+
+    #[test]
+    fn zone_words_before_trailing_tags_still_route() {
+        // Decided Z08 (step 9 review): a zone word followed by a trailing writer tag
+        // is still a zone word — the zone is read after stripping the shared tag
+        // vocabulary (quality, junk, status; `+1` stays a shift, not a zone).
+        for (name, zone) in [
+            ("HBO West (Backup)", FeedZone::West),
+            ("HBO West [4K]", FeedZone::West),
+            ("ITV1 (Central West) HD", FeedZone::West),
+            ("HBO (West) [HD]", FeedZone::West),
+            ("ESPN West +1", FeedZone::West),
+            ("ESPN East (Backup)", FeedZone::East),
+            ("HBO Pacific (Backup)", FeedZone::West),
+        ] {
+            assert_eq!(extract_zone_noguard(name), zone, "{name:?}");
+        }
+        // The guarded `extract_zone` stays SM's transcription: SM reads these as
+        // Default (its tails cover only its own quality list), and the SM parity
+        // sweep checks that function against the plugin.
+        assert_eq!(extract_zone("HBO West (Backup)"), FeedZone::Default);
+        assert_eq!(extract_zone("Antenna TV Pacific [HD]"), FeedZone::Default);
+        // The shift survives the strip: the zone read peels `+1`, the timeshift flag
+        // still reads the original name.
+        assert!(crate::engine::is_time_shift("ESPN West +1"));
+        assert!(!crate::engine::is_time_shift("ESPN West"));
+        // Stripping never invents a zone: untagged and unknown-tagged names stay put,
+        // and words merely containing a zone word are prose, not feeds.
+        for name in [
+            "HBO",
+            "HBO (Backup)",
+            "HBO [4K]",
+            "CNN (Moldova)",
+            "West Ham TV",
+            "Westworld",
+            "Western Movies",
+            "Easter Parade",
+        ] {
+            assert_eq!(extract_zone_noguard(name), FeedZone::Default, "{name:?}");
+        }
+        // A whole-tag name and a leading-space tag keep their text (never stripped to
+        // empty); superscript marks strip like their plain spellings.
+        assert_eq!(crate::tags::strip_zone_ignorable("[HD]"), "[HD]");
+        assert_eq!(crate::tags::strip_zone_ignorable("HD (Backup)"), "HD");
+        assert_eq!(crate::tags::strip_zone_ignorable(" HD"), " HD");
+        assert_eq!(crate::tags::strip_zone_ignorable("HBO West ᴴᴰ"), "HBO West");
+        assert_eq!(
+            crate::tags::strip_zone_ignorable("HBO West (Backup) (Moldova)"),
+            "HBO West (Backup) (Moldova)"
+        );
+        assert_eq!(
+            crate::tags::strip_zone_ignorable("Sky Sports (Backup) West"),
+            "Sky Sports (Backup) West"
+        );
     }
 
     #[test]

@@ -162,8 +162,8 @@ fn rank_winner_identity_is_order_independent() {
 #[test]
 fn data_version_is_namespaced() {
     let version = crosstalk_matching::engine::data_version();
-    // Step 8 moved identity tag extraction onto the shared vocabulary: `eng:2`.
-    assert!(version.contains("eng:2"), "{version}");
+    // Step 9 reads feed zones after stripping trailing writer tags (Z08): `eng:3`.
+    assert!(version.contains("eng:3"), "{version}");
     // Two calls agree (memoized), and distinct inputs key distinctly.
     assert_eq!(version, crosstalk_matching::engine::data_version());
     let a = IdentityCache::input_key("ESPN", &ctx());

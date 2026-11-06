@@ -196,7 +196,8 @@ mod tests {
         assert_eq!(memory.resolve("US: ESPN HD", &ctx), via_run);
 
         // The version namespaces the rows: a rule change misses every old identity.
-        assert!(run.engine().identity_version().contains("-eng:2"));
+        // `-eng:3`: step 9 reads feed zones after stripping trailing writer tags (Z08).
+        assert!(run.engine().identity_version().contains("-eng:3"));
     }
 
     #[tokio::test]

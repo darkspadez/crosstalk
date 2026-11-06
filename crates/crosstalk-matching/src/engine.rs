@@ -85,7 +85,7 @@ use crate::pyre::pythonize;
 use crate::similarity::{calculate_similarity_chars, length_scaled_threshold};
 use crate::tokens::{has_token_overlap_core, process_string_for_matching, trailing_number};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub use crate::country::{extract_zone_noguard, is_group_header};
 
@@ -95,7 +95,13 @@ pub use crate::country::{extract_zone_noguard, is_group_header};
 ///
 /// Step 8 moved identity tag extraction onto the shared vocabulary (`tags::split_tags`
 /// instead of SM's `country::extract_tags` beside it): `2`.
-pub const ENGINE_VERSION: &str = "2";
+///
+/// Step 9 reads feed zones after stripping trailing writer tags with the same
+/// vocabulary (decided Z08: `HBO West (Backup)` is West): `3`.
+pub const ENGINE_VERSION: &str = "3";
+
+/// How many configurations [`UnifiedEngine::cached`] keeps built.
+pub const ENGINE_CACHE_CAPACITY: usize = 8;
 
 /// The decided default decision threshold (D02/T10 `janitor-95`).
 ///
@@ -493,6 +499,64 @@ impl UnifiedEngine {
     /// The decided engine with shipped defaults (threshold 95, every country).
     pub fn decided() -> Self {
         Self::new(&EngineConfig::default())
+    }
+
+    /// Cache key for an [`EngineConfig`]: everything an identity or a verdict
+    /// depends on (threshold, enabled countries, normalisation flags, aliases).
+    pub fn cache_key(config: &EngineConfig) -> String {
+        let mut aliases: Vec<(&String, &Vec<String>)> = config.custom_aliases.iter().collect();
+        aliases.sort();
+        format!(
+            "thr:{}|countries:{}|flags:{:?}|aliases:{}",
+            config.threshold,
+            config.enabled_countries.join(","),
+            config.flags,
+            serde_json::json!(aliases)
+        )
+    }
+
+    /// The engine for `config`, shared across callers holding the same key.
+    ///
+    /// Building the reverse index costs ~0.25 s in debug (every alias variant is
+    /// normalized once); parity harnesses run thousands of cases over a handful of
+    /// distinct configurations, so per-case construction dominated their runtime.
+    /// The engine is immutable after construction and its data is compiled in, so
+    /// sharing is a pure speed-up; a changed `[matching]` (a hot reload) is a new key
+    /// and gets a fresh engine. The cache holds the [`ENGINE_CACHE_CAPACITY`] most
+    /// recently used configurations, so a long-lived daemon whose operator keeps
+    /// editing aliases or the threshold does not accumulate one engine per edit.
+    pub fn cached(config: &EngineConfig) -> Arc<Self> {
+        type Entries = Vec<(String, Arc<UnifiedEngine>)>;
+        static CACHE: OnceLock<Mutex<Entries>> = OnceLock::new();
+        let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
+        // A panic elsewhere while the lock was held leaves a list that is still valid.
+        let lock = || {
+            cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        };
+        let key = Self::cache_key(config);
+        {
+            let mut entries = lock();
+            if let Some(at) = entries.iter().position(|(k, _)| *k == key) {
+                // Most recently used last: eviction takes the front.
+                let entry = entries.remove(at);
+                let hit = Arc::clone(&entry.1);
+                entries.push(entry);
+                return hit;
+            }
+        }
+        // Built outside the lock: other configurations are not held up behind it (two
+        // racing misses on one key both build; the second insert simply wins).
+        let engine = Arc::new(Self::new(config));
+        let mut entries = lock();
+        entries.retain(|(k, _)| *k != key);
+        entries.push((key, Arc::clone(&engine)));
+        if entries.len() > ENGINE_CACHE_CAPACITY {
+            let excess = entries.len() - ENGINE_CACHE_CAPACITY;
+            entries.drain(..excess);
+        }
+        engine
     }
 
     pub fn threshold(&self) -> u8 {
@@ -1619,6 +1683,37 @@ mod tests {
         assert_eq!(engine.normalize_key("Sky Sports F1 UHD"), "Sky Sports F1");
         // N11: no Cinemax strip.
         assert_eq!(engine.normalize_key("Cinemax"), "Cinemax");
+    }
+
+    #[test]
+    fn cached_engines_follow_the_config_and_stay_bounded() {
+        let config = EngineConfig::default();
+        let first = UnifiedEngine::cached(&config);
+        assert!(Arc::ptr_eq(&first, &UnifiedEngine::cached(&config)));
+        // A hot-reloaded `[matching]` is a new key: a fresh engine with the new values.
+        let stricter = EngineConfig {
+            threshold: 70,
+            ..EngineConfig::default()
+        };
+        let other = UnifiedEngine::cached(&stricter);
+        assert!(!Arc::ptr_eq(&first, &other));
+        assert_eq!(other.threshold(), 70);
+        let mut aliased = EngineConfig::default();
+        aliased
+            .custom_aliases
+            .insert("Zorblax".to_string(), vec!["ZBX".to_string()]);
+        assert_ne!(
+            UnifiedEngine::cache_key(&aliased),
+            UnifiedEngine::cache_key(&config)
+        );
+        // Bounded: after CAPACITY other configs the first is rebuilt, not kept forever.
+        for cut in 0..ENGINE_CACHE_CAPACITY as u8 {
+            UnifiedEngine::cached(&EngineConfig {
+                threshold: 10 + cut,
+                ..EngineConfig::default()
+            });
+        }
+        assert!(!Arc::ptr_eq(&first, &UnifiedEngine::cached(&config)));
     }
 
     #[test]

@@ -2379,7 +2379,10 @@ impl MatchOptions {
         matching: &MatchingConfig,
         database: Option<ChannelDatabase>,
     ) -> Self {
-        let engine = Arc::new(UnifiedEngine::new(&matching.engine_config()));
+        // Shared per configuration (see `UnifiedEngine::cached`): parity harnesses
+        // run thousands of cases over a handful of configs, and per-case
+        // construction dominated their runtime.
+        let engine = UnifiedEngine::cached(&matching.engine_config());
         // Oracle tooling only (parity tests, the indexed-vs-full-scan check): the SM
         // profile matcher at the host `[matching]` cut. Production scores with
         // `engine`, above — and without this field in the binary.
