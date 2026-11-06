@@ -247,6 +247,66 @@ fn shift_canon(token: &str) -> Option<String> {
     }
 }
 
+/// Whether a pipe segment is junk Name Cleaner would drop: a single quality/junk
+/// token (NC's `QUALITY_SEGMENT`, plugin.py:46: `^\s*(?:QUALITY)\s*$`).
+///
+/// The token lists come from this vocabulary, not from a re-declared regex:
+/// `classify_token` covers the tabled tokens (`HD`, `VIP`, `MULTI-AUDIO`, …)
+/// plus the structural shapes NC's pattern enumerates (`\d{3,4}p`, `FHD\d+`,
+/// `H.265`/`H.264` spellings). Anything else — prose, callsigns, bare numbers —
+/// is not junk (`RTE`, `Moldova`). Case-insensitive, like NC's `re.IGNORECASE`.
+/// A `+N` shift is timeshift, not quality/junk, so it never counts here. Only tokens
+/// NC itself uses (`sources` contains `"NC"`) count: the vocabulary is wider than
+/// any one plugin (IC's `Unknown` is quality here but NC keeps it; LU's bare
+/// `1080` is quality here but NC's `\d{3,4}p` needs the `p`).
+pub fn is_pipe_junk_segment(segment: &str) -> bool {
+    classify_token(segment).is_some_and(|tag| {
+        matches!(tag.kind, TagKind::Quality | TagKind::Junk) && tag.sources.contains(&"NC")
+    })
+}
+
+/// Whether a bracket's inner text is junk Name Cleaner would strip (NC's
+/// `BRACKET_JUNK_INNER`, plugin.py:49:
+/// `^(?:\s*(?:\d{3,4}p|QUALITY)\s*[/,&+]?\s*)+$`, `re.IGNORECASE`).
+///
+/// The structural shape — junk tokens joined by `/`, `,`, `&` or `+` — is not a
+/// token and so cannot live in `tags.json`; this is the one structural pattern the
+/// vocabulary adds for NC (step 14 review). Each `/,&+`-separated run must split
+/// on whitespace into tokens that are all NC quality/junk per [`classify_token`]
+/// (which carries NC's exact sets: the tabled tokens plus `\d{3,4}p`, `FHD\d+`
+/// and the codec spellings; only `sources` containing `"NC"` count, as above).
+/// `(1080p)`, `[VIP]` and `(720p / HEVC)` strip; `(Moldova)`, `(4K + 1)` and
+/// `(East)` do not (a region is not junk).
+pub fn is_bracket_junk_inner(inner: &str) -> bool {
+    if inner.trim().is_empty() {
+        return false;
+    }
+    // NC matches one bracket pair at a time (`\(([^()]*)\)`, `\[([^\[\]]*)\]`):
+    // a nested bracket of either shape never matches the outer pair first, and the
+    // junk pattern itself cannot match a bracket char, so any bracket in here keeps it.
+    if inner.contains(['[', ']', '(', ')']) {
+        return false;
+    }
+    let mut any_word = false;
+    for run in inner.split(['/', ',', '&', '+']) {
+        let run = run.trim();
+        if run.is_empty() {
+            // A leading/trailing/doubled separator: NC's trailing `[/,&+]?` allows it.
+            continue;
+        }
+        for word in run.split_whitespace() {
+            any_word = true;
+            let junk = classify_token(word).is_some_and(|tag| {
+                matches!(tag.kind, TagKind::Quality | TagKind::Junk) && tag.sources.contains(&"NC")
+            });
+            if !junk {
+                return false;
+            }
+        }
+    }
+    any_word
+}
+
 /// Whether the token is a resolution (`1080p`, `720P`, `4K`-style bare is in
 /// the table; this is the `\d{3,4}p` pattern NC's `BRACKET_JUNK_INNER` matches).
 /// Char-based: byte slicing would split multi-byte marks (`ᴴᴰ`).
@@ -814,6 +874,74 @@ mod tests {
         assert!(classify_token("S.D.").is_none());
         assert!(classify_token("TV5").is_none());
         assert!(classify_token("E!").is_none());
+    }
+
+    #[test]
+    fn pipe_segments_and_bracket_inners_read_the_vocabulary() {
+        // NC's `QUALITY_SEGMENT` (plugin.py:46): one quality/junk token, nothing else.
+        for segment in [
+            "HD",
+            "hd",
+            "FHD",
+            "FHD1080",
+            "UHD",
+            "4K",
+            "8K",
+            "HEVC",
+            "H.265",
+            "H265",
+            "H 265",
+            "RAW",
+            "MULTI",
+            "MULTI-AUDIO",
+            "MULTIAUDIO",
+            "VIP",
+            "HQ",
+            "LQ",
+            "LOW",
+            "DUAL",
+            "GEO",
+            "BACKUP",
+            "1080p",
+            "720P",
+            "ᴴᴰ",
+        ] {
+            assert!(is_pipe_junk_segment(segment), "{segment}");
+        }
+        for segment in [
+            "", "Moldova", "RTE", "WABC", "12", "1080", "East", "+1", "Unknown",
+        ] {
+            // `Unknown` is IC's quality label, not NC's: NC keeps it. LU's bare `1080`
+            // is quality here but NC's `\d{3,4}p` needs the `p`. A region and a shift
+            // never count as pipe junk.
+            assert!(!is_pipe_junk_segment(segment), "{segment}");
+        }
+        // NC's `BRACKET_JUNK_INNER` (plugin.py:49): junk tokens joined by `/,&+`.
+        for inner in [
+            "1080p",
+            "VIP",
+            "720p / HEVC",
+            "1080p, HEVC",
+            "HD & FHD",
+            "H.265+RAW",
+            "MULTI-AUDIO",
+            "FHD1080",
+            "HD /",
+        ] {
+            assert!(is_bracket_junk_inner(inner), "{inner}");
+        }
+        for inner in [
+            "",
+            "   ",
+            "Moldova",
+            "East",
+            "4K + 1",
+            "1080p Moldova",
+            "BBC",
+            "1080p (HD)",
+        ] {
+            assert!(!is_bracket_junk_inner(inner), "{inner}");
+        }
     }
 
     #[test]

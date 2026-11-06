@@ -59,6 +59,56 @@ impl ActionKind {
     }
 }
 
+/// One free-text input an action takes, rendered as a text field on its action button
+/// (web) and passed as `--input` (CLI).
+///
+/// A single string input is the whole mechanism on purpose: the one action that needs one
+/// today (`lineup.test_name`, Name Cleaner's "Test a Name") takes a single name to try.
+/// A second input would be a second field, not a map: one input keeps the CLI flag, the
+/// web form, the run record and the tests to one shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActionInput {
+    /// The form field name and the CLI flag value carrier (one input, so always `input`).
+    pub name: &'static str,
+    /// The field label the web form shows.
+    pub label: &'static str,
+    /// One line of help shown under the field.
+    pub help: &'static str,
+}
+
+impl ActionInput {
+    pub const fn new(name: &'static str, label: &'static str, help: &'static str) -> Self {
+        Self { name, label, help }
+    }
+}
+
+/// The longest free-text input a run accepts, in characters. A channel name is far
+/// shorter; the cap keeps a pasted blob out of the run record, the summary and the logs.
+pub const MAX_ACTION_INPUT_CHARS: usize = 256;
+
+/// Refuse an input the action cannot take: one for an action that declares none, one
+/// longer than [`MAX_ACTION_INPUT_CHARS`], or one carrying control characters (a newline
+/// or escape would forge lines in the summary, the run page and the logs).
+///
+/// The runner calls this before reserving a run, so every caller — CLI, web, API — is
+/// held to it; the CLI and the web form only add friendlier messages in front.
+pub fn check_action_input(spec: &ActionSpec, input: Option<&str>) -> Result<()> {
+    let Some(input) = input else {
+        return Ok(());
+    };
+    if spec.input.is_none() {
+        anyhow::bail!("action {:?} takes no input", spec.id);
+    }
+    let chars = input.chars().count();
+    if chars > MAX_ACTION_INPUT_CHARS {
+        anyhow::bail!("the input is {chars} characters; the limit is {MAX_ACTION_INPUT_CHARS}");
+    }
+    if input.chars().any(char::is_control) {
+        anyhow::bail!("the input must be one line of text, without control characters");
+    }
+    Ok(())
+}
+
 /// One runnable action.
 #[derive(Debug, Clone)]
 pub struct ActionSpec {
@@ -78,6 +128,10 @@ pub struct ActionSpec {
     /// unguarded run is still recorded (so its answer lands on a run page), but it takes no slot
     /// and is not counted as "already running" by the cross-process guard.
     pub unguarded: bool,
+    /// The action's single free-text input, when it takes one. Rendered as a text field on
+    /// the web action button and passed as `--input` on the CLI; carried by
+    /// [`crate::jobs::JobContext::input`] and stored in the run record.
+    pub input: Option<ActionInput>,
 }
 
 impl ActionSpec {
@@ -95,7 +149,30 @@ impl ActionSpec {
             confirm: None,
             needs_dispatcharr: true,
             unguarded: false,
+            input: None,
         }
+    }
+
+    /// Declare the action's single free-text input (see [`ActionInput`]).
+    ///
+    /// Only a `Read` action takes one today: an input never changes what a write plans
+    /// beyond the one name it tries, and a write with a free-text input would be a
+    /// confirmation dialog away from a typo renaming channels. This is a hard panic in
+    /// every build, like [`ActionSpec::unguarded`], so the rule cannot drift.
+    pub fn with_input(
+        mut self,
+        name: &'static str,
+        label: &'static str,
+        help: &'static str,
+    ) -> Self {
+        assert_eq!(
+            self.kind,
+            ActionKind::Read,
+            "only a read-only action takes a free-text input: {}",
+            self.id
+        );
+        self.input = Some(ActionInput::new(name, label, help));
+        self
     }
 
     /// Mark an action that works entirely offline, so it does not demand credentials.
@@ -949,6 +1026,27 @@ mod tests {
 
         assert!(ActionKind::Destructive.touches_channels());
         assert!(ActionKind::Destructive.requires_confirmation());
+    }
+
+    #[test]
+    fn action_input_is_refused_unless_declared_short_and_one_line() {
+        let plain = ActionSpec::new("plain", "Plain", "help", ActionKind::Read);
+        let takes = ActionSpec::new("takes", "Takes", "help", ActionKind::Read)
+            .with_input("input", "Name", "help");
+        assert!(check_action_input(&plain, None).is_ok());
+        assert!(check_action_input(&takes, None).is_ok());
+        assert!(check_action_input(&takes, Some("Sky Atlantic | HD |")).is_ok());
+        assert!(check_action_input(&plain, Some("Sky")).is_err());
+        let at_cap = "é".repeat(MAX_ACTION_INPUT_CHARS);
+        assert!(check_action_input(&takes, Some(&at_cap)).is_ok());
+        let over = "x".repeat(MAX_ACTION_INPUT_CHARS + 1);
+        assert!(check_action_input(&takes, Some(&over)).is_err());
+        for forged in ["Sky\nRules fired: none", "Sky\r", "Sky\u{1b}[31m"] {
+            assert!(
+                check_action_input(&takes, Some(forged)).is_err(),
+                "{forged:?}"
+            );
+        }
     }
 
     #[test]

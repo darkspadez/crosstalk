@@ -426,6 +426,10 @@ struct StartForm {
     /// operator asks for the backlog from the beginning.
     #[serde(default)]
     fresh: Option<String>,
+    /// The action's single free-text input, when it declares one. Ignored for actions
+    /// without an input (the form only renders the field then).
+    #[serde(default)]
+    input: Option<String>,
 }
 
 async fn start_action(
@@ -457,6 +461,12 @@ async fn start_action(
         options.fresh()
     } else {
         options
+    };
+    // An input for an action that declares none is a forged field: drop it rather than
+    // record text no action reads. An empty input is no input (the context trims it).
+    let options = match (action.input, form.input.clone()) {
+        (Some(_), Some(text)) if !text.trim().is_empty() => options.with_input(Some(text)),
+        _ => options,
     };
     match state
         .runner

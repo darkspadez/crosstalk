@@ -3,6 +3,10 @@
 {% block content %}
 <h1>Run #{{ run.id }} <span class="muted">{{ run.app }} / {{ run.action }}</span></h1>
 
+{% if let Some(input) = run.action_input %}
+<p class="muted">Input: <code>{{ input }}</code></p>
+{% endif %}
+
 <section class="card" id="run-status"
          hx-get="/runs/{{ run.id }}/status" hx-trigger="every 2s" hx-swap="innerHTML">
   {% include "_run_status.html" %}

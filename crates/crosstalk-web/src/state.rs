@@ -134,6 +134,10 @@ pub struct UiAction {
     /// Whether it writes, and so is worth offering "start fresh" for.
     pub writing: bool,
     pub disabled: bool,
+    /// The action's single free-text input, when it declares one: label and help for the
+    /// text field the action button renders.
+    pub input_label: Option<String>,
+    pub input_help: Option<String>,
 }
 
 /// One workflow, as the dashboard lists it.
@@ -439,6 +443,8 @@ pub fn actions(registry: &Registry, runner: &JobRunner, app_id: &str) -> Vec<UiA
                 // An unguarded action is never disabled by another run: the guard does not
                 // apply to it.
                 disabled: busy && !action.unguarded,
+                input_label: action.input.map(|input| input.label.to_string()),
+                input_help: action.input.map(|input| input.help.to_string()),
             })
             .collect(),
         None => Vec::new(),
@@ -838,6 +844,7 @@ mod tests {
             counts: serde_json::json!({"matched": 3, "skipped": 0}),
             report_path: None,
             parent_run_id: None,
+            action_input: None,
         };
         assert_eq!(counts(&run), vec![("matched".to_string(), 3)]);
     }

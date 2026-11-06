@@ -538,3 +538,88 @@ Step 13 review (2026-11-06):
   LU's `^([A-Z]{2})_(.+)_lineup\.json$` exactly; a missing `package` gives no auto prefix.
 - Country: `lineuparr_category_country` is a new G02 entry point on the decided `lu`
   vocabulary; no guide/streams caller changes.
+
+Step 14 review (2026-11-06):
+- **Pipeline is NC's, token lists are the vocabulary's.** `clean.rs` follows
+  `plugin.py:148-191` step for step (unicode marks, NFKC, junk-only brackets, pipe
+  segments with removed-quality memory, +1, custom regex, smart casing, whitespace)
+  with NC's `step()` fire-only-on-change tracking. No list is re-declared: pipe and
+  bracket checks read `tags::is_pipe_junk_segment` / `tags::is_bracket_junk_inner`
+  (NC's exact sets, `sources` containing `"NC"` so IC's `Unknown` and LU's bare
+  `1080` never strip), the unicode marks are the non-ASCII members of
+  `tokens_from(Quality, "NC")`, and the bracket-inner `/,&+` shape — the one
+  structural pattern `tags.json` cannot enumerate — was added to the vocabulary as
+  `is_bracket_junk_inner` (one definition of junk). `+1` is `([A-Za-z0-9])\+1\b`
+  (Rust `regex` has no look-behind; byte-identical), custom/protect patterns compile
+  through the shared `compile_pattern` rejection (invalid lines warn-and-skip like
+  NC's `LOGGER.warning`), and `protect_regex` is empty-means-off like NC's.
+  `smart_title` is `_smart_title` verbatim (including `1+1` → `1 +1`: NC's documented
+  risk, setting off by default).
+- **Scope is the unified scope.** Clean plans over `JobContext::base_selection`
+  (host `[scope]` or the step override, `scope = "lineup`" included), resolved with
+  the host wildcard/case rules — not NC's casefolded-exact group match. Documented
+  in `clean.rs` and the only scope divergence; `protected_groups` stays NC-exact
+  (casefolded, no wildcards) because it is a protect list, not a scope.
+- **Collisions ride the one shared resolver.** `PlanOptions.collision =
+  settings.collision_strategy` with `collision_sep = join_separator` and the pipe
+  step's removed list per channel through the new
+  `PlanOptions.collision_removed` map (`PlannedName.removed_tags` needed no naming
+  change — it was already per-channel). NC's `suffix`-first-removed-tag rule is
+  preserved, with the step 7 fixes (counted slots, `skip` cascade to a fixpoint).
+  Global, like NC. No-op dropping is the plan's own; the CSV is NC's columns
+  (`id,group,status,old_name,new_name,rules`) with `|`-joined fired rules; apply is
+  one bulk edit; NC's plugin-dir backup CSVs are not ported — undo is the host's
+  from the run rows (round trip tested).
+- **Action input is a host mechanism, one string.** `ActionSpec::with_input`
+  (Read-only, hard-panics otherwise), `JobContext::input` +
+  `RunOptions::input`, `--input` on `crosstalk run` (refused for actions without
+  one), a text field on the web action button, and a nullable `runs.action_input`
+  column (migration in `add_run_columns`, `set_run_input` right after `insert_run`)
+  so the run page shows what was tried. `test_name` is Read + offline, reports the
+  cleaned name, fired rules, protection hit, and the unified identity
+  (canonical/callsign/zone/country) for the input — no Dispatcharr calls.
+- **Oracle gates at 0.** `scripts/clean_parity.py` drives NC's real
+  `_compute_changes` (Django stubbed, channel table faked) over lineup names,
+  merged DB names, corpus provider variants, NC test-like cases and collision
+  scenarios x 8 settings/scope variants (2398 rows), against `clean_dump` (the same
+  `compute_rows` + `plan_clean` the action runs): 0 mismatches. The corpus keeps
+  existing names unique case-insensitively so the run measures the pipeline, not
+  the slot-count fix; scope groups are spelled in exact case on both sides
+  (wildcard/casefold matching differs by design). CI runs it.
+- **Identity invariant (review).** A sweep of 24.9k names (corpus pairs, every merged
+  lineup name bare and `| HD |`-decorated, probes) x {defaults, all rules on} found that
+  clean never moves timeshift or callsign. Zone and country move only where the engine
+  misreads the uncleaned name: pipe residue (`Cinemax East | HD |` keys as `cinemax | |`,
+  default zone; East once cleaned) and names that are only a country code (`USA | HD |`,
+  `FR [HD]`). Cleaning moves those toward the right reading. `UK | Sky Sports | HD` ->
+  `UK Sky Sports` keeps country UK. Pinned by `clean_keeps_identity_on_the_corpus`
+  (every 6th lineup name x 8 decorations x {defaults, `+1` on}: identity of
+  clean(decorated) == identity of the undecorated form) and
+  `clean_never_moves_timeshift_callsign_zone_or_country_of_a_clean_name` (the
+  exceptions listed by name). Not fixed here: the engine's normalizer leaving `|` residue
+  is an engine change guide/streams parity would feel. `test_name` now shows the
+  identity after clean too, and names any field the rename moves (`identity_drift`).
+- **Custom replacements are Python templates.** NC's `pat.sub(rep, s)` reads `\1` /
+  `\g<name>` as groups and `$` as text; a verbatim copy into Rust `regex` inverted both.
+  `python_replacement` translates the template and refuses what Python refuses (bad
+  escape, missing group, trailing `\`; octal unsupported). The oracle gained a
+  `custom-backrefs` case (9 cases, 2742 rows, 0 mismatches).
+- **Action input is checked by the runner.** `subapp::check_action_input` (called by
+  `start_with` and `run_to_completion_with`, so CLI, web and API all hit it) refuses an
+  input for an action that declares none, more than `MAX_ACTION_INPUT_CHARS` (256), or
+  one with control characters (no forged lines in the summary, run page or logs). The
+  web field carries `maxlength`, the run page shows the stored input (askama-escaped),
+  and a failed `set_run_input` is logged rather than dropped. `test_name` stays guarded
+  (step 13 pins `status` as the one unguarded action).
+- **For the step 20 README (clean differences from NC):** scope is the unified host
+  scope (wildcards, case-sensitive, unknown group refused) where NC casefolded exact
+  names (`clean_scope_is_the_unified_scope_not_nc_casefold`); collisions count slots,
+  so renaming a case twin away does not free a name a kept channel holds
+  (`a_kept_name_stays_taken_when_a_case_twin_is_renamed_away`), and a `skip` loser
+  keeps its old name occupied (`naming::a_skipped_rename_keeps_its_old_name_occupied`);
+  `protected_groups` uses `to_lowercase`, not `casefold`; custom/protect patterns are
+  Rust `regex` (no backreferences or lookaround in the pattern); no backup CSVs (host
+  undo); `fix_casing` (off by default) changes the matching key of camel-case names
+  (`AccuWeather` -> `Accuweather`: `accu weather` -> `accuweather`), so it can cost
+  guide/streams matches, which `test_name` shows; `normalize_plus_one` rewrites
+  `1+1 International` to `1 +1 International` (NC's own risk).

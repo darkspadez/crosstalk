@@ -834,6 +834,17 @@ pub struct PlanOptions {
     /// The separator `suffix` collisions join with (`" "`, Name Cleaner's
     /// `join_separator`). Ignored unless [`Self::collision`] is set.
     pub collision_sep: String,
+    /// Per-channel removed quality tags for the `suffix` collision strategy: channel id
+    /// to the quality the cleaning stripped from that channel, uppercased (`["HD"]`).
+    ///
+    /// Name Cleaner's `suffix` strategy re-appends the FIRST removed segment
+    /// (`base + sep + rq[0]`, plugin.py:250-254) before falling back to a number; the
+    /// shared resolver ([`crate::naming::PlannedName::removed_tags`]) already takes one
+    /// list per planned name, and this is how a channel-ops plan supplies it — one map,
+    /// still one resolver. Channels absent here resolve with no removed tag (pure
+    /// numeric). Ignored unless [`Self::collision`] is set. Lineup's clean fills this
+    /// from the pipe segments its pipeline dropped.
+    pub collision_removed: HashMap<i64, Vec<String>>,
     /// Refuse a number that is already used by any channel.
     ///
     /// Opt-in per plan, off by default. When on, a planned number that is already used by
@@ -998,6 +1009,7 @@ pub fn plan_with_options(
             &mut skipped,
             strategy,
             &options.collision_sep,
+            &options.collision_removed,
         );
     }
 
@@ -1159,14 +1171,16 @@ pub fn next_free_numbers(world: &World, start: f64, n: usize) -> Vec<f64> {
 /// names the renames free — a rename frees its own slot for a sibling, exactly like the
 /// engine's first pass. A resolved name rewrites the change's `after`; a `Skip` loser, and a
 /// change the resolver turns back into its own current name, loses its change and gains a
-/// `skipped` row. Channel-ops carries no cleaning info, so `suffix` has no removed quality to
-/// re-append and behaves like `numeric`.
+/// `skipped` row. The per-channel removed quality comes from
+/// [`PlanOptions::collision_removed`] (lineup's clean fills it from the pipe segments its
+/// pipeline dropped); channels absent there resolve with no removed tag (pure numeric).
 fn resolve_plan_collisions(
     world: &World,
     changes: &mut Vec<Change>,
     skipped: &mut Vec<Skip>,
     strategy: crate::naming::CollisionStrategy,
     sep: &str,
+    removed: &HashMap<i64, Vec<String>>,
 ) {
     use crate::naming::PlannedName;
     let mut planned: Vec<PlannedName> = Vec::new();
@@ -1181,7 +1195,7 @@ fn resolve_plan_collisions(
             id: change.channel_id,
             old_name: old_name.clone(),
             new_name: new_name.clone(),
-            removed_tags: Vec::new(),
+            removed_tags: removed.get(&change.channel_id).cloned().unwrap_or_default(),
         });
     }
     if planned.is_empty() {

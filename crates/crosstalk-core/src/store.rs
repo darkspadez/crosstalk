@@ -97,6 +97,10 @@ pub struct RunRecord {
     /// the workflow's run page can list its steps without a second table and without guessing
     /// from timestamps which runs belong together.
     pub parent_run_id: Option<i64>,
+    /// The action's single free-text input (`--input` / the web field), when the run
+    /// carried one. `None` for every run that did not: inputs postdate every existing
+    /// row, and the column is nullable so old rows read back as "no input".
+    pub action_input: Option<String>,
 }
 
 /// What a run row is about.
@@ -666,6 +670,25 @@ impl Store {
                     counts,
                     report_path
                 ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Record the action's single free-text input on its run row.
+    ///
+    /// Called right after `insert_run` by the runner, so the input lands in the run
+    /// record whatever the action then does with it. A no-op for an empty input: the
+    /// column stays NULL, which reads back as "no input".
+    pub fn set_run_input(&self, run_id: i64, input: &str) -> Result<()> {
+        let input = input.trim();
+        if input.is_empty() {
+            return Ok(());
+        }
+        self.with_connection(|connection| {
+            connection.execute(
+                "UPDATE runs SET action_input = ?2 WHERE id = ?1",
+                params![run_id, input],
             )?;
             Ok(())
         })
@@ -1597,6 +1620,9 @@ fn add_run_columns(connection: &Connection) -> Result<()> {
         // The workflow link. Nullable, so every row written before it existed reads back as a
         // run that was started on its own, which is what it was.
         ("parent_run_id", "INTEGER"),
+        // The action's single free-text input. Nullable, so every run recorded before
+        // inputs existed reads back as "no input", which is what it had.
+        ("action_input", "TEXT"),
     ] {
         if !existing.contains(name) {
             // A daemon and a CLI opening together can both see the column missing: the second
@@ -1726,7 +1752,7 @@ fn map_stream_health(row: &rusqlite::Row<'_>) -> rusqlite::Result<StreamHealth> 
 /// same columns, and a column added to the table but missed in one query would make that query
 /// fail at runtime instead of at compile time.
 const RUN_COLUMNS: &str = "id, app, action, dry_run, started_at, finished_at, status, summary, \
-     counts, report_path, parent_run_id";
+     counts, report_path, parent_run_id, action_input";
 
 /// One `runs` row, from the columns [`RUN_COLUMNS`] selects.
 fn map_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
@@ -1744,6 +1770,7 @@ fn map_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
         counts: serde_json::from_str(&counts).unwrap_or_default(),
         report_path: row.get(9)?,
         parent_run_id: row.get(10)?,
+        action_input: row.get(11)?,
     })
 }
 

@@ -482,6 +482,9 @@ async fn execute(
             // The step's channel universe travels with the step: the action resolves it
             // through its context (see `JobContext::scoped_channels`).
             scope_override: step.scope.clone(),
+            // A workflow step never carries a free-text input: inputs are an operator's
+            // one-shot question to a single action, not a scheduled step's parameter.
+            input: None,
         };
         slot.progress(&ProgressEvent::new(
             name,

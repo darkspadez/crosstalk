@@ -263,6 +263,19 @@ jobs:
       # compares each entry with `crates/lineup/examples/lineup_dump`. A gate.
       - name: Lineup files vs Lineuparr's own loader
         run: python3 -I scripts/lineup_file_parity.py
+      # Phase 3 step 14: the clean pipeline is Channel Name Cleaner's fixed rule
+      # order, protect list, scope and collision strategies, ported onto the unified
+      # tags and the shared resolver. The harness drives the plugin's REAL
+      # `_compute_changes` (Django stubbed, channel table faked) over lineup names,
+      # merged DB names, corpus provider variants, NC test-like cases and collision
+      # scenarios x 9 settings/scope variants and compares every row (status, final
+      # name, rules, removed quality) with `crates/lineup/examples/clean_dump`. A
+      # gate: the corpus keeps existing names unique so the run measures the
+      # pipeline, not the two documented divergences (wildcard unified scope; the
+      # shared resolver's counted-slot/`skip`-cascade collision fixes, pinned by
+      # Rust unit tests instead).
+      - name: Lineup clean vs Name Cleaner's own pipeline
+        run: python3 -I scripts/clean_parity.py
       # Informational, never failing: what upstream changed since each pinned reference
       # commit in the files crosstalk ports from it. Covers every reference submodule
       # (EPG Janitor, Stream-Mapparr, IPTV Checker, Channel-Mapparr, Lineuparr, Channel

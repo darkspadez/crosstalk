@@ -26,6 +26,7 @@
 //! `crosstalk.toml`, the CSV retention is `[exports]`, the usage counters are not ported,
 //! and `clear_csv_exports` is the host's `exports clear`.
 
+pub mod clean;
 pub mod lineup_file;
 pub mod settings;
 #[cfg(test)]
@@ -137,6 +138,40 @@ impl SubApp for LineupApp {
             // Unguarded: refusing it while another run is live is backwards, because that
             // run is what the operator is asking about.
             .unguarded(),
+            ActionSpec::new(
+                ACTION_CLEAN_PREVIEW,
+                "Preview Cleanup (Dry Run)",
+                "Compute before → after for every in-scope channel and write a CSV. Changes \
+                 nothing.",
+                ActionKind::Read,
+            ),
+            ActionSpec::new(
+                ACTION_CLEAN_APPLY,
+                "Apply Cleanup",
+                "Rename the channels the preview would change (collisions handled per the \
+                 On Collision setting). Undoable through the host undo.",
+                ActionKind::Write,
+            )
+            .with_confirm(
+                "This will rename channels in Dispatcharr. The host undo can reverse it. \
+                 Continue?",
+            ),
+            ActionSpec::new(
+                ACTION_TEST_NAME,
+                "Test a Name",
+                "Run the clean rules against a single name from the action's input field, \
+                 and show which rules fired, what protection hit, and what identity every \
+                 app will match it as. Changes nothing.",
+                ActionKind::Read,
+            )
+            // Local: the cleaning is pure and the identity resolves in-process.
+            .offline()
+            .with_input(
+                "input",
+                "Test a Name",
+                "Type a channel name, then Run: shows the cleaned name, the fired rules, \
+                 and the unified identity (canonical, callsign, zone, country).",
+            ),
         ]
     }
 
@@ -255,13 +290,23 @@ impl LineupApp {
         context: &JobContext,
         dry_run: bool,
     ) -> Result<JobOutcome> {
-        // Every pair is declared preview-first, and an apply handed a dry run honours it.
-        // The pairs land with their steps; until then only validate and status exist, and
-        // the flag changes nothing.
-        let _ = dry_run;
+        // Every pair is declared preview-first, and an apply handed a dry run honours it:
+        // `clean_apply` with a dry run previews instead of writing.
         match action {
             ACTION_VALIDATE => self.validate(context),
             ACTION_STATUS => Ok(self.status(context)),
+            ACTION_CLEAN_PREVIEW => {
+                let settings = self.checked_settings(context)?;
+                clean::run(self, context, &settings, true).await
+            }
+            ACTION_CLEAN_APPLY => {
+                let settings = self.checked_settings(context)?;
+                clean::run(self, context, &settings, dry_run).await
+            }
+            ACTION_TEST_NAME => {
+                let settings = self.checked_settings(context)?;
+                clean::run_test_name(context, &settings)
+            }
             other => bail!("{APP_NAME} has no action {other:?} yet"),
         }
     }
@@ -358,16 +403,22 @@ mod tests {
     }
 
     #[test]
-    fn app_declares_validate_and_status_only() {
-        // Step 13: the skeleton registers `validate` and `status`; the pairs land with
-        // steps 14-18. The ids for those pairs are declared (so schedules and URLs can
-        // be guessed from the start) but not registered.
+    fn app_declares_validate_status_clean_and_test_name() {
+        // Step 13 registered `validate` and `status`; step 14 adds the `clean_*` pair
+        // and `test_name`. The ids for the later pairs are declared (so schedules and
+        // URLs can be guessed from the start) but not registered.
         let ids: Vec<&str> = app().actions().iter().map(|action| action.id).collect();
-        assert_eq!(ids, vec![ACTION_VALIDATE, ACTION_STATUS]);
+        assert_eq!(
+            ids,
+            vec![
+                ACTION_VALIDATE,
+                ACTION_STATUS,
+                ACTION_CLEAN_PREVIEW,
+                ACTION_CLEAN_APPLY,
+                ACTION_TEST_NAME
+            ]
+        );
         for future in [
-            ACTION_CLEAN_PREVIEW,
-            ACTION_CLEAN_APPLY,
-            ACTION_TEST_NAME,
             ACTION_NAMES_PREVIEW,
             ACTION_NAMES_APPLY,
             ACTION_CATEGORIZE_PREVIEW,
@@ -386,6 +437,21 @@ mod tests {
                 "{future} is declared but not registered until its step"
             );
         }
+        // The clean pair and test_name read like their plugin halves: preview and test
+        // are reads, the apply writes and confirms.
+        let by_id = |id: &str| {
+            app()
+                .actions()
+                .into_iter()
+                .find(|action| action.id == id)
+                .unwrap_or_else(|| panic!("{id} is registered"))
+        };
+        assert_eq!(by_id(ACTION_CLEAN_PREVIEW).kind, ActionKind::Read);
+        assert!(by_id(ACTION_CLEAN_PREVIEW).confirm.is_none());
+        assert_eq!(by_id(ACTION_CLEAN_APPLY).kind, ActionKind::Write);
+        assert!(by_id(ACTION_CLEAN_APPLY).confirm.is_some());
+        assert_eq!(by_id(ACTION_TEST_NAME).kind, ActionKind::Read);
+        assert!(by_id(ACTION_TEST_NAME).input.is_some());
         // Every future writing action is a preview/apply pair, and a preview is a read —
         // the naming rule every sub-app follows, pinned before the pairs exist.
         for (preview, apply) in [

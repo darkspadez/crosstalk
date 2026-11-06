@@ -31,14 +31,23 @@ mod tests {
 
     #[test]
     fn lineup_is_linked_in() {
-        // Step 13: the skeleton registers only `validate` and `status`; the pairs land
-        // with steps 14-18.
+        // Step 13 registered `validate` and `status`; step 14 adds the `clean_*`
+        // pair and `test_name`. The later pairs land with steps 15-18.
         let registry = builtin();
         let app = registry.get("lineup").expect("lineup is linked");
         assert_eq!(app.name(), "Lineup");
         assert!(app.description().contains("channel list"));
         let ids: Vec<&str> = app.actions().iter().map(|action| action.id).collect();
-        assert_eq!(ids, vec!["validate", "status"]);
+        assert_eq!(
+            ids,
+            vec![
+                "validate",
+                "status",
+                "clean_preview",
+                "clean_apply",
+                "test_name"
+            ]
+        );
         // Every section of the plan's settings layout is in the form.
         let sections: Vec<&str> = app.schema().sections().map(|s| s.label).collect();
         assert_eq!(

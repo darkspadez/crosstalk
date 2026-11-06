@@ -82,6 +82,10 @@ struct RunArgs {
     /// the scope, for instance.
     #[arg(long)]
     fresh: bool,
+    /// The action's single free-text input, for actions that declare one
+    /// (`lineup test_name --input "<text>"`). Refused for actions without an input.
+    #[arg(long)]
+    input: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -630,13 +634,23 @@ fn run_once(args: RunArgs) -> Result<()> {
             current.started_at,
         );
     }
+    // An input for an action that declares none is a typo (or a copy-paste from another
+    // action's command line): refuse it rather than silently dropping the text.
+    if args.input.is_some() && action.input.is_none() {
+        anyhow::bail!(
+            "action {:?} takes no input: --input is only for actions that declare one (for \
+             example `lineup test_name`)",
+            action.id
+        );
+    }
     let runner = JobRunner::new(registry, SharedConfig::new(config), store);
     let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
-    let options = if args.fresh {
+    let mut options = if args.fresh {
         crosstalk_core::runner::RunOptions::default().fresh()
     } else {
         crosstalk_core::runner::RunOptions::default()
     };
+    options = options.with_input(args.input.clone());
     let outcome = runtime.block_on(runner.run_to_completion_with(
         &args.app,
         action.id,
@@ -1169,6 +1183,7 @@ mod cli_tests {
                 dry_run: false,
                 yes: true,
                 fresh: false,
+                input: None,
             },
             "offline",
         )
@@ -1199,6 +1214,7 @@ mod cli_tests {
                 dry_run: false,
                 yes: false,
                 fresh: false,
+                input: None,
             },
             "offline",
         )

@@ -184,6 +184,10 @@ pub struct JobContext {
     /// The apps, for resolving a named scope override. `None` outside the runner (a bare
     /// test context has no registry, so a named override there is refused when resolved).
     registry: Option<crate::subapp::Registry>,
+    /// The action's single free-text input (`--input` on the CLI, the text field on the
+    /// web action button), when the action declares one. `None` means the caller passed
+    /// nothing; an action that needs one refuses an empty input itself.
+    action_input: Option<String>,
 }
 
 impl std::fmt::Debug for JobContext {
@@ -209,7 +213,27 @@ impl JobContext {
             live: None,
             scope_override: None,
             registry: None,
+            action_input: None,
         }
+    }
+
+    /// Carry the action's single free-text input. The runner sets this from
+    /// [`crate::runner::RunOptions::input`]; the CLI and the web form are the only
+    /// other callers, and a bare test context sets it directly.
+    pub fn with_input(mut self, input: Option<String>) -> Self {
+        self.action_input = input
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty());
+        self
+    }
+
+    /// The action's single free-text input, when the caller passed one.
+    ///
+    /// Trimmed and non-empty by construction ([`JobContext::with_input`]): an action
+    /// that needs one treats `None` as "no input was passed" rather than checking
+    /// for blank itself.
+    pub fn input(&self) -> Option<&str> {
+        self.action_input.as_deref()
     }
 
     /// Tie this context to a run: gives the action the shared cancel flag, a place to record

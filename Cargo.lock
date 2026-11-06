@@ -589,12 +589,15 @@ dependencies = [
  "anyhow",
  "crosstalk-core",
  "crosstalk-matching",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "toml",
  "tracing",
+ "unicode-normalization",
+ "wiremock",
 ]
 
 [[package]]

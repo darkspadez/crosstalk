@@ -63,6 +63,10 @@ pub struct RunOptions {
     ///
     /// Set by the workflow executor from the step; every other caller leaves it unset.
     pub scope_override: Option<WorkflowStepScope>,
+    /// The action's single free-text input (`--input` on the CLI, the text field on the
+    /// web action button). Carried into the [`JobContext`](crate::jobs::JobContext) and
+    /// stored in the run record. `None` means no input was passed.
+    pub input: Option<String>,
 }
 
 impl RunOptions {
@@ -87,6 +91,14 @@ impl RunOptions {
     /// Replace the host `[scope]` for this run with a workflow step's scope override.
     pub fn with_scope_override(mut self, scope: Option<WorkflowStepScope>) -> Self {
         self.scope_override = scope;
+        self
+    }
+
+    /// Carry the action's single free-text input into the run.
+    pub fn with_input(mut self, input: Option<String>) -> Self {
+        self.input = input
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty());
         self
     }
 }
@@ -504,6 +516,7 @@ impl JobRunner {
             .registry
             .find_action(app_id, action_id)
             .with_context(|| format!("no action {action_id:?} in sub-app {app_id:?}"))?;
+        crate::subapp::check_action_input(&spec, options.input.as_deref())?;
 
         let (run_id, cancel_flag) =
             self.reserve(app_id, spec.id, spec.unguarded, dry_run, &options)?;
@@ -609,6 +622,7 @@ impl JobRunner {
             .registry
             .find_action(app_id, action_id)
             .with_context(|| format!("no action {action_id:?} in sub-app {app_id:?}"))?;
+        crate::subapp::check_action_input(&spec, options.input.as_deref())?;
 
         let (run_id, cancel_flag) =
             self.reserve(app_id, spec.id, spec.unguarded, dry_run, &options)?;
@@ -858,12 +872,20 @@ impl JobRunner {
         options: &RunOptions,
     ) -> JobContext {
         let snapshot = Arc::new(self.config.snapshot());
+        // The run record keeps the input: `insert_run` leaves it NULL and this fills it
+        // in, so the one INSERT column list stays the single place new columns land.
+        if let Some(input) = options.input.as_deref() {
+            if let Err(error) = self.store.set_run_input(run_id, input) {
+                tracing::warn!(run_id, "could not record the run's input: {error:#}");
+            }
+        }
         JobContext::new(snapshot, sink)
             .for_run(app_id, action_id, run_id, self.store.clone(), cancel_flag)
             .with_deadline(options.deadline)
             .with_live_runs(Arc::clone(&self.active))
             .with_scope_override(options.scope_override.clone())
             .with_registry(self.registry.as_ref().clone())
+            .with_input(options.input.clone())
     }
 
     /// Delete run history older than the configured retention.
