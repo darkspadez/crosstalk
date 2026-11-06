@@ -605,7 +605,6 @@ pub async fn run(
         "streams.restore_{}",
         if dry_run { "preview" } else { "apply" }
     );
-    let scope = context.config().scope.clone();
 
     // 1. Which channels recovered, and what crosstalk did to them.
     let probe = probe::last_verdicts(context)?;
@@ -625,8 +624,10 @@ pub async fn run(
     };
 
     // 2. The live channels, which is what every value below is compared against.
+    // Profiles when the scope names them, or when a step override is present (a named
+    // scope resolving to a table may name them).
     let mut kinds = WorldKinds::only(WorldKind::Channels) | WorldKind::Groups;
-    if !scope.profiles.trim().is_empty() {
+    if context.may_need_profiles() {
         kinds = kinds | WorldKind::Profiles;
     }
     context.progress(&crosstalk_core::jobs::ProgressEvent::new(
@@ -670,8 +671,9 @@ pub async fn run(
     }
 
     // Every recovered channel is the selection, so a channel with nothing to restore is
-    // reported by `channel_ops` as the no-op it is rather than silently dropped.
-    let recovered_ids: Vec<i64> = probe
+    // reported by `channel_ops` as the no-op it is rather than silently dropped. A step
+    // override resolving to ids bounds the recovered set to exactly those channels.
+    let mut recovered_ids: Vec<i64> = probe
         .verdicts
         .iter()
         .filter(|verdict| {
@@ -682,9 +684,13 @@ pub async fn run(
         })
         .map(|verdict| verdict.channel_id)
         .collect();
+    let base = context.base_selection(&world)?;
+    if let Some(limit) = base.channel_ids.as_deref() {
+        recovered_ids.retain(|id| limit.contains(id));
+    }
     let selection = Selection {
         channel_ids: Some(recovered_ids),
-        ..Selection::in_scope(&scope)
+        ..base
     };
     let op_plan = channel_ops::plan(&world, &selection, &operations)?;
 

@@ -885,6 +885,21 @@ impl World {
             None => "No Group".to_string(),
         }
     }
+
+    /// A copy holding only these channels, for a workflow step whose scope override
+    /// resolves to channel ids (see [`crate::jobs::JobContext::scoped_channels`]).
+    ///
+    /// Groups, streams, profiles, entries and accounts are untouched: matching still reads
+    /// the pools, only the channel universe shrinks. Profile memberships are left as they
+    /// are — every read of them is a per-channel test (enabled, visible, hidden), never a
+    /// universe — so a step scoped to ids sees exactly those channels. A named scope
+    /// REPLACES the host scope: pair this with an empty scope table, never with the host
+    /// one (which would filter the ids back down to it).
+    pub fn retaining_channels(&self, limit: &std::collections::HashSet<i64>) -> Self {
+        let mut world = self.clone();
+        world.channels.retain(|channel| limit.contains(&channel.id));
+        world
+    }
 }
 
 /// One programme airing right now on an EPG entry, as `/epg/current-programs/` answers it.

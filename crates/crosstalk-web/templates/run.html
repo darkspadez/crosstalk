@@ -29,6 +29,28 @@
 </section>
 {% endif %}
 
+{% if !planned.is_empty() %}
+<section class="card">
+  <h2>Configured steps</h2>
+  <p class="muted">
+    Which channels each step reads, and which failures the workflow carries past, as the
+    workflow is configured now (a later settings change shows here, not what this run used).
+  </p>
+  <table>
+    <thead><tr><th>Step</th><th>Scope</th><th>On failure</th></tr></thead>
+    <tbody>
+      {% for step in planned %}
+      <tr>
+        <td><code>{{ step.action }}</code></td>
+        <td class="muted">{% if let Some(scope) = step.scope %}{{ scope }}{% else %}host scope{% endif %}</td>
+        <td>{% if step.continue_on_failure %}<span class="tag read">continue</span>{% else %}stop{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+
 {% if undo_eligible %}
 <section class="card">
   <h2>Undo</h2>

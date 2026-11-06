@@ -407,7 +407,7 @@ impl Default for AiVerifyConfig {
 /// table in an app's file would mean the form, the CSV preamble and the validation each had
 /// to know about a second place to look. Adding it later is a decision per app, not a
 /// default.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ScopeConfig {
     /// Profile names to scope to, comma-separated. The first one is used by actions that
@@ -719,6 +719,268 @@ impl Serialize for ScheduleEntry {
     }
 }
 
+/// Where one workflow step reads its channels from: a scope override for that step.
+///
+/// A bare name (`scope = "lineup"`) is a named scope: the channels one app offers under that
+/// name, resolved through the [`crate::subapp::Registry`] at run time (a table there would
+/// pin the step to today's group names; a name follows the app's lineup instead). A table
+/// (`scope = { groups = "DIRECTV: *" }`) is an inline [`ScopeConfig`] that REPLACES the
+/// host `[scope]` for that step. No `scope` key means the step runs under the host `[scope]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowStepScope {
+    /// A named scope one app provides (`lineup`, or a test's fake scope).
+    Named(String),
+    /// An inline scope table, replacing the host `[scope]` for this step.
+    Table(ScopeConfig),
+}
+
+impl WorkflowStepScope {
+    /// How the override reads in the dashboard, the run page and the CLI.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Named(name) => format!("scope {name:?}"),
+            Self::Table(scope) => {
+                let mut parts = Vec::new();
+                if !scope.profiles.trim().is_empty() {
+                    parts.push(format!("profiles {:?}", scope.profiles));
+                }
+                if !scope.groups.trim().is_empty() {
+                    parts.push(format!("groups {:?}", scope.groups));
+                }
+                if !scope.ignore_groups.trim().is_empty() {
+                    parts.push(format!("ignore_groups {:?}", scope.ignore_groups));
+                }
+                if parts.is_empty() {
+                    "scope {} (every channel)".to_string()
+                } else {
+                    format!("scope {}", parts.join(", "))
+                }
+            }
+        }
+    }
+}
+
+/// Deserialize a scope override as a bare name or an inline table.
+///
+/// Hand-written rather than `#[serde(untagged)]` so a mistyped table key names the field it
+/// did not understand instead of "data did not match any variant".
+impl<'de> Deserialize<'de> for WorkflowStepScope {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{self, MapAccess, Visitor};
+
+        struct ScopeVisitor;
+
+        impl<'de> Visitor<'de> for ScopeVisitor {
+            type Value = WorkflowStepScope;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a named scope, or an inline scope table")
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> std::result::Result<Self::Value, E> {
+                Ok(WorkflowStepScope::Named(value.to_string()))
+            }
+
+            fn visit_string<E: de::Error>(
+                self,
+                value: String,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(WorkflowStepScope::Named(value))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let scope = ScopeConfig::deserialize(de::value::MapAccessDeserializer::new(map))?;
+                Ok(WorkflowStepScope::Table(scope))
+            }
+        }
+
+        deserializer.deserialize_any(ScopeVisitor)
+    }
+}
+
+impl Serialize for WorkflowStepScope {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Named(name) => serializer.serialize_str(name),
+            Self::Table(scope) => scope.serialize(serializer),
+        }
+    }
+}
+
+/// Whether a `continue_on_failure` flag reads as unset, for the save's shape.
+///
+/// A table step written without the flag reloads as a table step without it; spelling
+/// `continue_on_failure = false` everywhere would bury the steps that do carry on.
+fn continue_unset(value: &bool) -> bool {
+    !value
+}
+
+/// The table form of a workflow step: an action plus its per-step settings.
+///
+/// ```toml
+/// [workflows.full_sync]
+/// steps = [
+///   "lineup.sync_apply",
+///   { action = "streams.match_apply", scope = "lineup" },
+///   { action = "guide.match_apply", scope = { groups = "DIRECTV: *" }, continue_on_failure = true },
+/// ]
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowStepDetail {
+    /// The `<app>.<action>` to run, never another workflow.
+    pub action: String,
+    /// Where the step reads its channels from, instead of the host `[scope]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<WorkflowStepScope>,
+    /// Carry on past this step when it fails. A cancelled or paused step still stops the
+    /// workflow; the workflow itself is recorded failed when any step failed.
+    #[serde(default, skip_serializing_if = "continue_unset")]
+    pub continue_on_failure: bool,
+}
+
+/// One entry of a workflow's `steps` list: today a bare `"<app>.<action>"` string, or a
+/// table carrying that action plus a scope override and a failure policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowStepEntry {
+    /// `"streams.probe"`: the shape every existing file uses.
+    Simple(String),
+    /// `{ action = "streams.match_apply", scope = ..., continue_on_failure = ... }`.
+    Detailed(WorkflowStepDetail),
+}
+
+impl WorkflowStepEntry {
+    /// The `<app>.<action>` this entry runs.
+    pub fn action(&self) -> &str {
+        match self {
+            Self::Simple(action) => action,
+            Self::Detailed(detail) => &detail.action,
+        }
+    }
+
+    /// The step's scope override, when it carries one.
+    pub fn scope(&self) -> Option<&WorkflowStepScope> {
+        match self {
+            Self::Simple(_) => None,
+            Self::Detailed(detail) => detail.scope.as_ref(),
+        }
+    }
+
+    /// Whether the workflow continues past this step's failure.
+    pub fn continue_on_failure(&self) -> bool {
+        match self {
+            Self::Simple(_) => false,
+            Self::Detailed(detail) => detail.continue_on_failure,
+        }
+    }
+
+    /// The entry as written, for an error or a display that names the step.
+    pub fn display(&self) -> String {
+        match self {
+            Self::Simple(action) => action.clone(),
+            Self::Detailed(detail) => {
+                let mut text = detail.action.clone();
+                if let Some(scope) = &detail.scope {
+                    text.push_str(&format!(" [{}]", scope.describe()));
+                }
+                if detail.continue_on_failure {
+                    text.push_str(" [continue on failure]");
+                }
+                text
+            }
+        }
+    }
+}
+
+impl From<&str> for WorkflowStepEntry {
+    fn from(action: &str) -> Self {
+        Self::Simple(action.to_string())
+    }
+}
+
+impl From<String> for WorkflowStepEntry {
+    fn from(action: String) -> Self {
+        Self::Simple(action)
+    }
+}
+
+impl From<WorkflowStepDetail> for WorkflowStepEntry {
+    fn from(detail: WorkflowStepDetail) -> Self {
+        Self::Detailed(detail)
+    }
+}
+
+/// Deserialize a step as a bare action string or an action table.
+///
+/// Hand-written rather than `#[serde(untagged)]` so a table with a mistyped key names the
+/// key instead of falling back to "expected a string".
+impl<'de> Deserialize<'de> for WorkflowStepEntry {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{self, MapAccess, Visitor};
+
+        struct EntryVisitor;
+
+        impl<'de> Visitor<'de> for EntryVisitor {
+            type Value = WorkflowStepEntry;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(
+                    "a \"<app>.<action>\" string, or a table with action, scope and \
+                     continue_on_failure",
+                )
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> std::result::Result<Self::Value, E> {
+                Ok(WorkflowStepEntry::Simple(value.to_string()))
+            }
+
+            fn visit_string<E: de::Error>(
+                self,
+                value: String,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(WorkflowStepEntry::Simple(value))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let detail =
+                    WorkflowStepDetail::deserialize(de::value::MapAccessDeserializer::new(map))?;
+                Ok(WorkflowStepEntry::Detailed(detail))
+            }
+        }
+
+        deserializer.deserialize_any(EntryVisitor)
+    }
+}
+
+impl Serialize for WorkflowStepEntry {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            // A bare string stays a bare string: a save round-trips the shape the operator
+            // wrote (comments survive through `toml_edit`; the shape survives here).
+            Self::Simple(action) => serializer.serialize_str(action),
+            Self::Detailed(detail) => detail.serialize(serializer),
+        }
+    }
+}
+
 /// One `[workflows.<name>]` entry: a named sequence of actions the host runs in order.
 ///
 /// ```toml
@@ -726,16 +988,18 @@ impl Serialize for ScheduleEntry {
 /// steps = ["streams.probe", "streams.sort_apply"]
 /// ```
 ///
-/// A step is an `<app>.<action>` like a schedule key, and a step may NOT be another workflow:
-/// the sequence is a flat list, so there is no recursion to guard against at run time. Steps run
-/// through the same [`crate::runner::JobRunner`] a manual or scheduled action does, which is why
-/// the scheduler's dry-run rule holds for them too: a `Read` step is a dry run and a writing
-/// step really writes.
+/// A step is an `<app>.<action>` like a schedule key, or a table carrying that action plus a
+/// scope override and a failure policy (see [`WorkflowStepDetail`]). A step may NOT be another
+/// workflow: the sequence is a flat list, so there is no recursion to guard against at run
+/// time. Steps run through the same [`crate::runner::JobRunner`] a manual or scheduled action
+/// does, which is why the scheduler's dry-run rule holds for them too: a `Read` step is a dry
+/// run and a writing step really writes.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowConfig {
-    /// The steps, in order.
-    pub steps: Vec<String>,
+    /// The steps, in order: a bare action string, or a table with the action plus its
+    /// scope override and failure policy.
+    pub steps: Vec<WorkflowStepEntry>,
     /// Start each step's backlog from the beginning when this workflow begins a new pass.
     ///
     /// Off by default, which is the resume-friendly choice: a `probe` that paused at its window's
@@ -1292,22 +1556,43 @@ impl CrosstalkConfig {
         }
 
         // Workflows: every step must be a step and not another workflow. The registered-action
-        // check needs the registry, so it lives in `Registry::unknown_workflow_steps`; what can
+        // and named-scope checks need the registry, so they live in
+        // `Registry::unknown_workflow_steps` and `Registry::unknown_workflow_scopes`; what can
         // be checked here is the shape, which is what a step naming a workflow gets wrong.
+        // Every error names the step's index, so a ten-step workflow's typo is found at once.
         for (name, workflow) in &self.workflows {
             if workflow.steps.is_empty() {
                 report.errors.push(format!("workflows.{name} has no steps"));
             }
-            for step in &workflow.steps {
-                if step.starts_with("workflow.") {
+            for (index, step) in workflow.steps.iter().enumerate() {
+                let action = step.action();
+                if action.trim().starts_with("workflow.") {
                     report.errors.push(format!(
-                        "workflows.{name}: {step} is a workflow, and a workflow step must be an \
-                         <app>.<action>: workflows do not nest"
+                        "workflows.{name}.steps[{index}]: {action} is a workflow, and a workflow \
+                         step must be an <app>.<action>: workflows do not nest"
                     ));
-                } else if !step.contains('.') {
+                } else if !action.trim().contains('.') {
                     report.errors.push(format!(
-                        "workflows.{name}: {step} must be <app>.<action>, e.g. streams.probe"
+                        "workflows.{name}.steps[{index}]: {action} must be <app>.<action>, e.g. \
+                         streams.probe"
                     ));
+                }
+                match step.scope() {
+                    Some(WorkflowStepScope::Named(scope)) if scope.trim().is_empty() => {
+                        report.errors.push(format!(
+                            "workflows.{name}.steps[{index}]: the scope name is empty"
+                        ));
+                    }
+                    Some(WorkflowStepScope::Table(scope))
+                        if !scope.groups.trim().is_empty()
+                            && !scope.ignore_groups.trim().is_empty() =>
+                    {
+                        report.errors.push(format!(
+                            "workflows.{name}.steps[{index}]: scope.groups and \
+                             scope.ignore_groups cannot both be set: use one or the other"
+                        ));
+                    }
+                    Some(_) | None => {}
                 }
             }
         }
@@ -2760,10 +3045,7 @@ fresh = true
         let config = CrosstalkConfig::load_file(dir.path()).expect("load");
         assert_eq!(
             config.workflows["nightly"].steps,
-            vec![
-                "streams.probe".to_string(),
-                "streams.sort_apply".to_string()
-            ]
+            vec!["streams.probe".into(), "streams.sort_apply".into()]
         );
         assert!(!config.workflows["nightly"].fresh, "off by default");
         assert!(config.workflows["rebuild"].fresh);
@@ -2782,21 +3064,215 @@ fresh = true
     }
 
     #[test]
-    fn a_workflow_step_cannot_be_a_workflow() {
-        // A step naming a workflow would be a cycle (or at least a sequence inside a sequence),
-        // and this port has neither: a flat list of actions is the whole feature.
+    fn workflow_steps_parse_as_strings_or_tables() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            r#"
+[workflows.full_sync]
+steps = [
+  "lineup.sync_apply",
+  { action = "streams.match_apply", scope = "lineup" },
+  { action = "guide.match_apply", scope = { groups = "DIRECTV: *" }, continue_on_failure = true },
+]
+"#,
+        );
+        let config = CrosstalkConfig::load_file(dir.path()).expect("load");
+        let steps = &config.workflows["full_sync"].steps;
+        assert_eq!(steps.len(), 3);
+        // The old string form is unchanged.
+        assert_eq!(steps[0], WorkflowStepEntry::from("lineup.sync_apply"));
+        // Nothing about the steps is an error (credentials aside: the temp file has none).
+        assert!(
+            config
+                .validate()
+                .errors
+                .iter()
+                .filter(|error| !error.contains("credentials"))
+                .all(|error| !error.contains("workflows.full_sync")),
+            "no step-shape error: {:?}",
+            config.validate().errors
+        );
+        match (&steps[1], &steps[2]) {
+            (WorkflowStepEntry::Detailed(first), WorkflowStepEntry::Detailed(second)) => {
+                assert_eq!(first.action, "streams.match_apply");
+                assert_eq!(
+                    first.scope,
+                    Some(WorkflowStepScope::Named("lineup".to_string()))
+                );
+                assert!(!first.continue_on_failure);
+                assert_eq!(second.action, "guide.match_apply");
+                assert_eq!(
+                    second.scope,
+                    Some(WorkflowStepScope::Table(ScopeConfig {
+                        groups: "DIRECTV: *".to_string(),
+                        ..ScopeConfig::default()
+                    }))
+                );
+                assert!(second.continue_on_failure);
+            }
+            other => panic!("tables parse as tables: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workflow_step_validation_names_the_bad_step() {
         let mut config = CrosstalkConfig::default();
         config.workflows.insert(
             "nightly".to_string(),
             WorkflowConfig {
-                steps: vec!["workflow.other".to_string()],
+                steps: vec![
+                    "streams.probe".into(),
+                    WorkflowStepEntry::Detailed(WorkflowStepDetail {
+                        action: "guide.match_apply".to_string(),
+                        scope: Some(WorkflowStepScope::Table(ScopeConfig {
+                            groups: "A".to_string(),
+                            ignore_groups: "B".to_string(),
+                            ..ScopeConfig::default()
+                        })),
+                        continue_on_failure: false,
+                    }),
+                    WorkflowStepEntry::Detailed(WorkflowStepDetail {
+                        action: "streams.sort_apply".to_string(),
+                        scope: Some(WorkflowStepScope::Named(String::new())),
+                        continue_on_failure: false,
+                    }),
+                ],
+                fresh: false,
+            },
+        );
+        let errors = config.validate().errors;
+        assert!(
+            errors.iter().any(|error| error
+                .contains("workflows.nightly.steps[1]: scope.groups and scope.ignore_groups")),
+            "{errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("workflows.nightly.steps[2]: the scope name")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn workflow_steps_keep_their_shape_through_a_save() {
+        // A string stays a string and a table stays a table, with the operator's comment
+        // intact: the save merges values, it does not re-render the file.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("crosstalk.toml");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            r#"# operator note
+[workflows.full_sync]
+steps = [
+  "lineup.sync_apply",
+  { action = "guide.match_apply", scope = { groups = "DIRECTV: *" }, continue_on_failure = true },
+]
+"#,
+        );
+        let config = CrosstalkConfig::load_file(dir.path()).expect("load");
+        config.save(&path).expect("save");
+        let text = std::fs::read_to_string(&path).expect("read back");
+        assert!(text.contains("# operator note"), "comments survive: {text}");
+        assert!(
+            text.contains("\"lineup.sync_apply\""),
+            "the string step stays a string: {text}"
+        );
+        assert!(
+            text.contains("continue_on_failure = true"),
+            "the table step stays a table: {text}"
+        );
+        let reloaded = CrosstalkConfig::load_file(dir.path()).expect("reload");
+        assert_eq!(
+            reloaded.workflows["full_sync"].steps,
+            config.workflows["full_sync"].steps
+        );
+    }
+
+    #[test]
+    fn workflow_steps_also_parse_as_an_array_of_tables() {
+        // TOML forbids newlines inside an inline table, so a long step reads better as
+        // `[[workflows.<name>.steps]]`. Every step is then a table; a save keeps them valid.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("crosstalk.toml");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            r#"[workflows.full_sync]
+fresh = false
+
+[[workflows.full_sync.steps]]
+action = "lineup.sync_apply"
+
+[[workflows.full_sync.steps]]
+action = "guide.match_apply"
+continue_on_failure = true
+scope = { groups = "DIRECTV: *" }
+
+[[workflows.full_sync.steps]]
+action = "streams.match_apply"
+scope = "lineup"
+"#,
+        );
+        let config = CrosstalkConfig::load_file(dir.path()).expect("load");
+        let steps = &config.workflows["full_sync"].steps;
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0].action(), "lineup.sync_apply");
+        assert!(!steps[0].continue_on_failure());
+        assert!(steps[1].continue_on_failure());
+        assert_eq!(
+            steps[1].scope(),
+            Some(&WorkflowStepScope::Table(ScopeConfig {
+                groups: "DIRECTV: *".to_string(),
+                ..ScopeConfig::default()
+            }))
+        );
+        assert_eq!(
+            steps[2].scope(),
+            Some(&WorkflowStepScope::Named("lineup".to_string()))
+        );
+
+        config.save(&path).expect("save");
+        let reloaded = CrosstalkConfig::load_file(dir.path()).expect("reload");
+        assert_eq!(reloaded.workflows["full_sync"].steps, *steps);
+    }
+
+    #[test]
+    fn a_mistyped_step_key_is_named() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            r#"[workflows.full_sync]
+steps = [{ action = "guide.match_apply", continue_on_fail = true }]
+"#,
+        );
+        let error = CrosstalkConfig::load_file(dir.path()).expect_err("unknown key");
+        assert!(
+            format!("{error:#}").contains("continue_on_fail"),
+            "the error names the key: {error:#}"
+        );
+    }
+
+    #[test]
+    fn a_workflow_step_cannot_be_a_workflow() {
+        // A step naming a workflow would be a cycle (or at least a sequence inside a
+        // sequence), and this port has neither: a flat list of actions is the whole feature.
+        let mut config = CrosstalkConfig::default();
+        config.workflows.insert(
+            "nightly".to_string(),
+            WorkflowConfig {
+                steps: vec!["workflow.other".into()],
                 fresh: false,
             },
         );
         config.workflows.insert(
             "other".to_string(),
             WorkflowConfig {
-                steps: vec!["workflow.nightly".to_string()],
+                steps: vec!["workflow.nightly".into()],
                 fresh: false,
             },
         );
@@ -2820,7 +3296,7 @@ fresh = true
         config.workflows.insert(
             "shapeless".to_string(),
             WorkflowConfig {
-                steps: vec!["probe".to_string()],
+                steps: vec!["probe".into()],
                 fresh: false,
             },
         );
@@ -2832,9 +3308,8 @@ fresh = true
             "{errors:?}"
         );
         assert!(
-            errors
-                .iter()
-                .any(|error| error.contains("workflows.shapeless: probe must be <app>.<action>")),
+            errors.iter().any(|error| error
+                .contains("workflows.shapeless.steps[0]: probe must be <app>.<action>")),
             "{errors:?}"
         );
     }
@@ -2960,10 +3435,7 @@ m3u_refresh = ["streams.match_apply"]
         let reloaded = CrosstalkConfig::load_file(dir.path()).expect("reload");
         assert_eq!(
             reloaded.workflows["nightly"].steps,
-            vec![
-                "streams.probe".to_string(),
-                "streams.sort_apply".to_string()
-            ]
+            vec!["streams.probe".into(), "streams.sort_apply".into()]
         );
         assert_eq!(
             reloaded.hooks.targets("m3u_refresh"),

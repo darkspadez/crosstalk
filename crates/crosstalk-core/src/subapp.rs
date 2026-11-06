@@ -15,8 +15,10 @@
 //! data, orange writes channel data but removes no assignment, red can remove an assignment
 //! and always confirms.
 
-use crate::config::CrosstalkConfig;
+use crate::config::{CrosstalkConfig, ScopeConfig, WorkflowStepScope};
+use crate::dispatcharr::World;
 use crate::jobs::JobContext;
+use crate::store::Store;
 use anyhow::Result;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -375,6 +377,45 @@ impl SettingsValues {
     }
 }
 
+/// One channel set an app offers workflow steps by name: `scope = "lineup"` in a step.
+///
+/// The name is resolved through the [`Registry`] at run time, when the world and the store
+/// are both at hand. The `lineup` app (phase 3, step 13+) will register its configured lineup
+/// under the name `lineup`; until then any app — including a test's fake — may provide names.
+/// A named scope REPLACES the host `[scope]` for that step: it is the step's channel
+/// universe, not a filter on top of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedScope {
+    /// The name a step writes (`scope = "lineup"`).
+    pub name: String,
+    /// One line for the dashboard and the validation error that lists what exists.
+    pub description: String,
+}
+
+impl NamedScope {
+    pub fn new(name: impl Into<String>, description: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+        }
+    }
+}
+
+/// What a named scope resolves to, for the step that named it.
+///
+/// Either shape REPLACES the host `[scope]`: the step reads exactly these channels. An
+/// explicit id set is the ownership answer ("the channels lineup X made"); an inline
+/// [`ScopeConfig`] is the group/profile answer ("`DIRECTV: *`"). The id set wins when an
+/// app can name its channels exactly, because group names can be renamed by hand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NamedScopeResolution {
+    /// Exactly these channel ids, in no particular order. Ids with no channel in the
+    /// loaded world are dropped: a channel deleted upstream is gone, not an error.
+    Channels(Vec<i64>),
+    /// A scope table to resolve like an inline one.
+    Scope(ScopeConfig),
+}
+
 /// A number that must already be a whole number in range.
 ///
 /// Truncating silently is how a typed `6.7` becomes `6` and a typed `-1` becomes `0`; both
@@ -658,6 +699,30 @@ pub trait SubApp: Send + Sync {
         context: &'a JobContext,
         dry_run: bool,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<JobOutcome>> + Send + 'a>>;
+
+    /// The named scopes this app offers workflow steps (`scope = "<name>"`).
+    ///
+    /// Empty by default: most apps select channels through the host `[scope]` and offer
+    /// nothing by name. The `lineup` app registers its configured lineup here, so a
+    /// `full_sync` step can read "the channels lineup owns" without pinning group names.
+    fn named_scopes(&self) -> Vec<NamedScope> {
+        Vec::new()
+    }
+
+    /// Resolve one of [`Self::named_scopes`] to channels, for the step that named it.
+    ///
+    /// `None` means "not mine"; the registry asks every app in turn. `Some(Err)` is a
+    /// real failure (the store could not be read), which fails the step rather than
+    /// silently scoping it to nothing.
+    fn resolve_named_scope(
+        &self,
+        name: &str,
+        world: &World,
+        store: &Store,
+    ) -> Option<Result<NamedScopeResolution>> {
+        let _ = (name, world, store);
+        None
+    }
 }
 
 /// The set of sub-apps this binary was built with.
@@ -671,6 +736,7 @@ impl Registry {
         // A duplicate id would make `get` return the first quietly, and the second app
         // would be unreachable from the UI, the CLI and the scheduler.
         let mut seen = std::collections::HashSet::new();
+        let mut scopes = std::collections::HashSet::new();
         for app in &apps {
             // `workflow` is the host's own app id: it is what `workflow.<name>` means in a
             // schedule key, a hook target and a run row, so a sub-app registered under it
@@ -685,6 +751,17 @@ impl Registry {
                 "two sub-apps share the id {:?}",
                 app.id()
             );
+            // Two apps offering one named scope would make `scope = "<name>"` ambiguous:
+            // the registry resolves first-match, so the second app's channels would never
+            // be read. Like a duplicate app id, this is a build-time bug, not a run-time
+            // choice.
+            for scope in app.named_scopes() {
+                assert!(
+                    scopes.insert(scope.name.clone()),
+                    "two sub-apps offer the named scope {:?}",
+                    scope.name
+                );
+            }
             // A hard check, not a `debug_assert`: the builder already panics, but an app
             // could set the flag by struct literal in the same crate, and an unguarded write
             // action would race another run of its app with no guard to stop it.
@@ -746,15 +823,92 @@ impl Registry {
         let mut unknown = Vec::new();
         for (name, workflow) in &config.workflows {
             for step in &workflow.steps {
-                if crate::workflow::Step::parse(step)
+                let action = step.action();
+                if crate::workflow::Step::parse(action)
                     .map(|step| self.find_action(&step.app, &step.action).is_none())
                     .unwrap_or(true)
                 {
-                    unknown.push((name.clone(), step.clone()));
+                    unknown.push((name.clone(), step.display()));
                 }
             }
         }
         unknown
+    }
+
+    /// Workflow step scope names no app provides, as `(workflow, scope)` pairs.
+    ///
+    /// The configuration's own validation cannot check these (it has no registry: a name the
+    /// build does not serve yet may belong to an app that registers later, like `lineup`),
+    /// so this registry-aware check is the load-time half. The run-time half is the step
+    /// executor, which fails the step when the name still resolves to nothing.
+    pub fn unknown_workflow_scopes(&self, config: &CrosstalkConfig) -> Vec<(String, String)> {
+        let mut unknown = Vec::new();
+        for (name, workflow) in &config.workflows {
+            for step in &workflow.steps {
+                if let Some(WorkflowStepScope::Named(scope_name)) = step.scope() {
+                    if !self.provides_named_scope(scope_name) {
+                        unknown.push((name.clone(), scope_name.clone()));
+                    }
+                }
+            }
+        }
+        unknown
+    }
+
+    /// Whether any registered app offers this named scope.
+    pub fn provides_named_scope(&self, name: &str) -> bool {
+        let wanted = name.trim();
+        self.apps
+            .iter()
+            .any(|app| app.named_scopes().iter().any(|scope| scope.name == wanted))
+    }
+
+    /// Every named scope the registered apps offer, as `(app, scope)` pairs, in order.
+    pub fn known_named_scopes(&self) -> Vec<(String, NamedScope)> {
+        let mut known = Vec::new();
+        for app in &self.apps {
+            for scope in app.named_scopes() {
+                known.push((app.id().to_string(), scope));
+            }
+        }
+        known
+    }
+
+    /// Resolve a step's named scope through the apps that offer one.
+    ///
+    /// The first app claiming the name wins; two apps offering the same name is a
+    /// registration the registry test would catch like a duplicate app id, so the lookup
+    /// stays first-match. An unclaimed name is an error listing what is claimed, which is
+    /// what the failed step reports.
+    pub fn resolve_named_scope(
+        &self,
+        name: &str,
+        world: &World,
+        store: &Store,
+    ) -> Result<NamedScopeResolution> {
+        let wanted = name.trim();
+        for app in &self.apps {
+            if let Some(resolved) = app.resolve_named_scope(wanted, world, store) {
+                return resolved;
+            }
+        }
+        let mut known: Vec<String> = self
+            .known_named_scopes()
+            .iter()
+            .map(|(_, scope)| scope.name.clone())
+            .collect();
+        known.sort();
+        known.dedup();
+        if known.is_empty() {
+            anyhow::bail!(
+                "workflow scope {wanted:?} names no scope this build provides: no sub-app \
+                 registers a named scope"
+            );
+        }
+        anyhow::bail!(
+            "workflow scope {wanted:?} names no scope this build provides; known: {}",
+            known.join(", ")
+        )
     }
 
     /// Hook targets that name no registered action and no configured workflow, as
@@ -944,14 +1098,14 @@ mod tests {
         config.workflows.insert(
             "nightly".to_string(),
             crate::config::WorkflowConfig {
-                steps: vec!["stub.apply".to_string(), "stub.nope".to_string()],
+                steps: vec!["stub.apply".into(), "stub.nope".into()],
                 fresh: false,
             },
         );
         config.workflows.insert(
             "nested".to_string(),
             crate::config::WorkflowConfig {
-                steps: vec!["workflow.other".to_string()],
+                steps: vec!["workflow.other".into()],
                 fresh: false,
             },
         );
@@ -1008,5 +1162,136 @@ mod tests {
         }
         let unknown = registry.unknown_schedules(&config);
         assert_eq!(unknown, vec!["stub.nope".to_string(), "typo".to_string()]);
+    }
+
+    /// A fake app offering one named scope, standing in for `lineup` until step 13.
+    struct ScopedApp;
+
+    impl SubApp for ScopedApp {
+        fn id(&self) -> &'static str {
+            "scoped"
+        }
+
+        fn name(&self) -> &'static str {
+            "Scoped"
+        }
+
+        fn description(&self) -> &'static str {
+            "test named scopes"
+        }
+
+        fn actions(&self) -> Vec<ActionSpec> {
+            vec![ActionSpec::new("act", "Act", "acts", ActionKind::Read).offline()]
+        }
+
+        fn schema(&self) -> &SettingsSchema {
+            static SCHEMA: std::sync::OnceLock<SettingsSchema> = std::sync::OnceLock::new();
+            SCHEMA.get_or_init(SettingsSchema::default)
+        }
+
+        fn load_settings(&self, _path: &Path) -> Result<SettingsValues> {
+            Ok(SettingsValues::new())
+        }
+
+        fn save_settings(&self, _path: &Path, _values: &SettingsValues) -> Result<()> {
+            Ok(())
+        }
+
+        fn named_scopes(&self) -> Vec<NamedScope> {
+            vec![NamedScope::new("fakescope", "the fake app's channels")]
+        }
+
+        fn resolve_named_scope(
+            &self,
+            name: &str,
+            _world: &World,
+            _store: &Store,
+        ) -> Option<Result<NamedScopeResolution>> {
+            if name.trim() == "fakescope" {
+                Some(Ok(NamedScopeResolution::Channels(vec![7])))
+            } else {
+                None
+            }
+        }
+
+        fn run<'a>(
+            &'a self,
+            _action: &'a str,
+            _context: &'a JobContext,
+            _dry_run: bool,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<JobOutcome>> + Send + 'a>>
+        {
+            Box::pin(async move { Ok(JobOutcome::new("done")) })
+        }
+    }
+
+    fn scoped_registry() -> Registry {
+        Registry::new(vec![Arc::new(ScopedApp)])
+    }
+
+    fn scoped_config() -> CrosstalkConfig {
+        let mut config = CrosstalkConfig::default();
+        config.workflows.insert(
+            "nightly".to_string(),
+            crate::config::WorkflowConfig {
+                steps: vec![crate::config::WorkflowStepEntry::Detailed(
+                    crate::config::WorkflowStepDetail {
+                        action: "scoped.act".to_string(),
+                        scope: Some(crate::config::WorkflowStepScope::Named(
+                            "fakescope".to_string(),
+                        )),
+                        continue_on_failure: false,
+                    },
+                )],
+                fresh: false,
+            },
+        );
+        config
+    }
+
+    #[test]
+    fn registry_knows_the_scopes_its_apps_offer() {
+        // No app in the stub registry offers a named scope: any name is unknown there.
+        assert!(!stub_registry().provides_named_scope("fakescope"));
+        assert!(stub_registry().known_named_scopes().is_empty());
+
+        let registry = scoped_registry();
+        assert!(registry.provides_named_scope("fakescope"));
+        assert!(!registry.provides_named_scope("nope"));
+        assert_eq!(
+            registry.known_named_scopes(),
+            vec![(
+                "scoped".to_string(),
+                NamedScope::new("fakescope", "the fake app's channels")
+            )]
+        );
+        // The configuration's own validation cannot check names (it has no registry), so
+        // this registry-aware check is the load-time half: a served name is not unknown.
+        assert!(registry
+            .unknown_workflow_scopes(&scoped_config())
+            .is_empty());
+        assert_eq!(
+            stub_registry().unknown_workflow_scopes(&scoped_config()),
+            vec![("nightly".to_string(), "fakescope".to_string())]
+        );
+    }
+
+    #[test]
+    fn resolving_an_unknown_scope_names_what_exists() {
+        let world = World::default();
+        let store = Store::in_memory().expect("store");
+        let error = scoped_registry()
+            .resolve_named_scope("nope", &world, &store)
+            .expect_err("unknown");
+        assert!(format!("{error:#}").contains("\"nope\""), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("fakescope"),
+            "the error lists what exists: {error:#}"
+        );
+
+        let resolved = scoped_registry()
+            .resolve_named_scope("fakescope", &world, &store)
+            .expect("served");
+        assert_eq!(resolved, NamedScopeResolution::Channels(vec![7]));
     }
 }

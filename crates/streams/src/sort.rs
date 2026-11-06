@@ -51,7 +51,7 @@ use crate::selection::AccountSelection;
 use crate::settings::StreamsSettings;
 use anyhow::Result;
 use chrono::Utc;
-use crosstalk_core::channel_ops::{self, Field, Op, Plan, ReportSpec, Selection, SetValue};
+use crosstalk_core::channel_ops::{self, Field, Op, Plan, ReportSpec, SetValue};
 use crosstalk_core::config::ScopeConfig;
 use crosstalk_core::csv_report;
 use crosstalk_core::dispatcharr::{World, WorldKind, WorldKinds};
@@ -439,7 +439,6 @@ pub async fn run(
 ) -> Result<JobOutcome> {
     let client = context.dispatcharr()?;
     let action_id = format!("streams.sort_{}", if dry_run { "preview" } else { "apply" });
-    let scope = context.config().scope.clone();
 
     // Every slice a sort reads: channels (their own ordered lists), groups (report names),
     // profiles (the scope's profile filter), streams (stats, accounts, custom flag) and the M3U
@@ -457,6 +456,19 @@ pub async fn run(
     ));
     let world = client.load_world_with(kinds).await?;
 
+    // The step's channel universe: a table override replaces `[scope]`; a named scope
+    // resolving to ids replaces it with exactly those channels (the filtered world, planned
+    // against an empty table, holds only them).
+    let resolved = context.resolve_scope(&world)?;
+    let filtered;
+    let plan_world: &World = match &resolved.limit {
+        Some(limit) => {
+            filtered = world.retaining_channels(limit);
+            &filtered
+        }
+        None => &world,
+    };
+
     let mut options = SortOptions::new(settings, &world, &context.config().matching);
     // One clock for the whole run, so every freshness check is against the same instant.
     options.model.now = Utc::now();
@@ -468,7 +480,7 @@ pub async fn run(
         None => Box::new(quality::MemoryThroughputSource::new()),
     };
 
-    let result = orders(&world, &scope, &options, throughput.as_ref())?;
+    let result = orders(plan_world, &resolved.tables, &options, throughput.as_ref())?;
     if result.channels == 0 {
         return Ok(JobOutcome::new(
             "No channels are in scope. Check the group and profile settings in crosstalk.toml.",
@@ -492,7 +504,7 @@ pub async fn run(
             description: format!(
                 "every channel in scope{} — {} channel(s) with more than one stream, all \
                  already in order",
-                scope_suffix(&scope),
+                scope_suffix(&resolved.tables),
                 result.candidates
             ),
             ..Plan::default()
@@ -502,7 +514,9 @@ pub async fn run(
             field: Field::Streams,
             values,
         }];
-        channel_ops::plan(&world, &Selection::in_scope(&scope), &operations)?
+        // The write plan starts from the run's channel universe, so a step override
+        // bounds the write like `[scope]` bounds an ordinary run.
+        channel_ops::plan(&world, &context.base_selection(&world)?, &operations)?
     };
 
     let applied = if dry_run || plan.changes.is_empty() {

@@ -157,7 +157,8 @@ run_history_days = 15
 
 # Named workflows: a sequence of `<app>.<action>` steps the host runs in order, each as an
 # ordinary run of its own (own run page, own CSV, own checkpoint), plus one run record for the
-# workflow itself that links them. It stops at the first step that fails or is cancelled; a step
+# workflow itself that links them. It stops at the first step that fails (unless that step sets
+# continue_on_failure, below) or is cancelled; a step
 # that pauses at its window's end pauses the workflow, and the next firing resumes that step.
 # Schedule one as "workflow.<name>", like an action.
 # [workflows.nightly]
@@ -165,6 +166,19 @@ run_history_days = 15
 # A new pass discards each step's saved progress. Off by default, which resumes instead: what
 # an operator turns on after widening the scope.
 # fresh = false
+#
+# A step can also be a table: `scope` REPLACES [scope] for that step (a table, or the name of
+# a scope an app provides, like "lineup" — which may reach channels [scope] excludes), and
+# `continue_on_failure` carries on past that step's failure (the workflow still ends failed).
+# A step's scope only ever comes from this file: hooks and the UI cannot pass one. TOML does
+# not allow a line break inside `{ ... }`, so keep each table on one line, or use
+# [[workflows.<name>.steps]] tables instead.
+# [workflows.full_sync]
+# steps = [
+#   "lineup.sync_apply",
+#   { action = "streams.match_apply", scope = "lineup" },
+#   { action = "guide.match_apply", scope = { groups = "DIRECTV: *" }, continue_on_failure = true },
+# ]
 
 # Dispatcharr Connect events, and what they trigger. A target is an `<app>.<action>` or a
 # `workflow.<name>`; the event names are whatever you subscribe to in Dispatcharr

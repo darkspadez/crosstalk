@@ -690,7 +690,7 @@ fn visibility_phase(
     let options = MatchOptions::with_database(settings, matching_config, Some(database.clone()));
     let setup_time = started.elapsed();
     let started = Instant::now();
-    let planned = visibility::plan_with_options(world, scope, &options);
+    let planned = visibility::plan_with_options(world, scope, &options, None);
     let plan_time = started.elapsed();
     let outcome = match planned {
         Ok(outcome) => outcome,

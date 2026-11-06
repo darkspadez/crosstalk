@@ -112,7 +112,6 @@ pub async fn run(
 ) -> Result<JobOutcome> {
     let client = context.dispatcharr()?;
     let action_id = action.action_id(dry_run);
-    let scope = context.config().scope.clone();
 
     // The plugin errored when its results file was missing; this is the same refusal, and it
     // happens before any request so a mistyped action costs nothing.
@@ -128,7 +127,21 @@ pub async fn run(
     }
 
     let world = client.load_world().await?;
-    let (selection, ops, options) = build(action, settings, &scope, scan.as_ref())?;
+    // The step's channel universe: a table override replaces `[scope]`; a named scope
+    // resolving to ids replaces it with exactly those channels. The `tables` scope feeds
+    // every refusal and profile name below; `base` feeds every selection's scope strings
+    // and id bound, so the override bounds the write like `[scope]` bounds an ordinary run.
+    let resolved = context.resolve_scope(&world)?;
+    let base = context.base_selection(&world)?;
+    // An id bound carries no profile names (its table is empty); `clear_hidden`'s profile
+    // is its subject, not its universe, so it stays the host `[scope] profiles` one. The
+    // ids still bound every selection through `base`.
+    let tables = if resolved.limit.is_some() {
+        &context.config().scope
+    } else {
+        &resolved.tables
+    };
+    let (selection, ops, options) = build(action, settings, tables, &base, scan.as_ref())?;
     let plan = channel_ops::plan_with_options(&world, &selection, &ops, &options)?;
 
     // An apply re-plans from the world this run loaded, so a channel that changed since the
@@ -187,10 +200,17 @@ pub async fn run(
 ///
 /// Split out so the refusals are a value the tests can call without a server: each one is a
 /// setting an operator left blank, and the message says which field and where it lives.
+///
+/// `tables` is the run's scope as a table — the host `[scope]`, the step's table override,
+/// or a named scope's table (the host `[scope]` again under an id bound, which names no
+/// profiles) — and feeds every refusal and profile name. `base` is the
+/// run's channel universe as a selection (scope strings plus an optional id bound from a
+/// named scope), and feeds every selection, so a step override bounds the write.
 fn build(
     action: Cleanup,
     settings: &GuideSettings,
-    scope: &ScopeConfig,
+    tables: &ScopeConfig,
+    base: &Selection,
     scan: Option<&LastScan>,
 ) -> Result<(Selection, Vec<Op>, PlanOptions)> {
     match action {
@@ -210,7 +230,7 @@ fn build(
             if settings.remove_epg_with_suffix {
                 ops.push(Op::ClearEpg);
             }
-            let selection = Selection::from_scan_rows(&scan_rows(scan)?, scope);
+            let selection = scan_selection(&scan_rows(scan)?, base);
             Ok((
                 selection,
                 ops,
@@ -222,24 +242,26 @@ fn build(
             ))
         }
         Cleanup::ClearMissing => Ok((
-            Selection::from_scan_rows(&scan_rows(scan)?, scope),
+            scan_selection(&scan_rows(scan)?, base),
             vec![Op::ClearEpg],
             PlanOptions::default(),
         )),
         Cleanup::ClearHidden => {
             // The plugin requires `channel_profile_name` (2574-2578); here the same value is
-            // `[scope] profiles`, which every app shares.
-            if scope.profiles.trim().is_empty() {
+            // `[scope] profiles`, which every app shares. A step override resolving to
+            // channel ids does not supply profile names, so it still needs them here.
+            if tables.profiles.trim().is_empty() {
                 bail!(
                     "no channel profile is configured, and clear_hidden needs the profiles whose \
-                     disabled channels it should clear: set [scope] profiles in crosstalk.toml"
+                     disabled channels it should clear: set [scope] profiles in crosstalk.toml \
+                     (or the step's scope override)"
                 );
             }
-            Ok((
-                Selection::hidden_in(&scope.profiles, scope),
-                vec![Op::ClearEpg],
-                PlanOptions::default(),
-            ))
+            let mut selection = Selection::hidden_in(&tables.profiles, &selection_strings(base));
+            if let Some(limit) = base.channel_ids.as_deref() {
+                selection.channel_ids = Some(limit.to_vec());
+            }
+            Ok((selection, vec![Op::ClearEpg], PlanOptions::default()))
         }
         Cleanup::ClearByRegex => {
             let pattern = settings.epg_regex_to_remove.trim().to_string();
@@ -256,14 +278,16 @@ fn build(
                     epg_name_regex: Some(pattern),
                     // The plugin's queryset filters `epg_data__isnull=False` first.
                     has_epg: true,
-                    ..Selection::in_scope(scope)
+                    ..base.clone()
                 },
                 vec![Op::ClearEpg],
                 PlanOptions::default(),
             ))
         }
         Cleanup::ClearGroups => {
-            if scope.groups.trim().is_empty() {
+            // An explicit id bound (a step override resolving to channel ids) is a safe
+            // selection on its own; only an empty group filter with no bound refuses.
+            if tables.groups.trim().is_empty() && base.channel_ids.is_none() {
                 // DELIBERATE divergence: the plugin treats an empty group filter as "every
                 // channel", so one press would unassign every guide in the install.
                 bail!(
@@ -277,12 +301,35 @@ fn build(
                     // Nothing assigned means nothing to clear, so it is not a no-op worth
                     // reporting as a skip for a channel the plugin never queried.
                     has_epg: true,
-                    ..Selection::in_scope(scope)
+                    ..base.clone()
                 },
                 vec![Op::ClearEpg],
                 PlanOptions::default(),
             ))
         }
+    }
+}
+
+/// A scan's result set bounded by the run's channel universe: the scan's ids, intersected
+/// with the step override's ids when it carries any, over the run's scope strings.
+fn scan_selection(rows: &[crosstalk_core::store::RunRow], base: &Selection) -> Selection {
+    let mut selection = Selection::from_scan_rows(rows, &selection_strings(base));
+    if let Some(limit) = base.channel_ids.as_deref() {
+        if let Some(ids) = selection.channel_ids.as_mut() {
+            ids.retain(|id| limit.contains(id));
+        }
+        selection.expected_epg.retain(|id, _| limit.contains(id));
+    }
+    selection
+}
+
+/// The scope strings a selection carries: the run's tables (host `[scope]` or the step's
+/// override), so a plan built from it is held to the same scope the run resolved.
+fn selection_strings(base: &Selection) -> ScopeConfig {
+    ScopeConfig {
+        profiles: base.profiles.clone(),
+        groups: base.groups.clone(),
+        ignore_groups: base.ignore_groups.clone(),
     }
 }
 

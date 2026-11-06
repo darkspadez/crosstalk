@@ -127,6 +127,9 @@ struct RunTemplate {
     report_available: bool,
     /// The steps of a workflow run, in the order they ran. Empty for an ordinary run.
     steps: Vec<RunRecord>,
+    /// The workflow's planned steps, with each step's scope override and failure policy.
+    /// Empty for an ordinary run.
+    planned: Vec<crate::state::UiStep>,
     /// Whether this run is a workflow's, whose results live on its steps' pages.
     is_workflow: bool,
     /// The workflow run this run is a step of, when it is one.
@@ -630,6 +633,7 @@ async fn run_page(State(state): State<AppState>, Path(id): Path<i64>) -> Respons
             rows: state::rows(&state.store, id),
             report_available: state::report_available(&run),
             steps: state::steps_of(&state.store, &run),
+            planned: state::planned_steps(&state.snapshot(), &run),
             is_workflow: run.app == crosstalk_core::workflow::APP_ID,
             parent: state::parent_of(&state.store, &run),
             undo_eligible: state::undo_eligible(&state.registry, &state.store, &run),

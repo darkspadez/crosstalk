@@ -76,9 +76,7 @@ use crate::selection::{self, StreamPool};
 use crate::settings::StreamsSettings;
 use anyhow::{Context, Result};
 use crosstalk_core::ai_gate;
-use crosstalk_core::channel_ops::{
-    self, ApplyReport, Field, Op, Plan, ReportSpec, Selection, SetValue,
-};
+use crosstalk_core::channel_ops::{self, ApplyReport, Field, Op, Plan, ReportSpec, SetValue};
 use crosstalk_core::config::{AiVerifyConfig, MatchingConfig, ScopeConfig};
 use crosstalk_core::csv_report;
 use crosstalk_core::dispatcharr::{Channel, Stream, World, WorldKind, WorldKinds};
@@ -3479,7 +3477,6 @@ pub async fn run(
         "streams.match_{}",
         if dry_run { "preview" } else { "apply" }
     );
-    let scope = context.config().scope.clone();
 
     // Every slice a match reads: channels (their own lists), groups (labels, stream groups,
     // zone bases), profiles (the scope's profile filter), streams (names, stats, accounts,
@@ -3502,6 +3499,11 @@ pub async fn run(
     ));
     let world = Arc::new(client.load_world_with(kinds).await?);
 
+    // The step's channel universe: a table override replaces `[scope]`; a named scope
+    // resolving to ids replaces it with exactly those channels. `tables` feeds the pure
+    // planners below.
+    let resolved = context.resolve_scope(&world)?;
+
     let mut options = MatchOptions::new(settings, &context.config().matching);
     // EPG-aware placeholder matching: resolve the titles BEFORE the blocking pass, in ONE
     // batched read for the entries a placeholder or watched name can actually reach. The
@@ -3509,7 +3511,8 @@ pub async fn run(
     let mut epg_error: Option<String> = None;
     let mut epg_timezone_error: Option<String> = None;
     if epg_settings.enabled {
-        let scoped = scope_channels(&world, &scope)?;
+        // The entry pool a placeholder can reach: the step's channels, not the host's.
+        let scoped = context.scoped_channels(&world)?;
         // The "Next Event" gate compares an embedded date against today in Dispatcharr's
         // own timezone (what the plugin reads in-process), fetched once per run. A settings
         // read that fails degrades to the host's date rather than refusing the match.
@@ -3575,8 +3578,13 @@ pub async fn run(
     };
 
     let settings_for_plan = settings.clone();
-    let scope_for_plan = scope.clone();
-    let world_for_plan = world.clone();
+    let scope_for_plan = resolved.tables.clone();
+    // The blocking pass plans against the step's universe: a filtered world for an id
+    // bound (with an empty scope table), the loaded world otherwise.
+    let world_for_plan: Arc<World> = match &resolved.limit {
+        Some(limit) => Arc::new(world.retaining_channels(limit)),
+        None => Arc::clone(&world),
+    };
     let options_for_plan = options.clone();
     let throughput_for_plan = Arc::clone(&throughput);
     context.progress(&crosstalk_core::jobs::ProgressEvent::new(
@@ -3609,8 +3617,9 @@ pub async fn run(
 
     // The `[ai.verify]` gate for borderline groups (step 9, task "streams"): a no-op
     // unless the gate can fire and the cut left a group empty. Only a model accept
-    // attaches streams, so this runs before the nothing-matched check below.
-    let scoped_for_gate = scope_channels(&world, &scope)?;
+    // attaches streams, so this runs before the nothing-matched check below. The gate
+    // reads the step's channels, like the plan did.
+    let scoped_for_gate = context.scoped_channels(&world)?;
     let ai = ai_gate::service(context.config());
     apply_ai_gate(
         &mut outcome,
@@ -3708,7 +3717,9 @@ pub async fn run(
             field: Field::Streams,
             values,
         }];
-        channel_ops::plan(&world, &Selection::in_scope(&scope), &operations)?
+        // The write plan starts from the run's channel universe, so a step override
+        // bounds the write like `[scope]` bounds an ordinary run.
+        channel_ops::plan(&world, &context.base_selection(&world)?, &operations)?
     };
 
     let applied = if dry_run || op_plan.changes.is_empty() {

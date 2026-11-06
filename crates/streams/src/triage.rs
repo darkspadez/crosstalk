@@ -883,7 +883,6 @@ pub async fn run(
         "streams.triage_{}",
         if dry_run { "preview" } else { "apply" }
     );
-    let scope = context.config().scope.clone();
 
     // 1. The result set, before anything else: a mistyped action with no probe run costs no
     //    request, exactly as the plugin refuses without a results file (3505-3507).
@@ -891,9 +890,10 @@ pub async fn run(
     probe::announce(context, &action_id, &probe);
 
     // 2. Channels (names, groups) and the groups slice: the plan re-reads every channel it
-    //    writes, so a probe from any age is safe. Profiles only when the scope names them.
+    //    writes, so a probe from any age is safe. Profiles when the scope names them, or
+    //    when a step override is present (a named scope resolving to a table may name them).
     let mut kinds = WorldKinds::only(WorldKind::Channels) | WorldKind::Groups;
-    if !scope.profiles.trim().is_empty() {
+    if context.may_need_profiles() {
         kinds = kinds | WorldKind::Profiles;
     }
     if formats_name_epg(settings) {
@@ -907,9 +907,10 @@ pub async fn run(
     ));
     let world = client.load_world_with(kinds).await?;
 
-    // The scope is resolved once, up front: a scope that names both a group filter and an
-    // ignore filter is refused here rather than after a destination group has been created.
-    let scoped = crosstalk_core::scope::scope_channels(&world, &scope)?;
+    // The channel universe is resolved once, up front: a scope that names both a group
+    // filter and an ignore filter is refused here rather than after a destination group
+    // has been created. A step override replaces `[scope]` (see `JobContext::scoped_channels`).
+    let scoped = context.scoped_channels(&world)?;
     let mut outcome = plan(&world, settings, &probe.verdicts)?;
     // A probe from before a `[scope]` change may judge channels this run may not touch.
     let in_scope: HashSet<i64> = scoped.channels.iter().map(|channel| channel.id).collect();
@@ -963,9 +964,17 @@ pub async fn run(
         });
     }
 
+    // The selection is the judged channels, held to the run's channel universe: a probe
+    // from before a `[scope]` change may judge channels this run may not touch, and a step
+    // override bounds them further to exactly its ids.
+    let base = context.base_selection(&world)?;
+    let mut target = outcome.target_ids();
+    if let Some(limit) = base.channel_ids.as_deref() {
+        target.retain(|id| limit.contains(id));
+    }
     let selection = Selection {
-        channel_ids: Some(outcome.target_ids()),
-        ..Selection::in_scope(&scope)
+        channel_ids: Some(target),
+        ..base
     };
     let mut op_plan = channel_ops::plan(&plan_world, &selection, &operations)?;
 

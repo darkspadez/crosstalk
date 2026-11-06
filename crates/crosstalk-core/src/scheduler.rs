@@ -611,17 +611,14 @@ mod tests {
         config.workflows.insert(
             "nightly".to_string(),
             crate::config::WorkflowConfig {
-                steps: vec!["streams.probe".to_string()],
+                steps: vec!["streams.probe".into()],
                 fresh: false,
             },
         );
         config.workflows.insert(
             "fixing".to_string(),
             crate::config::WorkflowConfig {
-                steps: vec![
-                    "streams.probe".to_string(),
-                    "streams.sort_apply".to_string(),
-                ],
+                steps: vec!["streams.probe".into(), "streams.sort_apply".into()],
                 fresh: false,
             },
         );

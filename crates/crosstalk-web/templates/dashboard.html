@@ -73,7 +73,7 @@
       {% for workflow in workflows %}
       <tr>
         <td><code>workflow.{{ workflow.name }}</code>{% if workflow.fresh %} <span class="tag read">fresh</span>{% endif %}</td>
-        <td>{% if workflow.steps.is_empty() %}<span class="muted">no steps</span>{% else %}{{ workflow.steps }}{% endif %}</td>
+        <td>{% if workflow.step_details.is_empty() %}<span class="muted">no steps</span>{% else %}{% for step in workflow.step_details %}<code>{{ step.action }}</code>{% if let Some(scope) = step.scope %} <span class="muted">[{{ scope }}]</span>{% endif %}{% if step.continue_on_failure %} <span class="tag read">continue on failure</span>{% endif %}{% if !loop.last %} → {% endif %}{% endfor %}{% endif %}</td>
         <td class="muted">{% if let Some(last) = workflow.last_run %}{{ last }}{% else %}never run{% endif %}</td>
         <td>
           {% if let Some(error) = workflow.error %}
@@ -82,7 +82,7 @@
           <span class="muted">a workflow is running</span>
           {% else %}
           <form method="post" action="/workflows/{{ workflow.name }}/run" class="inline"
-                data-confirm="Run {{ workflow.name }} now? It runs {{ workflow.step_count }} step{% if workflow.step_count != 1 %}s{% endif %} in order and stops at the first that fails.">
+                data-confirm="Run {{ workflow.name }} now? It runs {{ workflow.step_count }} step{% if workflow.step_count != 1 %}s{% endif %} in order and stops at the first failure a step does not carry past.">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <input type="hidden" name="confirm" value="true">
             <button type="submit" class="{% if workflow.dry_run %}ghost{% endif %}">Run</button>
@@ -96,7 +96,10 @@
   <p class="muted">
     Steps run in order through the same runner a manual run uses, so each one gets its own run
     page, report and status. A step that pauses at its window's end pauses the workflow; the next
-    firing resumes that step. One workflow runs at a time.
+    firing resumes that step. A step may carry its own scope (`scope = "lineup"` or
+    `scope = { groups = "..." }`) instead of the host `[scope]`, and
+    `continue_on_failure` to carry on past its failure; the workflow itself is failed
+    when any step failed. One workflow runs at a time.
   </p>
   {% endif %}
 </section>

@@ -229,6 +229,33 @@ fn an_unattached_stream_is_probed_only_when_the_setting_asks() {
 }
 
 #[test]
+fn a_step_bound_keeps_the_orphan_rule_on_the_whole_world() {
+    // A workflow step bound to channel 2 probes channel 2's stream and the real orphan;
+    // channel 1's own streams are attached (to a channel outside the bound), not orphans.
+    let world = probe_world();
+    let on = StreamsSettings {
+        probe_unattached_streams: true,
+        ..settings()
+    };
+    let limit: std::collections::HashSet<i64> = [PROBE_CHANNEL_TWO].into_iter().collect();
+    let selection = select_within(
+        &world,
+        &ScopeConfig::default(),
+        Some(&limit),
+        &on,
+        &HashMap::new(),
+        Utc::now(),
+    )
+    .expect("selection");
+    assert_eq!(selection.channels.len(), 1);
+    assert_eq!(selection.channels[0].channel_id, PROBE_CHANNEL_TWO);
+    assert_eq!(selection.unattached, 1);
+    let mut ids = selection.stream_ids();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![PROBE_FEED_THREE, PROBE_FEED_ORPHAN]);
+}
+
+#[test]
 fn a_fresh_stream_is_skipped_and_a_stale_one_is_due() {
     let world = probe_world();
     let now = Utc::now();

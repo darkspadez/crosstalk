@@ -567,7 +567,8 @@ fresh = false
 Each step is an ordinary run: its own app's one-run-per-app slot, its own run page, its own
 CSV, its own checkpoint. The workflow itself is one more run record (app `workflow`, action =
 the name) and every step run points at it, so the workflow's run page lists the steps it ran.
-Steps run one at a time and the sequence **stops at the first step that fails or is cancelled**.
+Steps run one at a time and the sequence **stops at the first step that fails or is cancelled**
+(unless the failed step sets `continue_on_failure`, see below).
 A workflow holds no app between steps: if a hook or a schedule started a run of the next step's
 app in the gap, the step waits for it (at most 30 minutes, never past the window) instead of
 failing.
@@ -578,6 +579,46 @@ inside a four-hour window never runs past it. One workflow runs at a time.
 
 Run one by hand with `crosstalk run workflow nightly` (or `crosstalk run workflow.nightly`),
 from the dashboard's **Workflows** card, or from a hook.
+
+### Step tables: a scope per step, and carrying on past a failure
+
+A step is a bare `"<app>.<action>"` string or a table with `action`, `scope` and
+`continue_on_failure`. TOML does not allow a line break inside an inline `{ ... }` table, so
+keep each one on one line, or write the steps as an array of tables:
+
+```toml
+[workflows.full_sync]
+steps = [
+  "lineup.sync_apply",
+  { action = "streams.match_apply", scope = "lineup" },
+  { action = "guide.match_apply", scope = { groups = "DIRECTV: *" }, continue_on_failure = true },
+]
+
+# The same steps as an array of tables (every step is then a table):
+# [[workflows.full_sync.steps]]
+# action = "lineup.sync_apply"
+#
+# [[workflows.full_sync.steps]]
+# action = "guide.match_apply"
+# scope = { groups = "DIRECTV: *" }
+# continue_on_failure = true
+```
+
+- `scope = { profiles = ..., groups = ..., ignore_groups = ... }` **replaces** `[scope]` for that
+  step. It is not intersected with it.
+- `scope = "<name>"` is a *named* scope that an app provides. `lineup` (once the lineup app is
+  built in) means the channels lineup created for its configured lineup. It also **replaces**
+  `[scope]`: the step reads exactly those channels, even ones `[scope]` excludes. A named scope
+  that no app in the build provides is refused when the workflow starts, and
+  `crosstalk validate` reports it too. Actions whose subject is one profile
+  (`streams.visibility_*`, `guide.clear_hidden_*`) still write the profile named in
+  `[scope] profiles` when a named scope picks the channels.
+- A step's scope only ever comes from this file. No hook, schedule or web request can pass a
+  run a different scope, so a scope wider than `[scope]` exists only where you wrote one.
+- `continue_on_failure = true` lets the workflow carry on when that step fails. A paused or
+  cancelled step still stops the workflow, and so does a step that could not start at all.
+  A workflow that carried on past a failure is recorded **failed**, and its summary lists each
+  step's outcome. Leave the flag off a step that later steps depend on, like `lineup.sync_apply`.
 
 ## Dispatcharr events
 

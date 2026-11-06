@@ -487,8 +487,8 @@ fn run_workflow_once(args: RunArgs, name: &str) -> Result<()> {
     let writes = !crosstalk_core::workflow::scheduled_dry_run(&registry, &config, name);
     if writes && !args.yes && !args.dry_run {
         println!("workflow {name}: {} step(s)", workflow.steps.len());
-        for step in workflow.labels() {
-            println!("  {step}");
+        for step in &workflow.steps {
+            println!("  {}", step.describe());
         }
         anyhow::bail!(
             "refusing to run workflow {name:?} without --yes: it changes data. Add --yes to \
@@ -928,20 +928,29 @@ fn validate(args: ConfigArgs) -> Result<()> {
         println!("error: hooks.{event} target {target:?} does not name a known action or workflow");
         failed = true;
     }
+    for (workflow, scope) in registry.unknown_workflow_scopes(&config) {
+        println!("error: workflow {workflow:?} scope {scope:?} names no scope this build provides");
+        failed = true;
+    }
     for workflow in crosstalk_core::workflow::describe(&config) {
         match (&workflow.error, workflow.steps.is_empty()) {
             (_, true) => println!("workflow {}: no steps", workflow.name),
             (Some(error), _) => println!("workflow {}: {error}", workflow.name),
-            (None, _) => println!(
-                "workflow {}: {} step(s){}",
-                workflow.name,
-                workflow.steps.len(),
-                if workflow.fresh {
-                    ", each new pass starts from the beginning"
-                } else {
-                    ""
+            (None, _) => {
+                println!(
+                    "workflow {}: {} step(s){}",
+                    workflow.name,
+                    workflow.steps.len(),
+                    if workflow.fresh {
+                        ", each new pass starts from the beginning"
+                    } else {
+                        ""
+                    }
+                );
+                for detail in &workflow.details {
+                    println!("  {}", detail.describe());
                 }
-            ),
+            }
         }
     }
     for (event, targets) in crosstalk_core::hooks::describe(&config.hooks) {

@@ -799,9 +799,30 @@ pub fn select(
     health: &HashMap<i64, StreamHealth>,
     now: DateTime<Utc>,
 ) -> Result<Selection> {
+    select_within(world, scope, None, settings, health, now)
+}
+
+/// [`select`], with the channels bounded to `limit` (a workflow step's named scope).
+///
+/// The bound applies to the scoped channels only; the orphan rule still reads the WHOLE
+/// world, so a stream attached to a channel outside the bound is not mistaken for an
+/// unattached one (filtering the world first would make it look orphaned).
+pub fn select_within(
+    world: &World,
+    scope: &ScopeConfig,
+    limit: Option<&std::collections::HashSet<i64>>,
+    settings: &StreamsSettings,
+    health: &HashMap<i64, StreamHealth>,
+    now: DateTime<Utc>,
+) -> Result<Selection> {
     world.require(WorldKind::Channels)?;
     world.require(WorldKind::Streams)?;
     let mut scoped = crosstalk_core::scope::scope_channels(world, scope)?;
+    if let Some(limit) = limit {
+        scoped
+            .channels
+            .retain(|channel| limit.contains(&channel.id));
+    }
 
     // 2843: `only_visible_channels` keeps the channels enabled in at least one profile.
     if settings.only_visible_channels {
@@ -1609,7 +1630,6 @@ pub async fn run_with(
     engines: ProbeEngines,
 ) -> Result<JobOutcome> {
     let client = context.dispatcharr()?;
-    let scope = context.config().scope.clone();
     let config = ProbeConfig::from_settings(settings);
 
     context.progress(&ProgressEvent::new(
@@ -1634,13 +1654,38 @@ pub async fn run_with(
         None => HashMap::new(),
     };
     let now = Utc::now();
-    let mut selection = select(&world, &scope, settings, &health, now)?;
+    // The step's channel universe: a table override replaces `[scope]`; a named scope
+    // resolving to ids replaces it with exactly those channels (planned against an empty
+    // table, bounded to the ids; the orphan rule still reads the whole world).
+    let resolved = context.resolve_scope(&world)?;
+    let mut selection = select_within(
+        &world,
+        &resolved.tables,
+        resolved.limit.as_ref(),
+        settings,
+        &health,
+        now,
+    )?;
     if selection.channels.is_empty() {
         return Ok(JobOutcome::new(
             "No channels are in scope. Check the group and profile settings in crosstalk.toml.",
         ));
     }
-    let fingerprint = probe_fingerprint(settings, &scope);
+    // The checkpoint key covers the settings AND the channel universe: a step override
+    // narrowing the scope must not resume a backlog planned for every channel.
+    let mut fingerprint = probe_fingerprint(settings, &resolved.tables);
+    if let Some(limit) = &resolved.limit {
+        use std::hash::{Hash, Hasher};
+        let mut sorted: Vec<i64> = limit.iter().copied().collect();
+        sorted.sort_unstable();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        sorted.hash(&mut hasher);
+        fingerprint = format!(
+            "{fingerprint}|step-scope:{}:{:x}",
+            resolved.label,
+            hasher.finish()
+        );
+    }
     selection.queue = resume(
         selection.queue,
         context.load_checkpoint().as_ref(),

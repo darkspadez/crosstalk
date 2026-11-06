@@ -314,7 +314,7 @@ async fn a_hook_can_trigger_a_workflow() {
     config.workflows.insert(
         "nightly".to_string(),
         WorkflowConfig {
-            steps: vec!["poke.fast".to_string()],
+            steps: vec!["poke.fast".into()],
             fresh: false,
         },
     );

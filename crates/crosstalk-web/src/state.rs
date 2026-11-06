@@ -142,6 +142,8 @@ pub struct UiWorkflow {
     pub name: String,
     /// The steps, ` → `-joined.
     pub steps: String,
+    /// Each step with its scope override and failure policy, for the steps table.
+    pub step_details: Vec<UiStep>,
     /// How many steps the entry has, for the Run button's confirmation text.
     pub step_count: usize,
     /// Whether a new pass discards each step's saved progress.
@@ -154,6 +156,17 @@ pub struct UiWorkflow {
     pub busy: bool,
     /// Whether a run of it would change nothing, which decides whether the form confirms.
     pub dry_run: bool,
+}
+
+/// One workflow step, as the dashboard's steps table and a run page's planned steps list it.
+#[derive(Debug, Clone)]
+pub struct UiStep {
+    /// The `<app>.<action>` the step runs.
+    pub action: String,
+    /// How the step's scope override reads (`scope "lineup"`, `scope groups ...`), if any.
+    pub scope: Option<String>,
+    /// Whether the workflow continues past this step's failure.
+    pub continue_on_failure: bool,
 }
 
 /// The `[hooks]` table, as the dashboard shows it (read-only).
@@ -186,6 +199,15 @@ pub fn workflows(runner: &JobRunner, config: &CrosstalkConfig, store: &Store) ->
             UiWorkflow {
                 name: info.name.clone(),
                 steps: info.steps.join(" → "),
+                step_details: info
+                    .details
+                    .iter()
+                    .map(|detail| UiStep {
+                        action: detail.action.clone(),
+                        scope: detail.scope.clone(),
+                        continue_on_failure: detail.continue_on_failure,
+                    })
+                    .collect(),
                 step_count: info.steps.len(),
                 fresh: info.fresh,
                 error: info.error,
@@ -245,6 +267,34 @@ pub fn steps_of(store: &Store, run: &RunRecord) -> Vec<RunRecord> {
         return Vec::new();
     }
     store.child_runs(run.id).unwrap_or_default()
+}
+
+/// A workflow run's PLANNED steps: each step with its scope override and failure policy.
+///
+/// The executed steps (see [`steps_of`]) carry each step's outcome; these carry the plan —
+/// which step reads which channels and which failures the workflow carries past — so the
+/// run page shows both. Empty for an ordinary run, or when the configuration no longer
+/// names the workflow.
+pub fn planned_steps(config: &CrosstalkConfig, run: &RunRecord) -> Vec<UiStep> {
+    if run.app != crosstalk_core::workflow::APP_ID {
+        return Vec::new();
+    }
+    config
+        .workflows
+        .get(&run.action)
+        .and_then(|entry| crosstalk_core::workflow::Workflow::from_entry(&run.action, entry).ok())
+        .map(|workflow| {
+            workflow
+                .steps
+                .iter()
+                .map(|step| UiStep {
+                    action: step.label(),
+                    scope: step.scope.as_ref().map(|scope| scope.describe()),
+                    continue_on_failure: step.continue_on_failure,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The workflow run a step belongs to, when it belongs to one.

@@ -23,7 +23,7 @@
 //!     (so two workflows never interleave), it is cancellable by its run id like any action, and
 //!     its steps are ordinary runs of their own apps that point back at it.
 
-use crate::config::{CrosstalkConfig, SharedConfig};
+use crate::config::{CrosstalkConfig, SharedConfig, WorkflowStepScope};
 use crate::jobs::{JobContext, ProgressEvent, ProgressSink};
 use crate::store::{RunStatus, Store};
 use crate::subapp::{ActionKind, JobOutcome, OutcomeStatus, Registry};
@@ -59,6 +59,10 @@ pub struct RunOptions {
     /// Recorded on the run row (`parent_run_id`) so the workflow's run page can list its steps.
     /// Nothing else reads it: a step is an ordinary run in every other respect.
     pub parent_run: Option<i64>,
+    /// A workflow step's scope override, replacing the host `[scope]` for this run.
+    ///
+    /// Set by the workflow executor from the step; every other caller leaves it unset.
+    pub scope_override: Option<WorkflowStepScope>,
 }
 
 impl RunOptions {
@@ -77,6 +81,12 @@ impl RunOptions {
     /// Record this run as a step of the given workflow run.
     pub fn with_parent(mut self, parent_run_id: i64) -> Self {
         self.parent_run = Some(parent_run_id);
+        self
+    }
+
+    /// Replace the host `[scope]` for this run with a workflow step's scope override.
+    pub fn with_scope_override(mut self, scope: Option<WorkflowStepScope>) -> Self {
+        self.scope_override = scope;
         self
     }
 }
@@ -852,6 +862,8 @@ impl JobRunner {
             .for_run(app_id, action_id, run_id, self.store.clone(), cancel_flag)
             .with_deadline(options.deadline)
             .with_live_runs(Arc::clone(&self.active))
+            .with_scope_override(options.scope_override.clone())
+            .with_registry(self.registry.as_ref().clone())
     }
 
     /// Delete run history older than the configured retention.

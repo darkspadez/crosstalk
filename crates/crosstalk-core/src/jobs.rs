@@ -37,7 +37,7 @@
 //! that a step which PAUSED pauses the workflow too, so the next firing continues at that step
 //! instead of re-running the ones before it.
 
-use crate::config::CrosstalkConfig;
+use crate::config::{CrosstalkConfig, WorkflowStepScope};
 use crate::runner::ActiveRun;
 use crate::store::{AiDecision, RunRow, Store};
 use anyhow::Result;
@@ -54,6 +54,21 @@ use std::time::Duration;
 /// it: `status` used to be refused while another run of its app was live, which is exactly when
 /// an operator asks what is going on.
 type LiveRuns = Arc<Mutex<HashMap<i64, ActiveRun>>>;
+
+/// One run's scope as planning input, resolved against the loaded world (see
+/// [`JobContext::scoped_channels`]).
+#[derive(Debug, Clone)]
+pub struct ResolvedScope {
+    /// The table planners read: the step's inline override, a named scope's table, or the
+    /// host `[scope]`. Empty when `limit` is set (plan over everything, then bound).
+    pub tables: crate::config::ScopeConfig,
+    /// An explicit channel-id bound, set only for a named scope resolving to ids. A named
+    /// scope REPLACES the host scope: the step reads exactly these channels.
+    pub limit: Option<std::collections::HashSet<i64>>,
+    /// How a channel-set scope reads in the filter description (`in scope "lineup"`).
+    /// Empty when no id bound applies.
+    pub label: String,
+}
 
 /// One progress update, as the UI and the run record show it.
 #[derive(Debug, Clone, PartialEq)]
@@ -162,6 +177,13 @@ pub struct JobContext {
     deadline: Option<DateTime<Utc>>,
     /// The runs in flight, when the runner built this context.
     live: Option<LiveRuns>,
+    /// A workflow step's scope override, when this run is such a step. `None` means the
+    /// step runs under the host `[scope]`; anything else REPLACES it for this run (see
+    /// [`JobContext::scoped_channels`]).
+    scope_override: Option<WorkflowStepScope>,
+    /// The apps, for resolving a named scope override. `None` outside the runner (a bare
+    /// test context has no registry, so a named override there is refused when resolved).
+    registry: Option<crate::subapp::Registry>,
 }
 
 impl std::fmt::Debug for JobContext {
@@ -185,6 +207,8 @@ impl JobContext {
             action: None,
             deadline: None,
             live: None,
+            scope_override: None,
+            registry: None,
         }
     }
 
@@ -246,6 +270,161 @@ impl JobContext {
     pub fn with_live_runs(mut self, live: LiveRuns) -> Self {
         self.live = Some(live);
         self
+    }
+
+    /// Carry a workflow step's scope override: the step reads its channels from there
+    /// instead of the host `[scope]`. The runner sets this from the step; anything else
+    /// leaves it unset, which means the host `[scope]`.
+    pub fn with_scope_override(mut self, scope: Option<WorkflowStepScope>) -> Self {
+        self.scope_override = scope;
+        self
+    }
+
+    /// Hand the context the apps, so a named scope override can be resolved at run time.
+    /// The runner sets this; a bare test context has none.
+    pub fn with_registry(mut self, registry: crate::subapp::Registry) -> Self {
+        self.registry = Some(registry);
+        self
+    }
+
+    /// This run's scope override, when it is a workflow step carrying one.
+    pub fn scope_override(&self) -> Option<&WorkflowStepScope> {
+        self.scope_override.as_ref()
+    }
+
+    /// Whether the Profiles slice may be needed: the host or table scope names profiles,
+    /// or any step override is present. A named scope resolving to a table may name them,
+    /// and loading the slice when it does not is harmless; used for the conditional slice
+    /// loads before the world is there to resolve against.
+    pub fn may_need_profiles(&self) -> bool {
+        !self.plan_scope().profiles.trim().is_empty() || self.scope_override().is_some()
+    }
+
+    /// The table scope this run plans against: the step's inline table override, or the
+    /// host `[scope]` when the step carries no table.
+    ///
+    /// A named override that resolves to a table is NOT reflected here — resolving one
+    /// needs the world, which this does not take. Pass this to pure planners only alongside
+    /// [`JobContext::scope_channel_limit`]; prefer [`JobContext::scoped_channels`] and
+    /// [`JobContext::base_selection`], which resolve every shape.
+    pub fn plan_scope(&self) -> &crate::config::ScopeConfig {
+        match &self.scope_override {
+            Some(WorkflowStepScope::Table(scope)) => scope,
+            Some(WorkflowStepScope::Named(_)) | None => &self.config.scope,
+        }
+    }
+
+    /// Resolve this run's scope against the loaded world: the ONE place a run's channel
+    /// universe is decided.
+    ///
+    /// No override (or no world-independent part of one) means the host `[scope]`, resolved
+    /// exactly as before. A table override replaces `[scope]` for this run. A named scope
+    /// resolves through the registry: an explicit channel-id set REPLACES the host scope
+    /// (the step reads exactly those channels), as does a resolved table. Every action that
+    /// used to call `scope_channels(world, &context.config().scope)` calls this instead, so
+    /// guide match/heal/scan/cleanup, streams match/sort/mirror/visibility/probe/triage/
+    /// restore and every `Selection::in_scope` built from the host scope all honour a step's
+    /// override with no second code path.
+    pub fn scoped_channels(
+        &self,
+        world: &crate::dispatcharr::World,
+    ) -> Result<crate::scope::ScopedChannels> {
+        let resolved = self.resolve_scope(world)?;
+        let mut scoped = crate::scope::scope_channels(world, &resolved.tables)?;
+        if let Some(limit) = &resolved.limit {
+            scoped
+                .channels
+                .retain(|channel| limit.contains(&channel.id));
+            scoped.filter_description = format!(
+                "{}{}",
+                resolved.label,
+                if scoped.channels.len() == 1 {
+                    " (1 channel)".to_string()
+                } else {
+                    format!(" ({} channels)", scoped.channels.len())
+                }
+            );
+        }
+        Ok(scoped)
+    }
+
+    /// The selection a channel-ops plan starts from: the host `[scope]` (or the step's
+    /// table override) as [`Selection::in_scope`](crate::channel_ops::Selection::in_scope),
+    /// or — for a named scope resolving to channel ids — exactly those ids. Callers compose
+    /// their own filters (scan rows, hidden profiles, regexes) onto this base, so a step's
+    /// override bounds every write the same way `[scope]` bounds an ordinary run.
+    pub fn base_selection(
+        &self,
+        world: &crate::dispatcharr::World,
+    ) -> Result<crate::channel_ops::Selection> {
+        let resolved = self.resolve_scope(world)?;
+        let mut base = crate::channel_ops::Selection::in_scope(&resolved.tables);
+        if let Some(limit) = resolved.limit {
+            let mut ids: Vec<i64> = limit.into_iter().collect();
+            ids.sort_unstable();
+            base.channel_ids = Some(ids);
+        }
+        Ok(base)
+    }
+
+    /// The explicit channel ids bounding this run, when the step's override resolves to
+    /// one. `None` means "no id bound": the run plans against `plan_scope` alone
+    /// (host `[scope]` or the step's table).
+    pub fn scope_channel_limit(
+        &self,
+        world: &crate::dispatcharr::World,
+    ) -> Result<Option<std::collections::HashSet<i64>>> {
+        Ok(self.resolve_scope(world)?.limit)
+    }
+
+    /// This run's scope as planning input, resolved against the loaded world.
+    ///
+    /// The table is the step's inline override, a named scope's table, or the host `[scope]`;
+    /// the id bound is `Some` only for a named scope resolving to channel ids, in which case
+    /// the table is empty (plan over everything) and the bound — the named scope — REPLACES
+    /// the host scope.
+    pub fn resolve_scope(&self, world: &crate::dispatcharr::World) -> Result<ResolvedScope> {
+        match &self.scope_override {
+            None => Ok(ResolvedScope {
+                tables: self.config.scope.clone(),
+                limit: None,
+                label: String::new(),
+            }),
+            Some(WorkflowStepScope::Table(scope)) => Ok(ResolvedScope {
+                tables: scope.clone(),
+                limit: None,
+                label: String::new(),
+            }),
+            Some(WorkflowStepScope::Named(name)) => {
+                let registry = self.registry.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "workflow scope {name:?} cannot be resolved outside the runner: a bare \
+                         context carries no app registry"
+                    )
+                })?;
+                let store = self.store.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "workflow scope {name:?} cannot be resolved outside a recorded run: it \
+                         needs the run store"
+                    )
+                })?;
+                match registry.resolve_named_scope(name, world, store)? {
+                    crate::subapp::NamedScopeResolution::Scope(scope) => Ok(ResolvedScope {
+                        tables: scope,
+                        limit: None,
+                        label: format!("in scope {name:?}"),
+                    }),
+                    crate::subapp::NamedScopeResolution::Channels(ids) => {
+                        let limit: std::collections::HashSet<i64> = ids.into_iter().collect();
+                        Ok(ResolvedScope {
+                            tables: crate::config::ScopeConfig::default(),
+                            limit: Some(limit),
+                            label: format!("in scope {name:?}"),
+                        })
+                    }
+                }
+            }
+        }
     }
 
     /// The runs in flight for one app, oldest first. Empty outside the runner.

@@ -1547,14 +1547,14 @@ fn with_hooks(config: &mut CrosstalkConfig) {
     config.workflows.insert(
         "nightly".to_string(),
         crosstalk_core::config::WorkflowConfig {
-            steps: vec!["echo.peek".to_string()],
+            steps: vec!["echo.peek".into()],
             fresh: false,
         },
     );
     config.workflows.insert(
         "writing".to_string(),
         crosstalk_core::config::WorkflowConfig {
-            steps: vec!["echo.poke".to_string()],
+            steps: vec!["echo.poke".into()],
             fresh: false,
         },
     );
@@ -1783,6 +1783,45 @@ async fn the_dashboard_lists_workflows_and_hooks_and_runs_one() {
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("Steps"), "{body}");
     assert!(body.contains("echo.peek"), "{body}");
+}
+
+#[tokio::test]
+async fn the_dashboard_shows_a_steps_scope_override_and_failure_policy() {
+    // A step carrying a scope override and `continue_on_failure` says so in the
+    // dashboard's steps table, so the operator sees what a run would touch before Run.
+    fn with_scoped(config: &mut CrosstalkConfig) {
+        use crosstalk_core::config::{
+            WorkflowConfig, WorkflowStepDetail, WorkflowStepEntry, WorkflowStepScope,
+        };
+        config.workflows.insert(
+            "scoped".to_string(),
+            WorkflowConfig {
+                steps: vec![
+                    "echo.peek".into(),
+                    WorkflowStepEntry::Detailed(WorkflowStepDetail {
+                        action: "echo.poke".to_string(),
+                        scope: Some(WorkflowStepScope::Named("lineup".to_string())),
+                        continue_on_failure: true,
+                    }),
+                ],
+                fresh: false,
+            },
+        );
+    }
+    let (state, _store, _dir) = state_with(None, with_scoped);
+    let (status, body) = get(&state, "/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("workflow.scoped"), "{body}");
+    assert!(body.contains("echo.peek"), "{body}");
+    assert!(body.contains("echo.poke"), "{body}");
+    assert!(
+        body.contains("scope &quot;lineup&quot;"),
+        "the named scope is shown: {body}"
+    );
+    assert!(
+        body.contains("continue on failure"),
+        "the failure policy is shown: {body}"
+    );
 }
 
 #[tokio::test]
