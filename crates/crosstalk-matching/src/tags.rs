@@ -44,6 +44,7 @@
 //! bracketed, and a region word after `Middle`/`Far`/`Wild` (a place name). Leading markers (`US: ESPN`)
 //! are NOT tags: they are the country detector's business and stay in the core.
 
+use std::borrow::Cow;
 use std::sync::OnceLock;
 
 /// What a token IS, for a writer deciding what to strip, keep or append.
@@ -305,6 +306,83 @@ pub fn is_bracket_junk_inner(inner: &str) -> bool {
         }
     }
     any_word
+}
+
+/// The core's delimited country-prefix codes (`CORE_PROVIDER_PREFIX_PATTERNS` rows
+/// 1 and 6 in `normalize.rs`): the codes [`collapse_pipe_segments`] keeps a
+/// delimiter beside, compared ASCII-case-insensitively like the core's tables.
+const PIPE_COUNTRY_CODES: [&str; 13] = [
+    "US", "USA", "UK", "CA", "AU", "FR", "DE", "ES", "IT", "NL", "BR", "MX", "IN",
+];
+
+fn is_pipe_country_code(token: &str) -> bool {
+    token.is_ascii() && PIPE_COUNTRY_CODES.contains(&token.to_ascii_uppercase().as_str())
+}
+
+/// Collapse `|`-separated segments for the engine's key/zone/country reads
+/// (decided N15, step-14 review).
+///
+/// Providers delimit packaging junk with pipes (`Cinemax East | HD |`,
+/// `UK | Sky Sports | HD`): before keying and before the zone/country reads the
+/// engine treats `|` as a segment separator, drops segments that are empty or pure
+/// junk per [`is_pipe_junk_segment`] (the ONE shared definition — Name Cleaner's
+/// exact set, step 14), and joins the survivors with a single space. A name with a
+/// meaningful pipe segment keeps it (`Sky Sports | Premier League` -> `Sky Sports
+/// Premier League`). Without a `|` the name borrows unchanged; when every segment
+/// drops (a name that is only junk and pipes) the collapse is empty.
+///
+/// A country code keeps a delimiter the core's tables already strip, so the pipe
+/// never strands a bare country word: a segment ending in a code joins with `: `
+/// (`UK | Sky Sports | HD` -> `UK: Sky Sports`, read and stripped like `UK: Sky
+/// Sports`; `RK: US | CNN` -> `RK: US: CNN`, whose `US:` the geographic table takes
+/// after the `RK:` prefix goes), and a final code-only segment keeps its bar
+/// (`BBC One | UK` stays, the core's trailing `| UK` strip). A lone code is no
+/// marker: `USA | HD |` (USA Network) collapses to `USA`, country-less like the
+/// cleaned name.
+///
+/// `+N` shifts are timeshift, never pipe junk, so they survive (`ESPN West +1 |
+/// HD |` -> `ESPN West +1`). The zone strip ([`strip_zone_ignorable`]) runs after
+/// this, on the collapsed form.
+///
+/// Byte parity with `scripts/corpus/ablate.py::collapse_pipe_segments` (which reads
+/// the same `data/merged/tags.json` vocabulary) is pinned by `engine_parity.py`
+/// (`pipe` kind: every corpus name bare and pipe-decorated) plus the battery in
+/// `ablate.py --self-test`. `str::trim`/`split_whitespace` are Unicode White_Space,
+/// which is exactly the `_RUST_WS` set the Python mirror uses (Python's
+/// `str.isspace` also counts U+001C..U+001F).
+pub fn collapse_pipe_segments(name: &str) -> Cow<'_, str> {
+    if !name.contains('|') {
+        return Cow::Borrowed(name);
+    }
+    let mut kept: Vec<&str> = Vec::new();
+    for part in name.split('|') {
+        let piece = part.trim();
+        if piece.is_empty() {
+            continue;
+        }
+        if is_pipe_junk_segment(piece) {
+            continue;
+        }
+        kept.push(piece);
+    }
+    let mut out = String::with_capacity(name.len());
+    for (index, piece) in kept.iter().enumerate() {
+        if index > 0 {
+            let previous_ends_in_code = kept[index - 1]
+                .split_whitespace()
+                .next_back()
+                .is_some_and(is_pipe_country_code);
+            if previous_ends_in_code {
+                out.push_str(": ");
+            } else if index == kept.len() - 1 && is_pipe_country_code(piece) {
+                out.push_str(" | ");
+            } else {
+                out.push(' ');
+            }
+        }
+        out.push_str(piece);
+    }
+    Cow::Owned(out)
 }
 
 /// Whether the token is a resolution (`1080p`, `720P`, `4K`-style bare is in
@@ -942,6 +1020,42 @@ mod tests {
         ] {
             assert!(!is_bracket_junk_inner(inner), "{inner}");
         }
+    }
+
+    #[test]
+    fn pipe_collapse_keeps_prose_drops_junk() {
+        // Decided N15 (step-14 review): `|` is a segment separator before the
+        // engine's key/zone/country reads; pure-junk segments drop (the one
+        // shared `is_pipe_junk_segment` definition), the rest join with a space.
+        assert_eq!(
+            collapse_pipe_segments("Cinemax East | HD |"),
+            "Cinemax East"
+        );
+        // A country code keeps a delimiter the core's tables strip.
+        assert_eq!(
+            collapse_pipe_segments("UK | Sky Sports | HD"),
+            "UK: Sky Sports"
+        );
+        assert_eq!(collapse_pipe_segments("HD | UK | Sky One"), "UK: Sky One");
+        assert_eq!(collapse_pipe_segments("RK: US | CNN"), "RK: US: CNN");
+        assert_eq!(collapse_pipe_segments("BBC One | UK | HD"), "BBC One | UK");
+        assert_eq!(collapse_pipe_segments("us | cnn"), "us: cnn");
+        assert_eq!(collapse_pipe_segments("USA | HD |"), "USA");
+        // A meaningful pipe segment survives the join.
+        assert_eq!(
+            collapse_pipe_segments("Sky Sports | Premier League"),
+            "Sky Sports Premier League"
+        );
+        // Shifts are timeshift, never pipe junk.
+        assert_eq!(
+            collapse_pipe_segments("ESPN West +1 | HD |"),
+            "ESPN West +1"
+        );
+        // No pipe: borrowed unchanged. All-junk collapses to empty.
+        assert_eq!(collapse_pipe_segments("ESPN"), "ESPN");
+        // Bracket-wrapped junk is junk too (`[HD]` classifies through its
+        // brackets), so an all-junk name collapses to empty.
+        assert_eq!(collapse_pipe_segments("| HD | [HD] |"), "");
     }
 
     #[test]

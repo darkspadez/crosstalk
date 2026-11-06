@@ -1004,13 +1004,15 @@ pub fn run_test_name(
 
 /// The identity fields a rename moves: `zone`, `timeshift`, `callsign`, `country`,
 /// in that order, for each that differs. The family key is left out on purpose: it
-/// moves on every real clean (`ESPN | HD |` keys as `espn | |`), which is the point.
+/// moves on every real clean (quality tags never survive in a key, which is the
+/// point: `ESPN | HD |` cleans to `ESPN` and both key as `espn`).
 ///
 /// The default rules never move timeshift or callsign (pinned on the corpus by
 /// `clean_keeps_identity_on_the_corpus`). Zone and country move only where the
-/// engine misread the uncleaned name: pipe residue (`Cinemax East | HD |` reads as
-/// the default zone until the `| HD |` goes) and names that are nothing but a
-/// country code. The opt-in `fix_casing` moves the key in a way that matters
+/// engine misreads the uncleaned name: a name that is nothing but a country code
+/// beside bracket junk (`FR [HD]` reads country FR until the `[HD]` goes; pipe junk
+/// no longer misreads since the step-14 N15 collapse). The opt-in `fix_casing`
+/// moves the key in a way that matters
 /// (`AccuWeather` -> `Accuweather` loses the camel-case split, so the family key goes
 /// from `accu weather` to `accuweather`), Name Cleaner's documented risk with the
 /// setting off by default.
@@ -1269,10 +1271,9 @@ mod tests {
         // brackets, unicode marks) is decoration, so a decorated name cleans to a name
         // with the SAME zone, timeshift, callsign and country as its undecorated form
         // — country prefixes (`UK |` -> `UK`), `+1` and regions (`East`, `(West)`)
-        // included. Compared against the undecorated form rather than the raw input
-        // because the engine misreads pipe residue (`Cinemax East | HD |` keys as
-        // `cinemax | |`, default zone): there cleaning moves identity TO the right
-        // reading, which is the point (`identity_drift`).
+        // included. Compared against the undecorated form rather than the raw input;
+        // since the step-14 N15 collapse the engine reads through pipe junk itself, so
+        // decorated and undecorated agree before cleaning runs (`identity_drift`).
         use crosstalk_matching::identity::{resolve_with, Identity, ResolveContext};
         let engine = crosstalk_matching::engine::UnifiedEngine::new(
             &crosstalk_core::config::MatchingConfig::default().engine_config(),
@@ -1342,12 +1343,13 @@ mod tests {
 
     #[test]
     fn clean_never_moves_timeshift_callsign_zone_or_country_of_a_clean_name() {
-        // The raw-input half of the invariant, on names with no pipe residue: what the
-        // rules strip never carries identity. The two documented exceptions are pinned
-        // here so they stay deliberate: a name that is nothing but a country code loses
-        // its country reading once the junk beside it goes (`USA | HD |` read `USA |`
-        // as a country marker; the lineup's `USA` is USA Network), and pipe residue in
-        // front (`HD | UK | Sky One`) hid a country the cleaned name shows.
+        // The raw-input half of the invariant: what the rules strip never carries
+        // identity. Since the step-14 N15 collapse the engine reads through pipe junk
+        // itself, so the pipe names that used to drift (`USA | HD |`, `HD | UK |
+        // Sky One`, `Cinemax East | HD |`) now sit in the no-drift list with the rest.
+        // The one documented exception is pinned here so it stays deliberate: `FR [HD]`
+        // is nothing but a country code beside bracket junk (not pipes, which N15
+        // does not touch), so it reads country FR until the `[HD]` goes.
         use crosstalk_matching::identity::{resolve_with, ResolveContext};
         let engine = crosstalk_matching::engine::UnifiedEngine::new(
             &crosstalk_core::config::MatchingConfig::default().engine_config(),
@@ -1369,6 +1371,10 @@ mod tests {
             "NBC 4 (WNBC) [FHD]",
             "KABC-DT [HD]",
             "Sky Sports Main Event ᵁᴴᴰ",
+            "USA | HD |",
+            "HD | UK | Sky One",
+            "UK | Sky Sports | HD",
+            "Cinemax East | HD |",
         ] {
             let (cleaned, fired, _) = clean_name(name, &rules, &[]);
             assert_ne!(cleaned, name, "{name:?} is a real clean");
@@ -1378,16 +1384,12 @@ mod tests {
                 "{name:?} -> {cleaned:?} ({fired:?}) moved {drift:?}"
             );
         }
-        for (name, moved) in [
-            ("USA | HD |", "country"),
-            ("FR [HD]", "country"),
-            ("HD | UK | Sky One", "country"),
-            ("Cinemax East | HD |", "zone"),
-        ] {
-            let (cleaned, _, _) = clean_name(name, &rules, &[]);
-            let drift = identity_drift(&resolve(name), &resolve(&cleaned));
-            assert_eq!(drift, vec![moved], "{name:?} -> {cleaned:?}");
-        }
+        // The one carve-out left: a bare country code with a bracketed tag reads as a
+        // country marker before cleaning and as a plain name after it.
+        let name = "FR [HD]";
+        let (cleaned, _, _) = clean_name(name, &rules, &[]);
+        let drift = identity_drift(&resolve(name), &resolve(&cleaned));
+        assert_eq!(drift, vec!["country"], "{name:?} -> {cleaned:?}");
     }
 
     #[test]

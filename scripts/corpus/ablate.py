@@ -275,6 +275,8 @@ def _zone_lu_like(query: str, candidate: str, pacific_or_west: bool,
 #: writer kinds through this table, mirroring `tags::strip_zone_ignorable` in Rust.
 _ZONE_STRIP_KINDS = ("quality", "junk", "status", "timeshift")
 _ZONE_VOCAB: dict = {}
+#: Upper-cased token -> (kind, sources) for the pipe-junk read (decided N15).
+_PIPE_VOCAB: dict = {}
 #: Rust's whitespace (`char::is_whitespace`, the Unicode White_Space property):
 #: Python's `str.isspace` also counts U+001C..U+001F, which Rust's `trim_end` /
 #: `split_whitespace` keep, so the mirror trims and splits on this set instead.
@@ -327,6 +329,113 @@ def _zone_token_kind(token: str):
     if compact in ("H265", "H264"):
         return "quality"
     return _zone_vocab().get(upper)
+
+
+def _pipe_vocab() -> dict:
+    """Upper-cased token -> (kind, sources) for the pipe-junk read.
+
+    The same `data/merged/tags.json` vocabulary the Rust engine's
+    `tags::is_pipe_junk_segment` classifies through (decided N15, the ONE shared
+    definition: only tokens Name Cleaner itself uses, `sources` containing
+    `"NC"`, count)."""
+    global _PIPE_VOCAB
+    if not _PIPE_VOCAB:
+        with open(os.path.join(MERGED, "tags.json"), encoding="utf-8") as handle:
+            data = json.load(handle)
+        for entry in (data.get("tags") or []):
+            token = (entry.get("token") or "").upper()
+            if token and token not in _PIPE_VOCAB:
+                _PIPE_VOCAB[token] = (entry.get("kind"), entry.get("sources") or [])
+    return _PIPE_VOCAB
+
+
+def _pipe_junk_segment(segment: str) -> bool:
+    """Whether a `|` segment is junk Name Cleaner would drop (decided N15).
+
+    Mirrors `tags::is_pipe_junk_segment` in Rust exactly: one quality/junk token
+    (tabled, `\\d{3,4}p` resolutions, `FHD\\d+`, `H.265`/`H.264` spellings, one
+    bracket layer peeled), case-insensitive, `+N` shifts and prose never junk,
+    and only `sources` containing `"NC"` count (IC's `Unknown`, LU's bare `1080`
+    and regions never strip)."""
+    trimmed = (segment or "").strip(_RUST_WS)
+    if not trimmed:
+        return False
+    if trimmed.startswith("+"):
+        # A shift is timeshift, never pipe junk (Rust `shift_canon`, which also
+        # rejects the non-shift "+" prose by returning None).
+        return False
+    bare = trimmed
+    if len(trimmed) >= 2 and ((trimmed[0] == "[" and trimmed[-1] == "]")
+                               or (trimmed[0] == "(" and trimmed[-1] == ")")):
+        bare = trimmed[1:-1].strip(_RUST_WS)
+        if not bare:
+            return False
+    upper = bare.upper()
+    vocab = _pipe_vocab()
+
+    def junk_kind(kind, sources) -> bool:
+        return kind in ("quality", "junk") and "NC" in (sources or [])
+    if upper.endswith("P") and 3 <= len(upper) - 1 <= 4 \
+            and all("0" <= c <= "9" for c in upper[:-1]):
+        # `\d{3,4}p` shares the hardcoded `1080P` row's sources in Rust.
+        found = vocab.get("1080P")
+        return bool(found) and junk_kind(*found)
+    if upper.startswith("FHD") and len(upper) > 3 \
+            and all("0" <= c <= "9" for c in upper[3:]):
+        found = vocab.get("FHD1080")
+        return bool(found) and junk_kind(*found)
+    compact = re.sub(r"[^A-Za-z0-9]", "", upper)
+    if compact in ("H265", "H264"):
+        canon = "H.265" if compact == "H265" else "H.264"
+        found = vocab.get(canon)
+        return bool(found) and junk_kind(*found)
+    found = vocab.get(upper)
+    return bool(found) and junk_kind(*found)
+
+
+#: The core's delimited country-prefix codes (`CORE_PROVIDER_PREFIX_PATTERNS`
+#: rows 1 and 6), mirroring `tags::PIPE_COUNTRY_CODES` in Rust.
+_PIPE_COUNTRY_CODES = frozenset(
+    ("US", "USA", "UK", "CA", "AU", "FR", "DE", "ES", "IT", "NL", "BR", "MX", "IN"))
+
+
+def _pipe_country_code(token: str) -> bool:
+    """ASCII-case-insensitive membership, like Rust `to_ascii_uppercase`."""
+    return token.isascii() and token.upper() in _PIPE_COUNTRY_CODES
+
+
+def collapse_pipe_segments(name: str) -> str:
+    """Collapse `|`-delimited junk segments before key/zone/country (decided N15).
+
+    Mirrors `tags::collapse_pipe_segments` in Rust byte for byte: split on `|`,
+    trim each segment on Rust whitespace, drop empties and pure-junk segments
+    (`_pipe_junk_segment`, the shared `tags.json` vocabulary), join survivors
+    with one space — except at a country code, which keeps a delimiter the
+    core's tables already strip: a segment ending in a code joins with `: `
+    (`RK: US | CNN` -> `RK: US: CNN`, `UK | Sky Sports` -> `UK: Sky Sports`)
+    and a final code-only segment keeps its bar (`BBC One | UK`). No `|` means
+    the name unchanged; all-junk collapses to empty."""
+    if "|" not in (name or ""):
+        return name
+    kept = []
+    for part in (name or "").split("|"):
+        piece = part.strip(_RUST_WS)
+        if not piece:
+            continue
+        if _pipe_junk_segment(piece):
+            continue
+        kept.append(piece)
+    out = kept[0] if kept else ""
+    for index in range(1, len(kept)):
+        previous, piece = kept[index - 1], kept[index]
+        if _pipe_country_code(_RUST_WS_RUN.split(previous)[-1]):
+            out += ": "
+        elif index == len(kept) - 1 and _pipe_country_code(piece):
+            out += " | "
+        else:
+            out += " "
+        out += piece
+    return out
 
 
 def _peel_zone_shift(text: str):
@@ -399,7 +508,9 @@ def sm_zone_noguard(mods, name) -> str:
     patterns read the name with those stripped (`strip_zone_ignorable`, the
     `tags.json` vocabulary)."""
     sm = mods["sm"]
-    core = strip_zone_ignorable(name or "")
+    # Decided N15: the zone reads the pipe-collapsed name (`Cinemax East | HD |`
+    # is East), then the Z08 tag strip.
+    core = strip_zone_ignorable(collapse_pipe_segments(name or ""))
     if sm._ZONE_WEST_RE.search(core) or sm._ZONE_PACIFIC_RE.search(core):
         return "WEST"
     if sm._ZONE_EAST_RE.search(core):
@@ -586,6 +697,10 @@ class Engine:
         memo: dict = {}
 
         def normalize_name(inner, name, *args, **kwargs):
+            # Decided N15: the key collapses `|` junk segments first, so no key
+            # carries `|` residue (`Cinemax East | HD |` keys as `Cinemax East`).
+            if isinstance(name, str):
+                name = collapse_pipe_segments(name)
             # SM fuzzy_match strips Cinemax from CANDIDATES only, when the
             # channel name contains "max" (fuzzy_matcher.py:778-800).
             if cinemax and inner._cinemax_pair and name != inner._query:
@@ -1224,6 +1339,28 @@ def self_test() -> int:
     check("N09 keep leaves star", "\u2605" in norm({"N09": "keep"}, "ESPN \u2605"), True)
     check("N08 rejoin keeps F1", norm({"N08": "sm-rejoin"}, "Sky Sports F1"),
           "Sky Sports F1")
+    for name, collapsed in [("Cinemax East | HD |", "Cinemax East"),
+                             ("UK | Sky Sports | HD", "UK: Sky Sports"),
+                             ("HD | UK | Sky One", "UK: Sky One"),
+                             ("RK: US | CNN", "RK: US: CNN"),
+                             ("BBC One | UK | HD", "BBC One | UK"),
+                             ("us | cnn", "us: cnn"),
+                             ("USA | HD |", "USA"),
+                             ("Sky Sports | Premier League",
+                              "Sky Sports Premier League"),
+                             ("ESPN West +1 | HD |", "ESPN West +1"),
+                             ("ESPN", "ESPN"),
+                             ("| HD | [HD] |", "")]:
+        check(f"N15 pipe collapse {name}", collapse_pipe_segments(name), collapsed)
+    # Junk segments never reach the key: the N02 core strips the bare zone word
+    # after the collapse, so pipe residue keys as the bare channel.
+    check("N15 pipe key drops residue", norm({}, "Cinemax East | HD |"), "Cinemax")
+    check("N15 pipe key keeps prose", norm({}, "Sky Sports | Premier League"),
+          "Sky Sports Premier League")
+    # A country code beside a pipe keeps a delimiter the core strips: no bare
+    # country word is stranded (`RK: US | CNN` keys like `US | CNN` and `CNN`).
+    for name in ("RK: US | CNN", "US | CNN", "UK | CNN | HD", "CNN | US"):
+        check(f"N15 pipe key strips country {name}", norm({}, name), "CNN")
     engine = Engine({}, 80, alias_map)
     routed = Engine({"ZONE": "sm-zone-noguard"}, 80, alias_map)
     for name, zone in [("HBO West (Backup)", "WEST"),
@@ -1231,6 +1368,9 @@ def self_test() -> int:
                         ("ITV1 (Central West) HD", "WEST"),
                         ("HBO (West) [HD]", "WEST"),
                         ("ESPN West +1", "WEST"),
+                        ("Cinemax East | HD |", "EAST"),
+                        ("UK | Sky Sports West | HD", "WEST"),
+                        ("West Ham TV | HD |", "DEFAULT"),
                         ("West Ham TV", "DEFAULT"),
                         ("Westworld", "DEFAULT")]:
         check(f"zone strip {name}", sm_zone_noguard(engine.mods, name), zone)

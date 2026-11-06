@@ -700,14 +700,17 @@ pub fn extract_zone(name: &str) -> FeedZone {
 ///
 /// Same markers as [`extract_zone`] — parenthesized `(W)`/`(E)`/`(WEST)`/`(EAST)`,
 /// standalone bare `WEST`/`EAST`, Pacific (`PACIFIC`/`(Pacific)`/`(PT)`) folding into
-/// `WEST` — read after stripping trailing writer tags (decided Z08: `HBO West (Backup)`
-/// is West), but no `_country_has_one_timezone` escape: the corpus labels a
-/// single-time-zone region (`UK: BBC One West`) as its own channel, the semantic the
-/// guard was written against. A bare `(P)` is NOT Pacific (decided Z07=sm-strict:
-/// SM's `_ZONE_PACIFIC_RE` matches bare `PACIFIC` and `(Pacific)`/`(PT)` only).
-/// The [`zone_pacific_re`] pattern already encodes that stricter reading, so both
-/// entry points agree on `(P)`.
+/// `WEST` — read after collapsing `|`-delimited junk segments (decided N15:
+/// `Cinemax East | HD |` is East) and stripping trailing writer tags (decided Z08:
+/// `HBO West (Backup)` is West), but no `_country_has_one_timezone` escape: the
+/// corpus labels a single-time-zone region (`UK: BBC One West`) as its own channel,
+/// the semantic the guard was written against. A bare `(P)` is NOT Pacific (decided
+/// Z07=sm-strict: SM's `_ZONE_PACIFIC_RE` matches bare `PACIFIC` and `(Pacific)`/
+/// `(PT)` only). The [`zone_pacific_re`] pattern already encodes that stricter
+/// reading, so both entry points agree on `(P)`.
 pub fn extract_zone_noguard(name: &str) -> FeedZone {
+    let collapsed = crate::tags::collapse_pipe_segments(name);
+    let name = collapsed.as_ref();
     if !maybe_zoned(name) {
         return FeedZone::Default;
     }
@@ -876,10 +879,17 @@ fn lineuparr_glued_re() -> &'static Regex {
 /// Recognises `(US) ...`, `(USA) ...`, `US: ...`, `MEX: ...`, `(PLUTO UK) ...`
 /// (case-insensitive). `None` when no recognised marker is present, so callers keep
 /// unlabeled streams (fail-open).
+///
+/// Decided N15: the name collapses first (`UK | Sky Sports | HD` reads as
+/// `UK: Sky Sports`, the delimited marker the reader already takes; `USA | HD |`
+/// reads as the bare code `USA`, which no marker form takes, so the USA Network
+/// name stays country-less like the cleaned `USA`).
 pub fn lineuparr_stream_country(name: &str) -> Option<&'static str> {
     if name.is_empty() {
         return None;
     }
+    let collapsed = crate::tags::collapse_pipe_segments(name);
+    let name = collapsed.as_ref();
     if let Ok(Some(caps)) = lineuparr_pluto_re().captures(name) {
         if let Some(group) = caps.get(1) {
             let upper = group.as_str().to_uppercase();
@@ -1476,6 +1486,43 @@ mod tests {
             crate::tags::strip_zone_ignorable("Sky Sports (Backup) West"),
             "Sky Sports (Backup) West"
         );
+    }
+
+    #[test]
+    fn pipe_segments_collapse_before_zone_and_country() {
+        // Decided N15 (step-14 review): `|` residue never reaches the key or the
+        // zone/country reads — junk segments drop, the rest join with a space.
+        // Keys keep the zone word and the meaningful pipe part.
+        let engine = crate::engine::UnifiedEngine::decided();
+        // N02=core strips the bare zone word for scoring, so the key is the
+        // bare channel (the step-14 spec: key `cinemax`, zone East).
+        assert_eq!(engine.normalize_key("Cinemax East | HD |"), "Cinemax");
+        assert_eq!(
+            engine.normalize_key("Sky Sports | Premier League"),
+            "Sky Sports Premier League"
+        );
+        assert_eq!(engine.normalize_key("UK | Sky Sports | HD"), "Sky Sports");
+        // Zones read through the pipes.
+        assert_eq!(extract_zone_noguard("Cinemax East | HD |"), FeedZone::East);
+        assert_eq!(
+            extract_zone_noguard("UK | Sky Sports West | HD"),
+            FeedZone::West
+        );
+        assert_eq!(
+            extract_zone_noguard("West Ham TV | HD |"),
+            FeedZone::Default
+        );
+        // A leading country-code segment stays a country marker: the collapsed
+        // space form reads exactly like the `:`/`|` marker forms (no regress).
+        assert_eq!(lineuparr_stream_country("UK | Sky Sports"), Some("UK"));
+        assert_eq!(lineuparr_stream_country("UK: Sky Sports"), Some("UK"));
+        assert_eq!(lineuparr_stream_country("UK Sky Sports"), Some("UK"));
+        assert_eq!(lineuparr_stream_country("UK | Sky Sports | HD"), Some("UK"));
+        assert_eq!(lineuparr_stream_country("HD | UK | Sky One"), Some("UK"));
+        // A bare code is not a marker (the decided rule): `USA | HD |` (USA
+        // Network) collapses to `USA`, which no marker form takes.
+        assert_eq!(lineuparr_stream_country("USA | HD |"), None);
+        assert_eq!(lineuparr_stream_country("USA"), None);
     }
 
     #[test]

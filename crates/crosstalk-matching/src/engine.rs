@@ -48,6 +48,7 @@
 //! | N12 `first` | prefix strip before hyphen normalisation | core order as-is |
 //! | N13 `strip` | invisible-format (Cf) strip | core Cf strip as-is |
 //! | N14 `core` | core geographic table | `core_pipeline: true` |
+//! | N15 `pipe-segments` | pipe junk collapses before key/zone/country; a country code keeps a delimiter | [`crate::tags::collapse_pipe_segments`] in [`UnifiedEngine::normalize_key`], [`extract_zone_noguard`], [`lineuparr_stream_country`] |
 //! | R01 `fallback` | pure-Python-equivalent arithmetic | [`similarity`] fallback port (no rapidfuzz) |
 //! | T01 `core` | core majority-overlap guard | [`has_token_overlap_core`] |
 //! | T02 `always` | basic-mode token floor always on | every stage calls the guard (never skipped) |
@@ -98,7 +99,11 @@ pub use crate::country::{extract_zone_noguard, is_group_header};
 ///
 /// Step 9 reads feed zones after stripping trailing writer tags with the same
 /// vocabulary (decided Z08: `HBO West (Backup)` is West): `3`.
-pub const ENGINE_VERSION: &str = "3";
+///
+/// Step 14 collapses `|`-delimited junk segments before keying and before the
+/// zone/country reads with the same vocabulary (decided N15: `Cinemax East |
+/// HD |` keys as `cinemax`, zone East): `4`.
+pub const ENGINE_VERSION: &str = "4";
 
 /// How many configurations [`UnifiedEngine::cached`] keeps built.
 pub const ENGINE_CACHE_CAPACITY: usize = 8;
@@ -458,7 +463,10 @@ impl UnifiedEngine {
                 }
             }
             for variant in ordered {
-                let normalized = normalizer.normalize_name(&variant, &[]);
+                // Decided N15, like `normalize_key`: alias variants collapse pipe
+                // junk before the reverse index keys them.
+                let collapsed = crate::tags::collapse_pipe_segments(variant.as_str());
+                let normalized = normalizer.normalize_name(&collapsed, &[]);
                 if normalized.is_empty() {
                     continue;
                 }
@@ -584,8 +592,12 @@ impl UnifiedEngine {
     }
 
     /// The normalize key: the decided normalizer with no user tags.
+    ///
+    /// Decided N15: pipe-delimited junk segments collapse first (`Cinemax East |
+    /// HD |` keys as `cinemax`), so the key carries no junk-segment residue.
     pub fn normalize_key(&self, name: &str) -> String {
-        self.normalizer.normalize_name(name, &[])
+        let collapsed = crate::tags::collapse_pipe_segments(name);
+        self.normalizer.normalize_name(&collapsed, &[])
     }
 
     /// The extracted callsign (shared-core ladder over the merged allowlist).

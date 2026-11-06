@@ -62,6 +62,9 @@ CORPUS = os.path.join(REPO, "data", "corpus")
 ENGINE_IO = ["cargo", "run", "--locked", "-q", "-p", "crosstalk-matching",
              "--example", "engine_io"]
 CHUNK = 2000
+#: Pipe decorations the `pipe` kind wraps every corpus name in (decided N15).
+PIPE_SHAPES = ("{}", "{} | HD |", "HD | {}", "UK | {} | FHD", "{} | US", "RK: US | {}",
+               "| {} | [4K] |", "{} | 1080p | +1")
 
 #: Worker-local decided engine for --jobs parallelism (built once per process).
 _WORKER: dict = {}
@@ -162,7 +165,10 @@ def python_identity(engine: ablate.Engine, name: str) -> dict:
         "zone": ablate.sm_zone_noguard(engine.mods, name),
         "timeshift": bool(ablate._PLUS_SHIFT_RE.search(name)),
         "callsign": normalize_callsign_base(raw),
-        "country": engine.mods["lu"].detect_stream_country(name),
+        # Decided N15: the country reads the pipe-collapsed name, like the Rust
+        # `lineuparr_stream_country` does internally.
+        "country": engine.mods["lu"].detect_stream_country(
+            ablate.collapse_pipe_segments(name)),
     }
 
 
@@ -213,7 +219,8 @@ def python_family(engine: ablate.Engine, threshold: int, query: str,
     if not family:
         return family
     ids = {name: python_identity(engine, name) for name, _s, _m in family}
-    query_country = engine.mods["lu"].detect_stream_country(query)
+    query_country = engine.mods["lu"].detect_stream_country(
+        ablate.collapse_pipe_segments(query))
 
     def compatible(country, name):
         identity = ids[name]
@@ -242,7 +249,7 @@ def main(argv=None) -> int:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--kinds",
-                        default="normalize,callsign,alias,identity,same,family")
+                        default="normalize,callsign,alias,identity,pipe,same,family")
     parser.add_argument("--threshold", type=int, default=80)
     parser.add_argument("--family-queries", type=int, default=400)
     parser.add_argument("--pool-queries", type=int, default=1500)
@@ -317,6 +324,19 @@ def main(argv=None) -> int:
                         if got[field] != expected[field]}
                 mismatches.append(f"identity {name!r}: (rust, python) {diff!r}")
         ok &= report("identity", len(names), mismatches, args.show)
+
+    if "pipe" in kinds:
+        # Decided N15: the collapse itself, on every name bare and in the pipe
+        # shapes providers use (junk segments, a leading/trailing country code).
+        battery = sorted({shape.format(name) for name in names for shape in PIPE_SHAPES})
+        requests = [{"kind": "pipe", "name": name} for name in battery]
+        mismatches = []
+        for name, response in zip(battery, rust.batch(requests)):
+            expected = ablate.collapse_pipe_segments(name)
+            if response.get("collapsed") != expected:
+                mismatches.append(f"pipe {name!r}: rust {response.get('collapsed')!r} "
+                                  f"!= python {expected!r}")
+        ok &= report("pipe", len(battery), mismatches, args.show)
 
     rust_same: list[bool] = []
     if "same" in kinds:

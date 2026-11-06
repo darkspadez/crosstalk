@@ -94,6 +94,8 @@ VARIANTS: dict[str, tuple[dict[str, list[str]], str, str]] = {
             "keep", "Invisible-format (Cf) strip"),
     "N14": ({"janitor-anywhere": [JAN], "cm-double-tag": [CM], "core": [SM, LU]},
             "core", "Geographic (country tag anywhere) table"),
+    "N15": ({"pipe-segments": [], "keep": ALL},
+            "keep", "Pipe-delimited junk segments in names"),
     "C01": ({"janitor": [JAN], "core-known": [SM], "cm-lookup": [CM],
              "core-naked": [LU]},
             "janitor", "Callsign ladder shape"),
@@ -258,6 +260,29 @@ ORCHESTRATED: dict[str, tuple[str, str]] = {
             "toward their marker (`Antenna TV Pacific [HD]`, `FanDuel Sports West "
             "[HD]`, `Nickelodeon East [FHD]`, `US: STARZ WEST HD [FHD]`). "
             "`West Ham TV` / `Westworld` stay Default (no word boundary)."),
+    "N15": ("pipe-segments", "Orchestrator decision (phase 3 step 14, step-14 review): "
+            "before keying and before the zone/country reads, the engine treats `|` "
+            "as a segment separator and drops segments that are pure junk per the shared "
+            "vocabulary (`tags::is_pipe_junk_segment`, the ONE definition from step 14: "
+            "single NC quality/junk tokens, `\\d{3,4}p`, `FHD\\d+`, `H.265`/`H.264` spellings, "
+            "one bracket layer peeled, only `sources` containing `NC`), then joins the "
+            "survivors with a space. A country code (the core's delimited-prefix codes) "
+            "keeps a delimiter the core's tables already strip, so no bare country word is "
+            "stranded: a segment ending in a code joins with `: ` (`UK | Sky Sports` -> "
+            "`UK: Sky Sports`; `RK: US | CNN` -> `RK: US: CNN`, keyed `CNN` like `US | CNN`) "
+            "and a final code-only segment keeps its bar (`BBC One | UK`, the core's "
+            "trailing strip). A lone code is not a marker, so `USA | HD |` (USA Network) "
+            "collapses to `USA` and stays country-less, like the cleaned name. Joining the "
+            "code with a bare space instead stranded `US` (`RK: US CNN`, `BBC One UK`) and "
+            "flipped N14 to Janitor's bare `USA?\\s` anywhere strip, which keys `X USA FHD` "
+            "and `HD X USA` differently. No plugin variant strips pipe segments "
+            "before matching, so there is no variant to ablate. Effect under the decided "
+            "configuration: `Cinemax East | HD |` keys as `cinemax` with zone East (was "
+            "`cinemax | |`, Default); `UK | Sky Sports | HD` -> country UK, key `sky sports`; "
+            "`HD | UK | Sky One` -> country UK; names with a meaningful pipe segment keep "
+            "both parts (`Sky Sports | Premier League` -> `Sky Sports Premier League`). "
+            "Byte-identical Rust/Python on every corpus name bare and pipe-decorated "
+            "(`engine_parity.py` kind `pipe`)."),
     "Z07": ("sm-strict", "Orchestrator decision (phase 3 step 6, Appendix C): "
             "`(P)` is NOT a Pacific zone marker (Stream-Mapparr's stricter reading; "
             "SM `_ZONE_PACIFIC_RE` matches bare PACIFIC and `(Pacific)`/`(PT)` only). "

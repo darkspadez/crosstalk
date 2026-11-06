@@ -596,9 +596,28 @@ Step 14 review (2026-11-06):
   (every 6th lineup name x 8 decorations x {defaults, `+1` on}: identity of
   clean(decorated) == identity of the undecorated form) and
   `clean_never_moves_timeshift_callsign_zone_or_country_of_a_clean_name` (the
-  exceptions listed by name). Not fixed here: the engine's normalizer leaving `|` residue
-  is an engine change guide/streams parity would feel. `test_name` now shows the
-  identity after clean too, and names any field the rename moves (`identity_drift`).
+  exceptions listed by name). `test_name` now shows the identity after clean too, and
+  names any field the rename moves (`identity_drift`).
+- **Pipe residue: resolved (N15 `pipe-segments`, N14 stays `core`, `ENGINE_VERSION`
+  4).** Before keying and before the zone/country reads the engine splits on `|`, drops
+  empty and pure-junk segments (`tags::is_pipe_junk_segment`, the one definition) and
+  joins the rest with a space, except beside a core country code, which keeps a
+  delimiter the core's tables already strip: `RK: US | CNN` -> `RK: US: CNN` (keys
+  `cnn`), `UK | Sky Sports | HD` -> `UK: Sky Sports` (country UK), `BBC One | UK` keeps
+  its bar (keys `bbc 1`). `Cinemax East | HD |` keys `cinemax`, zone East;
+  `Sky Sports | Premier League` keeps both parts; `USA | HD |` (USA Network) has no
+  country. A plain-space join stranded the country word (`RK: US CNN`, `BBC One UK`)
+  and flipped N14 to Janitor's bare `USA?\s` anywhere strip. That strip keys
+  `National Geographic USA FHD` and `HD National Geographic USA` differently (the
+  streams oracle lost that channel's family). It also strips the word `us` (`This Is
+  Us TV`), and an end-of-name variant would merge `5 USA` with `5` (UK DB). With the
+  delimiter join, N14's ablation is core 4 vs `janitor-anywhere` 6 (9 pairs, core).
+  Engine cost 853 -> 844 at cut 80 and 844 -> 835 at cut 95. Both oracle reports are
+  byte-identical to before N15. The guide +7 match_sim agreement under
+  `janitor-anywhere` was agreement with Janitor's own bare-USA rule. Rust/Python
+  collapse parity is the `pipe` kind of `engine_parity.py` (every corpus name x 8 pipe
+  shapes). `decoration_keeps_the_family_key` pins X / `X FHD` / `X [4K]` / `HD X` /
+  `X | HD |` on one family key.
 - **Custom replacements are Python templates.** NC's `pat.sub(rep, s)` reads `\1` /
   `\g<name>` as groups and `$` as text; a verbatim copy into Rust `regex` inverted both.
   `python_replacement` translates the template and refuses what Python refuses (bad

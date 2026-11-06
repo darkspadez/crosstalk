@@ -491,11 +491,11 @@
         "tp": 6369
       },
       "engine": {
-        "cost": 853,
-        "fn": 785,
+        "cost": 844,
+        "fn": 776,
         "fp": 34,
         "tn": 7416,
-        "tp": 12715
+        "tp": 12724
       },
       "janitor": {
         "cost": 3242,
@@ -746,10 +746,10 @@
     "construction_pairs": 20950,
     "pairs": 28450,
     "rows_decided": {
-      "no-evidence": 31,
-      "orchestrator": 2,
+      "no-evidence": 32,
+      "orchestrator": 3,
       "strong": 6,
-      "weak": 20
+      "weak": 19
     }
   },
   "rows": {
@@ -1274,50 +1274,50 @@
       "confidence": "weak",
       "evidence_pairs": 20950,
       "method": "threshold sweep",
-      "reason": "Cut sweep of the final engine over every construction pair, cost 2*FP+FN: 70: 830 (FP 35, FN 760), 75: 831 (FP 35, FN 761), 80: 853 (FP 34, FN 785), 85: 856 (FP 24, FN 808), 90: 844 (FP 11, FN 822), 95: 844 (FP 8, FN 828). Best cut 70; of the shipped defaults `janitor-95` is cheapest (runner-up `cm-lu-80` by 9). The cut is on the base engine's score (Janitor's 95 is on its own confidence scale with structural bonuses), so step 6 sets the one `[matching]` threshold on this sweep; the row only rules out the cuts that cost most.",
+      "reason": "Cut sweep of the final engine over every construction pair, cost 2*FP+FN: 70: 823 (FP 35, FN 753), 75: 824 (FP 35, FN 754), 80: 844 (FP 34, FN 776), 85: 847 (FP 24, FN 799), 90: 835 (FP 11, FN 813), 95: 835 (FP 8, FN 819). Best cut 70; of the shipped defaults `janitor-95` is cheapest (runner-up `cm-lu-80` by 9). The cut is on the base engine's score (Janitor's 95 is on its own confidence scale with structural bonuses), so step 6 sets the one `[matching]` threshold on this sweep; the row only rules out the cuts that cost most.",
       "strictest": "janitor-95",
       "sweep": {
         "70": {
-          "cost": 830,
-          "fn": 760,
+          "cost": 823,
+          "fn": 753,
           "fp": 35,
           "tn": 7415,
-          "tp": 12740
+          "tp": 12747
         },
         "75": {
-          "cost": 831,
-          "fn": 761,
+          "cost": 824,
+          "fn": 754,
           "fp": 35,
           "tn": 7415,
-          "tp": 12739
+          "tp": 12746
         },
         "80": {
-          "cost": 853,
-          "fn": 785,
+          "cost": 844,
+          "fn": 776,
           "fp": 34,
           "tn": 7416,
-          "tp": 12715
+          "tp": 12724
         },
         "85": {
-          "cost": 856,
-          "fn": 808,
+          "cost": 847,
+          "fn": 799,
           "fp": 24,
           "tn": 7426,
-          "tp": 12692
+          "tp": 12701
         },
         "90": {
-          "cost": 844,
-          "fn": 822,
+          "cost": 835,
+          "fn": 813,
           "fp": 11,
           "tn": 7439,
-          "tp": 12678
+          "tp": 12687
         },
         "95": {
-          "cost": 844,
-          "fn": 828,
+          "cost": 835,
+          "fn": 819,
           "fp": 8,
           "tn": 7442,
-          "tp": 12672
+          "tp": 12681
         }
       },
       "variant": "janitor-95"
@@ -1769,8 +1769,8 @@
       "costs": {
         "80": {
           "cm-strict": {
-            "cost": 1709,
-            "fn": 1709,
+            "cost": 1711,
+            "fn": 1711,
             "fp": 0,
             "tn": 3,
             "tp": 21
@@ -1780,20 +1780,20 @@
             "fn": 22,
             "fp": 3,
             "tn": 0,
-            "tp": 1708
+            "tp": 1710
           },
           "janitor": {
             "cost": 663,
             "fn": 661,
             "fp": 1,
             "tn": 2,
-            "tp": 1069
+            "tp": 1071
           }
         },
         "90": {
           "cm-strict": {
-            "cost": 1844,
-            "fn": 1844,
+            "cost": 1846,
+            "fn": 1846,
             "fp": 0,
             "tn": 1,
             "tp": 21
@@ -1803,21 +1803,21 @@
             "fn": 22,
             "fp": 1,
             "tn": 0,
-            "tp": 1843
+            "tp": 1845
           },
           "janitor": {
             "cost": 748,
             "fn": 748,
             "fp": 0,
             "tn": 1,
-            "tp": 1117
+            "tp": 1119
           }
         }
       },
-      "evidence_pairs": 1733,
-      "evidenced_share": 0.4882,
+      "evidence_pairs": 1735,
+      "evidenced_share": 0.4888,
       "method": "ablation",
-      "reason": "Ablation on the base engine: 1733 discriminating construction pairs; cost (2*FP+FN) 28 vs 663 for runner-up `janitor`; same winner at cut 90; 49% of the deciding pairs on evidenced forms. Negatives for bare-country stripping cannot be built safely: the plugins' own example (`UK Gold`) was the old name of `Gold`, and the near-miss filter drops pairs differing only in country tags, so this row leans to the table that strips more; weak.",
+      "reason": "Ablation on the base engine: 1735 discriminating construction pairs; cost (2*FP+FN) 28 vs 663 for runner-up `janitor`; same winner at cut 90; 49% of the deciding pairs on evidenced forms. Negatives for bare-country stripping cannot be built safely: the plugins' own example (`UK Gold`) was the old name of `Gold`, and the near-miss filter drops pairs differing only in country tags, so this row leans to the table that strips more; weak.",
       "strictest": "cm-strict",
       "variant": "core"
     },
@@ -2088,11 +2088,11 @@
             "fn": 0,
             "fp": 0,
             "tn": 0,
-            "tp": 41
+            "tp": 40
           },
           "sm-strip": {
-            "cost": 41,
-            "fn": 41,
+            "cost": 40,
+            "fn": 40,
             "fp": 0,
             "tn": 0,
             "tp": 0
@@ -2104,21 +2104,21 @@
             "fn": 0,
             "fp": 0,
             "tn": 0,
-            "tp": 41
+            "tp": 40
           },
           "sm-strip": {
-            "cost": 41,
-            "fn": 41,
+            "cost": 40,
+            "fn": 40,
             "fp": 0,
             "tn": 0,
             "tp": 0
           }
         }
       },
-      "evidence_pairs": 41,
-      "evidenced_share": 0.6585,
+      "evidence_pairs": 40,
+      "evidenced_share": 0.675,
       "method": "ablation",
-      "reason": "Ablation on the base engine: 41 discriminating construction pairs; cost (2*FP+FN) 0 vs 41 for runner-up `sm-strip`; same winner at cut 90; 66% of the deciding pairs on evidenced forms.",
+      "reason": "Ablation on the base engine: 40 discriminating construction pairs; cost (2*FP+FN) 0 vs 40 for runner-up `sm-strip`; same winner at cut 90; 68% of the deciding pairs on evidenced forms.",
       "strictest": "keep",
       "variant": "keep"
     },
@@ -2209,19 +2209,19 @@
       "variant": "strip"
     },
     "N14": {
-      "confidence": "weak",
+      "confidence": "no-evidence",
       "costs": {
         "80": {
           "cm-double-tag": {
-            "cost": 7,
-            "fn": 7,
+            "cost": 4,
+            "fn": 4,
             "fp": 0,
             "tn": 1,
             "tp": 4
           },
           "core": {
-            "cost": 7,
-            "fn": 7,
+            "cost": 4,
+            "fn": 4,
             "fp": 0,
             "tn": 1,
             "tp": 4
@@ -2231,20 +2231,20 @@
             "fn": 4,
             "fp": 1,
             "tn": 0,
-            "tp": 7
+            "tp": 4
           }
         },
         "90": {
           "cm-double-tag": {
-            "cost": 7,
-            "fn": 7,
+            "cost": 4,
+            "fn": 4,
             "fp": 0,
             "tn": 1,
             "tp": 6
           },
           "core": {
-            "cost": 7,
-            "fn": 7,
+            "cost": 4,
+            "fn": 4,
             "fp": 0,
             "tn": 1,
             "tp": 6
@@ -2254,16 +2254,24 @@
             "fn": 6,
             "fp": 1,
             "tn": 0,
-            "tp": 7
+            "tp": 4
           }
         }
       },
-      "evidence_pairs": 12,
-      "evidenced_share": 0.5833,
+      "evidence_pairs": 9,
+      "evidenced_share": 0.4444,
       "method": "ablation",
-      "reason": "Ablation on the base engine: 12 discriminating construction pairs; cost (2*FP+FN) 7 vs 6 for runner-up `janitor-anywhere`; same winner at cut 90; 58% of the deciding pairs on evidenced forms.",
+      "reason": "Ablation on the base engine: 9 discriminating construction pairs (< 10): strictest variant.",
       "strictest": "core",
       "variant": "core"
+    },
+    "N15": {
+      "confidence": "orchestrator",
+      "evidence_pairs": 0,
+      "method": "orchestrated",
+      "reason": "Orchestrator decision (phase 3 step 14, step-14 review): before keying and before the zone/country reads, the engine treats `|` as a segment separator and drops segments that are pure junk per the shared vocabulary (`tags::is_pipe_junk_segment`, the ONE definition from step 14: single NC quality/junk tokens, `\\d{3,4}p`, `FHD\\d+`, `H.265`/`H.264` spellings, one bracket layer peeled, only `sources` containing `NC`), then joins the survivors with a space. A country code (the core's delimited-prefix codes) keeps a delimiter the core's tables already strip, so no bare country word is stranded: a segment ending in a code joins with `: ` (`UK | Sky Sports` -> `UK: Sky Sports`; `RK: US | CNN` -> `RK: US: CNN`, keyed `CNN` like `US | CNN`) and a final code-only segment keeps its bar (`BBC One | UK`, the core's trailing strip). A lone code is not a marker, so `USA | HD |` (USA Network) collapses to `USA` and stays country-less, like the cleaned name. Joining the code with a bare space instead stranded `US` (`RK: US CNN`, `BBC One UK`) and flipped N14 to Janitor's bare `USA?\\s` anywhere strip, which keys `X USA FHD` and `HD X USA` differently. No plugin variant strips pipe segments before matching, so there is no variant to ablate. Effect under the decided configuration: `Cinemax East | HD |` keys as `cinemax` with zone East (was `cinemax | |`, Default); `UK | Sky Sports | HD` -> country UK, key `sky sports`; `HD | UK | Sky One` -> country UK; names with a meaningful pipe segment keep both parts (`Sky Sports | Premier League` -> `Sky Sports Premier League`). Byte-identical Rust/Python on every corpus name bare and pipe-decorated (`engine_parity.py` kind `pipe`).",
+      "strictest": "keep",
+      "variant": "pipe-segments"
     },
     "R01": {
       "confidence": "no-evidence",
@@ -2680,50 +2688,50 @@
       "confidence": "weak",
       "evidence_pairs": 20950,
       "method": "threshold sweep",
-      "reason": "Cut sweep of the final engine over every construction pair, cost 2*FP+FN: 70: 830 (FP 35, FN 760), 75: 831 (FP 35, FN 761), 80: 853 (FP 34, FN 785), 85: 856 (FP 24, FN 808), 90: 844 (FP 11, FN 822), 95: 844 (FP 8, FN 828). Best cut 70; of the shipped defaults `janitor-95` is cheapest (runner-up `cm-lu-80` by 9). The cut is on the base engine's score (Janitor's 95 is on its own confidence scale with structural bonuses), so step 6 sets the one `[matching]` threshold on this sweep; the row only rules out the cuts that cost most.",
+      "reason": "Cut sweep of the final engine over every construction pair, cost 2*FP+FN: 70: 823 (FP 35, FN 753), 75: 824 (FP 35, FN 754), 80: 844 (FP 34, FN 776), 85: 847 (FP 24, FN 799), 90: 835 (FP 11, FN 813), 95: 835 (FP 8, FN 819). Best cut 70; of the shipped defaults `janitor-95` is cheapest (runner-up `cm-lu-80` by 9). The cut is on the base engine's score (Janitor's 95 is on its own confidence scale with structural bonuses), so step 6 sets the one `[matching]` threshold on this sweep; the row only rules out the cuts that cost most.",
       "strictest": "janitor-95",
       "sweep": {
         "70": {
-          "cost": 830,
-          "fn": 760,
+          "cost": 823,
+          "fn": 753,
           "fp": 35,
           "tn": 7415,
-          "tp": 12740
+          "tp": 12747
         },
         "75": {
-          "cost": 831,
-          "fn": 761,
+          "cost": 824,
+          "fn": 754,
           "fp": 35,
           "tn": 7415,
-          "tp": 12739
+          "tp": 12746
         },
         "80": {
-          "cost": 853,
-          "fn": 785,
+          "cost": 844,
+          "fn": 776,
           "fp": 34,
           "tn": 7416,
-          "tp": 12715
+          "tp": 12724
         },
         "85": {
-          "cost": 856,
-          "fn": 808,
+          "cost": 847,
+          "fn": 799,
           "fp": 24,
           "tn": 7426,
-          "tp": 12692
+          "tp": 12701
         },
         "90": {
-          "cost": 844,
-          "fn": 822,
+          "cost": 835,
+          "fn": 813,
           "fp": 11,
           "tn": 7439,
-          "tp": 12678
+          "tp": 12687
         },
         "95": {
-          "cost": 844,
-          "fn": 828,
+          "cost": 835,
+          "fn": 819,
           "fp": 8,
           "tn": 7442,
-          "tp": 12672
+          "tp": 12681
         }
       },
       "variant": "janitor-95"

@@ -16,6 +16,7 @@
 //! * `identity`: `{name}` -> the [`Identity`] as JSON (canonical, callsign, network,
 //!   country, category, region, zone, timeshift, tags, key).
 //! * `zone`: `{name}` -> `{"zone": "EAST"|"WEST"|"DEFAULT"}` (noguard routing zone).
+//! * `pipe`: `{name}` -> `{"collapsed": ...}` (the decided N15 pipe collapse).
 //! * `version`: `{}` -> `{"data_version": ...}` (cache namespace).
 
 use crosstalk_matching::callsign::normalize_callsign;
@@ -183,6 +184,9 @@ fn handle(
         "timeshift" => {
             serde_json::json!({"timeshift": is_time_shift(str_field(request, "name"))})
         }
+        "pipe" => serde_json::json!({
+            "collapsed": crosstalk_matching::tags::collapse_pipe_segments(str_field(request, "name")),
+        }),
         _ => serde_json::json!({"error": format!("unknown kind {kind}")}),
     }
 }

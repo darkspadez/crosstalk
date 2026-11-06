@@ -162,8 +162,8 @@ fn rank_winner_identity_is_order_independent() {
 #[test]
 fn data_version_is_namespaced() {
     let version = crosstalk_matching::engine::data_version();
-    // Step 9 reads feed zones after stripping trailing writer tags (Z08): `eng:3`.
-    assert!(version.contains("eng:3"), "{version}");
+    // Step 14 collapses `|` junk segments before key/zone/country (N15): `eng:4`.
+    assert!(version.contains("eng:4"), "{version}");
     // Two calls agree (memoized), and distinct inputs key distinctly.
     assert_eq!(version, crosstalk_matching::engine::data_version());
     let a = IdentityCache::input_key("ESPN", &ctx());
@@ -188,4 +188,66 @@ fn merged_neighbors_stay_distinct() {
     }
     // Every one of these is its own channel; keys must all differ.
     assert_eq!(keys.len(), names.len(), "{keys:?}");
+}
+
+/// Decoration never moves the family key: a quality tag after or before the name,
+/// a bracketed tag, or pipe junk (decided N15) leaves key, zone, timeshift and
+/// callsign alone. Pins the step-14 review: `National Geographic USA FHD` and
+/// `HD National Geographic USA` key alike (N14 stays `core`; Janitor's bare
+/// `USA?\s` strip keyed them apart), and a pipe never strands a country word.
+///
+/// Names led by a provider/country prefix are not in the list: the core strips
+/// prefixes before quality tags (decided N12=`first`), so a leading `HD` hides
+/// them (`HD USA Today` keeps `usa`).
+#[test]
+fn decoration_keeps_the_family_key() {
+    let engine = engine();
+    let key = |name: &str| resolve_with(&engine, name, &ctx()).family_key();
+    let names = [
+        "National Geographic USA",
+        "National Geographic",
+        "5 USA",
+        "5",
+        "Fear Factor USA",
+        "ScreenPix US",
+        "USA Network",
+        "CNN",
+        "ESPN2",
+        "BBC One",
+        "BBC One West",
+        "HBO East",
+        "Nickelodeon East",
+        "Antenna TV Pacific",
+        "Starz Encore West",
+        "Sportsnet (P)",
+        "Comedy Central +1",
+        "ITV1 +1",
+        "KABC (ABC)",
+        "NBC 4 (WNBC)",
+        "Sky Sports Premier League",
+        "Sky Sports | Premier League",
+        "Sky Sports F1",
+        "Discovery Channel",
+        "This Is Us TV",
+        "AccuWeather",
+        "A&E",
+        "E!",
+        "Canal+",
+        "TSN 2",
+    ];
+    for name in names {
+        let bare = key(name);
+        for decorated in [
+            format!("{name} FHD"),
+            format!("{name} [4K]"),
+            format!("HD {name}"),
+            format!("{name} | HD |"),
+        ] {
+            assert_eq!(key(&decorated), bare, "{decorated:?} vs {name:?}");
+        }
+    }
+    // A pipe beside a country code keeps a delimiter the core strips (N15).
+    for name in ["US | CNN", "RK: US | CNN", "UK | CNN | HD", "CNN | US"] {
+        assert_eq!(key(name), key("CNN"), "{name:?}");
+    }
 }
