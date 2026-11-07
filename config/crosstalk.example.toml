@@ -63,8 +63,8 @@ concurrency = 8
 
 # The AI matching policy. The heuristics decide first and the model only promotes: it is
 # asked about results in the band below, or about candidates for a channel the heuristics
-# could not match at all. A heuristic result at or above a sub-app's own confidence
-# threshold is never re-checked or vetoed by the model. An AI-accepted pick is still
+# could not match at all. A heuristic result at or above the one [matching] cut is never
+# re-checked or vetoed by the model. An AI-accepted pick is still
 # validated for programme data: when every same-name copy is empty the channel is left
 # unmatched with a reason saying so. The guide app's heal never consults the model.
 #
@@ -75,6 +75,11 @@ provider = "typesafe"
 # Model name as the provider spells it. TypeSafe's aliases are jev-latest and jev-preview;
 # pinning a version (jev-1.14.0) keeps answers stable when a new release ships.
 model = "jev-latest"
+# Escalation chain: asked in order, each link handling what the earlier ones could not
+# decide (a Jev decision model handing off to an LLM fallback). Empty means the
+# provider/model pair above, as one link. Setting both the pair (non-default) and the
+# chain is an error `crosstalk validate` reports and the settings form refuses to save.
+# chain = [{ provider = "typesafe", model = "jev-latest" }, { provider = "llm", model = "kimi-k3" }]
 # Inclusive score band treated as uncertain.
 verify_band_low = 80
 verify_band_high = 94

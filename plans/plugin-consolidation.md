@@ -301,7 +301,8 @@ pieces each phase adds, and the cross-cutting rules below.
 
 ### Phase 3: `lineup` (Channel-Mapparr + Channel Name Cleaner + Lineuparr's channel half)
 
-> Detailed plan: `plans/phase-3-lineup.md`. **Goal reset (2026-11-04):** apps must share one
+> Status: built (steps 1–20 on `plan/phase-3-the-lineup-sub-app`); the phase-end review is
+> pending. Detailed plan: `plans/phase-3-lineup.md`. **Goal reset (2026-11-04):** apps must share one
 > implementation and give the same answer, so phase 3 opens by collapsing the per-plugin matcher
 > profiles into one engine (rules chosen on a labelled corpus), one merged data set, a shared
 > channel identity, one tag vocabulary / quality model / template engine / logo resolver, and
@@ -314,18 +315,20 @@ pieces each phase adds, and the cross-cutting rules below.
 | `clean_preview` / `clean_apply` | NC `preview`, `apply` | Junk stripping with protect-list and collision strategy. Also runs as the first stage of `names_*` |
 | `names_preview` / `names_apply` | CM `load_and_process_channels`, `rename_channels`, `rename_unknown_channels` | Canonical names (FCC OTA + country DBs, `{NETWORK}` templates). Tagging unmatched channels is an option |
 | `categorize_preview` / `categorize_apply` | CM `organize_by_category` | |
-| `logos_preview` / `logos_apply` | CM `apply_logos`, `apply_tv_logos`, `replace_tv_logos`; LU `apply_logo_match` | One source order (EPG icon → Logo Manager → tv-logos → default); `replace_existing` option |
-| `create_preview` / `create_apply` | CM `import_m3u_streams`, `create_channels_from_streams` | Mode: by category or one per broadcast station |
-| `sync_preview` / `sync_apply` | LU `sync_channels` | Build groups/channels/numbers from a lineup file; adds and renumbers, never deletes |
+| `logos_preview` / `logos_apply` | CM `apply_logos`, `apply_tv_logos`, `replace_tv_logos`; LU `apply_logo_match` | One source order (EPG icon → Logo Manager → tv-logos → network → default); `replace_existing` option |
+| `create_preview` / `create_apply` | CM `import_m3u_streams`, `create_channels_from_streams` | Streams mode (one channel per identity family) or stations mode (one per OTA station) |
+| `sync_preview` / `sync_apply` | LU `sync_channels` | Build groups/channels/numbers from a lineup file onto owned channels; adds, moves and renumbers owned channels, never deletes |
+| `tidy_preview` / `tidy_apply` | LU's replace-mode cleanup inside its stream match | Hides owned channels left with no streams (undoable) and unhides only what tidy hid |
 | `test_name` | NC `test_name` | Read-only tool |
-| workflow `full_sync` | LU `full_sync` | Host workflow: `lineup.sync_apply` → `streams.match_apply` (lineup mode) → `guide.match_apply` → `lineup.logos_apply` → enable in profile |
+| workflow `full_sync` | LU `full_sync` | Host workflow: `lineup.sync_apply` → `streams.match_apply` (lineup mode) → `guide.match_apply` (lineup scope) → `lineup.logos_apply` (lineup scope) → `lineup.tidy_apply`; `continue_on_failure` on the middle three. Status: shipped (step 19); the example in `config/crosstalk.example.toml` is exercised by `crates/lineup/tests/full_sync_workflow.rs` |
 
-- **Lost from Name Cleaner:** `undo_last` (generalized undo is out of scope). The old → new
-  CSV of every apply remains; a manual revert would come from it.
+- **Name Cleaner's `undo_last`** became the generalized host undo (`crosstalk undo` + the
+  Undo button, step 11), for every app; NC's backup CSVs are not ported.
 - **Data:** Channel-Mapparr's country files and FCC table differ from Janitor's copies
-  (byte diff earlier). Rule: parity-test each action against *its* plugin's data first, then
-  unify the tables in one deliberate, listed change. Lineup files (~30) vendored under
-  `data/lineups/`.
+  (byte diff earlier). The goal reset replaced "parity-test against each plugin's own data":
+  one merged, newest-union data set (`data/merged/`, step 4, provenance in
+  `docs/data-merge-report.md`); the 29 Lineuparr lineup files are vendored under
+  `data/merged/lineups/`.
 - **Network fetches:** tv-logos repo index, cached on disk with a TTL; shared fetch cache in core.
 - **Writes:** channel create, group create, logo create, number changes: all REST
   (`channels`, `from-stream/bulk`, `groups`, `logos`, `edit/bulk`).

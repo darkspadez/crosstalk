@@ -104,7 +104,8 @@ pub struct LineupSettings {
     // --- Names (Channel-Mapparr rename + unknown tagging, AI gate) ----------------------
     /// OTA template, e.g. `{NETWORK} - {STATE} {CITY} ({CALLSIGN})`. CM's `ota_format`.
     pub ota_format: String,
-    /// Fall back to the market when a channel has no callsign. CM's `ota_market_fallback`.
+    /// Fall back to the market when no printed callsign resolves to a station.
+    /// CM's `ota_market_fallback`.
     pub ota_market_fallback: bool,
     /// Suffix appended to a channel no database recognises. CM's `unknown_suffix`.
     pub unknown_suffix: String,
@@ -116,7 +117,8 @@ pub struct LineupSettings {
     pub ai_gate_enabled: bool,
 
     // --- Categorize (Channel-Mapparr organize) -------------------------------------------
-    /// Category group names the organize step manages. CM's `category_groups`.
+    /// Channel groups (exact names) whose channels the organize step categorizes, on top
+    /// of `[scope]`; empty means every in-scope channel. CM's `category_groups`.
     pub category_groups: String,
 
     // --- Logos (CM apply/replace tv-logos + LU logo tiers) -------------------------------
@@ -131,12 +133,12 @@ pub struct LineupSettings {
     /// leaves channels with a logo alone).
     pub replace_existing: bool,
     /// Country codes whose tv-logos directories the per-channel logo step searches.
-    /// Empty means the lineup file's own country.
+    /// Empty means the channel identity's country, else the enabled `[matching]` databases.
     pub tv_logos_countries: String,
 
     // --- Create (CM import M3U streams / create channels from streams) --------------------
-    /// What `create_*` makes: `streams` (one channel per matched stream, CM's
-    /// `import_m3u_streams`) or `stations` (one channel per OTA station from
+    /// What `create_*` makes: `streams` (one channel per identity family, carrying its
+    /// streams; CM's `import_m3u_streams` made one per stream) or `stations` (one channel per OTA station from
     /// unattached streams, CM's `create_channels_from_streams`).
     pub create_mode: String,
     /// Comma-separated M3U group titles to import from, applied BEFORE matching and
@@ -150,8 +152,8 @@ pub struct LineupSettings {
     /// Stream groups to scan for unattached streams (stations mode). CM's
     /// `seed_source_groups`.
     pub seed_source_groups: String,
-    /// The existing channel group the new stations are created in. CM's
-    /// `seed_target_group`.
+    /// The channel group the new stations are created in (created, owned, when missing).
+    /// CM's `seed_target_group`.
     pub seed_target_group: String,
     /// The first channel number to assign. Empty starts above the highest channel
     /// number on the system. CM's `seed_start_number`.
@@ -175,7 +177,8 @@ pub struct LineupSettings {
     /// The first number for `specific` numbering; every other mode ignores it.
     /// LU's `starting_channel_number`.
     pub starting_channel_number: String,
-    /// Channel profile(s) to enable the synced channels in. LU's `channel_profiles`.
+    /// Channel profile(s) a sync enables the channels it creates in (at creation only).
+    /// LU's `channel_profiles`.
     pub channel_profiles: String,
 }
 
@@ -586,7 +589,9 @@ pub fn schema() -> SettingsSchema {
             FieldKind::Boolean,
             FieldValue::Boolean(false),
         )
-        .with_help("Fall back to the market when a channel has no callsign."),
+        .with_help(
+            "Fall back to the market when no printed callsign resolves to a station.",
+        ),
         FieldSpec::new(
             "unknown_suffix",
             SECTION_NAMES,
@@ -634,7 +639,11 @@ pub fn schema() -> SettingsSchema {
             FieldValue::Text(String::new()),
         )
         .with_placeholder("e.g. News, Sports, Movies")
-        .with_help("Category group names the organize step manages. Empty means none."),
+        .with_help(
+            "Channel groups (exact, case-sensitive names) whose channels the organize step \
+             categorizes, on top of the host scope. Empty means every in-scope channel; a \
+             name matching no group fails the run.",
+        ),
         FieldSpec::section(
             SECTION_LOGOS,
             "Logos",
@@ -681,13 +690,13 @@ pub fn schema() -> SettingsSchema {
         )
         .with_help(
             "Country codes whose tv-logos directories the per-channel logo step searches. \
-             Empty means the lineup file's own country.",
+             Empty means the channel's own country, else the enabled channel databases.",
         ),
         FieldSpec::section(
             SECTION_CREATE,
             "Create",
-            "Channel-Mapparr's two creation modes. 'streams' makes one channel per matched \
-             stream (and links it); 'stations' makes one channel per OTA station from \
+            "Channel-Mapparr's two creation modes. 'streams' makes one channel per identity \
+             family and attaches the family's streams; 'stations' makes one channel per OTA station from \
              unattached streams in the source groups, and attaches no streams.",
         ),
         FieldSpec::new(
@@ -699,8 +708,8 @@ pub fn schema() -> SettingsSchema {
         )
         .with_placeholder("streams or stations")
         .with_help(
-            "'streams': one channel per matched stream. 'stations': one channel per OTA \
-             station from unattached streams.",
+            "'streams': one channel per identity family, carrying its streams. 'stations': \
+             one channel per OTA station from unattached streams.",
         ),
         FieldSpec::new(
             "m3u_group_filter",
@@ -760,7 +769,10 @@ pub fn schema() -> SettingsSchema {
             FieldValue::Text(String::new()),
         )
         .with_placeholder("US: ABC")
-        .with_help("Stations mode: the existing channel group the new channels are created in."),
+        .with_help(
+            "Stations mode: the channel group the new channels are created in (created when \
+             missing).",
+        ),
         FieldSpec::new(
             "seed_start_number",
             SECTION_CREATE,
@@ -868,8 +880,8 @@ pub fn schema() -> SettingsSchema {
         )
         .with_placeholder("blank = none  |  Living Room, Kids")
         .with_help(
-            "Channel profile(s) to enable the synced channels in. Leave blank to leave \
-             profiles alone. Separate several with commas; names are not case-sensitive. \
+            "Channel profile(s) to enable newly created channels in (channels a sync already \
+             made never gain a profile row). Leave blank to leave profiles alone. Separate several with commas; names are not case-sensitive. \
              Whether a named profile exists is only checked at run time, when Dispatcharr \
              can be reached.",
         ),

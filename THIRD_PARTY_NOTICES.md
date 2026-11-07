@@ -355,8 +355,11 @@ one of the plugin files credited in the sections above.
   otherwise a same-or-older subset that contributes no name of its own),
   deduplicated on the verbatim `channel_name` with a sorted `sources` list per
   entry (case-only variants such as `Afro`/`AFRO` stay separate, as upstream). Newest file version wins
-  header and field conflicts. Loaded behind `crosstalk-matching::data::merged`
-  (not wired into matching yet); the existing profiles keep their current files.
+  header and field conflicts. Compiled in behind `crosstalk-matching::data::merged`
+  and read by lineup's `names` and `categorize`; the per-plugin files under
+  `data/channels/` and `data/stream-mapparr/` still ship: streams' country filter
+  reads them (Stream-Mapparr's own file where it has one, else EPG Janitor's), and
+  they define the codes `[matching] enabled_databases` accepts.
 - `data/merged/stations.json`: Channel-Mapparr's `networks.json` (6,839 FCC
   stations, 2026-08-10 LMS dump) plus `networks_supplemental.json` (WGCL) with
   `scripts/networks_corrections.json` applied (WBMA-LD), keyed by full callsign
@@ -377,9 +380,36 @@ one of the plugin files credited in the sections above.
   step to decide.
 - `data/merged/lineups/` (29 files, 7,485 channels): Lineuparr's `*_lineup.json`
   files copied verbatim (schema in `data/merged/lineups/README.md`).
+The merged set is compiled into the binary (`include_str!`), which is why the
+Dockerfile's build stage copies `data/`; the runtime image carries no separate data files.
 
-`Dockerfile` already does `COPY ./data`, so the merged set ships in the image
-with no Dockerfile change.
+## tv-logos (`tv-logo/tv-logos`): a test fixture, not shipped
+
+`scripts/data/tv_logos_tree.json` is a recorded listing of the `tv-logo/tv-logos` git
+tree: `main` at `d32e347bb7c4c640dceec23957802ad9182f58a6`, recorded 2026-11-07, the
+5,892 blob paths under the `countries/<dir>/` directories Channel-Mapparr's
+`COUNTRY_DIR_MAP` names (plus `nordic/norway`). It holds paths only, no images. The logos
+oracle (`scripts/oracle_report_lineup_logos.py`) reads it so the plugins' matchers and the
+Rust resolver score the same files, offline and reproducibly (CI's `--check`).
+
+The repository publishes no licence (no `LICENSE` file; GitHub reports none), so by
+default its owners reserve all rights. The fixture copies no logo, only the file names
+and directory layout, which are largely factual (`cnn-us.png`); the residual risk is that
+the listing as a whole is a compilation its owners could object to. Mitigations: it lives
+under `scripts/` and is used only by the oracle: it is not compiled in and ships in
+neither the release tarball nor the image. A smaller hand-picked subset was rejected
+because the oracle compares fuzzy best-of-directory matches, which only mean something over
+the real directories. If the owners object, or a licence that forbids it appears, delete
+the file and regenerate it locally instead of committing it: fetch
+`https://api.github.com/repos/tv-logo/tv-logos/git/trees/main?recursive=1`, keep the
+`blob` entries whose path starts with one of those `countries/<dir>/` prefixes as
+`{"path", "type"}` objects under `tree` (with `truncated` and a `_recorded` note), then
+rerun the oracle without `--check` and re-attribute any new difference.
+
+At runtime crosstalk vendors nothing from the repository either: the resolver fetches
+one recursive tree through the fetch cache (24 h TTL, unauthenticated, offline between
+refreshes), and a chosen logo is created on Dispatcharr by its raw GitHub URL, exactly as
+both plugins did.
 
 ## The parity gates and the drift report, over all six references
 

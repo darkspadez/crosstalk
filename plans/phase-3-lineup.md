@@ -304,41 +304,41 @@ to the lineup's country.
 Each step: Muse Spark 1.3 Contributor implements → gate → Opus 5.5 reviews and fixes → gate → commit.
 
 **A. Unification (guide and streams migrate here)**
-- [ ] 1. References: pin Channel-Mapparr (`45ba787`), Lineuparr (`9f6a5ff`), Name Cleaner
+- [x] 1. References: pin Channel-Mapparr (`45ba787`), Lineuparr (`9f6a5ff`), Name Cleaner
   (`d68b195`); drift lists; notices.
-- [ ] 2. AI chain with escalation (`[ai.verify] chain`), used by the labeller and at runtime.
-- [ ] 3. Rule inventory + oracle runners for all four matchers (Python, from `reference/`).
-- [ ] 4. Merged data set (`data/`: one DB per country, one station table, one alias table,
+- [x] 2. AI chain with escalation (`[ai.verify] chain`), used by the labeller and at runtime.
+- [x] 3. Rule inventory + oracle runners for all four matchers (Python, from `reference/`).
+- [x] 4. Merged data set (`data/`: one DB per country, one station table, one alias table,
   lineup files) with a provenance/conflict report.
-- [ ] 5. Corpus build + automatic labelling (majority now; chain if keys present) +
+- [x] 5. Corpus build + automatic labelling (majority now; chain if keys present) +
   `docs/matching-decisions.md`.
-- [ ] 6. Unified engine: one normalizer/ladder/alias/guards path per the decisions; identity
+- [x] 6. Unified engine: one normalizer/ladder/alias/guards path per the decisions; identity
   resolve + rank families; identity cache; retire `MatchProfile` from production code;
   corpus gate.
-- [ ] 7. Unified tag vocabulary, quality model, template engine + collision resolver, logo
+- [x] 7. Unified tag vocabulary, quality model, template engine + collision resolver, logo
   resolver (core / matching), with the fetch cache.
-- [ ] 8. Migrate guide onto identity families (match, heal, scan, cleanup); oracle diff report
+- [x] 8. Migrate guide onto identity families (match, heal, scan, cleanup); oracle diff report
   vs Janitor.
 - [x] 9. Migrate streams (match, sort, mirror, visibility, probe format tiers, triage tags);
   oracle diff report vs Stream-Mapparr / IPTV Checker.
 
 **B. Host features**
-- [ ] 10. Channel ops: `Field::Number`/`Field::Logo`, create stage + `ChannelCreator`,
+- [x] 10. Channel ops: `Field::Number`/`Field::Logo`, create stage + `ChannelCreator`,
   ownership table, number-conflict check (collision resolver from step 7).
-- [ ] 11. Host undo (core + CLI + web) for every app.
-- [ ] 12. Workflow step tables (scope override, continue_on_failure).
+- [x] 11. Host undo (core + CLI + web) for every app.
+- [x] 12. Workflow step tables (scope override, continue_on_failure).
 
 **C. Lineup app (built on A + B)**
-- [ ] 13. Lineup crate skeleton: settings, lineup files + loader (country, category_detail),
+- [x] 13. Lineup crate skeleton: settings, lineup files + loader (country, category_detail),
   registry, validate/status.
-- [ ] 14. `clean_*` + `test_name` (unified tags + collision resolver); oracle vs NC.
-- [ ] 15. `names_*` (identity canonical names, OTA template, unknown tagging, AI gate);
+- [x] 14. `clean_*` + `test_name` (unified tags + collision resolver); oracle vs NC.
+- [x] 15. `names_*` (identity canonical names, OTA template, unknown tagging, AI gate);
   oracle vs CM.
-- [ ] 16. `categorize_*`, `logos_*` (unified logo resolver); oracle vs CM and LU.
-- [ ] 17. `create_*` (streams / stations modes); oracle vs CM.
-- [ ] 18. `sync_*` + `tidy_*` + ownership; oracle vs LU; fixes documented.
-- [ ] 19. `streams.match` lineup mode + `full_sync` example workflow.
-- [ ] 20. Docs: README (one matcher, decisions doc, every app's actions, differences, undo, AI
+- [x] 16. `categorize_*`, `logos_*` (unified logo resolver); oracle vs CM and LU.
+- [x] 17. `create_*` (streams / stations modes); oracle vs CM.
+- [x] 18. `sync_*` + `tidy_*` + ownership; oracle vs LU; fixes documented.
+- [x] 19. `streams.match` lineup mode + `full_sync` example workflow.
+- [x] 20. Docs: README (one matcher, decisions doc, every app's actions, differences, undo, AI
   chain), example configs, bench numbers.
 - [ ] Phase end: Fable 5.1 review and fixes over the whole phase (cross-app consistency: the
   same name must yield the same identity and family in guide, streams and lineup).

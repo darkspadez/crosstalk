@@ -21,8 +21,7 @@
 # its new home.
 #
 # The daemon writes back to this file when a setting is changed in the web UI,
-# preserving comments. Step 13 registers only validate and status; the clean, names,
-# categorize, logos, create, sync and tidy pairs land with steps 14-18.
+# preserving comments.
 
 # --- Clean ------------------------------------------------------------------
 #
@@ -77,7 +76,7 @@ max_preview_rows = 400
 # Template for US over-the-air channel names, from the callsign ladder and the station
 # table. The callsign suffix is stripped.
 ota_format = "{NETWORK} - {STATE} {CITY} ({CALLSIGN})"
-# Fall back to the market when a channel has no callsign.
+# Fall back to the market when no printed callsign resolves to a station.
 ota_market_fallback = false
 # Suffix appended to a channel no database recognises. The leading space is part of the
 # value: without it the name reads 'ESPN[Unk]'.
@@ -93,7 +92,9 @@ ai_gate_enabled = false
 #
 # Channel-Mapparr's organize step: the category group names it manages.
 
-# Category group names the organize step manages. Empty means none.
+# Channel groups (exact, case-sensitive names) whose channels the organize step
+# categorizes, on top of [scope]. Empty means every in-scope channel; a name matching no
+# group fails the run.
 category_groups = ""
 
 # --- Logos ---------------------------------------------------------------------
@@ -111,16 +112,16 @@ logo_sources = "epg, logo_manager, tv-logos, network"
 # off, channels with a logo are left alone.
 replace_existing = false
 # Country codes whose tv-logos directories the per-channel logo step searches. Empty
-# means the lineup file's own country.
+# means the channel's own country, else the enabled [matching] databases.
 tv_logos_countries = ""
 
 # --- Create ----------------------------------------------------------------------
 #
-# Channel-Mapparr's two creation modes. 'streams' makes one channel per matched stream
-# (and links it); 'stations' makes one channel per OTA station from unattached streams
+# Channel-Mapparr's two creation modes. 'streams' makes one channel per identity family
+# and attaches the family's streams (Channel-Mapparr made one per stream); 'stations' makes one channel per OTA station from unattached streams
 # in the source groups, and attaches no streams.
 
-# 'streams': one channel per matched stream. 'stations': one channel per OTA station
+# 'streams': one channel per identity family. 'stations': one channel per OTA station
 # from unattached streams.
 create_mode = "streams"
 # Comma-separated M3U group titles to import from, applied BEFORE matching. Leave empty
@@ -135,7 +136,7 @@ m3u_custom_group_name = ""
 # Stations mode: comma-separated stream groups to scan. Only streams in these groups
 # that are not attached to any channel are considered. Leave empty to do nothing.
 seed_source_groups = ""
-# Stations mode: the existing channel group the new channels are created in.
+# Stations mode: the channel group the new channels are created in (created when missing).
 seed_target_group = ""
 # Stations mode: the first channel number to assign. Numbers already in use are skipped.
 # Leave empty to start above the highest channel number on the system.
@@ -171,7 +172,7 @@ channel_numbering = "lineup"
 # The first number to use when Channel Numbering is 'specific'. Every other mode ignores
 # this setting.
 starting_channel_number = ""
-# Channel profile(s) to enable the synced channels in. Leave blank to leave profiles
-# alone. Separate several with commas; names are not case-sensitive. Whether a named
+# Channel profile(s) to enable newly created channels in (channels a sync already made
+# never gain a profile row). Leave blank to leave profiles alone. Separate several with commas; names are not case-sensitive. Whether a named
 # profile exists is only checked at run time, when Dispatcharr can be reached.
 channel_profiles = ""
