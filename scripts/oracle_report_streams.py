@@ -32,6 +32,11 @@ Usage:
 
 Attribution buckets (every difference lands in exactly one):
 
+- ``C07-callsign-first``: the channel names a station in parentheses
+  (``ABC (WABC)``) and the unified family carries that callsign while the
+  plugin's picks do not (typically the bare national ``ABC`` streams). Decided C07
+  ``callsign-first`` (orchestrator): same-callsign streams outrank the national
+  ones; the national family is the fallback only when no station stream exists.
 - ``callsign-anchor`` (C06/D04): the channel or the plugin's picks carry a callsign
   the engine's anchor does not promote (low-confidence or uncorroborated on one
   side). SM's regex path with corroboration is retired; station-format names still
@@ -131,6 +136,23 @@ def summary_line(raw: str, tag: str) -> str:
 
 COUNTRIES = ("US", "UK", "CA")
 
+#: Decided C07 probes (documented, not sampled), appended to the representative world:
+#: network-led station channels over streams holding both the station and the bare
+#: national feed, plus one with no station stream (the national fallback, whose known
+#: answer is the national feed). ``(channel, truth base)`` and ``(stream, truth base)``.
+C07_CHANNELS = (
+    ("ABC (WABC)", "WABC"),
+    ("US: NBC (KSDK) HD", "KSDK"),
+    ("CBS (WFOR) [HD]", "CBS"),
+)
+C07_STREAMS = (
+    ("ABC", "ABC"), ("ABC HD", "ABC"), ("WABC-TV", "WABC"),
+    ("ABC 7 New York (WABC) HD", "WABC"),
+    ("NBC", "NBC"), ("US: NBC HD", "NBC"), ("NBC 5 St. Louis KSDK", "KSDK"),
+    ("KSDK", "KSDK"),
+    ("CBS", "CBS"), ("CBS HD", "CBS"),
+)
+
 
 def fixture_world() -> tuple[list[dict], list[dict]]:
     """Deterministic REPRESENTATIVE world with a known answer (sections 2a/2b).
@@ -209,6 +231,12 @@ def fixture_world() -> tuple[list[dict], list[dict]]:
             group, group_country = (102, "US") if code == "US" else (103, "UK")
         channels.append({"name": label, "base": name, "country": country,
                          "group": group, "group_country": group_country})
+    # Decided C07 probes, appended after the seeded draws (the sample is unchanged).
+    for label, base in C07_STREAMS:
+        streams.append({"name": label, "base": base, "country": None})
+    for label, base in C07_CHANNELS:
+        channels.append({"name": label, "base": base, "country": None,
+                         "group": 100, "group_country": None})
     return channels, streams
 
 
@@ -348,6 +376,14 @@ def attribute(channel: str, python_after: list, rust_after: list, rust_reason: s
     rust_names = [id_to_name.get(i, "") for i in rust_after]
     if set(python_after) == set(rust_after) and python_after != rust_after:
         return "order"
+    paren_station = CALLSIGN_RE.search(channel)
+    if paren_station:
+        # Decided C07: the unified family carries the channel's callsign, the
+        # plugin's picks do not.
+        word = re.compile(rf"\b{re.escape(paren_station.group(1).split('-')[0])}\b")
+        if any(word.search(name) for name in rust_names) and not any(
+                word.search(name) for name in python_names):
+            return "C07-callsign-first"
     chan_tokens = upper_tokens(channel)
     pick_tokens = set().union(*(upper_tokens(name) for name in python_names))
     # Callsign-shaped agreement (a merged station-table base on both sides), not just
@@ -516,7 +552,11 @@ def render(parity: dict, worlds: list[tuple[str, str, dict]], show: int) -> str:
     lines.append("  provider variants per listed name — `HD`, `FHD`, `[4K]`, `(Backup)`, its own")
     lines.append("  `<CC>:` — and a foreign `<CC>:` duplicate for a quarter of them; channels:")
     lines.append("  85% of the names provider-decorated, a fifth of the US/UK ones in a")
-    lines.append("  `US: Sports`/`UK: Sports` group, plus the rest as true negatives)")
+    lines.append("  `US: Sports`/`UK: Sports` group, plus the rest as true negatives; plus three")
+    lines.append("  documented C07 probes: `ABC (WABC)` and `US: NBC (KSDK) HD` over streams")
+    lines.append("  holding the station and the bare national feed — answer: the station — and")
+    lines.append("  `CBS (WFOR) [HD]` with no WFOR stream — answer: the national `CBS`, the")
+    lines.append("  fallback)")
     lines.append(f"- disputed fixture: {dis['channels']} queries x {dis['streams']} streams")
     lines.append("  (queries mined from `data/corpus/pairs.jsonl`: pairs Stream-Mapparr takes")
     lines.append("  but another plugin disputes or the label disputes; entries are the pair")

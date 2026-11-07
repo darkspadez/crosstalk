@@ -162,8 +162,8 @@ fn rank_winner_identity_is_order_independent() {
 #[test]
 fn data_version_is_namespaced() {
     let version = crosstalk_matching::engine::data_version();
-    // Step 14 collapses `|` junk segments before key/zone/country (N15): `eng:4`.
-    assert!(version.contains("eng:4"), "{version}");
+    // Follow-up fix ranks network-led callsign names onto the station (C07): `eng:5`.
+    assert!(version.contains("eng:5"), "{version}");
     // Two calls agree (memoized), and distinct inputs key distinctly.
     assert_eq!(version, crosstalk_matching::engine::data_version());
     let a = IdentityCache::input_key("ESPN", &ctx());

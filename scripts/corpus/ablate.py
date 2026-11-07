@@ -630,6 +630,44 @@ def _known_set(source: str):
     return _KNOWN_SETS[source]
 
 
+def _normalize_base(raw: str | None) -> str | None:
+    """Suffix-stripped upper-cased callsign base, mirroring Rust's
+    `normalize_callsign` (the engine's `CandidateView.base` / `QueryPrep.base`)."""
+    if not raw:
+        return None
+    return re.sub(r"-(?:TV|CD|LP|DT|LD)$", "", raw.upper())
+
+
+def callsign_first_base(engine: "Engine", query: str) -> str | None:
+    """The query's callsign-first base (decided C07 `callsign-first`).
+
+    The normalized callsign when the query carries a high-confidence callsign
+    the merged station table knows, else None (the whole rule is off for that
+    query). Mirrors `UnifiedEngine::callsign_first_query` in Rust exactly:
+    high confidence from the decided ladder, membership in the merged table.
+    """
+    raw, high = engine.matcher._extract_callsign_with_confidence(query)
+    if not raw or not high:
+        return None
+    base = _normalize_base(raw)
+    if base not in _known_set("merged"):
+        return None
+    return base
+
+
+def candidate_known_base(engine: "Engine", name: str) -> str | None:
+    """The candidate's callsign base when the merged table knows it, else None.
+
+    Confidence is deliberately ignored (mirroring Rust's `CandidateView.base` +
+    `known.contains` read): a low-confidence mention of a real station is still
+    that station."""
+    raw, _high = engine.matcher._extract_callsign_with_confidence(name)
+    base = _normalize_base(raw)
+    if base not in _known_set("merged"):
+        return None
+    return base
+
+
 #: CALLSIGN configurations: (ladder, known set, OTA-number rescue).
 CALLSIGN_CONFIGS = {
     "lu": ("core", None, True),
@@ -844,6 +882,16 @@ class Engine:
             if not ranked:
                 return None
             _name, score, method = ranked[0]
+            # Decided C07 `callsign-first` (orchestrator): a network-led station
+            # name never takes a DIFFERENT known station. Mirrors Rust's
+            # `score_core` step 2a exactly: the anchor's high/high hard-reject,
+            # extended to any known candidate callsign. A callsign-less
+            # candidate is NOT rejected here (the national fallback).
+            query_base = callsign_first_base(self, query)
+            if query_base is not None:
+                candidate_base = candidate_known_base(self, candidate)
+                if candidate_base is not None and candidate_base != query_base:
+                    return None
             if method == "callsign":
                 # Callsign-anchored candidates skip the region filter and the
                 # fuzzy-loop guards (JAN :1373-1391, LU :871-893, :970).
@@ -1385,6 +1433,16 @@ def self_test() -> int:
     check("base same HBO/HBO HD", engine.same("HBO", "HBO HD"), True)
     check("base +1 shift rejects", engine.same("Zorblax Movies", "Zorblax Movies +1"),
           False)
+    decided = Engine({"CALLSIGN": "core-merged-norescue"}, 80, alias_map)
+    check("C07 query base WABC", callsign_first_base(decided, "ABC (WABC)"), "WABC")
+    check("C07 query base unknown", callsign_first_base(decided, "ABC (WZZZ)"), None)
+    check("C07 query base bare", callsign_first_base(decided, "ABC"), None)
+    check("C07 national fallback still pairs", decided.same("ABC (WABC)", "ABC"), True)
+    check("C07 different station excluded",
+          decided.same("ABC (WABC)", "NBC (KSDK)"), False)
+    check("C07 different low-confidence station excluded",
+          decided.same("ABC (WABC)", "KOMO News"), False)
+    check("C07 same station pairs", decided.same("ABC (WABC)", "WABC"), True)
     check("zone lu rejects regionless vs West", engine.same("HBO", "HBO West"), False)
     check("zone none keeps it", Engine({"ZONE": "none"}, 80, alias_map).same(
         "HBO", "HBO West"), True)

@@ -728,3 +728,50 @@ Step 15 review (2026-11-07):
   (digit-led shapes) blocks premium on CM's side only (`ota-vs-premium`); the DB
   base drops ignored quality tags (`BX Culture (HD)` -> `BX Culture`, so names
   and clean agree); one regional word at most; `NBC: ION` reads as `NBC`.
+- **RESOLVED (follow-up engine fix): new orchestrator row C07 `callsign-first`.**
+  When the query's identity has a high-confidence callsign (the engine's existing
+  confidence) that exists in the merged station table, a candidate with the same
+  callsign outranks any non-callsign match, and a candidate with a DIFFERENT known
+  callsign is excluded (the C06/D04 anchor's high/high hard-reject, extended to any
+  known candidate callsign — `score_core` step 2a); a candidate with no callsign
+  (the bare national `ABC`) only wins when no same-callsign candidate survives the
+  cut in the pool (`ranked_survivors` orders same-callsign first, then score — the
+  fallback keeps today's behaviour for pools lacking the station). Identity
+  families stay consistent: callsign identities already ignore country (bug-161),
+  unchanged. No plugin variant ranks callsign-first, so there is no variant to
+  ablate; mirrored exactly in the decided Python configuration
+  (`ablate.Engine.score` + `engine_parity.python_family` via `callsign_first_base` /
+  `candidate_known_base` over the merged table). `ENGINE_VERSION` 4 → 5 (identity
+  cache invalidation; `-eng:N` assertions fixed); `decide.py` re-run — engine cost
+  844 → 844 at cut 80 (FP 34, FN 776 unchanged) and 835 → 835 at cut 95 (FP 8,
+  FN 819 unchanged; the old anchor already rejected the corpus pairs this extends),
+  coherence checks hold. All three oracle reports regenerate byte-identically (0
+  deltas: no fixture sets a network-led station query against a pool holding both
+  the station and the bare national entry). `ota_renames_keep_the_guide_and_streams_families`
+  now pins the station family both before and after the rename, plus the national
+  fallback and the different-callsign exclusion; `13 WREX` unchanged; names without
+  a callsign never trigger the rule (engine property test).
+- **C07 review (2026-11-07).** False-exclusion audit over every name in the merged
+  channel DBs, lineups, alias tables and corpus (60,745): 2,940 carry a
+  high-confidence known callsign; no pair any of them matched before C07 (cut 95
+  through the Rust engine, HEAD vs working tree, every word-sharing candidate with
+  a known callsign; cut 80 through the Python mirror with the rule off, 517,447
+  pairs sharing half their words) carries a different known callsign, so ignoring
+  candidate-side confidence excludes nothing today and the rule stays as decided.
+  Candidate-side low-confidence hits on known stations are real stations
+  (`KOMO News`, `WGN America`, `NFL on KRQE`, `★ KCOP (MNT) ★`); the only words are
+  `Tyne & Wear TV` (WEAR) and `Hong Kong Fight Club` (KONG), which no station query
+  comes near. Fallback kept on evidence: Janitor's real `_find_best_epg_match`
+  assigns the bare national entry (`ABC`, Fuzzy 100) to `ABC (WABC)` with or
+  without the station listed, so the fallback IS Janitor's answer; a network feed's
+  guide is right for the network day and wrong only for local blocks, which beats
+  no guide, and nothing asks for an AI/rescue gate instead (revisit on operator
+  evidence). Oracle reports: the guide and streams representative worlds now carry
+  three documented C07 probes (`ABC (WABC)`, `US: NBC (KSDK) HD` with station and
+  national both present; `CBS (WFOR) [HD]` with no station, answer the national
+  `CBS`) and a `C07-callsign-first` bucket. Decide row: the non-chosen variant is
+  named `score-first` (what every plugin does), not `lu-anchor`; the coherence
+  check also requires the D04 anchor C07 extends.
+
+### Open for the phase review (orchestrator, after C07)
+- A stream or entry named only by its callsign (`KSDK`, `WABC-TV`) does not join the station's family for a network-led channel (`US: NBC (KSDK) HD`); Stream-Mapparr attaches it. Safe (writes less), attributed to `callsign-anchor` in docs/oracle-reports/streams.md. Likely cause: a bare callsign name resolves without a high-confidence callsign identity. Decide whether a name that is entirely a known station callsign should resolve to that station's callsign identity.

@@ -16,11 +16,14 @@ and it exists to show every kind of difference, not how often they happen.
 ## Inputs
 
 - cut (host `[matching]` sensitivity at strict): 95
-- representative world: 300 channels x 600 entries
+- representative world: 303 channels x 605 entries
   (entries: a seeded sample of the US/UK/CA channel-database display names;
   channels: provider-decorated copies of 240 of them — `HD`, `[FHD]`, `<CC>: `,
   `(Backup)`, upper case, verbatim — plus 60 database names absent from the
-  listing as true negatives)
+  listing as true negatives), plus three documented C07 probes: `ABC (WABC)` and
+  `US: NBC (KSDK) HD` over a listing holding the station and the bare national
+  entry (expected: the station), `CBS (WFOR) [HD]` with no WFOR entry (expected:
+  the national `CBS`, the fallback)
 - disputed fixture: 46 queries x 120 entries
   (queries mined from `data/corpus/pairs.jsonl`: pairs Janitor takes but another
   plugin or the label disputes; entries are the pair candidates plus DB names;
@@ -53,8 +56,8 @@ Against the known answer (the entry each channel was decorated from):
 
 | | Janitor | unified |
 |---|---|---|
-| decorated channels matched to their source (240) | 239 | 240 |
-| decorated channels matched to a different entry | 0 | 0 |
+| decorated channels matched to their source (243) | 240 | 243 |
+| decorated channels matched to a different entry | 2 | 0 |
 | absent channels matched to anything (60, false positives) | 1 | 1 |
 
 A "different entry" is not always wrong (a listing can carry the same channel
@@ -64,10 +67,11 @@ world measures how often the migration changes an everyday answer; the hard
 cases (typos, zones, regional splits, callsign-only names) are section 4 and the
 labelled corpus (`docs/matching-decisions.md`).
 
-- 299/300 queries agree on the winner
+- 300/303 queries agree on the winner
 
 ### Differences by attribution
 
+- `C07-callsign-first`: 2
 - `D06-retired`: 0
 - `D02/T10-cut`: 1
 - `alias+selection`: 0
@@ -75,6 +79,11 @@ labelled corpus (`docs/matching-decisions.md`).
 - `selection-rule`: 0
 - `zone-routing`: 0
 - `unattributed`: 0
+
+#### C07-callsign-first (2)
+
+- `ABC (WABC)`: janitor 'ABC' (100, Fuzzy) vs unified 'ABC 7 New York (WABC)' (95, callsign)
+- `US: NBC (KSDK) HD`: janitor 'NBC' (100, Fuzzy) vs unified 'NBC 5 St. Louis KSDK' (95, callsign)
 
 #### D02/T10-cut (1)
 
@@ -86,6 +95,7 @@ labelled corpus (`docs/matching-decisions.md`).
 
 ### Differences by attribution
 
+- `C07-callsign-first`: 0
 - `D06-retired`: 1
 - `D02/T10-cut`: 0
 - `alias+selection`: 1
@@ -127,6 +137,10 @@ labelled corpus (`docs/matching-decisions.md`).
 
 ## Bucket notes
 
+- `C07-callsign-first` (orchestrator): a network-led station channel
+  (`ABC (WABC)`) takes the entry carrying its callsign; Janitor takes the bare
+  national entry on the stripped key. The national entry is still the answer
+  when the listing has no entry for the station (the fallback).
 - `D06-retired`: Janitor's structural callsign/state/city/network score (whole-path
   comparison, no-evidence, sole implementation) is retired in step 8; callsign
   agreement decides at family level through the engine anchor (C06/D04 `lu-anchor`).

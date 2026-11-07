@@ -196,8 +196,8 @@ mod tests {
         assert_eq!(memory.resolve("US: ESPN HD", &ctx), via_run);
 
         // The version namespaces the rows: a rule change misses every old identity.
-        // `-eng:4`: pipe-delimited junk segments drop before keying (N15, after Z08's `-eng:3`).
-        assert!(run.engine().identity_version().contains("-eng:4"));
+        // `-eng:5`: network-led callsign names rank onto the station (C07, after N15's `-eng:4`).
+        assert!(run.engine().identity_version().contains("-eng:5"));
     }
 
     #[tokio::test]

@@ -206,6 +206,12 @@ def python_family(engine: ablate.Engine, threshold: int, query: str,
     """
     query_tokens = set(re.findall(r"[a-z0-9]+", (query or "").lower()))
     query_key = engine.normalize(query).lower()
+    # Decided C07 `callsign-first` (orchestrator): a surviving same-callsign
+    # candidate outranks any non-callsign match (`Engine.score` already drops a
+    # different KNOWN callsign, mirroring Rust's `score_core` step 2a). Mirrors
+    # Rust's `ranked_survivors` ordering exactly: same-callsign first, then score
+    # desc, then the identity-equal tie-break, then overlap, then position.
+    first_base = ablate.callsign_first_base(engine, query)
     scored = []
     for position, name in enumerate(candidates):
         hit = engine.score(query, name)
@@ -213,7 +219,10 @@ def python_family(engine: ablate.Engine, threshold: int, query: str,
             continue
         overlap = len(query_tokens & set(re.findall(r"[a-z0-9]+", name.lower())))
         equal = engine.normalize(name).lower() == query_key
-        scored.append((-hit[0], -int(equal), -overlap, position, name, hit[0], hit[1]))
+        first = (first_base is not None
+                 and ablate.candidate_known_base(engine, name) == first_base)
+        scored.append((-int(first), -hit[0], -int(equal), -overlap, position,
+                        name, hit[0], hit[1]))
     scored.sort()
     family = [(name, score, method) for *_key, name, score, method in scored]
     if not family:

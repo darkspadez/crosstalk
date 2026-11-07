@@ -2132,11 +2132,11 @@ mod tests {
             found.sort_unstable();
             found
         };
-        // Callsign-led names already rank onto the station: the rename keeps it. Network-led names (`ABC (WABC)`) rank on the stripped key
-        // first, so BEFORE the rename the shared ranker hands guide and streams the
-        // bare network (`ABC`, Exact 100) — the engine's precedence, the same in
-        // every app and independent of names. After the rename they rank by
-        // callsign onto the station. Pinned both ways so an engine change to that
+        // Decided C07 `callsign-first` (orchestrator, follow-up engine fix): a
+        // network-led station name (`ABC (WABC)`) ranks the station family both
+        // BEFORE and AFTER the rename — the same-callsign candidate outranks the
+        // bare national entry's stripped-key Exact 100, in every app. Callsign-led
+        // names keep the station as before. Pinned so any engine change to that
         // precedence flips this test on purpose.
         let station_only = |members: &[usize], names: &[String], callsign: &str| {
             !members.is_empty()
@@ -2147,7 +2147,7 @@ mod tests {
                 })
         };
         let mut swept = 0;
-        for (name, callsign_led) in [
+        for (name, _callsign_led) in [
             ("WABC-TV", true),
             ("13 WREX", true),
             ("ABC (WABC)", false),
@@ -2184,28 +2184,53 @@ mod tests {
                     row.new,
                     renamed.iter().map(|&i| &pool[i]).collect::<Vec<_>>()
                 );
-                if callsign_led {
-                    // Same station both sides; the top member may differ (`WABC-TV`
-                    // Exact before, `ABC 7 New York (WABC)` by Callsign after).
-                    assert!(
-                        station_only(&before, pool, &callsign),
-                        "{side}: {name:?} ranked {:?} before the rename",
-                        before.iter().map(|&i| &pool[i]).collect::<Vec<_>>()
-                    );
-                } else if side == "guide" {
-                    // The bare network entry wins on the stripped key. (The streams
-                    // pool is not pinned before the rename: whether a stream shares
-                    // the stripped key, like `US: NBC (KSDK) HD`, is the pool's luck.)
-                    assert!(
-                        !before.is_empty() && !station_only(&before, pool, &callsign),
-                        "{side}: {name:?} ranked {:?} before the rename",
-                        before.iter().map(|&i| &pool[i]).collect::<Vec<_>>()
-                    );
-                }
+                // Decided C07: the station family wins before the rename too —
+                // callsign-led or network-led, the pool decides, not the shape.
+                // The top member may differ (`WABC-TV` Exact before,
+                // `ABC 7 New York (WABC)` by Callsign after).
+                assert!(
+                    station_only(&before, pool, &callsign),
+                    "{side}: {name:?} ranked {:?} before the rename",
+                    before.iter().map(|&i| &pool[i]).collect::<Vec<_>>()
+                );
             }
             swept += 1;
         }
         assert_eq!(swept, 6);
+        // Fallback: with no same-callsign candidate in the pool the bare national
+        // entry still wins (today's behaviour for pools lacking the station).
+        let national_epg: Vec<String> = ["ABC", "NBC", "CBS"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let national_pool =
+            crosstalk_matching::engine::EngineIndex::build(&national_epg, &engine, &ctx);
+        for (name, national) in [
+            ("ABC (WABC)", "ABC"),
+            ("US: ABC (WABC) HD", "ABC"),
+            ("NBC (KSDK)", "NBC"),
+            ("CBS (WFOR) [HD]", "CBS"),
+        ] {
+            let family = engine.rank_index_in(name, None, &national_pool);
+            assert_eq!(family.len(), 1, "{name}: {family:?}");
+            assert_eq!(&national_epg[family[0].index], national);
+        }
+        // A different known station never joins a station query's family.
+        let rival_pool: Vec<String> = ["KSDK", "NBC", "ABC"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let rival_index =
+            crosstalk_matching::engine::EngineIndex::build(&rival_pool, &engine, &ctx);
+        let family = engine.rank_index_in("ABC (WABC)", None, &rival_index);
+        let names: Vec<&str> = family
+            .iter()
+            .map(|member| rival_pool[member.index].as_str())
+            .collect();
+        assert!(
+            names.iter().all(|name| !name.contains("KSDK")),
+            "no KSDK member: {names:?}"
+        );
     }
 
     #[test]

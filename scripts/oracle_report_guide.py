@@ -22,6 +22,11 @@ Usage:
 
 Attribution buckets (every difference lands in exactly one):
 
+- ``C07-callsign-first``: the channel names a station in parentheses
+  (``ABC (WABC)``) and the unified winner carries that callsign while Janitor's
+  does not (typically the bare national ``ABC`` on the stripped key). Decided C07
+  ``callsign-first`` (orchestrator): a same-callsign entry outranks the national
+  one; the national entry is the fallback only when the listing has no station.
 - ``D06-retired``: Janitor's winner is structural-only (its method names
   Callsign/State/City/Network with no Alias/Fuzzy side) while the unified engine
   decides by family. D06 kept the structural score as the sole EPG implementation
@@ -54,6 +59,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -68,6 +74,18 @@ THRESHOLD = 95
 
 STRUCTURAL_WORDS = ("callsign", "state", "city", "network")
 FUZZY_WORDS = ("fuzzy", "alias", "exact", "substring")
+#: A parenthesised station callsign on the channel (`ABC (WABC)`, `NBC (KSDK-TV)`).
+PAREN_CALLSIGN = re.compile(r"\(([KW][A-Z]{2,3})(?:-(?:TV|CD|LP|DT|LD))?\)")
+
+#: Decided C07 probes (documented, not sampled): a network-led station channel over a
+#: listing holding both the station and the bare national entry, plus one whose
+#: station is absent (the national fallback). ``(channel, expected entry)``.
+C07_PROBES = (
+    ("ABC (WABC)", "ABC 7 New York (WABC)"),
+    ("US: NBC (KSDK) HD", "NBC 5 St. Louis KSDK"),
+    ("CBS (WFOR) [HD]", "CBS"),
+)
+C07_ENTRIES = ("ABC", "NBC", "CBS", "ABC 7 New York (WABC)", "NBC 5 St. Louis KSDK")
 
 def run(cmd: list[str]) -> str:
     proc = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True)
@@ -167,13 +185,26 @@ def janitor_is_structural_only(method: str | None) -> bool:
     )
 
 
-def attribute(janitor: tuple | None, unified: tuple | None, zone_split: bool) -> str:
+def callsign_first_split(query: str, j_name: str | None, u_name: str | None) -> bool:
+    """Decided C07: the unified winner carries the channel's parenthesised callsign
+    and Janitor's winner does not."""
+    match = PAREN_CALLSIGN.search(query)
+    if not match or u_name is None:
+        return False
+    word = re.compile(rf"\b{match.group(1)}\b")
+    return bool(word.search(u_name)) and not (j_name and word.search(j_name))
+
+
+def attribute(query: str, janitor: tuple | None, unified: tuple | None,
+              zone_split: bool) -> str:
     """One bucket per difference (see the module docstring for the rules).
 
     ``zone_split`` comes from the engine itself (``oracle_io``'s ``probe_zone_split``:
     the Z01 guard separates the query from Janitor's winner), never from a word list."""
     j_name, j_score, j_method = janitor if janitor else (None, 0, None)
     u_name, u_score, u_method = unified if unified else (None, 0, None)
+    if j_name != u_name and callsign_first_split(query, j_name, u_name):
+        return "C07-callsign-first"
     if j_name is not None and u_name is not None and j_name != u_name:
         if janitor_is_structural_only(j_method):
             return "D06-retired"
@@ -260,6 +291,13 @@ def representative_names() -> tuple[list[str], list[str], list[str | None]]:
     for code, name in absent:
         queries.append(f"{code}: {name}")
         expected.append(None)
+    # Decided C07 probes, appended after the seeded draws (the sample is unchanged).
+    for name in C07_ENTRIES:
+        if name not in entries:
+            entries.append(name)
+    for query, want in C07_PROBES:
+        queries.append(query)
+        expected.append(want)
     return queries, entries, expected
 
 
@@ -293,6 +331,7 @@ def compare(queries: list[str], entries: list[str], show: int,
     }
 
     buckets: dict[str, list[dict]] = {
+        "C07-callsign-first": [],
         "D06-retired": [], "D02/T10-cut": [], "alias+selection": [],
         "decided-rows": [], "selection-rule": [], "zone-routing": [],
         "unattributed": [],
@@ -325,7 +364,7 @@ def compare(queries: list[str], entries: list[str], show: int,
         if j_id == row["winner_id"]:
             agreements += 1
             continue
-        bucket = attribute(j, u, bool(row.get("probe_zone_split")))
+        bucket = attribute(query, j, u, bool(row.get("probe_zone_split")))
         buckets.setdefault(bucket, buckets["unattributed"]).append({
             "query": query,
             "janitor": {"name": j[0] if j else None, "score": j[1] if j else 0,
@@ -365,7 +404,7 @@ def representative_section(show: int) -> dict:
     return compare(queries, entries, show, expected)
 
 
-BUCKETS = ("D06-retired", "D02/T10-cut", "alias+selection", "decided-rows",
+BUCKETS = ("C07-callsign-first", "D06-retired", "D02/T10-cut", "alias+selection", "decided-rows",
            "selection-rule", "zone-routing", "unattributed")
 
 
@@ -425,7 +464,10 @@ def render(sweep: dict, sim: dict, fixture: dict, representative: dict) -> str:
         "  (entries: a seeded sample of the US/UK/CA channel-database display names;",
         "  channels: provider-decorated copies of 240 of them — `HD`, `[FHD]`, `<CC>: `,",
         "  `(Backup)`, upper case, verbatim — plus 60 database names absent from the",
-        "  listing as true negatives)",
+        "  listing as true negatives), plus three documented C07 probes: `ABC (WABC)` and",
+        "  `US: NBC (KSDK) HD` over a listing holding the station and the bare national",
+        "  entry (expected: the station), `CBS (WFOR) [HD]` with no WFOR entry (expected:",
+        "  the national `CBS`, the fallback)",
         f"- disputed fixture: {fixture['queries']} queries x {fixture['entries']} entries",
         "  (queries mined from `data/corpus/pairs.jsonl`: pairs Janitor takes but another",
         "  plugin or the label disputes; entries are the pair candidates plus DB names;",
@@ -499,6 +541,10 @@ def render(sweep: dict, sim: dict, fixture: dict, representative: dict) -> str:
     lines += [
         "## Bucket notes",
         "",
+        "- `C07-callsign-first` (orchestrator): a network-led station channel",
+        "  (`ABC (WABC)`) takes the entry carrying its callsign; Janitor takes the bare",
+        "  national entry on the stripped key. The national entry is still the answer",
+        "  when the listing has no entry for the station (the fallback).",
         "- `D06-retired`: Janitor's structural callsign/state/city/network score (whole-path",
         "  comparison, no-evidence, sole implementation) is retired in step 8; callsign",
         "  agreement decides at family level through the engine anchor (C06/D04 `lu-anchor`).",

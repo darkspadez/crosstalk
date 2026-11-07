@@ -23,13 +23,17 @@ back.
 ## Inputs
 
 - cut (host `[matching]` sensitivity at strict, SM `exact`): 95
-- representative world: 222 channels x 621 streams
+- representative world: 225 channels x 631 streams
   (lineup: seeded anchors from the US/UK/CA channel databases plus up to three
   alphabetical siblings each — `ESPN`/`ESPN 2`/`ESPNews`; streams: two to five
   provider variants per listed name — `HD`, `FHD`, `[4K]`, `(Backup)`, its own
   `<CC>:` — and a foreign `<CC>:` duplicate for a quarter of them; channels:
   85% of the names provider-decorated, a fifth of the US/UK ones in a
-  `US: Sports`/`UK: Sports` group, plus the rest as true negatives)
+  `US: Sports`/`UK: Sports` group, plus the rest as true negatives; plus three
+  documented C07 probes: `ABC (WABC)` and `US: NBC (KSDK) HD` over streams
+  holding the station and the bare national feed — answer: the station — and
+  `CBS (WFOR) [HD]` with no WFOR stream — answer: the national `CBS`, the
+  fallback)
 - disputed fixture: 55 queries x 119 streams
   (queries mined from `data/corpus/pairs.jsonl`: pairs Stream-Mapparr takes
   but another plugin disputes or the label disputes; entries are the pair
@@ -51,12 +55,13 @@ parsing, sort key, mirror plan, tools) and stay gates at 0.
 
 ## 2a. streams end-to-end, representative world, country filter off: unified engine vs Stream-Mapparr
 
-- channels: 222, streams: 621
-- plugin matched: 176, unified matched: 177
-- agreement (identical after-lists): 143/222 (64.4%)
-- direction: 3 channel(s) where unified attaches extra streams (14 stream(s)); 68 where it attaches fewer (105 stream(s))
+- channels: 225, streams: 631
+- plugin matched: 179, unified matched: 180
+- agreement (identical after-lists): 144/225 (64.0%)
+- direction: 3 channel(s) where unified attaches extra streams (14 stream(s)); 70 where it attaches fewer (107 stream(s))
 - attribution:
   - `alias+selection`: 3
+  - `callsign-anchor`: 2
   - `cut-or-family`: 2
   - `decided-rows`: 64
   - `order`: 8
@@ -66,11 +71,11 @@ Against the known answer (streams of the channel's own database name, no contrad
 
 | | Stream-Mapparr | unified |
 |---|---|---|
-| right streams attached (of 676) | 611 | 543 |
+| right streams attached (of 682) | 617 | 547 |
 | wrong streams attached | 31 | 8 |
 
 - extra (only unified): 14 right, 0 wrong
-- fewer (only Stream-Mapparr): 82 right (missed), 23 wrong (dropped)
+- fewer (only Stream-Mapparr): 84 right (missed), 23 wrong (dropped)
 - reading it: a family holds ONE country (G03, `identity.rs`), so
   for a channel whose own country is unknown the unified engine keeps
   the unmarked feeds plus ONE country's and drops the other countries'
@@ -94,6 +99,17 @@ Against the known answer (streams of the channel's own database name, no contrad
   - plugin: ['UK: Sky Sports Football FHD', 'Sky Sports Football HD', 'US: Sky Sports Football (Backup)', 'Sky Sports Football [4K]']
   - unified: ['Sky Sports Football HD', 'US: Sky Sports Football (Backup)', 'Sky Sports Football [4K]']
   - reason: Identity family match (alias, score: 100)
+
+#### `callsign-anchor` (2)
+
+- channel `ABC (WABC)`
+  - plugin: ['WABC-TV', 'ABC 7 New York (WABC) HD']
+  - unified: ['ABC 7 New York (WABC) HD']
+  - reason: Identity family match (callsign, score: 95)
+- channel `US: NBC (KSDK) HD`
+  - plugin: ['NBC 5 St. Louis KSDK', 'KSDK']
+  - unified: ['NBC 5 St. Louis KSDK']
+  - reason: Identity family match (callsign, score: 95)
 
 #### `cut-or-family` (2)
 
@@ -197,12 +213,13 @@ Against the known answer (streams of the channel's own database name, no contrad
 
 ## 2b. streams end-to-end, representative world, country filter on: unified engine vs Stream-Mapparr
 
-- channels: 222, streams: 621
-- plugin matched: 178, unified matched: 176
-- agreement (identical after-lists): 158/222 (71.2%)
-- direction: 0 channel(s) where unified attaches extra streams (0 stream(s)); 56 where it attaches fewer (97 stream(s))
+- channels: 225, streams: 631
+- plugin matched: 181, unified matched: 179
+- agreement (identical after-lists): 159/225 (70.7%)
+- direction: 0 channel(s) where unified attaches extra streams (0 stream(s)); 58 where it attaches fewer (99 stream(s))
 - attribution:
   - `alias+selection`: 3
+  - `callsign-anchor`: 2
   - `cut-or-family`: 2
   - `decided-rows`: 48
   - `order`: 8
@@ -212,11 +229,11 @@ Against the known answer (streams of the channel's own database name, no contrad
 
 | | Stream-Mapparr | unified |
 |---|---|---|
-| right streams attached (of 670) | 610 | 542 |
+| right streams attached (of 676) | 616 | 546 |
 | wrong streams attached | 37 | 8 |
 
 - extra (only unified): 0 right, 0 wrong
-- fewer (only Stream-Mapparr): 68 right (missed), 29 wrong (dropped)
+- fewer (only Stream-Mapparr): 70 right (missed), 29 wrong (dropped)
 - reading it: a family holds ONE country (G03, `identity.rs`), so
   for a channel whose own country is unknown the unified engine keeps
   the unmarked feeds plus ONE country's and drops the other countries'
@@ -240,6 +257,17 @@ Against the known answer (streams of the channel's own database name, no contrad
   - plugin: ['UK: Sky Sports Football FHD', 'Sky Sports Football HD', 'US: Sky Sports Football (Backup)', 'Sky Sports Football [4K]']
   - unified: ['Sky Sports Football HD', 'US: Sky Sports Football (Backup)', 'Sky Sports Football [4K]']
   - reason: Identity family match (alias, score: 100)
+
+#### `callsign-anchor` (2)
+
+- channel `ABC (WABC)`
+  - plugin: ['WABC-TV', 'ABC 7 New York (WABC) HD']
+  - unified: ['ABC 7 New York (WABC) HD']
+  - reason: Identity family match (callsign, score: 95)
+- channel `US: NBC (KSDK) HD`
+  - plugin: ['NBC 5 St. Louis KSDK', 'KSDK']
+  - unified: ['NBC 5 St. Louis KSDK']
+  - reason: Identity family match (callsign, score: 95)
 
 #### `cut-or-family` (2)
 

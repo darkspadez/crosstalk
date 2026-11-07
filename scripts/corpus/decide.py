@@ -96,6 +96,8 @@ VARIANTS: dict[str, tuple[dict[str, list[str]], str, str]] = {
             "core", "Geographic (country tag anywhere) table"),
     "N15": ({"pipe-segments": [], "keep": ALL},
             "keep", "Pipe-delimited junk segments in names"),
+    "C07": ({"callsign-first": [], "score-first": ALL},
+            "callsign-first", "Network-led station callsign precedence"),
     "C01": ({"janitor": [JAN], "core-known": [SM], "cm-lookup": [CM],
              "core-naked": [LU]},
             "janitor", "Callsign ladder shape"),
@@ -283,6 +285,46 @@ ORCHESTRATED: dict[str, tuple[str, str]] = {
             "both parts (`Sky Sports | Premier League` -> `Sky Sports Premier League`). "
             "Byte-identical Rust/Python on every corpus name bare and pipe-decorated "
             "(`engine_parity.py` kind `pipe`)."),
+    "C07": ("callsign-first", "Orchestrator decision (follow-up engine fix, plan step-15 review): "
+            "when the query's identity has a high-confidence callsign (the engine's "
+            "existing confidence) that exists in the merged station table, a candidate "
+            "with the same callsign outranks any non-callsign match, and a candidate "
+            "with a DIFFERENT known callsign is excluded (the C06/D04 anchor's high/high "
+            "hard-reject, extended to any known candidate callsign); a candidate with no "
+            "callsign (the bare national `ABC`) only wins when no same-callsign candidate "
+            "survives the cut in the pool (fallback keeps today's behaviour for pools "
+            "that lack the station). Identity families stay consistent: callsign "
+            "identities already ignore country (bug-161), unchanged. No plugin variant "
+            "ranks callsign-first (LU's anchor only decides high/high pairs; nothing "
+            "reorders a same-callsign 95 above a stripped-key Exact 100), so there is no "
+            "variant to ablate. Implemented in Rust's `score_core` (step 2a: different "
+            "known callsign excluded) + `ranked_survivors` (same callsign sorts before "
+            "any higher-scoring non-callsign candidate) and mirrored in the decided "
+            "Python configuration (`ablate.Engine.score` + `engine_parity.python_family` "
+            "via `callsign_first_base` / `candidate_known_base` over the merged table). "
+            "Corpus effect under the decided configuration: engine cost 844 at cut "
+            "80 (unchanged: FP 34, FN 776) and 835 at cut 95 (unchanged: FP 8, "
+            "FN 819) — the old high/high anchor already rejected the corpus pairs "
+            "this extends, and no construction pair sets a known low-confidence "
+            "rival callsign against a station query; the four "
+            "network-led examples (`ABC (WABC)`, `US: ABC (WABC) HD`, `NBC (KSDK)`, "
+            "`CBS (WFOR) [HD]`) now rank the station family with the station in the pool "
+            "and the national family without it. `13 WREX` unchanged; names without a "
+            "callsign never trigger the rule. Step-15 C07 review audit: over every "
+            "name in the merged channel DBs, lineups, alias tables and corpus "
+            "(60,745), no pair a high-confidence station query matched before C07 "
+            "(cut 95 through the Rust engine on every word-sharing candidate; "
+            "cut 80 through this mirror on 517,447 candidate pairs sharing half "
+            "their words) carries a different known "
+            "callsign, so the exclusion removes nothing today; the only "
+            "non-station words it reads as known callsigns are `Tyne & Wear TV` "
+            "(WEAR) and `Hong Kong Fight Club` (KONG), neither near a station "
+            "query. The national fallback keeps Janitor's answer: Janitor assigns "
+            "the bare national entry to `ABC (WABC)` whether or not the station is "
+            "listed (the oracle reports' `C07-callsign-first` probes); a "
+            "network feed's guide is right for the network day and wrong for local "
+            "news, which beats no guide, and no evidence asks for an AI/rescue "
+            "gate instead."),
     "Z07": ("sm-strict", "Orchestrator decision (phase 3 step 6, Appendix C): "
             "`(P)` is NOT a Pacific zone marker (Stream-Mapparr's stricter reading; "
             "SM `_ZONE_PACIFIC_RE` matches bare PACIFIC and `(Pacific)`/`(PT)` only). "
@@ -464,6 +506,12 @@ COHERENCE_CHECKS = [
      "rescue (C04, low confidence) has nothing to feed.",
      lambda r: r["D04"] == "jan-lu-anchor"
      and not (r["C04"] == "sm-rescue" and r["C02"] == "lu-none")),
+    ("Callsign-first (C07 `callsign-first`) needs the merged allowlist (C02 "
+     "`merged`) and extends the high-confidence anchor (D04 `jan-lu-anchor`): "
+     "the query's callsign only counts when it is high-confidence and the "
+     "merged station table knows it.",
+     lambda r: r["C07"] != "callsign-first"
+     or (r["C02"] == "merged" and r["D04"] == "jan-lu-anchor")),
     ("The ranker is LU's match_all_streams shape (T09), which carries the "
      "always-majority floor (T02), the guarded exact tier (T04), scaled "
      "thresholds (T05), the header skip (Z05) and LU's country rule (G01-G03, "

@@ -21,6 +21,7 @@
 //! | C04 `none` | no OTA-number rescue at the loose position | rescue disabled (never constructed) |
 //! | C05 `shared` | one `normalize_callsign` | [`normalize_callsign`] (shared) |
 //! | C06 `lu-anchor` | callsign decides at app level via the anchor | [`UnifiedEngine::same`] step 2 (95 floor / hard reject, high-confidence only) |
+//! | C07 `callsign-first` | a network-led station callsign outranks the national entry | [`UnifiedEngine::same`] step 2a (different known callsign excluded) + [`UnifiedEngine::rank_index_in`] (same callsign first, national fallback) |
 //! | D02/T10 `janitor-95` | the decision threshold | [`DEFAULT_THRESHOLD`] = 95, [`sensitivity_preset`] |
 //! | D03 `none` | no channel-number boost | absent by construction (pairs carry no number) |
 //! | D04 `jan-lu-anchor` | high-confidence anchor in `match_all_streams` | step 2, both sides high-confidence |
@@ -103,7 +104,10 @@ pub use crate::country::{extract_zone_noguard, is_group_header};
 /// Step 14 collapses `|`-delimited junk segments before keying and before the
 /// zone/country reads with the same vocabulary (decided N15: `Cinemax East |
 /// HD |` keys as `cinemax`, zone East): `4`.
-pub const ENGINE_VERSION: &str = "4";
+///
+/// Follow-up fix reads a network-led callsign name onto its station (decided C07
+/// `callsign-first`: `ABC (WABC)` ranks the `WABC` family first): `5`.
+pub const ENGINE_VERSION: &str = "5";
 
 /// How many configurations [`UnifiedEngine::cached`] keeps built.
 pub const ENGINE_CACHE_CAPACITY: usize = 8;
@@ -618,6 +622,23 @@ impl UnifiedEngine {
         )
     }
 
+    /// The query's callsign-first base (decided C07 `callsign-first`): the
+    /// normalized callsign when the query's identity has a high-confidence
+    /// callsign that exists in the merged station table, else `None` (the whole
+    /// rule is off for that query — including callsign-led names whose callsign
+    /// no station row knows, and every name without a callsign).
+    fn callsign_first_query(&self, prep: &QueryPrep) -> Option<String> {
+        if !prep.high {
+            return None;
+        }
+        let base = prep.base.clone()?;
+        if self.known.contains(&base) {
+            Some(base)
+        } else {
+            None
+        }
+    }
+
     /// Resolve `name` through the reverse index (A01 `identity`): the canonical both
     /// the query and the candidate must share. Colliding keys yield `None`.
     pub fn alias_canonical(&self, name: &str) -> Option<String> {
@@ -738,6 +759,25 @@ impl UnifiedEngine {
             (Some(q), Some(c)) if prep.high && view.high => Some(q == normalize_callsign(c)),
             _ => None,
         };
+
+        // Callsign-first (decided C07 `callsign-first`, orchestrator): the query
+        // carries a high-confidence callsign the merged station table knows (a
+        // network-led station name like `ABC (WABC)`). A candidate carrying a
+        // DIFFERENT known callsign is a different station and never joins — the
+        // anchor's high/high hard-reject, extended to any known candidate
+        // callsign (the anchor only sees high-confidence candidates; a
+        // low-confidence `KOMO` in `KOMO News` is still that station). A
+        // candidate with NO callsign (the bare national `ABC`) is NOT rejected
+        // here: it still matches at pair level, so a pool holding no station
+        // keeps today's national family (the ranker prefers a same-callsign
+        // candidate whenever one survives the cut — see `ranked_survivors`).
+        if let Some(query_base) = self.callsign_first_query(prep) {
+            if let Some(candidate_base) = view.base.as_deref() {
+                if candidate_base != query_base && self.known.contains(candidate_base) {
+                    return None;
+                }
+            }
+        }
 
         // Best-hit accumulation: highest score wins; ties keep the earliest
         // stage (alias > fuzzy stages; the anchor only replaces a LOWER score).
@@ -1039,8 +1079,8 @@ impl UnifiedEngine {
     ) -> Vec<EngineRanked> {
         let mut ranked = self.ranked_survivors(query, country_hint, index);
         let query_identity_country = country_hint.or_else(|| lineuparr_stream_country(query));
-        ranked.retain(|(r, _)| family_compatible(query_identity_country, r.index, index));
-        ranked.into_iter().map(|(r, _)| r).collect()
+        ranked.retain(|(r, _, _)| family_compatible(query_identity_country, r.index, index));
+        ranked.into_iter().map(|(r, _, _)| r).collect()
     }
 
     /// The engine with a different decision cut and everything else shared: same
@@ -1055,12 +1095,15 @@ impl UnifiedEngine {
 
     /// Score, country rule (G03) and cut, ranked best first with the original-token
     /// overlap tie-break: the ranker's list before the family cut.
+    ///
+    /// Each entry also carries its callsign-first flag (decided C07): a surviving
+    /// same-callsign candidate sorts before every higher-scoring non-callsign one.
     fn ranked_survivors(
         &self,
         query: &str,
         country_hint: Option<&str>,
         index: &EngineIndex,
-    ) -> Vec<(EngineRanked, usize)> {
+    ) -> Vec<(EngineRanked, usize, bool)> {
         if is_group_header(query) {
             return Vec::new();
         }
@@ -1081,6 +1124,13 @@ impl UnifiedEngine {
         let Some(prep) = QueryPrep::build(query, self) else {
             return Vec::new();
         };
+        // Decided C07 `callsign-first`: a same-callsign candidate outranks any
+        // non-callsign match, so the stripped-key Exact 100 on the bare national
+        // entry no longer beats the station's Callsign 95. Candidates with a
+        // different KNOWN callsign never reach the sort (`score_core` rejects
+        // them); callsign-less candidates stay, ordered after every surviving
+        // same-callsign candidate — the fallback when the pool holds no station.
+        let first_base = self.callsign_first_query(&prep);
         let query_nospace = nospace(&prep.lower);
         let query_country = country_hint.or_else(|| self.country_of(query));
         let mut count = CountryFilterCount::default();
@@ -1131,7 +1181,7 @@ impl UnifiedEngine {
         // score each survivor once, at the cut.
         // The query's own identity key, for the tie-break below.
         let query_key = norm_q.to_lowercase();
-        let mut scored: Vec<(EngineRanked, usize)> = Vec::new();
+        let mut scored: Vec<(EngineRanked, usize, bool)> = Vec::new();
         for i in probe {
             if !self.country_keep_index(query_country, qn, index, i, &mut count) {
                 continue;
@@ -1141,6 +1191,9 @@ impl UnifiedEngine {
                     continue;
                 }
                 let overlap = token_overlap_count(&query_tokens, &index.names[i]);
+                let first = first_base
+                    .as_deref()
+                    .is_some_and(|qb| index.views[i].base.as_deref() == Some(qb));
                 scored.push((
                     EngineRanked {
                         index: i,
@@ -1148,10 +1201,15 @@ impl UnifiedEngine {
                         method,
                     },
                     tie_rank(index.identity_keys[i].key == query_key, overlap),
+                    first,
                 ));
             }
         }
-        scored.sort_by(|a, b| b.0.score.cmp(&a.0.score).then_with(|| b.1.cmp(&a.1)));
+        scored.sort_by(|a, b| {
+            b.2.cmp(&a.2)
+                .then_with(|| b.0.score.cmp(&a.0.score))
+                .then_with(|| b.1.cmp(&a.1))
+        });
         scored
     }
 
@@ -1166,28 +1224,28 @@ impl UnifiedEngine {
     /// re-scored here.
     fn family_cut(
         &self,
-        mut ranked: Vec<(EngineRanked, usize)>,
+        mut ranked: Vec<(EngineRanked, usize, bool)>,
         query_country: Option<&str>,
         index: &EngineIndex,
     ) -> Vec<EngineRanked> {
         let compatible = |country: Option<&str>, i: usize| family_compatible(country, i, index);
-        ranked.retain(|(r, _)| compatible(query_country, r.index));
-        let Some((top, _)) = ranked.first() else {
+        ranked.retain(|(r, _, _)| compatible(query_country, r.index));
+        let Some((top, _, _)) = ranked.first() else {
             return Vec::new();
         };
         let top_key = &index.identity_keys[top.index];
         let family_country = query_country.or_else(|| {
             ranked
                 .iter()
-                .filter(|(r, _)| &index.identity_keys[r.index] == top_key)
-                .find_map(|(r, _)| index.identity_country(r.index))
+                .filter(|(r, _, _)| &index.identity_keys[r.index] == top_key)
+                .find_map(|(r, _, _)| index.identity_country(r.index))
         });
         ranked
             .into_iter()
-            .filter(|(r, _)| {
+            .filter(|(r, _, _)| {
                 &index.identity_keys[r.index] == top_key && compatible(family_country, r.index)
             })
-            .map(|(r, _)| r)
+            .map(|(r, _, _)| r)
             .collect()
     }
 
@@ -1199,7 +1257,7 @@ impl UnifiedEngine {
         query_base: Option<&str>,
         query_high: bool,
         index: &EngineIndex,
-    ) -> Vec<(EngineRanked, usize)> {
+    ) -> Vec<(EngineRanked, usize, bool)> {
         let Some(base) = query_base else {
             return Vec::new();
         };
@@ -1212,7 +1270,9 @@ impl UnifiedEngine {
         let query_country = country_hint.or_else(|| self.country_of(query));
         let mut count = CountryFilterCount::default();
         let query_tokens = ascii_tokens(&query.to_lowercase());
-        let mut ranked: Vec<(EngineRanked, usize)> = Vec::new();
+        // Anchor-only queries carry one callsign by construction (the map lookup),
+        // so callsign-first ordering is vacuous here (`true` throughout).
+        let mut ranked: Vec<(EngineRanked, usize, bool)> = Vec::new();
         for &i in indexes {
             if !index.callsign_high[i] || 95 < self.threshold {
                 continue;
@@ -1228,6 +1288,7 @@ impl UnifiedEngine {
                     method: EngineMethod::Callsign,
                 },
                 overlap,
+                true,
             ));
         }
         ranked.sort_by(|a, b| b.0.score.cmp(&a.0.score).then_with(|| b.1.cmp(&a.1)));
@@ -1822,6 +1883,155 @@ mod tests {
         assert_eq!((shortlist[1].index, shortlist[1].score), (0, 90));
         // The family at the low cut still holds one identity only.
         assert_eq!(low.rank_index("Sky Cinema Premiere", &index).len(), 1);
+    }
+
+    #[test]
+    fn callsign_first_prefers_the_station_over_the_national_entry() {
+        // Decided C07 `callsign-first` (orchestrator): a network-led callsign name
+        // whose callsign the merged station table knows ranks the station family
+        // first, even though the bare national entry scores a stripped-key Exact
+        // 100 above the station's Callsign 95.
+        let engine = UnifiedEngine::decided();
+        for (query, station) in [
+            ("ABC (WABC)", "WABC"),
+            ("US: ABC (WABC) HD", "WABC"),
+            ("NBC (KSDK)", "KSDK"),
+            ("CBS (WFOR) [HD]", "WFOR"),
+        ] {
+            let candidates: Vec<String> = [
+                "ABC",
+                "NBC",
+                "CBS",
+                "WABC",
+                "WABC-TV",
+                "ABC 7 New York (WABC)",
+                "KSDK",
+                "NBC 5 St. Louis KSDK",
+                "WFOR-TV",
+                "CBS 4 Miami (WFOR)",
+            ]
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+            let index = EngineIndex::build(
+                &candidates,
+                &engine,
+                &crate::identity::ResolveContext::default(),
+            );
+            let family = engine.rank_index(query, &index);
+            assert!(!family.is_empty(), "{query} ranks nothing");
+            let top = &candidates[family[0].index];
+            let (callsign, _) = engine.callsign_confidence(top);
+            assert_eq!(
+                callsign.as_deref().map(normalize_callsign).as_deref(),
+                Some(station),
+                "{query} tops {top}"
+            );
+            // The pair verdict on the national entry still holds (fallback): the
+            // preference is a rank ordering, not a rejection.
+            let national = station_national(station);
+            assert!(
+                engine.same(query, national),
+                "{query} vs {national} still matches at pair level"
+            );
+        }
+    }
+
+    #[test]
+    fn callsign_first_falls_back_to_the_national_family_without_a_station() {
+        // The pool decides: with no same-callsign candidate in it, the bare
+        // national entry wins — today's behaviour for pools lacking the station.
+        let engine = UnifiedEngine::decided();
+        let candidates: Vec<String> = ["ABC", "NBC", "CBS", "ESPN"]
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        let index = EngineIndex::build(
+            &candidates,
+            &engine,
+            &crate::identity::ResolveContext::default(),
+        );
+        for (query, national) in [
+            ("ABC (WABC)", "ABC"),
+            ("US: ABC (WABC) HD", "ABC"),
+            ("NBC (KSDK)", "NBC"),
+            ("CBS (WFOR) [HD]", "CBS"),
+        ] {
+            let family = engine.rank_index(query, &index);
+            assert_eq!(family.len(), 1, "{query}: {family:?}");
+            assert_eq!(&candidates[family[0].index], national);
+        }
+    }
+
+    #[test]
+    fn a_different_known_callsign_never_joins() {
+        // Decided C07 extends the anchor (C06/D04): a candidate carrying a
+        // DIFFERENT known callsign is excluded even when the anchor's high/high
+        // shape does not see it (e.g. a low-confidence mention of that station).
+        let engine = UnifiedEngine::decided();
+        assert!(!engine.same("ABC (WABC)", "NBC (KSDK)"));
+        assert!(!engine.same("ABC (WABC)", "NBC 5 St. Louis KSDK"));
+        assert!(!engine.same("ABC (WABC)", "KOMO News"));
+        let candidates: Vec<String> = ["KSDK", "NBC 5 St. Louis KSDK", "NBC", "ABC"]
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        let index = EngineIndex::build(
+            &candidates,
+            &engine,
+            &crate::identity::ResolveContext::default(),
+        );
+        let family = engine.rank_index("ABC (WABC)", &index);
+        let names: Vec<&str> = family
+            .iter()
+            .map(|r| candidates[r.index].as_str())
+            .collect();
+        assert!(
+            names.iter().all(|name| !name.contains("KSDK")),
+            "no KSDK member: {names:?}"
+        );
+    }
+
+    #[test]
+    fn callsign_first_leaves_callsign_less_queries_alone() {
+        // Property: without a high-confidence station callsign on the query the rule
+        // is off — no exclusion, no reordering, whatever the pool carries.
+        let engine = UnifiedEngine::decided();
+        let candidates: Vec<String> = ["ABC", "WABC", "KSDK", "NBC", "ESPN"]
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        let index = EngineIndex::build(
+            &candidates,
+            &engine,
+            &crate::identity::ResolveContext::default(),
+        );
+        // A bare national query still takes its own entry first, stations and all.
+        let family = engine.rank_index("ABC", &index);
+        assert_eq!(&candidates[family[0].index], "ABC");
+        // A known station still joins a callsign-less query when it scores: the
+        // query's own entry outranks it, nothing is excluded.
+        assert!(engine.same("ABC", "US: ABC HD"));
+        let family = engine.rank_index("ABC", &index);
+        let names: Vec<&str> = family
+            .iter()
+            .map(|r| candidates[r.index].as_str())
+            .collect();
+        assert_eq!(names[0], "ABC", "{names:?}");
+        // A callsign the station table does not know disables the rule too.
+        assert!(engine.same("ABC (WZZZ)", "ABC"));
+        let family = engine.rank_index("ABC (WZZZ)", &index);
+        assert_eq!(&candidates[family[0].index], "ABC");
+    }
+
+    /// The bare national entry for a station callsign (test helper only).
+    fn station_national(station: &str) -> &'static str {
+        match station {
+            "WABC" => "ABC",
+            "KSDK" => "NBC",
+            "WFOR" => "CBS",
+            _ => panic!("unknown station {station}"),
+        }
     }
 
     #[test]
