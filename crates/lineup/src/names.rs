@@ -506,7 +506,7 @@ pub(crate) fn zone_label(identity: &Identity) -> &'static str {
     }
 }
 
-fn method_label(method: &EngineMethod) -> String {
+pub(crate) fn method_label(method: &EngineMethod) -> String {
     match method {
         EngineMethod::Alias => "Alias".to_string(),
         EngineMethod::Exact => "Exact".to_string(),
@@ -514,6 +514,123 @@ fn method_label(method: &EngineMethod) -> String {
         EngineMethod::Fuzzy(score) => format!("Fuzzy Match - fuzzy ({score}) (score: {score})"),
         EngineMethod::Callsign => "Callsign".to_string(),
     }
+}
+
+/// What a name resolves to, before any CSV wording: the ONE naming decision
+/// (names renames to it, create names a new channel with it).
+#[derive(Debug, Clone)]
+pub enum NameTarget {
+    /// An OTA station: the identity's callsign is a merged station, or (opt-in)
+    /// the market fallback found one. `name` is the rendered `ota_format`, `None`
+    /// when the template lacks a field. `market` is the network the market
+    /// fallback resolved through (`None` for a callsign hit).
+    Ota {
+        callsign: String,
+        station: Box<crosstalk_matching::data::merged::MergedStation>,
+        market: Option<String>,
+        name: Option<String>,
+    },
+    /// A printed callsign with no station row: never premium (`plugin.py:2008`).
+    BlockedCallsign(String),
+    /// The best premium family at the cut: the leader's DB name plus the
+    /// re-attached tags.
+    Premium {
+        name: String,
+        score: u8,
+        method: EngineMethod,
+    },
+    /// No family at the cut.
+    Unmatched,
+}
+
+/// Resolve a name's [`NameTarget`]: the OTA decision ([`decide_ota_target`]),
+/// else the premium family.
+pub fn decide_target(
+    name: &str,
+    identity: &Identity,
+    engine: &UnifiedEngine,
+    index: &crosstalk_matching::engine::EngineIndex,
+    db_names: &[String],
+    settings: &crate::settings::LineupSettings,
+) -> NameTarget {
+    if let Some(target) = decide_ota_target(name, identity, settings) {
+        return target;
+    }
+    // Premium: the best identity family against the merged DB at the cut.
+    let family = engine.rank_index(name, index);
+    match family.first() {
+        Some(top) => {
+            let base = db_names.get(top.index).cloned().unwrap_or_default();
+            let (regional, extra, quality) = extract_reattach_tags(name);
+            NameTarget::Premium {
+                name: build_final_channel_name(&base, regional.as_deref(), &extra, &quality),
+                score: top.score,
+                method: top.method.clone(),
+            }
+        }
+        None => NameTarget::Unmatched,
+    }
+}
+
+/// The OTA half of [`decide_target`]: [`NameTarget::Ota`] for an identity
+/// callsign in the station table or an opt-in market hit, [`NameTarget::BlockedCallsign`]
+/// for a printed callsign neither resolves, `None` when the name is not OTA at
+/// all (premium decides). `lineup.create` stations mode reads this directly, so
+/// a seeded station is named exactly as a rename names it.
+pub fn decide_ota_target(
+    name: &str,
+    identity: &Identity,
+    settings: &crate::settings::LineupSettings,
+) -> Option<NameTarget> {
+    // OTA: the identity's callsign resolves to a merged station.
+    if let Some(callsign) = identity.callsign.clone() {
+        if let Some(station) = station_for_callsign(&callsign) {
+            let network_override = extract_stream_network(name);
+            let fields = crosstalk_core::naming::ota_fields(
+                station.network_affiliation.as_deref().unwrap_or(""),
+                network_override.as_deref(),
+                station.community_served_city.as_deref().unwrap_or(""),
+                station.community_served_state.as_deref().unwrap_or(""),
+                &callsign,
+            );
+            let rendered = crosstalk_core::naming::render_ota(&settings.ota_format, &fields);
+            return Some(NameTarget::Ota {
+                callsign,
+                station: Box::new(station),
+                market: None,
+                name: rendered,
+            });
+        }
+    }
+    // OTA market fallback (opt-in): a market reference resolves to one station.
+    // A printed callsign that resolved no station still gets here (CM's
+    // `match_broadcast_channel(allow_market_fallback)`).
+    if settings.ota_market_fallback {
+        if let Some(network) = extract_stream_network(name) {
+            if let Some(station) = crosstalk_matching::market::market_station_for(name, &network) {
+                let callsign = station.callsign.clone();
+                let fields = crosstalk_core::naming::ota_fields(
+                    station.network_affiliation.as_deref().unwrap_or(""),
+                    Some(&network),
+                    station.community_served_city.as_deref().unwrap_or(""),
+                    station.community_served_state.as_deref().unwrap_or(""),
+                    &callsign,
+                );
+                let rendered = crosstalk_core::naming::render_ota(&settings.ota_format, &fields);
+                return Some(NameTarget::Ota {
+                    callsign,
+                    station: Box::new(station),
+                    market: Some(network),
+                    name: rendered,
+                });
+            }
+        }
+    }
+    // A printed callsign that resolved no station never reaches premium (CM's
+    // `match_broadcast_channel` returns `(callsign, None)` after the fallback
+    // misses, and a found callsign blocks premium: `plugin.py:2008`). Without
+    // this, `ABC (WZZZ)` would lose its callsign and land on the national `ABC`.
+    identity.callsign.clone().map(NameTarget::BlockedCallsign)
 }
 
 /// The heuristic naming decision for one channel (no AI yet).
@@ -546,168 +663,89 @@ pub fn decide_heuristic(
                 identity: identity.clone(),
             }
         };
+    let already = || {
+        base_row(
+            "Skipped",
+            channel.name.clone(),
+            "none",
+            "No Match".to_string(),
+            "Already in correct format".to_string(),
+        )
+    };
 
-    // OTA: the identity's callsign resolves to a merged station.
-    if let Some(callsign) = identity.callsign.clone() {
-        if is_station_callsign(&callsign) {
-            if let Some(station) = station_for_callsign(&callsign) {
-                let network_override = extract_stream_network(&channel.name);
-                let fields = crosstalk_core::naming::ota_fields(
-                    station.network_affiliation.as_deref().unwrap_or(""),
-                    network_override.as_deref(),
-                    station.community_served_city.as_deref().unwrap_or(""),
-                    station.community_served_state.as_deref().unwrap_or(""),
-                    &callsign,
-                );
-                match crosstalk_core::naming::render_ota(&settings.ota_format, &fields) {
-                    Some(target) if target != channel.name => {
-                        return (
-                            base_row(
-                                "Renamed",
-                                target.clone(),
-                                "Broadcast (OTA)",
-                                "OTA - Callsign Match".to_string(),
-                                format!("OTA callsign {callsign} resolves to a station"),
-                            ),
-                            false,
-                        );
-                    }
-                    Some(_) => {
-                        return (
-                            base_row(
-                                "Skipped",
-                                channel.name.clone(),
-                                "none",
-                                "No Match".to_string(),
-                                "Already in correct format".to_string(),
-                            ),
-                            false,
-                        );
-                    }
-                    None => {
-                        return (
-                            base_row(
-                                "Skipped",
-                                channel.name.clone(),
-                                "none",
-                                "No Match".to_string(),
-                                "Missing required fields for OTA format".to_string(),
-                            ),
-                            false,
-                        );
-                    }
-                }
+    match decide_target(&channel.name, identity, engine, index, db_names, settings) {
+        NameTarget::Ota {
+            callsign,
+            market,
+            name,
+            ..
+        } => match name {
+            Some(target) if target != channel.name => {
+                let reason = match market {
+                    Some(network) => format!("OTA market {network} resolves to {callsign}"),
+                    None => format!("OTA callsign {callsign} resolves to a station"),
+                };
+                (
+                    base_row(
+                        "Renamed",
+                        target,
+                        "Broadcast (OTA)",
+                        "OTA - Callsign Match".to_string(),
+                        reason,
+                    ),
+                    false,
+                )
             }
-        }
-    }
-    // A printed callsign that resolved no station: the market fallback (below) may
-    // still name it, but it never reaches premium (CM's `match_broadcast_channel`
-    // returns `(callsign, None)` after the fallback misses, and a found callsign
-    // blocks premium: `plugin.py:2008`). Without this, `ABC (WZZZ)` would lose its
-    // callsign and land on the national `ABC` entry.
-    let blocked_callsign = identity.callsign.clone();
-
-    // OTA market fallback (opt-in): a market reference resolves to one station.
-    if settings.ota_market_fallback {
-        if let Some(network) = extract_stream_network(&channel.name) {
-            if let Some(station) =
-                crosstalk_matching::market::market_station_for(&channel.name, &network)
-            {
-                let callsign = station.callsign.clone();
-                let fields = crosstalk_core::naming::ota_fields(
-                    station.network_affiliation.as_deref().unwrap_or(""),
-                    Some(&network),
-                    station.community_served_city.as_deref().unwrap_or(""),
-                    station.community_served_state.as_deref().unwrap_or(""),
-                    &callsign,
-                );
-                match crosstalk_core::naming::render_ota(&settings.ota_format, &fields) {
-                    Some(target) if target != channel.name => {
-                        return (
-                            base_row(
-                                "Renamed",
-                                target,
-                                "Broadcast (OTA)",
-                                "OTA - Callsign Match".to_string(),
-                                format!("OTA market {network} resolves to {callsign}"),
-                            ),
-                            false,
-                        );
-                    }
-                    Some(_) => {
-                        return (
-                            base_row(
-                                "Skipped",
-                                channel.name.clone(),
-                                "none",
-                                "No Match".to_string(),
-                                "Already in correct format".to_string(),
-                            ),
-                            false,
-                        );
-                    }
-                    None => {
-                        return (
-                            base_row(
-                                "Skipped",
-                                channel.name.clone(),
-                                "none",
-                                "No Match".to_string(),
-                                "Missing required fields for OTA format".to_string(),
-                            ),
-                            false,
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    // The blocked callsign goes through the unknown handling, like CM's
-    // `rename_unknown_channels` tagging every Skipped row.
-    if let Some(callsign) = blocked_callsign {
-        let (new, status, matcher, method, _) = unmatched_target(&channel.name, settings);
-        let reason = if status == "Renamed" {
-            format!("Callsign {callsign} not in channel databases; tagged with the unknown suffix")
-        } else {
-            format!("Callsign {callsign} not in channel databases")
-        };
-        return (base_row(status, new, &matcher, method, reason), false);
-    }
-
-    // Premium: the best identity family against the merged DB at the cut.
-    let family = engine.rank_index(&channel.name, index);
-    if let Some(top) = family.first() {
-        let base = db_names.get(top.index).cloned().unwrap_or_default();
-        let (regional, extra, quality) = extract_reattach_tags(&channel.name);
-        let target = build_final_channel_name(&base, regional.as_deref(), &extra, &quality);
-        if target == channel.name {
-            return (
+            Some(_) => (already(), false),
+            None => (
                 base_row(
                     "Skipped",
                     channel.name.clone(),
                     "none",
                     "No Match".to_string(),
-                    "Already in correct format".to_string(),
+                    "Missing required fields for OTA format".to_string(),
                 ),
                 false,
-            );
-        }
-        return (
-            base_row(
-                "Renamed",
-                target,
-                "Premium/Cable",
-                method_label(&top.method),
-                format!("premium match {}% {}", top.score, method_label(&top.method)),
             ),
-            false,
-        );
+        },
+        // The blocked callsign goes through the unknown handling, like CM's
+        // `rename_unknown_channels` tagging every Skipped row.
+        NameTarget::BlockedCallsign(callsign) => {
+            let (new, status, matcher, method, _) = unmatched_target(&channel.name, settings);
+            let reason = if status == "Renamed" {
+                format!(
+                    "Callsign {callsign} not in channel databases; tagged with the unknown suffix"
+                )
+            } else {
+                format!("Callsign {callsign} not in channel databases")
+            };
+            (base_row(status, new, &matcher, method, reason), false)
+        }
+        NameTarget::Premium {
+            name,
+            score,
+            method,
+        } => {
+            if name == channel.name {
+                return (already(), false);
+            }
+            (
+                base_row(
+                    "Renamed",
+                    name,
+                    "Premium/Cable",
+                    method_label(&method),
+                    format!("premium match {score}% {}", method_label(&method)),
+                ),
+                false,
+            )
+        }
+        // No family at the cut: borderline (AI) or unmatched.
+        NameTarget::Unmatched => {
+            let (new, status, matcher, method, reason) = unmatched_target(&channel.name, settings);
+            (base_row(status, new, &matcher, method, reason), true)
+        }
     }
-
-    // No family at the cut: borderline (AI) or unmatched.
-    let (new, status, matcher, method, reason) = unmatched_target(&channel.name, settings);
-    (base_row(status, new, &matcher, method, reason), true)
 }
 
 /// The unmatched target for a name with no family (no AI): tag or skip.

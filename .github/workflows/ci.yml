@@ -312,6 +312,23 @@ jobs:
       # `docs/oracle-reports/lineup-logos.md` (bar: 0 unattributed).
       - name: Lineup logos oracle diff report reproduces
         run: python3 -I scripts/oracle_report_lineup_logos.py --check
+      # Phase 3 step 17: lineup create is Channel-Mapparr's two creation modes
+      # (`import_m3u_streams`: one channel per matched stream at max+1 with that
+      # stream attached; `create_channels_from_streams`: one channel per OTA
+      # station from unattached streams, no streams attached) on the unified
+      # engine — one channel per identity family carrying the family's streams
+      # (the documented divergence), owned `lineup:create:` keys so a rerun
+      # creates nothing (CM duplicated), the shared collision guard and the
+      # global number check. The harness drives CM's REAL import decision path
+      # via scripts/corpus/oracles.py plus the REAL `channel_seeder` planner,
+      # runs CM twice to show the duplicate-on-rerun, and compares every stream
+      # with `crates/lineup/examples/create_dump` (the action's own
+      # `decide_streams` / `decide_stations`, cross-checked per stream against
+      # `names_dump` and `categorize_dump`). The report reproduces byte for byte
+      # (--check); every difference is attributed in
+      # `docs/oracle-reports/lineup-create.md` (bar: 0 unattributed).
+      - name: Lineup create oracle diff report reproduces
+        run: python3 -I scripts/oracle_report_lineup_create.py --check
       # Informational, never failing: what upstream changed since each pinned reference
       # commit in the files crosstalk ports from it. Covers every reference submodule
       # (EPG Janitor, Stream-Mapparr, IPTV Checker, Channel-Mapparr, Lineuparr, Channel

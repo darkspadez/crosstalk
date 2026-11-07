@@ -15,7 +15,8 @@
 //!     with its own step and its own oracle report.
 //!
 //! Steps 13-15 register `validate`, `status`, the `clean_*` pair + `test_name` (14)
-//! and the `names_*` pair (15): the settings, the loader, the registry wiring and the
+//! and the `names_*` pair (15); step 16 the `categorize_*` and `logos_*` pairs;
+//! step 17 the `create_*` pair: the settings, the loader, the registry wiring and the
 //! named `lineup` scope. The action ids below name the pairs the later steps register,
 //! so a schedule key and an API caller can guess the pair from the start: every writing
 //! action is a `<verb>_preview` / `<verb>_apply` pair, and a preview is always a read.
@@ -28,6 +29,7 @@
 
 pub mod categorize;
 pub mod clean;
+pub mod create;
 pub mod lineup_file;
 pub mod logos;
 pub mod names;
@@ -230,6 +232,25 @@ impl SubApp for LineupApp {
                 "This will create logos and assign them to channels in Dispatcharr. The \
                  host undo can reverse the assignments. Continue?",
             ),
+            ActionSpec::new(
+                ACTION_CREATE_PREVIEW,
+                "Preview Create (Dry Run)",
+                "Compute the channels (and groups) the streams or stations mode would \
+                 create and write a CSV. Changes nothing.",
+                ActionKind::Read,
+            ),
+            ActionSpec::new(
+                ACTION_CREATE_APPLY,
+                "Apply Create",
+                "Create the channels (and groups) the preview would create: one channel \
+                 per identity family (streams mode) or per OTA station (stations mode). \
+                 Undoable through the host undo (created channels hide).",
+                ActionKind::Write,
+            )
+            .with_confirm(
+                "This will create channels and groups in Dispatcharr. The host undo can \
+                 hide the created channels. Continue?",
+            ),
         ]
     }
 
@@ -389,6 +410,14 @@ impl LineupApp {
                 let settings = self.checked_settings(context)?;
                 logos::run(self, context, &settings, dry_run).await
             }
+            ACTION_CREATE_PREVIEW => {
+                let settings = self.checked_settings(context)?;
+                create::run(self, context, &settings, true).await
+            }
+            ACTION_CREATE_APPLY => {
+                let settings = self.checked_settings(context)?;
+                create::run(self, context, &settings, dry_run).await
+            }
             other => bail!("{APP_NAME} has no action {other:?} yet"),
         }
     }
@@ -485,12 +514,12 @@ mod tests {
     }
 
     #[test]
-    fn app_declares_validate_status_clean_names_categorize_logos_and_test_name() {
+    fn app_declares_validate_status_clean_names_categorize_logos_create_and_test_name() {
         // Step 13 registered `validate` and `status`; step 14 adds the `clean_*` pair
         // and `test_name`; step 15 adds the `names_*` pair; step 16 adds the
-        // `categorize_*` and `logos_*` pairs. The ids for the later pairs are
-        // declared (so schedules and URLs can be guessed from the start) but not
-        // registered.
+        // `categorize_*` and `logos_*` pairs; step 17 adds the `create_*` pair. The ids
+        // for the later pairs are declared (so schedules and URLs can be guessed from
+        // the start) but not registered.
         let ids: Vec<&str> = app().actions().iter().map(|action| action.id).collect();
         assert_eq!(
             ids,
@@ -505,12 +534,12 @@ mod tests {
                 ACTION_CATEGORIZE_PREVIEW,
                 ACTION_CATEGORIZE_APPLY,
                 ACTION_LOGOS_PREVIEW,
-                ACTION_LOGOS_APPLY
+                ACTION_LOGOS_APPLY,
+                ACTION_CREATE_PREVIEW,
+                ACTION_CREATE_APPLY,
             ]
         );
         for future in [
-            ACTION_CREATE_PREVIEW,
-            ACTION_CREATE_APPLY,
             ACTION_SYNC_PREVIEW,
             ACTION_SYNC_APPLY,
             ACTION_TIDY_PREVIEW,
@@ -542,7 +571,7 @@ mod tests {
         assert!(by_id(ACTION_NAMES_PREVIEW).confirm.is_none());
         assert_eq!(by_id(ACTION_NAMES_APPLY).kind, ActionKind::Write);
         assert!(by_id(ACTION_NAMES_APPLY).confirm.is_some());
-        // The categorize and logos pairs read the same way.
+        // The categorize, logos and create pairs read the same way.
         assert_eq!(by_id(ACTION_CATEGORIZE_PREVIEW).kind, ActionKind::Read);
         assert!(by_id(ACTION_CATEGORIZE_PREVIEW).confirm.is_none());
         assert_eq!(by_id(ACTION_CATEGORIZE_APPLY).kind, ActionKind::Write);
@@ -551,6 +580,10 @@ mod tests {
         assert!(by_id(ACTION_LOGOS_PREVIEW).confirm.is_none());
         assert_eq!(by_id(ACTION_LOGOS_APPLY).kind, ActionKind::Write);
         assert!(by_id(ACTION_LOGOS_APPLY).confirm.is_some());
+        assert_eq!(by_id(ACTION_CREATE_PREVIEW).kind, ActionKind::Read);
+        assert!(by_id(ACTION_CREATE_PREVIEW).confirm.is_none());
+        assert_eq!(by_id(ACTION_CREATE_APPLY).kind, ActionKind::Write);
+        assert!(by_id(ACTION_CREATE_APPLY).confirm.is_some());
         // Every future writing action is a preview/apply pair, and a preview is a read —
         // the naming rule every sub-app follows, pinned before the pairs exist.
         for (preview, apply) in [

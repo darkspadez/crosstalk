@@ -590,6 +590,7 @@ dependencies = [
  "async-trait",
  "crosstalk-core",
  "crosstalk-matching",
+ "crosstalk-streams",
  "regex",
  "serde",
  "serde_json",

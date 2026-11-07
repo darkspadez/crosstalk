@@ -9,6 +9,12 @@ description = "crosstalk sub-app: the channel list itself — names, numbers, gr
 [dependencies]
 crosstalk-core.workspace = true
 crosstalk-matching.workspace = true
+# Direction rule: lineup -> streams only (create reuses the StreamPool selection and
+# the quality order, so a created channel carries exactly what streams.match would
+# attach). streams must never depend on lineup: its lineup mode (step 19) reads lineup's
+# channels through core (store ownership keys), never through this crate. Cargo refuses
+# the cycle, so breaking the rule fails the build.
+crosstalk-streams.workspace = true
 
 anyhow.workspace = true
 async-trait.workspace = true

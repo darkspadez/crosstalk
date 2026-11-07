@@ -475,10 +475,7 @@ pub async fn run(
     // The store's `stream_health` is the throughput evidence (Stream-Mapparr read its own JSON
     // cache). A context without a store sorts as the plugin does with an empty cache: every
     // stream is "unknown" and the key falls back to resolution and frame rate.
-    let throughput: Box<dyn ThroughputSource> = match context.store() {
-        Some(store) => Box::new(quality::StoreThroughputSource::load(store)?),
-        None => Box::new(quality::MemoryThroughputSource::new()),
-    };
+    let throughput = quality::throughput_source(context.store())?;
 
     let result = orders(plan_world, &resolved.tables, &options, throughput.as_ref())?;
     if result.channels == 0 {

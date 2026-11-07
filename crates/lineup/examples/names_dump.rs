@@ -20,6 +20,7 @@
 use crosstalk_core::config::ScopeConfig;
 use crosstalk_core::dispatcharr::{Channel, ChannelGroup, World};
 use crosstalk_core::engine_run::RunEngine;
+use crosstalk_lineup::names::NameTarget;
 use crosstalk_matching::identity::ResolveContext;
 use std::collections::HashMap;
 use std::io::Read;
@@ -131,6 +132,24 @@ fn main() -> anyhow::Result<()> {
             &db_names,
             &settings,
         );
+        // The decision kind and target behind the row (the one naming decision,
+        // which `create` reads too): the create oracle checks create == names.
+        let (target_kind, target_name) = match crosstalk_lineup::names::decide_target(
+            &channel.name,
+            &identity,
+            &engine,
+            &index,
+            &db_names,
+            &settings,
+        ) {
+            NameTarget::Ota {
+                name: Some(name), ..
+            } => ("ota", Some(name)),
+            NameTarget::Ota { name: None, .. } => ("ota-missing-fields", None),
+            NameTarget::BlockedCallsign(_) => ("blocked-callsign", None),
+            NameTarget::Premium { name, .. } => ("premium", Some(name)),
+            NameTarget::Unmatched => ("unmatched", None),
+        };
         // The family leader (before tag re-attachment) for attribution: the DB
         // name the unified engine ranked first at the cut, if any.
         let family = engine.rank_index(&channel.name, &index);
@@ -163,6 +182,8 @@ fn main() -> anyhow::Result<()> {
             "leader": leader,
             "leader_score": leader_score,
             "floor": floor,
+            "target_kind": target_kind,
+            "target_name": target_name,
         }));
     }
     println!("{}", serde_json::to_string(&dumped)?);

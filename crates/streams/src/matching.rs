@@ -71,7 +71,7 @@
 //!     the gate's floor; only a model accept can attach a sub-cut stream.
 
 use crate::epg::{EpgRun, EpgSettings, EpgTitles};
-use crate::quality::{self, QualityKey, QualityModel, StreamView, ThroughputSource};
+use crate::quality::{self, QualityKey, QualityModel, ThroughputSource};
 use crate::selection::{self, StreamPool};
 use crate::settings::StreamsSettings;
 use anyhow::{Context, Result};
@@ -1348,37 +1348,7 @@ impl<'a> RunData<'a> {
 
         let keys: Vec<QualityKey> = ids
             .iter()
-            .map(|id| {
-                let stream = pool.get(*id);
-                match stream {
-                    Some(stream) => quality::key_of(
-                        &StreamView {
-                            id: *id,
-                            name: &stream.name,
-                            stats: Some(&stream.stream_stats),
-                            m3u_priority: pool
-                                .priority
-                                .get(id)
-                                .copied()
-                                .unwrap_or(selection::UNLISTED_PRIORITY),
-                            is_custom: stream.is_custom,
-                        },
-                        model,
-                        throughput,
-                    ),
-                    None => quality::key_of(
-                        &StreamView {
-                            id: *id,
-                            name: "",
-                            stats: None,
-                            m3u_priority: selection::UNLISTED_PRIORITY,
-                            is_custom: false,
-                        },
-                        model,
-                        throughput,
-                    ),
-                }
-            })
+            .map(|id| quality::key_of(&pool.quality_view(*id), model, throughput))
             .collect();
 
         let mut zones: HashMap<i64, FeedZone> = HashMap::with_capacity(world.streams.len());
@@ -3572,10 +3542,8 @@ pub async fn run(
         }
     }
     let options = Arc::new(options);
-    let throughput: Arc<dyn ThroughputSource> = match context.store() {
-        Some(store) => Arc::new(quality::StoreThroughputSource::load(store)?),
-        None => Arc::new(quality::MemoryThroughputSource::new()),
-    };
+    let throughput: Arc<dyn ThroughputSource> =
+        Arc::from(quality::throughput_source(context.store())?);
 
     let settings_for_plan = settings.clone();
     let scope_for_plan = resolved.tables.clone();

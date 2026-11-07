@@ -635,6 +635,15 @@ impl ThroughputSource for StoreThroughputSource {
     }
 }
 
+/// The throughput evidence a run reads: the store's `stream_health`, or nothing when the
+/// context has no store (every stream "unknown", like the plugin with an empty cache).
+pub fn throughput_source(store: Option<&Store>) -> anyhow::Result<Box<dyn ThroughputSource>> {
+    Ok(match store {
+        Some(store) => Box::new(StoreThroughputSource::load(store)?),
+        None => Box::new(MemoryThroughputSource::new()),
+    })
+}
+
 // ---------------------------------------------------------------------------------------
 // The model
 // ---------------------------------------------------------------------------------------

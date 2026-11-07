@@ -1015,6 +1015,28 @@ impl<'a> StreamPool<'a> {
         self.eligible_ids.contains(&id)
     }
 
+    /// A stream as the quality key sees it: its stats, custom flag and this run's M3U
+    /// priority (an id the pool does not know is unlisted, with no stats). The one view
+    /// `match` ranks a channel's streams on and `lineup.create` orders a new channel's by.
+    pub fn quality_view(&self, id: i64) -> crate::quality::StreamView<'a> {
+        match self.get(id) {
+            Some(stream) => crate::quality::StreamView {
+                id,
+                name: &stream.name,
+                stats: Some(&stream.stream_stats),
+                m3u_priority: self.priority.get(&id).copied().unwrap_or(UNLISTED_PRIORITY),
+                is_custom: stream.is_custom,
+            },
+            None => crate::quality::StreamView {
+                id,
+                name: "",
+                stats: None,
+                m3u_priority: UNLISTED_PRIORITY,
+                is_custom: false,
+            },
+        }
+    }
+
     /// The name MATCHING sees for a stream, or `None` when it is not eligible this run.
     pub fn match_name_of(&self, id: i64) -> Option<&str> {
         self.match_name.get(&id).map(String::as_str)
