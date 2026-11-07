@@ -55,7 +55,11 @@ mod tests {
                 "logos_preview",
                 "logos_apply",
                 "create_preview",
-                "create_apply"
+                "create_apply",
+                "sync_preview",
+                "sync_apply",
+                "tidy_preview",
+                "tidy_apply"
             ]
         );
         // Every section of the plan's settings layout is in the form.

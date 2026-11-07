@@ -34,8 +34,10 @@ pub mod lineup_file;
 pub mod logos;
 pub mod names;
 pub mod settings;
+pub mod sync;
 #[cfg(test)]
 mod test_support;
+pub mod tidy;
 
 use anyhow::{bail, Result};
 use crosstalk_core::jobs::JobContext;
@@ -115,10 +117,9 @@ impl SubApp for LineupApp {
 
     /// The actions, in the order the UI shows them.
     ///
-    /// Step 13 registers only `validate` and `status`. Each later step appends its pair
-    /// here in plan order — `clean_*` + `test_name`, `names_*`, `categorize_*`,
-    /// `logos_*`, `create_*`, `sync_*`, `tidy_*` — preview first, so a preview can never
-    /// ship without its apply.
+    /// Steps 13-18 register `validate`, `status`, the `clean_*` pair + `test_name`,
+    /// the `names_*`, `categorize_*`, `logos_*`, `create_*`, `sync_*` and `tidy_*`
+    /// pairs — preview first, so a preview can never ship without its apply.
     fn actions(&self) -> Vec<ActionSpec> {
         vec![
             ActionSpec::new(
@@ -250,6 +251,45 @@ impl SubApp for LineupApp {
             .with_confirm(
                 "This will create channels and groups in Dispatcharr. The host undo can \
                  hide the created channels. Continue?",
+            ),
+            ActionSpec::new(
+                ACTION_SYNC_PREVIEW,
+                "Preview Sync (Dry Run)",
+                "Compute the groups, channels, renumbers and moves the configured lineup \
+                 file implies and write a CSV. Changes nothing.",
+                ActionKind::Read,
+            ),
+            ActionSpec::new(
+                ACTION_SYNC_APPLY,
+                "Apply Sync",
+                "Create the missing lineup groups and channels, then renumber and move \
+                 the owned channels that drifted. Owned channels only; renames never. \
+                 Undoable through the host undo.",
+                ActionKind::Write,
+            )
+            .with_confirm(
+                "This will create channels and groups and move channels in Dispatcharr. \
+                 The host undo can reverse the edits and hide the created channels. \
+                 Continue?",
+            ),
+            ActionSpec::new(
+                ACTION_TIDY_PREVIEW,
+                "Preview Tidy (Dry Run)",
+                "Compute which owned lineup channels would hide (no streams) or unhide \
+                 (streams again after tidy hid them) and write a CSV. Changes nothing.",
+                ActionKind::Read,
+            ),
+            ActionSpec::new(
+                ACTION_TIDY_APPLY,
+                "Apply Tidy",
+                "Hide the owned lineup channels left with no streams, and unhide the \
+                 ones that regained streams after tidy hid them. Owned channels only. \
+                 Undoable through the host undo.",
+                ActionKind::Destructive,
+            )
+            .with_confirm(
+                "This will hide channels in Dispatcharr. The host undo can unhide them. \
+                 Continue?",
             ),
         ]
     }
@@ -418,6 +458,22 @@ impl LineupApp {
                 let settings = self.checked_settings(context)?;
                 create::run(self, context, &settings, dry_run).await
             }
+            ACTION_SYNC_PREVIEW => {
+                let settings = self.checked_settings(context)?;
+                sync::run(self, context, &settings, true).await
+            }
+            ACTION_SYNC_APPLY => {
+                let settings = self.checked_settings(context)?;
+                sync::run(self, context, &settings, dry_run).await
+            }
+            ACTION_TIDY_PREVIEW => {
+                let settings = self.checked_settings(context)?;
+                tidy::run(self, context, &settings, true).await
+            }
+            ACTION_TIDY_APPLY => {
+                let settings = self.checked_settings(context)?;
+                tidy::run(self, context, &settings, dry_run).await
+            }
             other => bail!("{APP_NAME} has no action {other:?} yet"),
         }
     }
@@ -514,12 +570,12 @@ mod tests {
     }
 
     #[test]
-    fn app_declares_validate_status_clean_names_categorize_logos_create_and_test_name() {
-        // Step 13 registered `validate` and `status`; step 14 adds the `clean_*` pair
-        // and `test_name`; step 15 adds the `names_*` pair; step 16 adds the
-        // `categorize_*` and `logos_*` pairs; step 17 adds the `create_*` pair. The ids
-        // for the later pairs are declared (so schedules and URLs can be guessed from
-        // the start) but not registered.
+    fn app_declares_validate_status_clean_names_categorize_logos_create_sync_tidy_and_test_name() {
+        // Step 13 registered `validate` and `status`; step 14 the `clean_*` pair and
+        // `test_name`; step 15 the `names_*` pair; step 16 the `categorize_*` and
+        // `logos_*` pairs; step 17 the `create_*` pair; step 18 the `sync_*` and
+        // `tidy_*` pairs. All are registered; the plan's action table named them from
+        // the start so schedules and URLs can be guessed.
         let ids: Vec<&str> = app().actions().iter().map(|action| action.id).collect();
         assert_eq!(
             ids,
@@ -537,19 +593,12 @@ mod tests {
                 ACTION_LOGOS_APPLY,
                 ACTION_CREATE_PREVIEW,
                 ACTION_CREATE_APPLY,
+                ACTION_SYNC_PREVIEW,
+                ACTION_SYNC_APPLY,
+                ACTION_TIDY_PREVIEW,
+                ACTION_TIDY_APPLY,
             ]
         );
-        for future in [
-            ACTION_SYNC_PREVIEW,
-            ACTION_SYNC_APPLY,
-            ACTION_TIDY_PREVIEW,
-            ACTION_TIDY_APPLY,
-        ] {
-            assert!(
-                !ids.contains(&future),
-                "{future} is declared but not registered until its step"
-            );
-        }
         // The clean pair and test_name read like their plugin halves: preview and test
         // are reads, the apply writes and confirms.
         let by_id = |id: &str| {
@@ -584,6 +633,16 @@ mod tests {
         assert!(by_id(ACTION_CREATE_PREVIEW).confirm.is_none());
         assert_eq!(by_id(ACTION_CREATE_APPLY).kind, ActionKind::Write);
         assert!(by_id(ACTION_CREATE_APPLY).confirm.is_some());
+        // The sync pair reads like every other write pair; the tidy apply hides
+        // channels, so it is Destructive.
+        assert_eq!(by_id(ACTION_SYNC_PREVIEW).kind, ActionKind::Read);
+        assert!(by_id(ACTION_SYNC_PREVIEW).confirm.is_none());
+        assert_eq!(by_id(ACTION_SYNC_APPLY).kind, ActionKind::Write);
+        assert!(by_id(ACTION_SYNC_APPLY).confirm.is_some());
+        assert_eq!(by_id(ACTION_TIDY_PREVIEW).kind, ActionKind::Read);
+        assert!(by_id(ACTION_TIDY_PREVIEW).confirm.is_none());
+        assert_eq!(by_id(ACTION_TIDY_APPLY).kind, ActionKind::Destructive);
+        assert!(by_id(ACTION_TIDY_APPLY).confirm.is_some());
         // Every future writing action is a preview/apply pair, and a preview is a read —
         // the naming rule every sub-app follows, pinned before the pairs exist.
         for (preview, apply) in [
@@ -965,18 +1024,6 @@ mod tests {
             "{}",
             outcome.summary
         );
-    }
-
-    #[tokio::test]
-    async fn future_actions_are_rejected_until_their_step() {
-        // The ids are declared but not registered: a schedule naming one fails loudly at
-        // lookup time rather than running half a verb.
-        let fixture = Fixture::with_credentials();
-        let error = app()
-            .dispatch(ACTION_SYNC_PREVIEW, &fixture.context(), true)
-            .await
-            .expect_err("unknown");
-        assert!(format!("{error}").contains("no action"), "{error:#}");
     }
 
     #[tokio::test]

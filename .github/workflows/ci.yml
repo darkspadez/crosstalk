@@ -329,6 +329,24 @@ jobs:
       # `docs/oracle-reports/lineup-create.md` (bar: 0 unattributed).
       - name: Lineup create oracle diff report reproduces
         run: python3 -I scripts/oracle_report_lineup_create.py --check
+      # Phase 3 step 18: lineup sync is Lineuparr's group + channel sync
+      # (get_or_create by name/group, lineup/auto/specific numbering, renumber
+      # existing, enable in profiles, the `All` group migration) on the
+      # owned-channel rule — owned channels keep their number on re-sync (LU
+      # renumbered every rerun), only owned channels are adopted (a foreign
+      # same-name clash is reported and skipped), the global number check, and
+      # `tidy_*` is the post-match cleanup as hide instead of delete, owned
+      # channels only. The harness drives LU's REAL `_sync_groups` +
+      # `_do_sync_channels` with ORM fakes over 29 files x 4 numbering modes x
+      # 4 detail modes, runs every case twice (rerun) and with a pre-existing
+      # foreign same-name channel plus a number squatter, vs
+      # `crates/lineup/examples/sync_dump` (the action's own `decide_sync` +
+      # `plan_sync_creates`), and
+      # the cleanup query chain vs `tidy_dump`. The report reproduces byte for
+      # byte (--check); every difference is attributed in
+      # `docs/oracle-reports/lineup-sync.md` (bar: 0 unattributed).
+      - name: Lineup sync oracle diff report reproduces
+        run: python3 -I scripts/oracle_report_lineup_sync.py --check
       # Informational, never failing: what upstream changed since each pinned reference
       # commit in the files crosstalk ports from it. Covers every reference submodule
       # (EPG Janitor, Stream-Mapparr, IPTV Checker, Channel-Mapparr, Lineuparr, Channel
