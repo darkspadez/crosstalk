@@ -174,12 +174,48 @@ run_history_days = 15
 # A step's scope only ever comes from this file: hooks and the UI cannot pass one. TOML does
 # not allow a line break inside `{ ... }`, so keep each table on one line, or use
 # [[workflows.<name>.steps]] tables instead.
+#
+# `full_sync` is Lineuparr's `full_sync`, as a workflow: sync the channel list from the
+# configured lineup file, match streams and guide entries over exactly those channels,
+# assign their logos, then hide the owned channels left with no streams.
+# `scope = "lineup"` is lineup's owned channels for its configured lineup file (the
+# named scope replaces [scope] for that step); streams' lineup mode additionally
+# restricts those steps to the lineup file's country. `continue_on_failure` carries
+# the sequence past a failed match/guide/logo step (a failed sync still stops it),
+# and the workflow itself ends failed, with each step listed.
 # [workflows.full_sync]
-# steps = [
-#   "lineup.sync_apply",
-#   { action = "streams.match_apply", scope = "lineup" },
-#   { action = "guide.match_apply", scope = { groups = "DIRECTV: *" }, continue_on_failure = true },
-# ]
+# [[workflows.full_sync.steps]]
+# action = "lineup.sync_apply"
+# [[workflows.full_sync.steps]]
+# action = "streams.match_apply"
+# scope = "lineup"
+# continue_on_failure = true
+# [[workflows.full_sync.steps]]
+# action = "guide.match_apply"
+# scope = "lineup"
+# continue_on_failure = true
+# [[workflows.full_sync.steps]]
+# action = "lineup.logos_apply"
+# scope = "lineup"
+# continue_on_failure = true
+# [[workflows.full_sync.steps]]
+# action = "lineup.tidy_apply"
+#
+# Optional steps, commented out because `sync` already names channels after the lineup:
+# `names_apply` would rename every channel to the unified identity's canonical name
+# (the OTA template or the merged database leader) and tag what nothing recognises —
+# display names from every app then agree, but the lineup's own provider spellings are
+# gone. `categorize_apply` would move channels into groups named after their database
+# category instead of the lineup's categories. Either (or both) goes between
+# `lineup.sync_apply` and the match steps when wanted, with the same lineup scope:
+# [[workflows.full_sync.steps]]
+# action = "lineup.names_apply"
+# scope = "lineup"
+# continue_on_failure = true
+# [[workflows.full_sync.steps]]
+# action = "lineup.categorize_apply"
+# scope = "lineup"
+# continue_on_failure = true
 
 # Dispatcharr Connect events, and what they trigger. A target is an `<app>.<action>` or a
 # `workflow.<name>`; the event names are whatever you subscribe to in Dispatcharr

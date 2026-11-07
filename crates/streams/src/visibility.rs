@@ -277,7 +277,8 @@ pub fn plan_with_options(
     let tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
     // One grouping for match and visibility (step 9): the identity family key — the same
     // call Match & Assign makes, through the same function. The normalizer is the
-    // unified engine's (one normalizer), not the retired SM profile's.
+    // unified engine's (one normalizer), not the retired SM profile's. A lineup step
+    // carries the lineup country like Match & Assign does (`apply_scope_hints`).
     let groups = matching::build_groups(
         &scoped.channels,
         &options.database,
@@ -286,6 +287,7 @@ pub fn plan_with_options(
         options.restrict_matching_to_country,
         &group_names,
         &options.engine,
+        options.lineup_country.as_deref(),
     );
 
     // One set, not a `Vec::contains` per channel: at 20k channels the vector scan would be a
@@ -397,13 +399,9 @@ pub async fn run(
         0,
         "grouping channels",
     ));
-    let outcome = plan(
-        &world,
-        scope_for_plan,
-        settings,
-        &context.config().matching,
-        resolved.limit.as_ref(),
-    )?;
+    let mut options = MatchOptions::new(settings, &context.config().matching);
+    options.apply_scope_hints(settings, &resolved.scope_hints);
+    let outcome = plan_with_options(&world, scope_for_plan, &options, resolved.limit.as_ref())?;
     if outcome.channels == 0 {
         return Ok(JobOutcome::new(
             "No channels are in scope. Check the group and profile settings in crosstalk.toml.",

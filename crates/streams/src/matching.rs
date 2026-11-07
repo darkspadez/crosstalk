@@ -69,6 +69,26 @@
 //!     `UnifiedEngine::shortlist_index_in`, `match_run::score_shortlists`,
 //!     `RunEngine::shortlist_engine`). A group with no family at the cut is re-ranked at
 //!     the gate's floor; only a model accept can attach a sub-cut stream.
+//!
+//! # Lineup mode (step 19)
+//!
+//! A workflow step with `scope = "lineup"` reads lineup's owned channels through the
+//! id bound (step 12: the bound already replaces the host scope, so the channel set
+//! needs no work here). What lineup mode adds is the country restriction, from the
+//! hint the scope carries — the lineup file's country — with no dependency from
+//! streams back to lineup: lineup sets the hint on its own
+//! [`crosstalk_core::subapp::NamedScopeResolution`], core carries it on
+//! [`crosstalk_core::jobs::ResolvedScope`], and this module reads it through
+//! [`crosstalk_core::jobs::JobContext::scope_hints`].
+//!
+//! With the hint and `lineup_mode_country_restriction` on (the default), the run
+//! behaves as if `restrict_matching_to_country` was on, with the lineup's country as
+//! the default channel country ([`MatchOptions::lineup_country`], enforced in
+//! [`effective_channel_country`]). The hint is the default, not the law: a channel
+//! whose identity names a different known country keeps its own (a foreign entry in a
+//! domestic lineup still matches its own country's streams), and a channel whose
+//! identity carries a callsign is never country-qualified (bug-161), hint or not.
+//! With the setting off, a lineup step matches exactly like an ordinary run.
 
 use crate::epg::{EpgRun, EpgSettings, EpgTitles};
 use crate::quality::{self, QualityKey, QualityModel, ThroughputSource};
@@ -918,13 +938,15 @@ impl Assignment {
 /// whose country is unknown is not qualified (fail open).
 ///
 /// `pub(crate)` because [`crate::visibility`] groups through the same key: match and
-/// visibility group the same channels together.
+/// visibility group the same channels together. `lineup_country` is the `scope =
+/// "lineup"` hint (the lineup file's country); `None` is an ordinary run.
 pub(crate) fn group_identity_key(
     channel: &Channel,
     engine: &UnifiedEngine,
     restrict_country: bool,
     database: &ChannelDatabase,
     group_name: &str,
+    lineup_country: Option<&str>,
 ) -> String {
     let identity = resolve_with(engine, &channel.name, &ResolveContext::default());
     let FamilyKey {
@@ -938,7 +960,14 @@ pub(crate) fn group_identity_key(
         callsign.as_deref().unwrap_or("")
     );
     if callsign.is_none() {
-        let hint = query_country(channel, restrict_country, database, group_name);
+        let hint = effective_channel_country(
+            engine,
+            channel,
+            restrict_country,
+            database,
+            group_name,
+            lineup_country,
+        );
         if let Some(country) = hint.as_deref().or(identity.country.as_deref()) {
             base.push_str(&format!("@@{country}"));
         }
@@ -951,6 +980,39 @@ pub(crate) fn group_identity_key(
 /// when it is off (the engine then reads the name's own marker). One helper for the
 /// grouping key and the collector, so the two can never disagree on a channel's country.
 /// Callsign exemption (bug-161) is the caller's: both callers check the identity first.
+///
+/// Step 19 (lineup mode): `lineup_country` is the `scope = "lineup"` hint, the lineup
+/// file's country. With it, the hint is the DEFAULT channel country: a channel whose
+/// own identity names a different known country keeps its own (a foreign entry in a
+/// domestic lineup still matches its own country's streams), and every other channel
+/// is ranked under the lineup's. `None` is an ordinary run: the database/group/name
+/// code, or nothing when the filter is off.
+fn effective_channel_country(
+    engine: &UnifiedEngine,
+    channel: &Channel,
+    restrict_country: bool,
+    database: &ChannelDatabase,
+    group_name: &str,
+    lineup_country: Option<&str>,
+) -> Option<String> {
+    if !restrict_country {
+        return None;
+    }
+    let Some(hint) = lineup_country
+        .map(str::trim)
+        .filter(|hint| !hint.is_empty())
+    else {
+        return query_country(channel, restrict_country, database, group_name);
+    };
+    let identity = resolve_with(engine, &channel.name, &ResolveContext::default());
+    if let Some(own) = identity.country.as_deref() {
+        if !own.eq_ignore_ascii_case(hint) {
+            return Some(own.to_uppercase());
+        }
+    }
+    Some(hint.to_uppercase())
+}
+
 fn query_country(
     channel: &Channel,
     restrict_country: bool,
@@ -973,7 +1035,8 @@ fn query_country(
 ///
 /// `pub` (not just `pub(crate)`) so [`crate::visibility`] and the cross-app
 /// consistency gate group through this same function: one grouping for match and
-/// visibility.
+/// visibility. `lineup_country` is the `scope = "lineup"` hint
+/// ([`MatchOptions::lineup_country`]); `None` is an ordinary run.
 #[allow(clippy::too_many_arguments)]
 pub fn build_groups(
     channels: &[Channel],
@@ -983,6 +1046,7 @@ pub fn build_groups(
     restrict_country: bool,
     group_names: &HashMap<i64, String>,
     engine: &UnifiedEngine,
+    lineup_country: Option<&str>,
 ) -> Vec<Group> {
     let mut groups: Vec<Group> = Vec::new();
     let mut positions: HashMap<String, usize> = HashMap::new();
@@ -999,7 +1063,14 @@ pub fn build_groups(
                     .and_then(|id| group_names.get(&id))
                     .map(String::as_str)
                     .unwrap_or("No Group");
-                group_identity_key(channel, engine, restrict_country, database, group_name)
+                group_identity_key(
+                    channel,
+                    engine,
+                    restrict_country,
+                    database,
+                    group_name,
+                    lineup_country,
+                )
             })
             .clone();
         match positions.get(&key) {
@@ -2307,6 +2378,15 @@ pub struct MatchOptions {
     pub keep_custom_streams: bool,
     pub allow_same_name_streams: bool,
     pub restrict_matching_to_country: bool,
+    /// The `scope = "lineup"` hint: the lineup file's country (step 19).
+    ///
+    /// `None` is an ordinary run. `Some` means lineup mode is on: `run` sets it from
+    /// the scope hints when `lineup_mode_country_restriction` allows, and turns
+    /// `restrict_matching_to_country` on alongside it, so the grouping key, the
+    /// collector and the zone routing all read the lineup default through
+    /// `effective_channel_country`. Never read from another crate: lineup sets the
+    /// hint on its own named-scope resolution, core carries it, streams reads it.
+    pub lineup_country: Option<String>,
     pub visible_channel_limit: usize,
     /// `ota_only`: run Stream-Mapparr's **Match US OTA Only** instead of Match & Assign.
     ///
@@ -2331,6 +2411,28 @@ pub struct MatchOptions {
 }
 
 impl MatchOptions {
+    /// Turn lineup mode on from a step's scope hints (step 19).
+    ///
+    /// A `scope = "lineup"` step already reads lineup's owned channels through the id
+    /// bound; what the hint adds is the country restriction, on by default. The hint is
+    /// the lineup file's country and the default, not the law: a channel whose identity
+    /// names a different known country keeps its own (see `effective_channel_country`).
+    /// Off (`lineup_mode_country_restriction = false`), or no country hint, matches like
+    /// an ordinary run. Match and visibility both call this, so a lineup step groups the
+    /// same channels together in each.
+    pub fn apply_scope_hints(
+        &mut self,
+        settings: &StreamsSettings,
+        hints: &crosstalk_core::subapp::NamedScopeHints,
+    ) {
+        if let Some(country) = hints.country.clone() {
+            if settings.lineup_mode_country_restriction {
+                self.restrict_matching_to_country = true;
+                self.lineup_country = Some(country);
+            }
+        }
+    }
+
     /// The options `streams.toml` and the host's `[matching]` describe.
     pub fn new(settings: &StreamsSettings, matching: &MatchingConfig) -> Self {
         Self::with_database(settings, matching, None)
@@ -2382,6 +2484,7 @@ impl MatchOptions {
             keep_custom_streams: settings.keep_custom_streams,
             allow_same_name_streams: settings.allow_same_name_streams,
             restrict_matching_to_country: settings.restrict_matching_to_country,
+            lineup_country: None,
             visible_channel_limit: settings.visible_channel_limit.max(1) as usize,
             ota_only: settings.ota_only,
             filter_dead_streams: settings.filter_dead_streams,
@@ -2534,6 +2637,7 @@ pub fn plan(
         options.restrict_matching_to_country,
         &data.group_names,
         &options.engine,
+        options.lineup_country.as_deref(),
     );
     // `_zone_routed_map` runs once over every scoped channel, because a channel qualifies
     // through a SIBLING's zone.
@@ -2894,6 +2998,7 @@ async fn apply_ai_gate(
                 options.restrict_matching_to_country,
                 &data.group_names,
                 &options.engine,
+                options.lineup_country.as_deref(),
             );
             let zones = crate::sort::zone_routed(&scoped, &data.normalizer, &data.tags);
             let by_leader: HashMap<i64, &Group> = groups
@@ -2992,12 +3097,15 @@ fn group_country(
         return (None, None, country);
     }
     // The same helper the grouping key reads, so a group's key and its leader's hint
-    // name one country.
-    let code = query_country(
+    // name one country — lineup mode included (see `effective_channel_country`): the
+    // key qualifies with the lineup default and the collector enforces it.
+    let code = effective_channel_country(
+        &data.engine,
         leader,
         options.restrict_matching_to_country,
         &data.database,
         group_name,
+        options.lineup_country.as_deref(),
     );
     if code.is_some() {
         country.engaged += 1;
@@ -3262,7 +3370,14 @@ fn same_country_ids_for(
         return None;
     }
     let group_name = data.channel_group_name(channel);
-    let code = channel_country_code(channel, &data.database, true, &group_name)?;
+    let code = effective_channel_country(
+        &data.engine,
+        channel,
+        collector.options.restrict_matching_to_country,
+        &data.database,
+        &group_name,
+        collector.options.lineup_country.as_deref(),
+    )?;
     let mut same: HashSet<i64> = HashSet::new();
     for id in matched {
         let Some(position) = data.position_of_id.get(id).copied() else {
@@ -3475,6 +3590,7 @@ pub async fn run(
     let resolved = context.resolve_scope(&world)?;
 
     let mut options = MatchOptions::new(settings, &context.config().matching);
+    options.apply_scope_hints(settings, &resolved.scope_hints);
     // EPG-aware placeholder matching: resolve the titles BEFORE the blocking pass, in ONE
     // batched read for the entries a placeholder or watched name can actually reach. The
     // plugin asks the programme table per lookup (memoized per pass); this asks once.
@@ -3708,6 +3824,12 @@ pub async fn run(
             "Match mode",
             if options.ota_only {
                 "US OTA only (callsign matching, no grouping)".to_string()
+            } else if let Some(country) = options.lineup_country.as_deref() {
+                format!(
+                    "Match & Assign over the lineup scope, restricted to the lineup \
+                     country {country} (a channel whose identity names a different known \
+                     country keeps its own)"
+                )
             } else {
                 "Match & Assign (identity family groups)".to_string()
             },
@@ -3780,15 +3902,21 @@ pub async fn run(
             );
         }
     }
-    if settings.restrict_matching_to_country {
+    if settings.restrict_matching_to_country || options.lineup_country.is_some() {
         spec = spec.note(
             "Country filter",
             format!(
                 "engaged on {} group(s), {} foreign stream(s) dropped, skipped on {} \
-                     (no country detected)",
+                     (no country detected){}",
                 outcome.country.engaged,
                 outcome.country.foreign_dropped,
-                outcome.country.skipped_unknown_channel
+                outcome.country.skipped_unknown_channel,
+                options
+                    .lineup_country
+                    .as_deref()
+                    .map_or(String::new(), |country| {
+                        format!("; lineup mode restricted to the lineup country {country}")
+                    })
             ),
         );
     }
@@ -4449,6 +4577,103 @@ mod tests {
     }
 
     #[test]
+    fn lineup_mode_restricts_to_the_lineup_country_without_the_explicit_filter() {
+        // Step 19: `run` turns the filter on from the scope hint and sets
+        // `lineup_country`; `plan` then behaves like the explicit filter, with the
+        // lineup file's country as the default. The channel names no country, so the
+        // US hint is what enforces.
+        let world = World {
+            channels: vec![channel(1, "CNN", vec![], 1)],
+            streams: vec![
+                stream(10, "UK: CNN", Some(1), Some(TVE)),
+                stream(11, "CNN", Some(1), Some(TVE)),
+                stream(12, "US: CNN", Some(1), Some(TVE)),
+            ],
+            m3u_accounts: accounts(),
+            groups: groups(),
+            ..World::default()
+        };
+        let mut options = match_options(&StreamsSettings::default());
+        options.restrict_matching_to_country = true;
+        options.lineup_country = Some("US".to_string());
+        let throughput = quality::MemoryThroughputSource::new();
+        let outcome = plan(
+            &world,
+            &ScopeConfig::default(),
+            &StreamsSettings::default(),
+            &options,
+            &throughput,
+        )
+        .expect("plan");
+        let row = assignment(&outcome, 1);
+        // The UK feed is dropped outright; the same-country feed leads the unknown one.
+        assert_eq!(row.after, vec![12, 11], "{:?}", row.after);
+        assert_eq!(outcome.country.engaged, 1);
+        assert_eq!(outcome.country.foreign_dropped, 1);
+    }
+
+    #[test]
+    fn scope_hints_turn_lineup_mode_on_only_when_the_setting_allows() {
+        let hinted = crosstalk_core::subapp::NamedScopeHints::with_country("UK");
+        let settings = StreamsSettings::default();
+        let mut options = match_options(&settings);
+        options.apply_scope_hints(&settings, &hinted);
+        assert!(options.restrict_matching_to_country);
+        assert_eq!(options.lineup_country.as_deref(), Some("UK"));
+
+        // Off: a lineup step matches like an ordinary run.
+        let off = StreamsSettings {
+            lineup_mode_country_restriction: false,
+            ..StreamsSettings::default()
+        };
+        let mut options = match_options(&off);
+        options.apply_scope_hints(&off, &hinted);
+        assert!(!options.restrict_matching_to_country);
+        assert_eq!(options.lineup_country, None);
+
+        // No hint (an ordinary run, or a lineup file without a country prefix).
+        let mut options = match_options(&settings);
+        options.apply_scope_hints(&settings, &crosstalk_core::subapp::NamedScopeHints::none());
+        assert!(!options.restrict_matching_to_country);
+        assert_eq!(options.lineup_country, None);
+    }
+
+    #[test]
+    fn lineup_mode_keeps_a_channel_whose_identity_names_another_country() {
+        // Step 19: the hint is the DEFAULT, not the law. The channel's own identity
+        // is British, so the US lineup hint does not re-nationalise it: the US feed
+        // is the foreign one here.
+        let world = World {
+            channels: vec![channel(1, "UK: CNN", vec![], 1)],
+            streams: vec![
+                stream(10, "UK: CNN", Some(1), Some(TVE)),
+                stream(11, "CNN", Some(1), Some(TVE)),
+                stream(12, "US: CNN", Some(1), Some(TVE)),
+            ],
+            m3u_accounts: accounts(),
+            groups: groups(),
+            ..World::default()
+        };
+        let mut options = match_options(&StreamsSettings::default());
+        options.restrict_matching_to_country = true;
+        options.lineup_country = Some("US".to_string());
+        let throughput = quality::MemoryThroughputSource::new();
+        let outcome = plan(
+            &world,
+            &ScopeConfig::default(),
+            &StreamsSettings::default(),
+            &options,
+            &throughput,
+        )
+        .expect("plan");
+        let row = assignment(&outcome, 1);
+        // Enforced UK (the channel's own), not the US hint: the US feed drops.
+        assert_eq!(row.after, vec![10, 11], "{:?}", row.after);
+        assert_eq!(outcome.country.engaged, 1);
+        assert_eq!(outcome.country.foreign_dropped, 1);
+    }
+
+    #[test]
     fn two_countries_never_share_a_group_whether_or_not_the_filter_is_on() {
         // Filter OFF: `UK: CNN` and `US: CNN` share a normalize key, but their families
         // differ by country (G03), so the UK leader's family must not land on the US
@@ -4932,6 +5157,7 @@ mod tests {
             options.restrict_matching_to_country,
             &data.group_names,
             &options.engine,
+            options.lineup_country.as_deref(),
         );
         let collector = Collector {
             data: &data,

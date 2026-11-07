@@ -604,16 +604,16 @@ pub async fn run(
 
     let mut applied = 0;
     if !dry_run {
-        let associations: Vec<(i64, Option<i64>)> = matched
-            .iter()
-            .filter_map(|row| row.epg_data_id.map(|epg| (row.channel_id, Some(epg))))
-            .collect();
-        if !associations.is_empty() {
-            applied = client
-                .batch_set_epg(&associations)
-                .await
-                .context("applying the EPG assignments")?;
-        }
+        applied = write_assignments(
+            client,
+            context,
+            world,
+            &associations(&rows),
+            run_rows.len() as i64,
+            "guide.match",
+        )
+        .await
+        .context("applying the EPG assignments")?;
     }
 
     // Tidy up only after a successful run: deleting older reports before an apply that then
@@ -637,6 +637,72 @@ pub async fn run(
         candidates: scoped_entries.entries.len(),
         channels: scoped_channels.channels.len(),
     })
+}
+
+/// Write guide assignments as channel operations, recording one undoable row per write.
+///
+/// The match and heal rows say what the run FOUND; these rows say what it WROTE, in the
+/// shape host undo reverses (`epg_data_id`, the entry the channel was on before, the one
+/// it got). They go after the run's own rows (`first_ordinal` on), so the CSV and the
+/// match rows read as before. A channel already on its matched entry is planned as a skip
+/// and not sent: a rerun over a matched lineup writes nothing, like every other
+/// channel-ops write. A failed write still records its rows (failed, so an undo leaves
+/// them alone) before the run fails with the client's message. Returns the writes that
+/// landed.
+pub(crate) async fn write_assignments(
+    client: &DispatcharrClient,
+    context: &JobContext,
+    world: &World,
+    assignments: &[(i64, i64)],
+    first_ordinal: i64,
+    action: &str,
+) -> Result<usize> {
+    use crosstalk_core::channel_ops::{self, Field, Op, RowStatus, Selection, SetValue};
+    if assignments.is_empty() {
+        return Ok(0);
+    }
+    let selection = Selection {
+        channel_ids: Some(assignments.iter().map(|(channel, _)| *channel).collect()),
+        ..Selection::default()
+    };
+    let values: HashMap<i64, SetValue> = assignments
+        .iter()
+        .map(|(channel, entry)| (*channel, SetValue::Epg(Some(*entry))))
+        .collect();
+    let plan = channel_ops::plan(
+        world,
+        &selection,
+        &[Op::Set {
+            field: Field::Epg,
+            values,
+        }],
+    )?;
+    if plan.changes.is_empty() {
+        return Ok(0);
+    }
+    let applied = channel_ops::apply(client, &plan, context, action).await;
+    let rows: Vec<RunRow> = channel_ops::run_rows(&plan, Some(&applied))
+        .into_iter()
+        .filter(|row| row.status != "skipped")
+        .map(|mut row| {
+            row.ordinal += first_ordinal;
+            row
+        })
+        .collect();
+    context.record_rows(&rows)?;
+    if let Some(failed) = applied
+        .changes
+        .iter()
+        .find(|change| change.status == RowStatus::Failed)
+    {
+        anyhow::bail!(
+            "{} of {} assignment(s) failed: {}",
+            applied.failed,
+            plan.changes.len(),
+            failed.reason
+        );
+    }
+    Ok(applied.ok)
 }
 
 /// Whether a scoped EPG entry carries programme data in the run's window.
@@ -1158,6 +1224,111 @@ mod tests {
         .await
         .expect("apply");
         assert_eq!(result.applied, 1);
+    }
+
+    #[tokio::test]
+    async fn an_apply_records_undoable_rows_and_skips_unchanged_assignments() {
+        // The match rows say what the run found; the write rows after them say what it
+        // wrote, in the shape host undo reverses. A channel already on its match is not
+        // re-sent: a rerun over a matched world writes nothing.
+        let (server, mut world, context) = fixture("espn.us").await;
+        let store = crosstalk_core::store::Store::in_memory().expect("store");
+        let run_id = store.start_run("guide", "match_apply", false).expect("run");
+        let context = context.for_run(
+            "guide",
+            "match_apply",
+            run_id,
+            store.clone(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let settings = GuideSettings::default();
+        let (channels, entries) = scoped(&world);
+
+        let result = run(
+            &GuideApp::new(),
+            &context,
+            &settings,
+            None,
+            &world,
+            &channels,
+            &entries,
+            false,
+        )
+        .await
+        .expect("apply");
+        assert_eq!(result.applied, 1);
+        let rows = store.rows(run_id).expect("rows");
+        let writes: Vec<&RunRow> = rows.iter().filter(|row| !row.field.is_empty()).collect();
+        assert_eq!(writes.len(), 1, "{rows:?}");
+        let write = writes[0];
+        assert_eq!(write.channel_id, 1);
+        assert_eq!(write.field, "epg_data_id");
+        assert_eq!(write.before_value.as_deref(), Some("none"));
+        assert_eq!(write.after_value.as_deref(), Some("7"));
+        assert_eq!(write.status, "ok");
+        assert_eq!(
+            write.ordinal,
+            result.rows.len() as i64,
+            "after the match rows"
+        );
+
+        // The same world with the assignment landed: nothing is sent, nothing recorded.
+        store
+            .finish_run(
+                run_id,
+                crosstalk_core::store::RunStatus::Succeeded,
+                None,
+                &serde_json::json!({}),
+                None,
+            )
+            .expect("finish");
+        world.channels[0].epg_data_id = Some(7);
+        world.channels[0].effective_epg_data_id = Some(7);
+        let sent_before = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|request| request.method.as_str() == "POST")
+            .count();
+        let rerun_id = store.start_run("guide", "match_apply", false).expect("run");
+        let rerun_context = context.clone().for_run(
+            "guide",
+            "match_apply",
+            rerun_id,
+            store.clone(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let (channels, entries) = scoped(&world);
+        let rerun = run(
+            &GuideApp::new(),
+            &rerun_context,
+            &settings,
+            None,
+            &world,
+            &channels,
+            &entries,
+            false,
+        )
+        .await
+        .expect("rerun");
+        assert_eq!(rerun.applied, 0);
+        let sent_after = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|request| request.method.as_str() == "POST")
+            .count();
+        assert_eq!(
+            sent_after, sent_before,
+            "an unchanged assignment is not re-sent"
+        );
+        assert!(store
+            .rows(rerun_id)
+            .expect("rows")
+            .iter()
+            .all(|row| row.field.is_empty()));
     }
 
     #[tokio::test]

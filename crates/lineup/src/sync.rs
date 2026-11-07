@@ -2260,7 +2260,10 @@ mod tests {
             .expect("resolves");
         assert_eq!(
             resolved,
-            crosstalk_core::subapp::NamedScopeResolution::Channels(vec![1, 3])
+            crosstalk_core::subapp::NamedScopeResolution::ChannelsWithHints {
+                ids: vec![1, 3],
+                hints: crosstalk_core::subapp::NamedScopeHints::with_country("US"),
+            }
         );
     }
 }

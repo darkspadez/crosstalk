@@ -84,6 +84,12 @@ allow_same_name_streams = false
 # Only match streams detected as the same country as the channel. A stream with no
 # recognizable country marker is not dropped, it sorts behind same-country matches.
 restrict_matching_to_country = false
+# In a scope = "lineup" step, restrict matching to the lineup file's country (lineup
+# mode). The step's channels are already lineup's owned channels; this is the country
+# half: with it on (the default) the step matches as if the filter above was on, with
+# the lineup file's two-letter country as the default. A channel whose identity names a
+# different known country keeps its own. Off matches like an ordinary run.
+lineup_mode_country_restriction = true
 # PREFIX=COUNTRY pairs telling the country filter what a provider prefix means, for a prefix
 # that names a platform rather than a country. Only consulted when nothing else identified
 # the stream, and only at the start of a name: NOW=UK, GO=US.

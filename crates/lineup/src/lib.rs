@@ -352,10 +352,12 @@ impl SubApp for LineupApp {
         )]
     }
 
-    /// Resolve `scope = "lineup"` to the owned channel ids.
+    /// Resolve `scope = "lineup"` to the owned channel ids, with the lineup file's
+    /// country as the hint.
     ///
     /// `None` means "not mine" (any other name). `Some` is every channel id the store
-    /// records this app owning under the configured file's [`owner_key_prefix`]. Ids
+    /// records this app owning under the configured file's [`owner_key_prefix`], plus
+    /// the file's country for steps that restrict by it (streams' lineup mode). Ids
     /// with no channel in the loaded world are dropped by the scope resolution itself,
     /// so a channel deleted upstream is gone, not an error. A settings file that does
     /// not load (or names an unknown lineup) fails the step rather than scoping it to
@@ -384,7 +386,17 @@ impl SubApp for LineupApp {
 }
 
 impl LineupApp {
-    /// The channel ids owned under the configured lineup file's ownership prefix.
+    /// The channel ids owned under the configured lineup file's ownership prefix,
+    /// with the file's country as the scope hint.
+    ///
+    /// The hint is the filename's two-letter country prefix
+    /// ([`lineup_file::filename_country`]); a file without one carries no country
+    /// hint, and a streams step over it then matches like an ordinary run (only an
+    /// explicit `restrict_matching_to_country` restricts). Every vendored file has
+    /// one. Per-entry
+    /// countries (`CC_` prefixes, category countries) are NOT folded in here: the
+    /// hint is the default, and a channel whose identity names a different known
+    /// country keeps its own (decided in streams' lineup mode, step 19).
     fn owned_lineup_channels(
         &self,
         config_dir: &Path,
@@ -400,7 +412,15 @@ impl LineupApp {
             .collect();
         ids.sort_unstable();
         ids.dedup();
-        Ok(NamedScopeResolution::Channels(ids))
+        // The hint rides the same spelling the prefix pins (short or full filename,
+        // `normalize_lineup_name` settles it), so the country can never disagree with
+        // the channel set: both name the configured file.
+        let filename = lineup_file::normalize_lineup_name(&settings.lineup_file)
+            .map(lineup_file::full_filename)
+            .unwrap_or_else(|| settings.lineup_file.clone());
+        let mut hints = crosstalk_core::subapp::NamedScopeHints::none();
+        hints.country = lineup_file::filename_country(&filename);
+        Ok(NamedScopeResolution::ChannelsWithHints { ids, hints })
     }
 
     async fn dispatch(
@@ -732,7 +752,15 @@ mod tests {
             )
             .expect("served")
             .expect("resolves");
-        assert_eq!(resolved, NamedScopeResolution::Channels(Vec::new()));
+        // Empty but hinted: the fixture's default lineup file (`US_DirecTV-Premier`)
+        // names a country even before anything is owned.
+        assert_eq!(
+            resolved,
+            NamedScopeResolution::ChannelsWithHints {
+                ids: Vec::new(),
+                hints: crosstalk_core::subapp::NamedScopeHints::with_country("US"),
+            }
+        );
         assert!(
             app()
                 .resolve_named_scope("nope", &fixture.config, &World::default(), &store)
@@ -799,7 +827,10 @@ mod tests {
         // The default lineup file.
         assert_eq!(
             resolve(&fixture).expect("resolves"),
-            NamedScopeResolution::Channels(vec![7, 8])
+            NamedScopeResolution::ChannelsWithHints {
+                ids: vec![7, 8],
+                hints: crosstalk_core::subapp::NamedScopeHints::with_country("US"),
+            }
         );
         // Switching lineup_file (either spelling) switches the scope; the old lineup's
         // channels stay owned but leave the scope.
@@ -811,7 +842,10 @@ mod tests {
             .expect("seed");
             assert_eq!(
                 resolve(&fixture).expect("resolves"),
-                NamedScopeResolution::Channels(vec![9]),
+                NamedScopeResolution::ChannelsWithHints {
+                    ids: vec![9],
+                    hints: crosstalk_core::subapp::NamedScopeHints::with_country("UK"),
+                },
                 "{spelling}"
             );
         }

@@ -1792,6 +1792,7 @@ mod cross_app_consistency_tests {
             false,
             &std::collections::HashMap::new(),
             &engine,
+            None,
         );
         for group in &mut groups {
             group.members.sort_unstable();

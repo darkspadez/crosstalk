@@ -453,20 +453,27 @@ pub async fn run(
     // Step 4: write the replacements that clear the threshold.
     let mut applied = 0;
     if !dry_run {
-        let associations: Vec<(i64, Option<i64>)> = rows
+        let associations: Vec<(i64, i64)> = rows
             .iter()
             .filter(|row| row.status == HealStatus::Healed)
-            .filter_map(|row| row.new_epg_id.map(|epg| (row.channel_id, Some(epg))))
+            .filter_map(|row| row.new_epg_id.map(|epg| (row.channel_id, epg)))
             .collect();
-        if !associations.is_empty() {
-            let plan = report
-                .as_deref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "(no report)".to_string());
-            applied = client.batch_set_epg(&associations).await.with_context(|| {
-                format!("applying the EPG replacements; the plan was recorded in {plan}")
-            })?;
-        }
+        let plan = report
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "(no report)".to_string());
+        applied = crate::matching::write_assignments(
+            client,
+            context,
+            world,
+            &associations,
+            run_rows.len() as i64,
+            "guide.heal",
+        )
+        .await
+        .with_context(|| {
+            format!("applying the EPG replacements; the plan was recorded in {plan}")
+        })?;
     }
 
     // Tidy up only after a successful run: deleting older reports before an apply that then

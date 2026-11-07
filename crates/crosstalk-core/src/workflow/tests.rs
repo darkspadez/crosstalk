@@ -733,6 +733,129 @@ async fn a_named_scope_from_an_app_replaces_the_host_scope() {
     assert_eq!(*seen.lock().expect("seen lock"), vec![vec![1]]);
 }
 
+/// A fake app offering a HINTED named scope (`ChannelsWithHints`): the channel set plus
+/// what the app knows about it, so the test proves hints reach the step's action through
+/// the same executor, run options and context the channel set travels.
+struct HintApp {
+    seen_ids: Arc<Mutex<Vec<Vec<i64>>>>,
+    seen_hints: Arc<Mutex<Vec<Option<String>>>>,
+}
+
+impl SubApp for HintApp {
+    fn id(&self) -> &'static str {
+        "hint"
+    }
+
+    fn name(&self) -> &'static str {
+        "Hint"
+    }
+
+    fn description(&self) -> &'static str {
+        "test scope hints"
+    }
+
+    fn actions(&self) -> Vec<ActionSpec> {
+        vec![ActionSpec::new("record", "Record", "records its scope", ActionKind::Read).offline()]
+    }
+
+    fn schema(&self) -> &SettingsSchema {
+        static SCHEMA: std::sync::OnceLock<SettingsSchema> = std::sync::OnceLock::new();
+        SCHEMA.get_or_init(SettingsSchema::default)
+    }
+
+    fn load_settings(&self, _path: &std::path::Path) -> Result<SettingsValues> {
+        Ok(SettingsValues::new())
+    }
+
+    fn save_settings(&self, _path: &std::path::Path, _values: &SettingsValues) -> Result<()> {
+        Ok(())
+    }
+
+    fn named_scopes(&self) -> Vec<NamedScope> {
+        vec![NamedScope::new(
+            "hinted",
+            "the fake app's channels, with the country they share",
+        )]
+    }
+
+    fn resolve_named_scope(
+        &self,
+        name: &str,
+        _config: &crate::config::CrosstalkConfig,
+        _world: &World,
+        _store: &crate::store::Store,
+    ) -> Option<Result<NamedScopeResolution>> {
+        match name.trim() {
+            "hinted" => Some(Ok(NamedScopeResolution::ChannelsWithHints {
+                ids: vec![1],
+                hints: crate::subapp::NamedScopeHints::with_country("UK"),
+            })),
+            _ => None,
+        }
+    }
+
+    fn run<'a>(
+        &'a self,
+        action: &'a str,
+        context: &'a crate::jobs::JobContext,
+        _dry_run: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<JobOutcome>> + Send + 'a>> {
+        Box::pin(async move {
+            assert_eq!(action, "record");
+            // The same hand-built world every scope test reads: the point is what the
+            // CONTEXT resolves, not Dispatcharr.
+            let world = ScopeApp::world();
+            let scoped = context.scoped_channels(&world)?;
+            let mut ids: Vec<i64> = scoped.channels.iter().map(|channel| channel.id).collect();
+            ids.sort_unstable();
+            self.seen_ids.lock().expect("seen lock").push(ids.clone());
+            let hints = context.scope_hints(&world)?;
+            self.seen_hints
+                .lock()
+                .expect("seen lock")
+                .push(hints.country.clone());
+            Ok(JobOutcome::new(format!(
+                "recorded {} channel(s) under {:?}",
+                ids.len(),
+                hints.country,
+            )))
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_hinted_named_scope_carries_hints_to_the_step() {
+    // The step names the hinted scope: the bound still replaces the host scope (only the
+    // Sports channel reaches the action), and the hint rides along — the country the
+    // providing app reported for those channels.
+    let seen_ids = Arc::new(Mutex::new(Vec::new()));
+    let seen_hints = Arc::new(Mutex::new(Vec::new()));
+    let registry = Registry::new(vec![Arc::new(HintApp {
+        seen_ids: seen_ids.clone(),
+        seen_hints: seen_hints.clone(),
+    })]);
+    let mut config = config_with_entries(vec![table_step(
+        "hint.record",
+        Some(WorkflowStepScope::Named("hinted".to_string())),
+        false,
+    )]);
+    config.scope.groups = "News".to_string();
+    let runner = JobRunner::new(
+        registry,
+        crate::config::SharedConfig::new(config),
+        Store::in_memory().expect("store"),
+    );
+    let outcome = run_to_completion(&runner, "nightly", false, RunOptions::default())
+        .await
+        .expect("runs");
+    assert!(!outcome.is_failed(), "{}", outcome.summary);
+    assert_eq!(*seen_ids.lock().expect("seen lock"), vec![vec![1]]);
+    assert_eq!(
+        *seen_hints.lock().expect("seen lock"),
+        vec![Some("UK".to_string())]
+    );
+}
+
 #[tokio::test]
 async fn an_unknown_scope_name_is_refused_before_the_workflow_starts() {
     // Like a step naming no registered action, a scope no app provides is a configuration

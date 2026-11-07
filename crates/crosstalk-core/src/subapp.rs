@@ -478,9 +478,42 @@ impl NamedScope {
     }
 }
 
+/// Hints a named scope carries for the step that named it.
+///
+/// Hints travel with the channel set but never widen it: a step scoped to `"lineup"`
+/// still reads exactly the scope's channels. They let the providing app share what it
+/// knows about those channels without the consuming app depending on it (streams must
+/// never depend on lineup): lineup sets the lineup file's country, and streams' lineup
+/// mode reads it. Forward-compatible by shape: new hints join this struct, never the
+/// [`NamedScopeResolution`] enum's id arms.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NamedScopeHints {
+    /// The default country the scope's channels belong to (`None` = unknown).
+    ///
+    /// Lineup sets the configured lineup file's country (its filename's two-letter
+    /// prefix). It is the DEFAULT: a channel whose own identity names a different
+    /// known country keeps its own (a foreign entry in a domestic lineup still
+    /// matches its own country's streams).
+    pub country: Option<String>,
+}
+
+impl NamedScopeHints {
+    /// No hints: the scope names channels and nothing else.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// A scope whose channels default to `country`.
+    pub fn with_country(country: impl Into<String>) -> Self {
+        Self {
+            country: Some(country.into()),
+        }
+    }
+}
+
 /// What a named scope resolves to, for the step that named it.
 ///
-/// Either shape REPLACES the host `[scope]`: the step reads exactly these channels. An
+/// Every shape REPLACES the host `[scope]`: the step reads exactly these channels. An
 /// explicit id set is the ownership answer ("the channels lineup X made"); an inline
 /// [`ScopeConfig`] is the group/profile answer ("`DIRECTV: *`"). The id set wins when an
 /// app can name its channels exactly, because group names can be renamed by hand.
@@ -488,9 +521,45 @@ impl NamedScope {
 pub enum NamedScopeResolution {
     /// Exactly these channel ids, in no particular order. Ids with no channel in the
     /// loaded world are dropped: a channel deleted upstream is gone, not an error.
+    /// Carries no hints (see [`ChannelsWithHints`](Self::ChannelsWithHints)).
     Channels(Vec<i64>),
+    /// Exactly these channel ids, plus what the providing app knows about them.
+    ///
+    /// Lineup resolves `"lineup"` to this, with the lineup file's country as the
+    /// hint (see [`NamedScopeHints`]): streams' lineup mode turns on the country
+    /// restriction from it. Any other consumer ignores hints it does not read.
+    ChannelsWithHints {
+        ids: Vec<i64>,
+        hints: NamedScopeHints,
+    },
     /// A scope table to resolve like an inline one.
     Scope(ScopeConfig),
+}
+
+impl NamedScopeResolution {
+    /// The channel ids this resolution names, in no particular order.
+    ///
+    /// Empty for a table resolution (which names channels by rule, not by id).
+    /// Ids with no channel in the loaded world are dropped by the scope resolution
+    /// itself, so a channel deleted upstream is gone, not an error.
+    pub fn ids(&self) -> &[i64] {
+        match self {
+            Self::Channels(ids) => ids,
+            Self::ChannelsWithHints { ids, .. } => ids,
+            Self::Scope(_) => &[],
+        }
+    }
+
+    /// The hints this resolution carries, or none.
+    ///
+    /// A table resolution and a bare id set carry no hints; a hinted id set carries
+    /// what the providing app knew.
+    pub fn hints(&self) -> NamedScopeHints {
+        match self {
+            Self::ChannelsWithHints { hints, .. } => hints.clone(),
+            Self::Channels(_) | Self::Scope(_) => NamedScopeHints::none(),
+        }
+    }
 }
 
 /// A number that must already be a whole number in range.
@@ -1396,5 +1465,15 @@ mod tests {
             .resolve_named_scope("fakescope", &CrosstalkConfig::default(), &world, &store)
             .expect("served");
         assert_eq!(resolved, NamedScopeResolution::Channels(vec![7]));
+        // The id-set helpers read through the hinted shape too: a bare set carries
+        // no hints, a hinted set carries what the app knew.
+        assert_eq!(resolved.ids(), &[7]);
+        assert_eq!(resolved.hints(), NamedScopeHints::none());
+        let hinted = NamedScopeResolution::ChannelsWithHints {
+            ids: vec![7, 8],
+            hints: NamedScopeHints::with_country("UK"),
+        };
+        assert_eq!(hinted.ids(), &[7, 8]);
+        assert_eq!(hinted.hints().country.as_deref(), Some("UK"));
     }
 }

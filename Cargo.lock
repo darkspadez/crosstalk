@@ -589,6 +589,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "crosstalk-core",
+ "crosstalk-guide",
  "crosstalk-matching",
  "crosstalk-streams",
  "regex",

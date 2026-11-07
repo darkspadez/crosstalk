@@ -68,6 +68,10 @@ pub struct ResolvedScope {
     /// How a channel-set scope reads in the filter description (`in scope "lineup"`).
     /// Empty when no id bound applies.
     pub label: String,
+    /// What the providing app knows about the scope's channels (see
+    /// [`crate::subapp::NamedScopeHints`]). Set only for a named scope that carries
+    /// hints; a step's own table override and the host `[scope]` carry none.
+    pub scope_hints: crate::subapp::NamedScopeHints,
 }
 
 /// One progress update, as the UI and the run record show it.
@@ -413,11 +417,13 @@ impl JobContext {
                 tables: self.config.scope.clone(),
                 limit: None,
                 label: String::new(),
+                scope_hints: crate::subapp::NamedScopeHints::none(),
             }),
             Some(WorkflowStepScope::Table(scope)) => Ok(ResolvedScope {
                 tables: scope.clone(),
                 limit: None,
                 label: String::new(),
+                scope_hints: crate::subapp::NamedScopeHints::none(),
             }),
             Some(WorkflowStepScope::Named(name)) => {
                 let registry = self.registry.as_ref().ok_or_else(|| {
@@ -437,6 +443,7 @@ impl JobContext {
                         tables: scope,
                         limit: None,
                         label: format!("in scope {name:?}"),
+                        scope_hints: crate::subapp::NamedScopeHints::none(),
                     }),
                     crate::subapp::NamedScopeResolution::Channels(ids) => {
                         let limit: std::collections::HashSet<i64> = ids.into_iter().collect();
@@ -444,11 +451,35 @@ impl JobContext {
                             tables: crate::config::ScopeConfig::default(),
                             limit: Some(limit),
                             label: format!("in scope {name:?}"),
+                            scope_hints: crate::subapp::NamedScopeHints::none(),
+                        })
+                    }
+                    crate::subapp::NamedScopeResolution::ChannelsWithHints { ids, hints } => {
+                        let limit: std::collections::HashSet<i64> = ids.into_iter().collect();
+                        Ok(ResolvedScope {
+                            tables: crate::config::ScopeConfig::default(),
+                            limit: Some(limit),
+                            label: format!("in scope {name:?}"),
+                            scope_hints: hints,
                         })
                     }
                 }
             }
         }
+    }
+
+    /// What the step's named scope knows about its channels, for the run that named it.
+    ///
+    /// Empty (no hints) unless the run is a workflow step whose named scope carries
+    /// them: today that is `scope = "lineup"`, whose hint is the lineup file's
+    /// country. A step's own table override and an ordinary run carry none. Needs the
+    /// world because resolving the scope does; a bare context without a registry or a
+    /// store refuses, like [`JobContext::resolve_scope`] does.
+    pub fn scope_hints(
+        &self,
+        world: &crate::dispatcharr::World,
+    ) -> Result<crate::subapp::NamedScopeHints> {
+        Ok(self.resolve_scope(world)?.scope_hints)
     }
 
     /// The runs in flight for one app, oldest first. Empty outside the runner.

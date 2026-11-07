@@ -158,6 +158,14 @@ pub struct StreamsSettings {
     pub allow_same_name_streams: bool,
     /// Only match streams detected as the channel's country. `restrict_matching_to_country`.
     pub restrict_matching_to_country: bool,
+    /// In a `scope = "lineup"` step, restrict matching to the lineup's country (step 19).
+    ///
+    /// Lineup mode: the step's channels are already lineup's owned channels; what this
+    /// adds is the country restriction, defaulting to the lineup file's country (its
+    /// filename's two-letter prefix). A channel whose identity names a different known
+    /// country keeps its own. Off behaves exactly like an ordinary run: only an
+    /// explicit `restrict_matching_to_country` restricts.
+    pub lineup_mode_country_restriction: bool,
     /// `PREFIX=COUNTRY` pairs telling the country filter what a provider prefix means.
     /// Stream-Mapparr's `stream_prefix_countries`.
     pub stream_prefix_countries: String,
@@ -352,6 +360,10 @@ impl Default for StreamsSettings {
             keep_custom_streams: true,
             allow_same_name_streams: false,
             restrict_matching_to_country: false,
+            // Lineup mode restricts to the lineup's country by default (step 19): a
+            // `scope = "lineup"` step matches like the filter was on, with the lineup
+            // file's country as the default. Off keeps ordinary-run behaviour.
+            lineup_mode_country_restriction: true,
             stream_prefix_countries: String::new(),
             visible_channel_limit: 1,
             ota_only: false,
@@ -829,6 +841,21 @@ pub fn schema() -> SettingsSchema {
              behind same-country matches. Best with one [matching] database selected: with \
              several, a name that disagrees between them is treated as ambiguous and the \
              filter is skipped for that channel rather than guessing.",
+        ),
+        FieldSpec::new(
+            "lineup_mode_country_restriction",
+            SECTION_MATCH,
+            "Restrict Lineup Mode To The Lineup Country",
+            FieldKind::Boolean,
+            FieldValue::Boolean(true),
+        )
+        .with_help(
+            "When on (the default), a `scope = \"lineup\"` step matches as if the filter \
+             above was on, with the lineup file's country as the default channel country: \
+             the step's channels are already lineup's owned channels, and this is the \
+             country half of lineup mode. A channel whose identity names a different \
+             known country keeps its own. When off, a lineup step matches like an \
+             ordinary run — only an explicit Restrict Matching To Same Country restricts.",
         ),
         FieldSpec::new(
             "stream_prefix_countries",
@@ -1600,6 +1627,10 @@ pub fn to_values(settings: &StreamsSettings) -> SettingsValues {
             "restrict_matching_to_country",
             settings.restrict_matching_to_country,
         ),
+        (
+            "lineup_mode_country_restriction",
+            settings.lineup_mode_country_restriction,
+        ),
         ("ota_only", settings.ota_only),
         ("filter_dead_streams", settings.filter_dead_streams),
         (
@@ -1826,6 +1857,9 @@ pub fn apply_values(settings: &mut StreamsSettings, values: &SettingsValues) -> 
     }
     if let Some(value) = values.bool("restrict_matching_to_country") {
         settings.restrict_matching_to_country = value;
+    }
+    if let Some(value) = values.bool("lineup_mode_country_restriction") {
+        settings.lineup_mode_country_restriction = value;
     }
     if let Some(value) = values.bool("ota_only") {
         settings.ota_only = value;
@@ -2213,6 +2247,7 @@ mod tests {
             keep_custom_streams: false,
             allow_same_name_streams: true,
             restrict_matching_to_country: true,
+            lineup_mode_country_restriction: false,
             stream_prefix_countries: "NOW=UK".to_string(),
             visible_channel_limit: 3,
             ota_only: true,
