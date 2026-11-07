@@ -14,11 +14,11 @@
 //!     `create` (step 17), `sync` + `tidy` (step 18) — one module per verb, each landing
 //!     with its own step and its own oracle report.
 //!
-//! This step (13) registers only `validate` and `status`: the settings, the loader, the
-//! registry wiring and the named `lineup` scope. The action ids below name the pairs the
-//! later steps register, so a schedule key and an API caller can guess the pair from the
-//! start: every writing action is a `<verb>_preview` / `<verb>_apply` pair, and a preview
-//! is always a read.
+//! Steps 13-15 register `validate`, `status`, the `clean_*` pair + `test_name` (14)
+//! and the `names_*` pair (15): the settings, the loader, the registry wiring and the
+//! named `lineup` scope. The action ids below name the pairs the later steps register,
+//! so a schedule key and an API caller can guess the pair from the start: every writing
+//! action is a `<verb>_preview` / `<verb>_apply` pair, and a preview is always a read.
 //!
 //! What the three plugins did that a host does once, this app does not do at all: the
 //! dry-run switch is the preview half of a pair (or `--dry-run`), the schedules, windows
@@ -28,6 +28,7 @@
 
 pub mod clean;
 pub mod lineup_file;
+pub mod names;
 pub mod settings;
 #[cfg(test)]
 mod test_support;
@@ -172,6 +173,25 @@ impl SubApp for LineupApp {
                 "Type a channel name, then Run: shows the cleaned name, the fired rules, \
                  and the unified identity (canonical, callsign, zone, country).",
             ),
+            ActionSpec::new(
+                ACTION_NAMES_PREVIEW,
+                "Preview Names (Dry Run)",
+                "Compute the canonical name for every in-scope channel (OTA template, \
+                 premium canonical + tags, unknown suffix) and write a CSV. Changes \
+                 nothing.",
+                ActionKind::Read,
+            ),
+            ActionSpec::new(
+                ACTION_NAMES_APPLY,
+                "Apply Names",
+                "Rename the channels the preview would change (collisions handled per the \
+                 On Collision setting). Undoable through the host undo.",
+                ActionKind::Write,
+            )
+            .with_confirm(
+                "This will rename channels in Dispatcharr. The host undo can reverse it. \
+                 Continue?",
+            ),
         ]
     }
 
@@ -307,6 +327,14 @@ impl LineupApp {
                 let settings = self.checked_settings(context)?;
                 clean::run_test_name(context, &settings)
             }
+            ACTION_NAMES_PREVIEW => {
+                let settings = self.checked_settings(context)?;
+                names::run(self, context, &settings, true).await
+            }
+            ACTION_NAMES_APPLY => {
+                let settings = self.checked_settings(context)?;
+                names::run(self, context, &settings, dry_run).await
+            }
             other => bail!("{APP_NAME} has no action {other:?} yet"),
         }
     }
@@ -403,10 +431,11 @@ mod tests {
     }
 
     #[test]
-    fn app_declares_validate_status_clean_and_test_name() {
+    fn app_declares_validate_status_clean_names_and_test_name() {
         // Step 13 registered `validate` and `status`; step 14 adds the `clean_*` pair
-        // and `test_name`. The ids for the later pairs are declared (so schedules and
-        // URLs can be guessed from the start) but not registered.
+        // and `test_name`; step 15 adds the `names_*` pair. The ids for the later
+        // pairs are declared (so schedules and URLs can be guessed from the start)
+        // but not registered.
         let ids: Vec<&str> = app().actions().iter().map(|action| action.id).collect();
         assert_eq!(
             ids,
@@ -415,12 +444,12 @@ mod tests {
                 ACTION_STATUS,
                 ACTION_CLEAN_PREVIEW,
                 ACTION_CLEAN_APPLY,
-                ACTION_TEST_NAME
+                ACTION_TEST_NAME,
+                ACTION_NAMES_PREVIEW,
+                ACTION_NAMES_APPLY
             ]
         );
         for future in [
-            ACTION_NAMES_PREVIEW,
-            ACTION_NAMES_APPLY,
             ACTION_CATEGORIZE_PREVIEW,
             ACTION_CATEGORIZE_APPLY,
             ACTION_LOGOS_PREVIEW,
@@ -452,6 +481,12 @@ mod tests {
         assert!(by_id(ACTION_CLEAN_APPLY).confirm.is_some());
         assert_eq!(by_id(ACTION_TEST_NAME).kind, ActionKind::Read);
         assert!(by_id(ACTION_TEST_NAME).input.is_some());
+        // The names pair reads like its plugin halves: the preview is a read, the
+        // apply writes and confirms.
+        assert_eq!(by_id(ACTION_NAMES_PREVIEW).kind, ActionKind::Read);
+        assert!(by_id(ACTION_NAMES_PREVIEW).confirm.is_none());
+        assert_eq!(by_id(ACTION_NAMES_APPLY).kind, ActionKind::Write);
+        assert!(by_id(ACTION_NAMES_APPLY).confirm.is_some());
         // Every future writing action is a preview/apply pair, and a preview is a read —
         // the naming rule every sub-app follows, pinned before the pairs exist.
         for (preview, apply) in [

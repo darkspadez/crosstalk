@@ -134,8 +134,10 @@ fn title_case(raw: &str) -> String {
 /// token of a messy FCC affiliation string.
 ///
 /// Legacy `D1-` subchannel prefixes, callsign-prefixed `D1 -` runs and `Ch 3.1`
-/// position markers are dropped first; the rest is split on `[;,/&.]` and
-/// whitespace; LEADING callsign-shaped tokens (`KALB`, `WXYZ-TV`) are dropped
+/// position markers are dropped first; the rest is split on `[;,/&.:]` and
+/// whitespace (`:` is a fix over CM's `[;,/&.]`: `NBC: ION` read as `NBC:`, and
+/// the rendered `NBC: - CA Eureka (KIEM)` re-renamed on the next run once the
+/// stream-network override read `NBC`); LEADING callsign-shaped tokens (`KALB`, `WXYZ-TV`) are dropped
 /// because the station is not the network; a trailing `Television Network` /
 /// `Network` is stripped; the survivor reads upper. `KALB/NBC` → `NBC`,
 /// `CBS Ch 3.1, CW/MTN Ch 3.2` → `CBS`.
@@ -170,7 +172,7 @@ pub fn parse_network_affiliation(raw: &str) -> String {
         .replace_all(&text, " ")
         .to_string();
     let call = re(&CALL, r"^[KW][A-Z]{2,3}(?:-(?:TV|CD|LP|DT|LD)\d*)?$");
-    let mut tokens: Vec<&str> = re(&SPLIT, r"[;,/&.]|\s+")
+    let mut tokens: Vec<&str> = re(&SPLIT, r"[;,/&.:]|\s+")
         .split(&text)
         .filter(|t| !t.trim().is_empty())
         .collect();
@@ -594,6 +596,7 @@ mod tests {
         assert_eq!(parse_network_affiliation("FOX Television Network"), "FOX");
         assert_eq!(parse_network_affiliation("WXYZ-TV ABC"), "ABC");
         assert_eq!(parse_network_affiliation("D1-CBS"), "CBS");
+        assert_eq!(parse_network_affiliation("NBC: ION"), "NBC");
         assert_eq!(parse_network_affiliation(""), "");
     }
 

@@ -642,3 +642,89 @@ Step 14 review (2026-11-06):
   (`AccuWeather` -> `Accuweather`: `accu weather` -> `accuweather`), so it can cost
   guide/streams matches, which `test_name` shows; `normalize_plus_one` rewrites
   `1+1 International` to `1 +1 International` (NC's own risk).
+
+Step 15 review (2026-11-07):
+- **Target names are the unified engine's, per path with CM citations.**
+  `crates/lineup/src/names.rs` resolves every in-scope channel through the same
+  `RunEngine` + identity cache guide/streams run on, then: OTA when the identity
+  callsign is in the merged station table (target = `render_ota(ota_fields(...))`
+  with the `_extract_stream_network` override; missing placeholder refuses like
+  `_format_ota_name` returning `None`; opt-in `ota_market_fallback` via the new
+  shared `crosstalk-matching::market` port of `market_index.py` against the same
+  merged stations); premium = the best identity family's DB leader (merged DBs
+  for the enabled `[matching]` countries, at the one cut) + CM's tag
+  re-attachment rebuilt from the shared tag vocabulary (ignored = quality/status
+  kinds = CM's default ignored list); unmatched = `unknown_suffix` through
+  `apply_suffix` when `tag_unmatched_channels`, else left alone. A callsign with
+  no station row blocks premium and still tags (CM's `rename_unknown_channels`
+  tags every Skipped row). The AI gate (lineup `ai_gate_enabled` AND host
+  `[ai.verify]`, task `"names"`, off by default) re-ranks empty-family channels
+  at the gate floor and only a model accept renames, through the gate's country
+  rule. `names_preview`/`names_apply` plan from live state (`Op::Set Name` per
+  channel, collision resolver on, no-op drops), CSV = CM's rename columns + the
+  identity fields + reason, apply = one bulk edit, undo = the host's from run rows.
+- **Identity invariant (review).** Premium renames always re-resolve into the same
+  family (pinned by `renames_keep_the_identity_family`). The OTA template is the
+  documented exception: it changes the normalize key (`13 WREX` -> `NBC - IL
+  Rockford (WREX)`), so `same_family` does not hold — but the callsign is kept,
+  and callsign identity ignores country (bug-161), so the broadcast entity is the
+  same station under a different display shape (asserted, listed by name).
+- **No-double re-attachment (fix over CM).** `build_final_channel_name` never
+  re-attaches a tag the DB base already carries (`KSPT-DT3 (HEROICN)` stays
+  itself; `truTV (Pacific)` gains no second Pacific) — pinned by
+  `reattachment_never_doubles_what_the_base_holds`. Same never-double rule as
+  `apply_suffix` for `[Unk]`.
+- **Deterministic station lookup.** The base-callsign -> full-key map is built
+  over sorted keys: two full spellings sharing a base (`KAZT-CD` vs `KAZT-TV`)
+  always resolve the same way. A `HashMap`-iteration-ordered first-wins map made
+  the oracle report flip between runs (caught by `--check`).
+- **Oracle gates at 0 unattributed.** `scripts/oracle_report_lineup_names.py`
+  drives CM's real `load_and_process_channels` path (oracles.py CM path, DB-order
+  ties like `oracles.py`, plus verbatim `_extract_stream_network` /
+  `_parse_network_affiliation` / `_format_ota_name`) + `rename_unknown` folding
+  (every CM Skipped row, OTA ones included), over a representative world (station
+  decorations, DB names with provider decorations, 40 popular national networks
+  in provider decorations, unmatched) x {defaults, market-fallback} plus a
+  disputed set, vs `names_dump` (the action's own `decide_heuristic` + the
+  ranker's no-cut `floor`): 304/555 agree, 0 unattributed. Every bucket is a
+  CHECK, never elimination: `ota-format`/`ota-vs-premium` (ladders: one side OTA,
+  or one side reads a callsign), `premium-canonical` (both winners in both DBs
+  and different; a decided alias row; CM's own `fuzzy_match` rejecting Rust's
+  winner; or the ranker never scoring CM's winner), `cm-prefilter` (CM's scorer
+  accepts Rust's winner, its `get_candidates` pre-filter drops it: `A&E`),
+  `merged-data` (winner absent from the other DB, or differing station rows),
+  `cut` (CM's winner in the `floor` shortlist below the host cut — 0 rows: the
+  10 rows the first draft called `cut` were CM doubling a tag the base holds,
+  `K28NN-D (CBS) (CBS)`, now `tag-reattachment`), `unknown-tag` (two documented
+  fixes: only truly unmatched rows tag, never twice). CI runs the report
+  non-failing with `--check` gating byte-reproducibility (added to `ci.yml`).
+- **Review fixes (step 15 review).** (1) BLOCKER: with `ota_market_fallback` on,
+  a printed callsign with no station (`ABC (WZZZ)`) fell through to premium and
+  renamed to the national `ABC`; it now tries the market and otherwise blocks
+  premium like CM (`market_fallback_never_turns_a_blocked_callsign_premium`).
+  (2) The AI gate keyed borderline on the row's wording, so with the default
+  `[Unk]` tagging it never fired; `decide_heuristic` now returns the borderline
+  flag itself, unanswered outcomes are ignored, and an accept onto the current
+  name skips (`ai_gate_runs_on_tagged_unmatched_rows_and_only_there`). (3) A base
+  stating a feed zone gains no second regional word (`Cinemax Action (Pacific)
+  West` -> `Cinemax Action (Pacific)`). (4) names and clean fought on DB bases
+  carrying ignored tags (`BX Culture` -> `BX Culture (HD)` -> clean -> ...): the
+  base drops its ignored (quality/status) groups; `names_and_clean_do_not_fight`
+  pins idempotence and a joint fixpoint in both orders (the order still picks
+  between same-family endpoints: `ESPN [HD]` names to `ESPN HD`, cleaned first
+  to `ESPN`). (5) `parse_network_affiliation` splits on `:` too (fix over CM:
+  `NBC: ION` rendered `NBC: - CA Eureka (KIEM)`, which re-renamed next run).
+- **Cross-app finding (engine, LEFT for the phase review).** Network-led callsign
+  names (`ABC (WABC)`, `NBC (KSDK)`) rank on the stripped key first, so guide and
+  streams give them the bare national entry (`ABC`, Exact 100) before the rename
+  and the station (Callsign 95) after it. Callsign-led names keep the station.
+  `ota_renames_keep_the_guide_and_streams_families` pins both, so an engine change
+  to callsign precedence flips it on purpose.
+- **For the step 20 README (names differences from CM):** one engine/identity/cut
+  everywhere (CM's 80 vs strict 95 is the `cut` bucket); merged newest-union data
+  vs CM's older per-country DB (`merged-data`); no saved-JSON replay (live plans);
+  the collision guard on every rename (CM has none); only unmatched rows tag and
+  never twice; a callsign CM's ladder reads but the merged allowlist does not
+  (digit-led shapes) blocks premium on CM's side only (`ota-vs-premium`); the DB
+  base drops ignored quality tags (`BX Culture (HD)` -> `BX Culture`, so names
+  and clean agree); one regional word at most; `NBC: ION` reads as `NBC`.

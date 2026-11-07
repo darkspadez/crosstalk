@@ -587,6 +587,7 @@ name = "crosstalk-lineup"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "crosstalk-core",
  "crosstalk-matching",
  "regex",

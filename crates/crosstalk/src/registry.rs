@@ -32,7 +32,8 @@ mod tests {
     #[test]
     fn lineup_is_linked_in() {
         // Step 13 registered `validate` and `status`; step 14 adds the `clean_*`
-        // pair and `test_name`. The later pairs land with steps 15-18.
+        // pair and `test_name`; step 15 adds the `names_*` pair. The later pairs
+        // land with steps 16-18.
         let registry = builtin();
         let app = registry.get("lineup").expect("lineup is linked");
         assert_eq!(app.name(), "Lineup");
@@ -45,7 +46,9 @@ mod tests {
                 "status",
                 "clean_preview",
                 "clean_apply",
-                "test_name"
+                "test_name",
+                "names_preview",
+                "names_apply"
             ]
         );
         // Every section of the plan's settings layout is in the form.

@@ -276,6 +276,18 @@ jobs:
       # Rust unit tests instead).
       - name: Lineup clean vs Name Cleaner's own pipeline
         run: python3 -I scripts/clean_parity.py
+      # Phase 3 step 15: lineup names are Channel-Mapparr's canonical names (OTA
+      # template, premium canonical + tag re-attachment, unknown suffix, AI gate),
+      # ported onto the unified engine. The harness drives CM's REAL
+      # `load_and_process_channels` decision path (via scripts/corpus/oracles.py
+      # plus the OTA formatting) over OTA decorations, merged-DB provider
+      # variants, unmatched names and the disputed set x 2 settings cases, and
+      # compares every final name with `crates/lineup/examples/names_dump` (the
+      # action's own `decide_heuristic`). The report reproduces byte for byte
+      # (--check); it never fails on differences — every difference is attributed
+      # in `docs/oracle-reports/lineup-names.md` (bar: 0 unattributed).
+      - name: Lineup names oracle diff report reproduces
+        run: python3 -I scripts/oracle_report_lineup_names.py --check
       # Informational, never failing: what upstream changed since each pinned reference
       # commit in the files crosstalk ports from it. Covers every reference submodule
       # (EPG Janitor, Stream-Mapparr, IPTV Checker, Channel-Mapparr, Lineuparr, Channel
