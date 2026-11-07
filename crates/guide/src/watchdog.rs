@@ -1946,6 +1946,7 @@ mod tests {
                         name: format!("guide {source}"),
                         tvg_id: format!("tvg.{source}"),
                         epg_source: Some(source),
+                        icon_url: None,
                     })
                     .collect(),
                 ..World::default()

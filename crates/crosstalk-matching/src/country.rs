@@ -732,6 +732,28 @@ pub fn extract_zone_noguard(name: &str) -> FeedZone {
     }
 }
 
+/// The name with its feed-zone marker removed, or `None` when [`extract_zone_noguard`]
+/// reads no zone.
+///
+/// The same reading as [`extract_zone_noguard`] (pipe segments collapsed, trailing
+/// writer tags peeled, the West/Pacific patterns before East), with the matched marker
+/// cut out: `Showtime (W)` -> `Showtime`, `HBO East HD` -> `HBO`. The peeled tags go
+/// too, so the result is for name matching that ignores the feed (zone feeds share
+/// their brand's logo), not for display.
+pub fn strip_zone_marker(name: &str) -> Option<String> {
+    let collapsed = crate::tags::collapse_pipe_segments(name);
+    let name = collapsed.as_ref();
+    if !maybe_zoned(name) {
+        return None;
+    }
+    let core = crate::tags::strip_zone_ignorable(name);
+    let found = [zone_west_re(), zone_pacific_re(), zone_east_re()]
+        .into_iter()
+        .find_map(|re| re.find(core).ok().flatten())?;
+    let stripped = format!("{} {}", &core[..found.start()], &core[found.end()..]);
+    Some(stripped.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
 /// Zone-aware routing keep rule (decided Z01=sm-zone, Z02=none, D09=sm-both).
 ///
 /// A `WEST` name keeps only `WEST` candidates; any other name keeps only non-`WEST`
@@ -923,6 +945,24 @@ pub fn lineuparr_stream_country(name: &str) -> Option<&'static str> {
         return Some("US");
     }
     None
+}
+
+/// The name without its leading delimited country marker (`US: CNN HD` -> `CNN HD`,
+/// `UK | Sky One` -> `Sky One`): the marker [`lineuparr_stream_country`] reads in its
+/// delimited form, recognised codes only (`TV - ...`, `NFL: ...` and network prefixes
+/// stay). Unchanged when there is no marker or nothing follows it.
+pub fn strip_delimited_country_marker(name: &str) -> &str {
+    if let Ok(Some(caps)) = lineuparr_delim_re().captures(name) {
+        if let (Some(whole), Some(group)) = (caps.get(0), caps.get(1)) {
+            if lineuparr_normalize_token(group.as_str()).is_some() {
+                let rest = name[whole.end()..].trim_start();
+                if !rest.is_empty() {
+                    return rest;
+                }
+            }
+        }
+    }
+    name
 }
 
 /// Lineuparr's `detect_name_country_prefix`: split a `CC_` prefix off a lineup name.
@@ -1489,6 +1529,36 @@ mod tests {
     }
 
     #[test]
+    fn zone_markers_strip_on_the_engines_own_reading() {
+        for (name, stripped) in [
+            ("Showtime (W)", "Showtime"),
+            ("Showtime (E)", "Showtime"),
+            ("HBO East HD", "HBO"),
+            ("HBO West (Backup)", "HBO"),
+            ("Starz (Pacific)", "Starz"),
+            ("Cinemax East | HD |", "Cinemax"),
+        ] {
+            assert_eq!(
+                strip_zone_marker(name).as_deref(),
+                Some(stripped),
+                "{name:?}"
+            );
+            assert_ne!(extract_zone_noguard(name), FeedZone::Default, "{name:?}");
+        }
+        // No zone read, nothing stripped: prose words and a bare `(P)` (decided Z07).
+        for name in [
+            "HBO",
+            "West Ham TV",
+            "Westworld",
+            "Easter Parade",
+            "Starz (P)",
+        ] {
+            assert_eq!(strip_zone_marker(name), None, "{name:?}");
+            assert_eq!(extract_zone_noguard(name), FeedZone::Default, "{name:?}");
+        }
+    }
+
+    #[test]
     fn pipe_segments_collapse_before_zone_and_country() {
         // Decided N15 (step-14 review): `|` residue never reaches the key or the
         // zone/country reads — junk segments drop, the rest join with a space.
@@ -1531,5 +1601,22 @@ mod tests {
         assert_eq!(detector.country_from_name("US: ESPN"), Some("US"));
         assert_eq!(detector.country_from_group("Canada"), Some("CA"));
         assert_eq!(extract_zone("HBO West"), FeedZone::West);
+    }
+
+    #[test]
+    fn the_delimited_country_marker_strips() {
+        assert_eq!(strip_delimited_country_marker("US: CNN HD"), "CNN HD");
+        assert_eq!(strip_delimited_country_marker("UK | Sky One"), "Sky One");
+        assert_eq!(strip_delimited_country_marker("USA - ESPN"), "ESPN");
+        // Not a country, or nothing after it: unchanged.
+        for name in [
+            "TV - Shopping",
+            "NFL: RedZone",
+            "CBS - AL Birmingham (WIAT)",
+            "US:",
+            "CNN",
+        ] {
+            assert_eq!(strip_delimited_country_marker(name), name, "{name}");
+        }
     }
 }

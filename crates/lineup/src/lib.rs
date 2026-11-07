@@ -26,8 +26,10 @@
 //! `crosstalk.toml`, the CSV retention is `[exports]`, the usage counters are not ported,
 //! and `clear_csv_exports` is the host's `exports clear`.
 
+pub mod categorize;
 pub mod clean;
 pub mod lineup_file;
+pub mod logos;
 pub mod names;
 pub mod settings;
 #[cfg(test)]
@@ -192,6 +194,42 @@ impl SubApp for LineupApp {
                 "This will rename channels in Dispatcharr. The host undo can reverse it. \
                  Continue?",
             ),
+            ActionSpec::new(
+                ACTION_CATEGORIZE_PREVIEW,
+                "Preview Categorize (Dry Run)",
+                "Compute the category group each in-scope channel moves to (creating \
+                 missing groups) and write a CSV. Changes nothing.",
+                ActionKind::Read,
+            ),
+            ActionSpec::new(
+                ACTION_CATEGORIZE_APPLY,
+                "Apply Categorize",
+                "Create the missing category groups and move the channels the preview \
+                 would move. Undoable through the host undo.",
+                ActionKind::Write,
+            )
+            .with_confirm(
+                "This will create channel groups and move channels in Dispatcharr. The \
+                 host undo can reverse the moves. Continue?",
+            ),
+            ActionSpec::new(
+                ACTION_LOGOS_PREVIEW,
+                "Preview Logos (Dry Run)",
+                "Compute the logo each in-scope channel takes (EPG icon, Logo Manager, \
+                 tv-logos, default) and write a CSV. Changes nothing.",
+                ActionKind::Read,
+            ),
+            ActionSpec::new(
+                ACTION_LOGOS_APPLY,
+                "Apply Logos",
+                "Create the missing logos and assign the logos the preview would assign. \
+                 Undoable through the host undo.",
+                ActionKind::Write,
+            )
+            .with_confirm(
+                "This will create logos and assign them to channels in Dispatcharr. The \
+                 host undo can reverse the assignments. Continue?",
+            ),
         ]
     }
 
@@ -335,6 +373,22 @@ impl LineupApp {
                 let settings = self.checked_settings(context)?;
                 names::run(self, context, &settings, dry_run).await
             }
+            ACTION_CATEGORIZE_PREVIEW => {
+                let settings = self.checked_settings(context)?;
+                categorize::run(self, context, &settings, true).await
+            }
+            ACTION_CATEGORIZE_APPLY => {
+                let settings = self.checked_settings(context)?;
+                categorize::run(self, context, &settings, dry_run).await
+            }
+            ACTION_LOGOS_PREVIEW => {
+                let settings = self.checked_settings(context)?;
+                logos::run(self, context, &settings, true).await
+            }
+            ACTION_LOGOS_APPLY => {
+                let settings = self.checked_settings(context)?;
+                logos::run(self, context, &settings, dry_run).await
+            }
             other => bail!("{APP_NAME} has no action {other:?} yet"),
         }
     }
@@ -431,11 +485,12 @@ mod tests {
     }
 
     #[test]
-    fn app_declares_validate_status_clean_names_and_test_name() {
+    fn app_declares_validate_status_clean_names_categorize_logos_and_test_name() {
         // Step 13 registered `validate` and `status`; step 14 adds the `clean_*` pair
-        // and `test_name`; step 15 adds the `names_*` pair. The ids for the later
-        // pairs are declared (so schedules and URLs can be guessed from the start)
-        // but not registered.
+        // and `test_name`; step 15 adds the `names_*` pair; step 16 adds the
+        // `categorize_*` and `logos_*` pairs. The ids for the later pairs are
+        // declared (so schedules and URLs can be guessed from the start) but not
+        // registered.
         let ids: Vec<&str> = app().actions().iter().map(|action| action.id).collect();
         assert_eq!(
             ids,
@@ -446,14 +501,14 @@ mod tests {
                 ACTION_CLEAN_APPLY,
                 ACTION_TEST_NAME,
                 ACTION_NAMES_PREVIEW,
-                ACTION_NAMES_APPLY
+                ACTION_NAMES_APPLY,
+                ACTION_CATEGORIZE_PREVIEW,
+                ACTION_CATEGORIZE_APPLY,
+                ACTION_LOGOS_PREVIEW,
+                ACTION_LOGOS_APPLY
             ]
         );
         for future in [
-            ACTION_CATEGORIZE_PREVIEW,
-            ACTION_CATEGORIZE_APPLY,
-            ACTION_LOGOS_PREVIEW,
-            ACTION_LOGOS_APPLY,
             ACTION_CREATE_PREVIEW,
             ACTION_CREATE_APPLY,
             ACTION_SYNC_PREVIEW,
@@ -487,6 +542,15 @@ mod tests {
         assert!(by_id(ACTION_NAMES_PREVIEW).confirm.is_none());
         assert_eq!(by_id(ACTION_NAMES_APPLY).kind, ActionKind::Write);
         assert!(by_id(ACTION_NAMES_APPLY).confirm.is_some());
+        // The categorize and logos pairs read the same way.
+        assert_eq!(by_id(ACTION_CATEGORIZE_PREVIEW).kind, ActionKind::Read);
+        assert!(by_id(ACTION_CATEGORIZE_PREVIEW).confirm.is_none());
+        assert_eq!(by_id(ACTION_CATEGORIZE_APPLY).kind, ActionKind::Write);
+        assert!(by_id(ACTION_CATEGORIZE_APPLY).confirm.is_some());
+        assert_eq!(by_id(ACTION_LOGOS_PREVIEW).kind, ActionKind::Read);
+        assert!(by_id(ACTION_LOGOS_PREVIEW).confirm.is_none());
+        assert_eq!(by_id(ACTION_LOGOS_APPLY).kind, ActionKind::Write);
+        assert!(by_id(ACTION_LOGOS_APPLY).confirm.is_some());
         // Every future writing action is a preview/apply pair, and a preview is a read —
         // the naming rule every sub-app follows, pinned before the pairs exist.
         for (preview, apply) in [

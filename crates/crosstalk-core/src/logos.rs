@@ -1,7 +1,9 @@
-//! The unified logo resolver: one source order for every app.
+//! The unified logo resolver: one tier walk ([`resolve_logo`]) for every app.
 //!
 //! Phase 3 step 7. Both plugins fetch tv-logos over the network and match
-//! filenames with a ratio; Lineuparr's assignment order is the decided one:
+//! filenames with a ratio; Lineuparr's assignment order is the decided default
+//! ([`LogoSource::DEFAULT_ORDER`]; an operator's `logo_sources` reorders it through
+//! [`LogoSource::parse_order`]):
 //!
 //! 1. the channel's EPG icon (it is already curated for that exact entry);
 //! 2. the Logo Manager: a logo whose NAME matches the channel name exactly,
@@ -14,8 +16,9 @@
 //! Channel-Mapparr's order differs (station → fuzzy → EPG → network, and it
 //! only consults EPG/network logos for channels with NO logo yet); the unified
 //! order is Lineuparr's 3-tier fallback plus the default, decided for step 7.
-//! Creating `Logo` rows is lineup's job (step 16); this module only resolves a
-//! URL and names its source.
+//! The tiers, their order, the country search ([`search_tv_logos`]) and the
+//! default safety net live here only; creating `Logo` rows is lineup's job (step
+//! 16), which resolves through this module.
 //!
 //! # The tv-logos index
 //!
@@ -147,31 +150,81 @@ pub fn build_logo_url(repo: &str, branch: &str, dir: &str, filename: &str) -> St
     format!("https://raw.githubusercontent.com/{repo}/{branch}/countries/{path}")
 }
 
-/// Where a resolved logo came from, in consult order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Where a resolved logo came from: the tiers [`resolve_logo`] consults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LogoSource {
     EpgIcon,
     LogoManager,
     TvLogos,
+    /// The station's network logo (Channel-Mapparr's `network_logo` fallback).
+    Network,
     Default,
 }
 
 impl LogoSource {
+    /// The unified consult order: Lineuparr's (decided in step 7) EPG icon, Logo
+    /// Manager, tv-logos, then Channel-Mapparr's network-logo fallback, which CM also
+    /// consults last (`_assign_tv_logos`: station, fuzzy, EPG icon, network). The
+    /// default logo is the safety net after these.
+    pub const DEFAULT_ORDER: [LogoSource; 4] = [
+        LogoSource::EpgIcon,
+        LogoSource::LogoManager,
+        LogoSource::TvLogos,
+        LogoSource::Network,
+    ];
+
     pub fn label(self) -> &'static str {
         match self {
             LogoSource::EpgIcon => "epg_icon",
             LogoSource::LogoManager => "logo_manager",
             LogoSource::TvLogos => "tv_logos",
+            LogoSource::Network => "network",
             LogoSource::Default => "default",
         }
     }
+
+    /// Parse an operator's source order (comma or newline separated, case-insensitive):
+    /// `epg`, `logo_manager`, `tv-logos`, `network`, `default` (and their `_`/`-`
+    /// spellings).
+    ///
+    /// An unknown token is an error naming the valid ones; repeats keep the first
+    /// position; empty means [`DEFAULT_ORDER`](Self::DEFAULT_ORDER).
+    pub fn parse_order(raw: &str) -> anyhow::Result<Vec<LogoSource>> {
+        let mut order: Vec<LogoSource> = Vec::new();
+        for token in raw.split([',', '\n']) {
+            let token = token.trim().to_lowercase();
+            if token.is_empty() {
+                continue;
+            }
+            let source = match token.as_str() {
+                "epg" | "epg_icon" | "epg-icon" => LogoSource::EpgIcon,
+                "logo_manager" | "logo-manager" | "manager" => LogoSource::LogoManager,
+                "tv-logos" | "tv_logos" | "tvlogos" => LogoSource::TvLogos,
+                "network" | "network_logo" | "network-logo" => LogoSource::Network,
+                "default" => LogoSource::Default,
+                other => anyhow::bail!(
+                    "unknown logo source {other:?}; use epg, logo_manager, tv-logos, network \
+                     or default"
+                ),
+            };
+            if !order.contains(&source) {
+                order.push(source);
+            }
+        }
+        if order.is_empty() {
+            order = Self::DEFAULT_ORDER.to_vec();
+        }
+        Ok(order)
+    }
 }
 
-/// A resolved logo: the URL to assign and the tier that produced it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A resolved logo: the URL to assign, the tier that produced it, and the tv-logos
+/// file detail when that tier did.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedLogo {
     pub url: String,
     pub source: LogoSource,
+    pub tv_hit: Option<TvHit>,
 }
 
 /// The parsed recursive-tree index: image filenames per directory path.
@@ -525,86 +578,281 @@ pub fn match_channel_to_logo(
     )
 }
 
-/// What [`resolve_logo`] may consult.
+/// One tv-logos hit: the URL to assign and how it was found.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TvHit {
+    pub url: String,
+    pub file: String,
+    /// The directory under `countries/` the file lives in (`united-states/us-local`).
+    pub dir: String,
+    /// The fuzzy score (0–100); `None` for a station-file hit (a callsign match, not a
+    /// similarity).
+    pub score: Option<f64>,
+}
+
+/// A tv-logos file the fuzzy tier scored (oracle evidence).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TvScored {
+    pub dir: String,
+    pub file: String,
+    pub score: f64,
+    /// The normalized filename the score compares against.
+    pub norm_file: String,
+}
+
+/// Search the tv-logos index for a name across country codes, in order.
+///
+/// Station-format names take the station file first — each code's station directory,
+/// then its country directory (Channel-Mapparr's two-phase order across countries) —
+/// else the best fuzzy filename match at `threshold`, the first country with a hit
+/// winning. Returns the hit plus every file the fuzzy tier scored, so an oracle can
+/// verify a similarity attribution both ways. A code with no directory is skipped.
+pub fn search_tv_logos(
+    name: &str,
+    index: &TvLogosIndex,
+    codes: &[String],
+    threshold: u8,
+) -> (Option<TvHit>, Vec<TvScored>) {
+    search_tv(name, index, codes, threshold, true)
+}
+
+/// [`search_tv_logos`]; `collect` keeps every scored file (oracle evidence), which
+/// [`resolve_logo`] skips — the hit alone is what a run needs.
+fn search_tv(
+    name: &str,
+    index: &TvLogosIndex,
+    codes: &[String],
+    threshold: u8,
+    collect: bool,
+) -> (Option<TvHit>, Vec<TvScored>) {
+    let mut scored: Vec<TvScored> = Vec::new();
+    if let Some(station) = parse_station_name(name) {
+        let dirs: Vec<&str> = codes
+            .iter()
+            .filter_map(|code| country_dir_for(code))
+            .collect();
+        let station_dirs = dirs
+            .iter()
+            .filter_map(|dir| TvLogosIndex::station_dir_for(dir))
+            .chain(dirs.iter().copied());
+        for dir in station_dirs {
+            if let Some(file) = match_station_logo(&station, index.files_for(dir)) {
+                return (
+                    Some(TvHit {
+                        url: build_logo_url(TV_LOGOS_REPO, TV_LOGOS_BRANCH, dir, &file),
+                        file,
+                        dir: dir.to_string(),
+                        score: None,
+                    }),
+                    scored,
+                );
+            }
+        }
+    }
+    let norm_channel = normalize_channel_name(name);
+    for code in codes {
+        let Some(dir) = country_dir_for(code) else {
+            continue;
+        };
+        let suffix = country_suffix_for(code);
+        let files = index.files_for(dir);
+        if collect {
+            for file in files {
+                let norm_file = normalize_logo_filename(file, &suffix);
+                if norm_file.is_empty() {
+                    continue;
+                }
+                scored.push(TvScored {
+                    dir: dir.to_string(),
+                    file: file.clone(),
+                    score: logo_similarity(&norm_channel, &norm_file),
+                    norm_file,
+                });
+            }
+        }
+        if let Some((file, matched)) = match_zone_feed(name, files, &suffix, threshold) {
+            // The plain name's similarity to the file (a timeshift matched as
+            // `<name> plus` reports the plain reading, like the scored list).
+            let score = Some(logo_similarity(
+                &normalize_channel_name(&matched),
+                &normalize_logo_filename(&file, &suffix),
+            ));
+            return (
+                Some(TvHit {
+                    url: build_logo_url(TV_LOGOS_REPO, TV_LOGOS_BRANCH, dir, &file),
+                    file,
+                    dir: dir.to_string(),
+                    score,
+                }),
+                scored,
+            );
+        }
+    }
+    (None, scored)
+}
+
+/// [`match_channel_to_logo`] with the feed zone kept out of the competition: a zone
+/// feed (`Showtime (W)`, `HBO East`, read by the engine's own
+/// [`strip_zone_marker`](crosstalk_matching::country::strip_zone_marker)) shares its
+/// brand's logo, so it matches on the zone-free name — unless the full name's file
+/// itself names the zone (`Sportsnet West` is its own channel with its own file).
+/// Returns the file and the name it matched on.
+fn match_zone_feed(
+    name: &str,
+    files: &[String],
+    suffix: &str,
+    threshold: u8,
+) -> Option<(String, String)> {
+    let full = match_channel_to_logo(name, files, suffix, threshold);
+    let Some(zone_free) = crosstalk_matching::country::strip_zone_marker(name) else {
+        return full.map(|file| (file, name.to_string()));
+    };
+    let channel_words = normalize_channel_name(name);
+    let names_the_zone = |file: &String| {
+        normalize_logo_filename(file, suffix)
+            .split(' ')
+            .any(|word| {
+                matches!(word, "west" | "east" | "pacific")
+                    && channel_words.split(' ').any(|own| own == word)
+            })
+    };
+    if let Some(file) = full.filter(names_the_zone) {
+        return Some((file, name.to_string()));
+    }
+    if zone_free.is_empty() {
+        return None;
+    }
+    match_channel_to_logo(&zone_free, files, suffix, threshold).map(|file| (file, zone_free))
+}
+
+/// The tv-logos file for a network name (`cbs`), or `None` (CM's `network_logo`):
+/// `<network>-<suffix>.png`, then the white variant (`cbs-logo-white-us.png`, the
+/// only CBS network logo the repo has). Exact filenames, no similarity.
+pub fn network_logo(network: &str, files: &[String], country_suffix: &str) -> Option<String> {
+    [
+        format!("{network}-{country_suffix}.png"),
+        format!("{network}-logo-white-{country_suffix}.png"),
+    ]
+    .into_iter()
+    .find(|candidate| files.iter().any(|file| file == candidate))
+}
+
+/// The network-logo tier: a station-format name (`CBS - AL Birmingham (WIAT)`) takes
+/// its network's logo from the first searched country that has one (CM's order). A
+/// name that is not station-shaped has no network to look up.
+pub fn search_network_logo(name: &str, index: &TvLogosIndex, codes: &[String]) -> Option<TvHit> {
+    let (network, _) = parse_station_name(name)?;
+    codes.iter().find_map(|code| {
+        let dir = country_dir_for(code)?;
+        let file = network_logo(&network, index.files_for(dir), &country_suffix_for(code))?;
+        Some(TvHit {
+            url: build_logo_url(TV_LOGOS_REPO, TV_LOGOS_BRANCH, dir, &file),
+            file,
+            dir: dir.to_string(),
+            score: None,
+        })
+    })
+}
+
+/// What [`resolve_logo`] may consult for one run.
 #[derive(Debug, Default)]
-pub struct LogoLookups<'a> {
-    /// The channel's EPG icon URL, when its guide entry carries one.
-    pub epg_icon: Option<&'a str>,
-    /// Logo Manager logos by LOWER name (exact, case-insensitive).
-    pub manager_by_name: HashMap<String, &'a str>,
-    /// The tv-logos tree index, when the run fetched it.
-    pub tv_logos: Option<TvLogosIndex>,
-    /// Lineup's configured default logo URL.
-    pub default_logo: Option<&'a str>,
-    /// ISO-2 country choosing the tv-logos directory.
-    pub country: Option<&'a str>,
+pub struct LogoSources<'a> {
+    /// The consult order; empty means [`LogoSource::DEFAULT_ORDER`]. The default logo is
+    /// consulted last even when the order does not name it (the safety net).
+    pub order: Vec<LogoSource>,
+    /// Logo Manager logo URLs by LOWER name (exact, case-insensitive).
+    pub manager_by_name: HashMap<String, String>,
+    /// The tv-logos tree index, when the run loaded it.
+    pub tv_logos: Option<&'a TvLogosIndex>,
+    /// The configured default logo URL.
+    pub default_logo: Option<String>,
     /// Fuzzy threshold (default [`LOGO_MATCH_THRESHOLD`]).
     pub threshold: Option<u8>,
 }
 
-/// Resolve a channel name to a logo URL, in the unified source order.
+/// One channel as [`resolve_logo`] sees it.
+#[derive(Debug, Default)]
+pub struct LogoQuery<'a> {
+    /// The channel name, for the Logo Manager's exact-name tier.
+    pub name: &'a str,
+    /// The name the tv-logos tier matches (an app passes the identity's canonical name,
+    /// so a decorated name and its bare form take the same file).
+    pub match_name: &'a str,
+    /// The icon URL of the channel's assigned EPG entry, when it carries one.
+    pub epg_icon: Option<&'a str>,
+    /// ISO-2 countries whose tv-logos directories are searched, in order.
+    pub countries: &'a [String],
+    /// The channel already carries a logo: the network tier only fills a channel
+    /// with none (CM's `current_logo_id is None`), so a replace run never swaps a
+    /// logo for the generic network one.
+    pub has_logo: bool,
+}
+
+/// Resolve a channel to a logo URL: the ONE tier walk every app uses.
 ///
-/// EPG icon → Logo Manager (exact name) → tv-logos (station file for OTA
-/// names, else fuzzy) → default. `None` only when every tier misses (a lineup
-/// with no default configured). Creating the `Logo` row is lineup's job.
-pub fn resolve_logo(channel_name: &str, lookups: &LogoLookups<'_>) -> Option<ResolvedLogo> {
-    if let Some(icon) = lookups.epg_icon.filter(|icon| !icon.trim().is_empty()) {
-        return Some(ResolvedLogo {
-            url: icon.to_string(),
-            source: LogoSource::EpgIcon,
-        });
-    }
-    if let Some(url) = lookups
-        .manager_by_name
-        .get(&channel_name.to_lowercase())
-        .filter(|url| !url.trim().is_empty())
-    {
-        return Some(ResolvedLogo {
-            url: (*url).to_string(),
-            source: LogoSource::LogoManager,
-        });
-    }
-    let threshold = lookups.threshold.unwrap_or(LOGO_MATCH_THRESHOLD);
-    if let Some(index) = &lookups.tv_logos {
-        if let Some(code) = lookups.country {
-            if let Some(dir) = country_dir_for(code) {
-                let suffix = country_suffix_for(code);
-                if let Some(station) = parse_station_name(channel_name) {
-                    // Station files first (their own dir), then the country's.
-                    let station_dir = TvLogosIndex::station_dir_for(dir);
-                    let mut found = station_dir.and_then(|station_dir| {
-                        match_station_logo(&station, index.files_for(station_dir))
-                            .map(|file| (station_dir, file))
-                    });
-                    if found.is_none() {
-                        found = match_station_logo(&station, index.files_for(dir))
-                            .map(|file| (dir, file));
-                    }
-                    if let Some((file_dir, file)) = found {
-                        return Some(ResolvedLogo {
-                            url: build_logo_url(TV_LOGOS_REPO, TV_LOGOS_BRANCH, file_dir, &file),
-                            source: LogoSource::TvLogos,
-                        });
-                    }
-                }
-                if let Some(file) =
-                    match_channel_to_logo(channel_name, index.files_for(dir), &suffix, threshold)
-                {
-                    return Some(ResolvedLogo {
-                        url: build_logo_url(TV_LOGOS_REPO, TV_LOGOS_BRANCH, dir, &file),
-                        source: LogoSource::TvLogos,
-                    });
-                }
-            }
+/// The tiers run in [`LogoSources::order`] (default EPG icon → Logo Manager (exact
+/// name) → tv-logos (station file for OTA names, else fuzzy, [`search_tv_logos`]) →
+/// the station's network logo for a channel with no logo ([`search_network_logo`])),
+/// then the default logo when the order did not name it. `None` only when every tier
+/// misses. Creating the `Logo` row is the app's job.
+pub fn resolve_logo(query: &LogoQuery<'_>, sources: &LogoSources<'_>) -> Option<ResolvedLogo> {
+    let threshold = sources.threshold.unwrap_or(LOGO_MATCH_THRESHOLD);
+    let order: &[LogoSource] = if sources.order.is_empty() {
+        &LogoSource::DEFAULT_ORDER
+    } else {
+        &sources.order
+    };
+    let hit = |url: &str, source: LogoSource| {
+        Some(ResolvedLogo {
+            url: url.to_string(),
+            source,
+            tv_hit: None,
+        })
+    };
+    let tiers = order
+        .iter()
+        .copied()
+        .chain((!order.contains(&LogoSource::Default)).then_some(LogoSource::Default));
+    for tier in tiers {
+        let found = match tier {
+            LogoSource::EpgIcon => query
+                .epg_icon
+                .filter(|icon| !icon.trim().is_empty())
+                .and_then(|icon| hit(icon, tier)),
+            LogoSource::LogoManager => sources
+                .manager_by_name
+                .get(&query.name.to_lowercase())
+                .filter(|url| !url.trim().is_empty())
+                .and_then(|url| hit(url.as_str(), tier)),
+            LogoSource::TvLogos => sources.tv_logos.and_then(|index| {
+                search_tv(query.match_name, index, query.countries, threshold, false)
+                    .0
+                    .map(|tv| ResolvedLogo {
+                        url: tv.url.clone(),
+                        source: tier,
+                        tv_hit: Some(tv),
+                    })
+            }),
+            LogoSource::Network => sources
+                .tv_logos
+                .filter(|_| !query.has_logo)
+                .and_then(|index| search_network_logo(query.match_name, index, query.countries))
+                .map(|tv| ResolvedLogo {
+                    url: tv.url.clone(),
+                    source: tier,
+                    tv_hit: Some(tv),
+                }),
+            LogoSource::Default => sources
+                .default_logo
+                .as_deref()
+                .filter(|url| !url.trim().is_empty())
+                .and_then(|url| hit(url, tier)),
+        };
+        if found.is_some() {
+            return found;
         }
     }
-    lookups
-        .default_logo
-        .filter(|url| !url.trim().is_empty())
-        .map(|url| ResolvedLogo {
-            url: url.to_string(),
-            source: LogoSource::Default,
-        })
+    None
 }
 
 #[cfg(test)]
@@ -706,6 +954,42 @@ mod tests {
     }
 
     #[test]
+    fn a_zone_feed_takes_its_brands_logo_unless_a_file_names_the_zone() {
+        let index = TvLogosIndex::from_tree(&json!({"tree": [
+            {"path": "countries/united-states/showtime-us.png", "type": "blob"},
+            {"path": "countries/united-states/showtime-2-us.png", "type": "blob"},
+            {"path": "countries/united-states/hbo-us.png", "type": "blob"},
+            {"path": "countries/united-states/hbo-2-us.png", "type": "blob"},
+            {"path": "countries/canada/sportsnet-ca.png", "type": "blob"},
+            {"path": "countries/canada/sportsnet-west-ca.png", "type": "blob"}
+        ]}));
+        let file = |name: &str, code: &str| {
+            search_tv_logos(name, &index, &[code.to_string()], LOGO_MATCH_THRESHOLD)
+                .0
+                .map(|hit| hit.file)
+        };
+        // `(W)` must not pull the West feed onto `showtime-2` (W vs 2, one char each).
+        assert_eq!(
+            file("Showtime (W)", "US").as_deref(),
+            Some("showtime-us.png")
+        );
+        assert_eq!(
+            file("Showtime (E)", "US").as_deref(),
+            Some("showtime-us.png")
+        );
+        assert_eq!(file("HBO East", "US").as_deref(), Some("hbo-us.png"));
+        assert_eq!(
+            file("Showtime 2", "US").as_deref(),
+            Some("showtime-2-us.png")
+        );
+        // A file naming the zone is that channel's own logo.
+        assert_eq!(
+            file("Sportsnet West", "CA").as_deref(),
+            Some("sportsnet-west-ca.png")
+        );
+    }
+
+    #[test]
     fn fuzzy_names_match_through_the_unified_similarity() {
         let files = vec![
             "cnn-us.png".to_string(),
@@ -738,52 +1022,176 @@ mod tests {
         );
     }
 
+    fn us() -> Vec<String> {
+        vec!["US".to_string()]
+    }
+
     #[test]
     fn resolution_follows_epg_then_manager_then_tvlogos_then_default() {
         let index = TvLogosIndex::from_tree(&fixture_tree());
-        let base = LogoLookups {
-            tv_logos: Some(index),
-            country: Some("US"),
-            default_logo: Some("https://example.com/default.png"),
-            ..LogoLookups::default()
-        };
-        // EPG icon wins over everything.
-        let epg = LogoLookups {
-            epg_icon: Some("https://example.com/epg.png"),
-            manager_by_name: [("cnn".to_string(), "https://example.com/m.png")]
+        let countries = us();
+        let sources = LogoSources {
+            manager_by_name: [("cnn".to_string(), "https://example.com/m.png".to_string())]
                 .into_iter()
                 .collect(),
-            ..base_shallow(&base)
+            tv_logos: Some(&index),
+            default_logo: Some("https://example.com/default.png".to_string()),
+            ..LogoSources::default()
         };
-        let hit = resolve_logo("CNN", &epg).expect("epg");
+        let query = |name: &'static str, epg_icon: Option<&'static str>| LogoQuery {
+            name,
+            match_name: name,
+            epg_icon,
+            countries: &countries,
+            has_logo: false,
+        };
+        // EPG icon wins over everything.
+        let hit = resolve_logo(&query("CNN", Some("https://example.com/epg.png")), &sources)
+            .expect("epg");
         assert_eq!(
             (hit.url.as_str(), hit.source),
             ("https://example.com/epg.png", LogoSource::EpgIcon)
         );
         // Manager is exact-name, case-insensitive.
-        let mut manager = base_shallow(&base);
-        manager
-            .manager_by_name
-            .insert("cnn".to_string(), "https://example.com/m.png");
-        let hit = resolve_logo("CNN", &manager).expect("manager");
+        let hit = resolve_logo(&query("CNN", None), &sources).expect("manager");
         assert_eq!(hit.source, LogoSource::LogoManager);
-        assert!(resolve_logo("CNN HD", &manager).expect("fuzzy").source == LogoSource::TvLogos);
-        // OTA names take the station file, under its OWN directory.
-        let hit = resolve_logo("CBS - AL Birmingham (WIAT)", &base).expect("station");
+        let hit = resolve_logo(&query("CNN HD", None), &sources).expect("fuzzy");
+        assert_eq!(hit.source, LogoSource::TvLogos);
+        assert_eq!(
+            hit.tv_hit.as_ref().map(|tv| tv.file.as_str()),
+            Some("cnn-us.png")
+        );
+        // OTA names take the station file, under its OWN directory, with no score.
+        let hit =
+            resolve_logo(&query("CBS - AL Birmingham (WIAT)", None), &sources).expect("station");
         assert_eq!(
             hit.url,
             "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/united-states/us-local/cbs-42-wiat-us.png"
         );
-        // Default when nothing matches.
-        let hit = resolve_logo("Zzqxj Kbv", &base).expect("default");
+        assert_eq!(hit.tv_hit.and_then(|tv| tv.score), None);
+        // Default when nothing matches, even though the order does not name it.
+        let hit = resolve_logo(&query("Zzqxj Kbv", None), &sources).expect("default");
         assert_eq!(hit.source, LogoSource::Default);
         // No default configured: None rather than a wrong logo.
-        let bare = LogoLookups {
-            tv_logos: base.tv_logos.clone(),
-            country: Some("US"),
-            ..LogoLookups::default()
+        let bare = LogoSources {
+            tv_logos: Some(&index),
+            ..LogoSources::default()
         };
-        assert_eq!(resolve_logo("Zzqxj Kbv", &bare), None);
+        assert_eq!(resolve_logo(&query("Zzqxj Kbv", None), &bare), None);
+    }
+
+    #[test]
+    fn the_order_is_the_setting_and_parses_strictly() {
+        let index = TvLogosIndex::from_tree(&fixture_tree());
+        let countries = us();
+        let sources = LogoSources {
+            order: LogoSource::parse_order("tv-logos, epg").expect("order"),
+            manager_by_name: [("cnn".to_string(), "https://example.com/m.png".to_string())]
+                .into_iter()
+                .collect(),
+            tv_logos: Some(&index),
+            ..LogoSources::default()
+        };
+        let query = LogoQuery {
+            name: "CNN",
+            match_name: "CNN",
+            epg_icon: Some("https://example.com/epg.png"),
+            countries: &countries,
+            has_logo: false,
+        };
+        // tv-logos first: the file wins over the EPG icon; the manager is not consulted.
+        let hit = resolve_logo(&query, &sources).expect("tv");
+        assert_eq!(hit.source, LogoSource::TvLogos);
+        assert_eq!(
+            LogoSource::parse_order("").expect("empty"),
+            LogoSource::DEFAULT_ORDER.to_vec()
+        );
+        assert_eq!(
+            LogoSource::parse_order("Default, EPG, epg").expect("dedup"),
+            vec![LogoSource::Default, LogoSource::EpgIcon]
+        );
+        let error = LogoSource::parse_order("epg, beacons").expect_err("rejects");
+        assert!(format!("{error:#}").contains("logo_manager"), "{error:#}");
+    }
+
+    #[test]
+    fn a_station_with_no_file_takes_its_network_logo_when_it_has_none() {
+        let index = TvLogosIndex::from_tree(&json!({
+            "tree": [
+                {"path": "countries/united-states/cbs-logo-white-us.png", "type": "blob"},
+                {"path": "countries/united-states/nbc-us.png", "type": "blob"},
+                {"path": "countries/united-states/us-local/cbs-42-wiat-us.png", "type": "blob"},
+            ]
+        }));
+        let countries = us();
+        let sources = LogoSources {
+            tv_logos: Some(&index),
+            default_logo: Some("https://example.com/default.png".to_string()),
+            ..LogoSources::default()
+        };
+        let query = |name: &'static str, has_logo: bool| LogoQuery {
+            name,
+            match_name: name,
+            epg_icon: None,
+            countries: &countries,
+            has_logo,
+        };
+        // The station file still wins over the network logo.
+        let hit =
+            resolve_logo(&query("CBS - AL Birmingham (WIAT)", false), &sources).expect("station");
+        assert_eq!(hit.source, LogoSource::TvLogos);
+        // No station file: the network logo (CM's white CBS variant), before the default.
+        let hit = resolve_logo(&query("CBS - KS Hays (KBSH)", false), &sources).expect("cbs");
+        assert_eq!(hit.source, LogoSource::Network);
+        assert!(
+            hit.url.ends_with("/united-states/cbs-logo-white-us.png"),
+            "{}",
+            hit.url
+        );
+        let hit = resolve_logo(&query("NBC - OH Dayton (WDTN)", false), &sources).expect("nbc");
+        assert!(
+            hit.url.ends_with("/united-states/nbc-us.png"),
+            "{}",
+            hit.url
+        );
+        // A channel that has a logo never gets the generic network one.
+        let hit = resolve_logo(&query("NBC - OH Dayton (WDTN)", true), &sources).expect("default");
+        assert_eq!(hit.source, LogoSource::Default);
+        // Not station-shaped, or a network with no file: no network logo.
+        assert_eq!(search_network_logo("NBC News", &index, &countries), None);
+        assert_eq!(
+            search_network_logo("PBS - AK Fairbanks (KUAC)", &index, &countries),
+            None
+        );
+        // `network` is a token of the order.
+        assert_eq!(
+            LogoSource::parse_order("network, default").expect("order"),
+            vec![LogoSource::Network, LogoSource::Default]
+        );
+    }
+
+    #[test]
+    fn countries_are_searched_in_order_station_dirs_first() {
+        let index = TvLogosIndex::from_tree(&fixture_tree());
+        // A station name finds its us-local file even when US is the second code.
+        let codes = vec!["GB".to_string(), "US".to_string()];
+        let (hit, _) = search_tv_logos(
+            "CBS - AL Birmingham (WIAT)",
+            &index,
+            &codes,
+            LOGO_MATCH_THRESHOLD,
+        );
+        assert_eq!(
+            hit.map(|hit| hit.dir).as_deref(),
+            Some("united-states/us-local")
+        );
+        // Fuzzy: the first country with a hit wins, and every scored file is reported.
+        let (hit, scored) = search_tv_logos("BBC One", &index, &codes, LOGO_MATCH_THRESHOLD);
+        assert_eq!(hit.map(|hit| hit.dir).as_deref(), Some("united-kingdom"));
+        assert!(scored.iter().all(|item| item.dir == "united-kingdom"));
+        // An unknown code is skipped.
+        let (hit, _) = search_tv_logos("CNN", &index, &["ZZ".to_string()], LOGO_MATCH_THRESHOLD);
+        assert_eq!(hit, None);
     }
 
     #[test]
@@ -824,12 +1232,19 @@ mod tests {
         assert_eq!(country_suffix_for("GB"), "uk");
         assert_eq!(country_suffix_for("us"), "us");
         let index = TvLogosIndex::from_tree(&fixture_tree());
-        let lookups = LogoLookups {
-            tv_logos: Some(index),
-            country: Some("GB"),
-            ..LogoLookups::default()
+        let countries = vec!["GB".to_string()];
+        let sources = LogoSources {
+            tv_logos: Some(&index),
+            ..LogoSources::default()
         };
-        let hit = resolve_logo("BBC One", &lookups).expect("bbc one");
+        let query = LogoQuery {
+            name: "BBC One",
+            match_name: "BBC One",
+            epg_icon: None,
+            countries: &countries,
+            has_logo: false,
+        };
+        let hit = resolve_logo(&query, &sources).expect("bbc one");
         assert!(
             hit.url.ends_with("/united-kingdom/bbc-one-uk.png"),
             "{}",
@@ -850,16 +1265,5 @@ mod tests {
             match_station_logo(&station, &files).as_deref(),
             Some("cbs-4-kxyz-dtv-us.png")
         );
-    }
-
-    fn base_shallow<'a>(base: &LogoLookups<'a>) -> LogoLookups<'a> {
-        LogoLookups {
-            epg_icon: base.epg_icon,
-            manager_by_name: HashMap::new(),
-            tv_logos: base.tv_logos.clone(),
-            default_logo: base.default_logo,
-            country: base.country,
-            threshold: base.threshold,
-        }
     }
 }

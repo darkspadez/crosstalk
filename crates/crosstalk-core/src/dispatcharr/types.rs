@@ -182,6 +182,11 @@ pub struct EpgEntry {
     pub tvg_id: String,
     #[serde(default)]
     pub epg_source: Option<i64>,
+    /// The guide entry's icon (`EPGData.icon_url`, what Channel-Mapparr reads as
+    /// `epg_data__icon_url` for its EPG logo fallback). Builds that omit the key
+    /// deserialize to `None`, and the tier is skipped for those entries.
+    #[serde(default)]
+    pub icon_url: Option<String>,
 }
 
 /// One provider stream.

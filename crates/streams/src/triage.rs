@@ -1065,16 +1065,13 @@ pub async fn run(
         spec = spec.note("Left alone", skips);
     }
     let report = channel_ops::write_ops_report(context, &spec, &op_plan, applied.as_ref())?;
-    // Create rows first (the groups were made before the moves), then the edit rows shifted
-    // past them: `run_id` + `ordinal` is the row's key, so the two sequences must not overlap.
-    let mut rows = channel_ops::create_run_rows(&create_plan, create_applied.as_ref());
-    let mut edit_rows = channel_ops::run_rows(&op_plan, applied.as_ref());
-    let base = rows.len() as i64;
-    for row in &mut edit_rows {
-        row.ordinal += base;
-    }
-    rows.extend(edit_rows);
-    context.record_rows(&rows)?;
+    // Create rows first (the groups were made before the moves), then the edit rows.
+    context.record_rows(&channel_ops::create_and_edit_run_rows(
+        &create_plan,
+        create_applied.as_ref(),
+        &op_plan,
+        applied.as_ref(),
+    ))?;
 
     let name = report
         .file_name()

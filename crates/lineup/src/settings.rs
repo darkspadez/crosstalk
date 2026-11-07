@@ -123,8 +123,8 @@ pub struct LineupSettings {
     /// Logo assigned to a channel with no better match, by name. CM's `default_logo`.
     pub default_logo: String,
     /// Where a logo may come from, in priority order. Lineuparr's tiers
-    /// (EPG icon, Logo Manager name, tv-logos) as one source list; Channel-Mapparr's
-    /// station/network fallbacks read the same resolver.
+    /// (EPG icon, Logo Manager name, tv-logos) plus Channel-Mapparr's network
+    /// fallback (`network`) as one source list, resolved by `core::logos`.
     pub logo_sources: String,
     /// Also replace a logo a channel already has when the resolver finds a match.
     /// Channel-Mapparr's `replace_tv_logos` (as opposed to `apply_tv_logos`, which
@@ -213,7 +213,7 @@ impl Default for LineupSettings {
             default_logo: String::new(),
             // Lineuparr's tiers, in Lineuparr's order: the EPG icon first, then the
             // Logo Manager name, then tv-logos.
-            logo_sources: "epg, logo_manager, tv-logos".to_string(),
+            logo_sources: "epg, logo_manager, tv-logos, network".to_string(),
             replace_existing: false,
             tv_logos_countries: String::new(),
 
@@ -655,11 +655,11 @@ pub fn schema() -> SettingsSchema {
             SECTION_LOGOS,
             "Logo Sources (comma-separated, in order)",
             FieldKind::Text,
-            FieldValue::Text("epg, logo_manager, tv-logos".to_string()),
+            FieldValue::Text("epg, logo_manager, tv-logos, network".to_string()),
         )
         .with_help(
             "Where a logo may come from, in priority order: the EPG icon, the Logo Manager \
-             name, then tv-logos.",
+             name, tv-logos, then the station's network logo (channels with no logo only).",
         ),
         FieldSpec::new(
             "replace_existing",
@@ -1148,6 +1148,9 @@ pub fn validate(settings: &LineupSettings) -> Vec<String> {
             settings.max_preview_rows
         ));
     }
+    if let Err(error) = crosstalk_core::logos::LogoSource::parse_order(&settings.logo_sources) {
+        errors.push(format!("logo_sources: {error:#}"));
+    }
     errors
 }
 
@@ -1168,6 +1171,17 @@ pub fn warnings(settings: &LineupSettings) -> Vec<String> {
              ignored"
                 .to_string(),
         );
+    }
+    // A country code with no tv-logos directory silently disables the tv-logos
+    // tier for that code: say so now rather than at the moment the run finds
+    // nothing (a typo like "UKK" would otherwise read as "no match").
+    for code in crate::logos::parse_country_codes(&settings.tv_logos_countries) {
+        if crosstalk_core::logos::country_dir_for(&code).is_none() {
+            warnings.push(format!(
+                "tv_logos_countries names {code:?}, which has no tv-logos directory: the \
+                 tv-logos tier skips it"
+            ));
+        }
     }
     warnings
 }
@@ -1250,7 +1264,10 @@ mod tests {
         assert_eq!(settings.unknown_suffix, " [Unk]");
         assert!(settings.tag_unmatched_channels);
         assert!(!settings.ai_gate_enabled);
-        assert_eq!(settings.logo_sources, "epg, logo_manager, tv-logos");
+        assert_eq!(
+            settings.logo_sources,
+            "epg, logo_manager, tv-logos, network"
+        );
         assert!(!settings.replace_existing);
         assert_eq!(settings.create_mode, "streams");
         assert_eq!(settings.lineup_file, "US_DirecTV-Premier_lineup.json");

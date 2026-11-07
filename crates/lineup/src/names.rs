@@ -497,7 +497,8 @@ pub fn is_station_callsign(callsign: &str) -> bool {
     station_for_callsign(callsign).is_some()
 }
 
-fn zone_label(identity: &Identity) -> &'static str {
+/// The identity's feed zone as the CSVs print it (names, categorize).
+pub(crate) fn zone_label(identity: &Identity) -> &'static str {
     match identity.zone {
         crosstalk_matching::country::FeedZone::East => "EAST",
         crosstalk_matching::country::FeedZone::West => "WEST",

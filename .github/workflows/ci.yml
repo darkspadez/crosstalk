@@ -288,6 +288,30 @@ jobs:
       # in `docs/oracle-reports/lineup-names.md` (bar: 0 unattributed).
       - name: Lineup names oracle diff report reproduces
         run: python3 -I scripts/oracle_report_lineup_names.py --check
+      # Phase 3 step 16: lineup categorize is Channel-Mapparr's organize step
+      # (premium category map, normalized-exact then fuzzy, get-or-create groups,
+      # bulk moves) on the unified engine — an OTA identity is never classified
+      # (CM has no callsign branch). The harness drives CM's REAL
+      # `category_groups_dry_run` decision path via
+      # scripts/corpus/oracles.py over categorized DB names, station names and
+      # the disputed set x 2 scope cases, and compares every category with
+      # `crates/lineup/examples/categorize_dump` (the action's own
+      # `decide_category`). The report reproduces byte for byte (--check); every
+      # difference is attributed in `docs/oracle-reports/lineup-categorize.md`
+      # (bar: 0 unattributed).
+      - name: Lineup categorize oracle diff report reproduces
+        run: python3 -I scripts/oracle_report_lineup_categorize.py --check
+      # Phase 3 step 16: lineup logos are Channel-Mapparr's tv-logos actions and
+      # Lineuparr's logo tiers on the unified resolver (EPG icon, Logo Manager,
+      # tv-logos, default), matched on the identity's canonical name. The harness
+      # drives both plugins' REAL `logo_matcher` functions over the SAME
+      # recorded tree (`scripts/data/tv_logos_tree.json`, tv-logos `main` recorded
+      # 2026-11-07, parsed like the Rust index) and compares every URL with
+      # `crates/lineup/examples/logos_dump` (the action's own `decide_logo`). The report reproduces byte for byte
+      # (--check); every difference is attributed in
+      # `docs/oracle-reports/lineup-logos.md` (bar: 0 unattributed).
+      - name: Lineup logos oracle diff report reproduces
+        run: python3 -I scripts/oracle_report_lineup_logos.py --check
       # Informational, never failing: what upstream changed since each pinned reference
       # commit in the files crosstalk ports from it. Covers every reference submodule
       # (EPG Janitor, Stream-Mapparr, IPTV Checker, Channel-Mapparr, Lineuparr, Channel

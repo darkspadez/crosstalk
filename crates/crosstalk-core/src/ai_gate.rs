@@ -869,6 +869,7 @@ mod tests {
             name: name.to_string(),
             tvg_id: format!("tvg{id}"),
             epg_source: Some(4),
+            icon_url: None,
         }
     }
 

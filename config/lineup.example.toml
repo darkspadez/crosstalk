@@ -105,8 +105,8 @@ category_groups = ""
 # Logo assigned to a channel with no better match, by name.
 default_logo = ""
 # Where a logo may come from, in priority order: the EPG icon, the Logo Manager name,
-# then tv-logos.
-logo_sources = "epg, logo_manager, tv-logos"
+# tv-logos, then the station's network logo (channels with no logo only).
+logo_sources = "epg, logo_manager, tv-logos, network"
 # Also replace a logo a channel already has when the resolver finds a match. With it
 # off, channels with a logo are left alone.
 replace_existing = false

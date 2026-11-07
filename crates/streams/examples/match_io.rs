@@ -272,6 +272,7 @@ impl Case {
                     name: String::new(),
                     tvg_id: entry.tvg_id.clone(),
                     epg_source: Some(1),
+                    icon_url: None,
                 })
                 .collect(),
             streams: self

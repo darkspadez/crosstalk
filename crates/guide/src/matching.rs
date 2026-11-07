@@ -1016,6 +1016,7 @@ mod tests {
                 name: entry_name.to_string(),
                 tvg_id: "espn.us".to_string(),
                 epg_source: Some(4),
+                icon_url: None,
             }],
             ..World::default()
         };
@@ -1889,12 +1890,14 @@ mod tests {
                     name: entry_name.to_string(),
                     tvg_id: "espn-empty.us".to_string(),
                     epg_source: Some(4),
+                    icon_url: None,
                 },
                 EpgEntry {
                     id: 8,
                     name: entry_name.to_string(),
                     tvg_id: "espn-live.us".to_string(),
                     epg_source: Some(4),
+                    icon_url: None,
                 },
             ],
             ..World::default()

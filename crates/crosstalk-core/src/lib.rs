@@ -64,10 +64,11 @@ pub use identity_cache::CachedIdentities;
 pub use jobs::{JobContext, ProgressEvent, ProgressSink};
 pub use limiter::{Limiter, LimiterConfig, Permit};
 pub use logos::{
-    build_logo_url, country_dir_for, match_channel_to_logo, match_station_logo,
+    build_logo_url, country_dir_for, match_channel_to_logo, match_station_logo, network_logo,
     normalize_channel_name, normalize_logo_filename, parse_station_name, resolve_logo,
-    split_timeshift, LogoLookups, LogoSource, ResolvedLogo, TvLogosIndex, COUNTRY_DIR_MAP,
-    LOGO_MATCH_THRESHOLD, STATION_SUBDIRS, TV_LOGOS_BRANCH, TV_LOGOS_REPO, TV_LOGOS_TREE_URL,
+    search_network_logo, search_tv_logos, split_timeshift, LogoQuery, LogoSource, LogoSources,
+    ResolvedLogo, TvHit, TvLogosIndex, TvScored, COUNTRY_DIR_MAP, LOGO_MATCH_THRESHOLD,
+    STATION_SUBDIRS, TV_LOGOS_BRANCH, TV_LOGOS_REPO, TV_LOGOS_TREE_URL,
 };
 pub use naming::{
     apply_prefix, apply_suffix, ota_fields, parse_network_affiliation, render_channel, render_ota,

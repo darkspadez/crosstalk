@@ -3239,8 +3239,9 @@ where
 /// the object it already made. A preview (`applied` is `None`) records every planned object
 /// as `planned`; an apply records each outcome's own status.
 ///
-/// Ordinals start at 0: a caller that also records edit rows shifts those after these (see
-/// streams' triage), because `run_id` + `ordinal` is the row's key.
+/// Ordinals start at 0: a caller that also records edit rows uses
+/// [`create_and_edit_run_rows`], which shifts those after these, because `run_id` +
+/// `ordinal` is the row's key (an overlap silently replaces the create rows).
 pub fn create_run_rows(plan: &CreatePlan, applied: Option<&CreateReport>) -> Vec<RunRow> {
     let mut rows = Vec::new();
     let mut ordinal = 0i64;
@@ -3343,6 +3344,26 @@ pub fn create_run_rows(plan: &CreatePlan, applied: Option<&CreateReport>) -> Vec
         });
         ordinal += 1;
     }
+    rows
+}
+
+/// A create stage's rows followed by the edit plan's rows, as one run's rows.
+///
+/// The creates ran first, so their rows come first; the edit rows are shifted past them so
+/// no two rows share `run_id` + `ordinal` (the store's key, written with `INSERT OR
+/// REPLACE`: an overlap would drop the `created` rows the undo lists and ownership reads).
+pub fn create_and_edit_run_rows(
+    create_plan: &CreatePlan,
+    created: Option<&CreateReport>,
+    plan: &Plan,
+    applied: Option<&ApplyReport>,
+) -> Vec<RunRow> {
+    let mut rows = create_run_rows(create_plan, created);
+    let base = rows.len() as i64;
+    rows.extend(run_rows(plan, applied).into_iter().map(|mut row| {
+        row.ordinal += base;
+        row
+    }));
     rows
 }
 
@@ -7004,6 +7025,39 @@ mod tests {
         );
         store.append_rows(run_id, &rows).expect("append");
         assert_eq!(store.rows(run_id).expect("rows").len(), 5);
+
+        // Create rows plus edit rows in one run: the edit rows are shifted past the create
+        // rows, so none replaces a `created` row (`run_id` + `ordinal` is the key).
+        let edits = Plan {
+            changes: vec![Change {
+                channel_id: 7,
+                channel_name: "CNN".to_string(),
+                channel_number: None,
+                channel_group: "Test".to_string(),
+                op: OpKind::Set,
+                field: Field::Group,
+                before: Value::Group(Some((1, "Test".to_string()))),
+                after: Value::Group(Some((100, "News".to_string()))),
+                status: RowStatus::Ok,
+                reason: String::new(),
+            }],
+            ..Plan::default()
+        };
+        let both = create_and_edit_run_rows(&plan, Some(&report), &edits, None);
+        assert_eq!(both.len(), 6);
+        let ordinals: std::collections::HashSet<i64> = both.iter().map(|row| row.ordinal).collect();
+        assert_eq!(ordinals.len(), 6, "every row keeps its own ordinal");
+        let other_run = store
+            .start_run("streams", "triage_apply", false)
+            .expect("start");
+        store.append_rows(other_run, &both).expect("append");
+        let stored = store.rows(other_run).expect("rows");
+        assert_eq!(stored.len(), 6);
+        assert_eq!(
+            stored.iter().filter(|row| row.field == "created").count(),
+            5,
+            "the created rows survive the edit rows"
+        );
     }
 
     #[tokio::test]

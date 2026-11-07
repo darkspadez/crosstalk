@@ -790,12 +790,14 @@ mod tests {
                     name: old_name.to_string(),
                     tvg_id: "old.us".to_string(),
                     epg_source: Some(4),
+                    icon_url: None,
                 },
                 EpgEntry {
                     id: 8,
                     name: new_name.to_string(),
                     tvg_id: "new.us".to_string(),
                     epg_source: Some(4),
+                    icon_url: None,
                 },
             ],
             ..World::default()

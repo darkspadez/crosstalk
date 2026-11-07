@@ -5236,12 +5236,14 @@ mod tests {
                     name: "PPV 04".to_string(),
                     tvg_id: "ppv04.us".to_string(),
                     epg_source: Some(1),
+                    icon_url: None,
                 },
                 crosstalk_core::dispatcharr::EpgEntry {
                     id: 8,
                     name: "ESPN".to_string(),
                     tvg_id: "espn.us".to_string(),
                     epg_source: Some(1),
+                    icon_url: None,
                 },
             ],
             m3u_accounts: accounts(),
@@ -5304,6 +5306,7 @@ mod tests {
                 name: "PPV 04".to_string(),
                 tvg_id: "ppv04.us".to_string(),
                 epg_source: Some(1),
+                icon_url: None,
             }],
             ..World {
                 channels: vec![Channel {

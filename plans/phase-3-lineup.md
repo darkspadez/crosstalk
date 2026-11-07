@@ -773,5 +773,117 @@ Step 15 review (2026-11-07):
   named `score-first` (what every plugin does), not `lu-anchor`; the coherence
   check also requires the D04 anchor C07 extends.
 
-### Open for the phase review (orchestrator, after C07)
+### Step 16 implementation notes (Muse Spark, 2026-11-07, unreviewed).
+- `categorize.rs`: category = the channel's best identity family leader looked up
+  in a merged-DB category map (last country wins, entries without a category never
+  enter it — CM's `category_map_premium` verbatim). No callsign branch, like CM
+  (`plugin.py:3165-3172`, dead-map comment): OTA station names take the premium path
+  or stay put, so no `Broadcast` group is ever created here (that string only exists
+  in CM's stream-import path). Moves are `Op::Set Group` per channel through the
+  shared planner; missing groups go through the create stage (`NewGroup`, exact-name
+  dedup, owned `lineup:category:<name>`, intents + `load_owned` reconcile). Scope is
+  the host scope restricted by `category_groups` (exact, case-sensitive, fail-closed
+  like CM's `_resolve_group_scope` with `include_wildcards = False`); targets under
+  `[scope].ignore_groups` are refused with the reason (CM's `is_ignored_name_tokens`).
+  CSV = CM's 8 preview columns + status/reason + identity fields. Collision/n/a.
+- `logos.rs`: tiers consulted in `logo_sources` order (default
+  `epg, logo_manager, tv-logos`; `default` names the tier explicitly, otherwise the
+  configured `default_logo` is the final safety net). EPG icon of the assigned entry
+  (new `EpgEntry.icon_url`, `None` on older builds), Logo Manager exact
+  case-insensitive name, tv-logos over `tv_logos_countries` else the identity country
+  else the enabled `[matching]` countries (CM station-first then fuzzy across every
+  searched country; LU's single country is the one-code case). The fuzzy match runs
+  on the identity canonical name (`resolve` per channel through the same `RunEngine`
+  guide/streams run on). Threshold stays 85 in both modes (CM's replace followed
+  match sensitivity; documented as a fix: the logo similarity is not a sensitivity
+  decision). New URLs become `NewLogo` rows (exact-URL dedup, owned
+  `lineup:logo:<url>`), then `Op::Set Logo`; CM's replace-mode JSON backup is the
+  run rows' before values instead (host undo). `load_tv_index` fetches the one cached
+  recursive tree only when the tv tier is consulted and a candidate needs it; tests
+  and the oracle dump inject the index (no network).
+- Oracles: `scripts/oracle_report_lineup_categorize.py` (CM's real
+  normalized-exact + `get_candidates`/`fuzzy_match` path over CM's own DBs vs
+  `categorize_dump`, incl. the no-cut `floor` for `cut`) and
+  `scripts/oracle_report_lineup_logos.py` (CM + LU real `logo_matcher` functions
+  over the SAME recorded tree `scripts/data/tv_logos_tree.json` vs `logos_dump`
+  with per-file unified scores). Both follow the names oracle's shape (representative
+  + disputed worlds, `--check` byte-reproducibility, every bucket a CHECK). CI runs
+  both `--check` gates after the names one.
+- For the step 20 README (categorize/logos differences from CM/LU): one engine/cut
+  everywhere (CM's 80 vs strict 95 is the `cut` bucket); merged newest-union data vs
+  CM's older tables (`merged-data`); no saved-JSON replay, no whole-run errors for a
+  missing default (per-channel skips); never double-moves (already-correct is a skip);
+  EPG-first order vs CM's station-first (`order`); no network-logo tier
+  (`network-logo`); GB `-uk` and `nordic/norway` are fixes over CM; URLs are
+  percent-encoded; unknown `logo_sources` tokens and zero-match `category_groups`
+  fail the run; created groups/logos are owned, left in place by undo and listed.
+- NOT RUN HERE: the sandbox blocked shell execution, so `cargo fmt/clippy/test`,
+  both oracle generations (`python3 scripts/oracle_report_lineup_{categorize,logos}.py`
+  to write `docs/oracle-reports/lineup-{categorize,logos}.md` — `--check` fails until
+  the reports are generated once), `clean_parity`, `lineup_file_parity`,
+  `one_matcher_check.sh` and `actionlint` still need the orchestrator's gate run.
+
+Step 16 review (2026-11-07, Opus 5.5; cargo blocked in the reviewer's sandbox, so the
+orchestrator runs the gate and generates both reports):
+- **BLOCKER fixed: created rows were overwritten.** categorize/logos recorded the create
+  rows and the edit rows both from ordinal 0; `run_rows` is keyed `(run_id, ordinal)` with
+  `INSERT OR REPLACE`, so every `created` group/logo row was replaced by a move/assign row
+  (undo listed nothing, ownership audit lost). One helper,
+  `channel_ops::create_and_edit_run_rows`, now shifts the edit rows past the create rows;
+  categorize, logos and streams' triage (which did it by hand) all use it, pinned in
+  `creates_plan_dedup_resolve_and_apply_with_ownership`.
+- **OTA is never categorized** (`ota` bucket). CM's name-only path is `No Match` for an
+  OTA-template name (`CBS - AL Birmingham (WIAT)`), but the unified ranker reaches the
+  station entry through C07 (`WIAT (CBS)`), whose DB category is the COUNTRY (30,654 of the
+  US DB's entries say `United States`). A channel whose identity callsign is a merged
+  station — the same OTA test `names` uses — stays put. Strictly safer than CM where CM
+  classifies a network-led name by its bare network (`ABC (WABC)` → `Broadcast`). Regional
+  NON-station names still move to `United States` exactly like CM (parity; revisit with
+  the user if a country-named group is unwanted).
+- `Premium (Exact)` is CM's exact (the channel's normalize key IS the leader's, at 100),
+  whichever engine stage scored it (CNN is an alias-stage 100 in the engine).
+- **Logos: one resolver.** The tier walk, order parsing (`LogoSource::parse_order`,
+  `DEFAULT_ORDER`), multi-country station-first search (`search_tv_logos`) and the default
+  safety net moved into `core::logos::resolve_logo` (which had no production caller and a
+  fixed order); lineup's `LogoTier`/`parse_logo_sources`/`search_tv` are gone and
+  `decide_logo` maps the resolver's answer to its row.
+- **Oracle honesty.** `scripts/data/tv_logos_tree.json` was a 22-entry hand-made fixture;
+  it is now the real tree (tv-logos `main` sha `d32e347b`, recorded 2026-11-07, the 5,892
+  blobs under the `COUNTRY_DIR_MAP` directories), and the logos world gained a broad
+  seeded half (popular networks plain/decorated, merged US content names, OTA station
+  names in the `names` template, UK names). Logos attribution fixes: `replace-scope`
+  requires Rust's own skip reason; new `lu-order` (Rust = LU on a tier LU consults before
+  tv-logos, CM differs); `order` verifies both tiers fire on Rust's evidence and the
+  configured order; the dump's `searched` lists station directories (a station miss read
+  as `country-dirs` otherwise). Categorize: `cut`/`premium-canonical` read the CM
+  winner's no-cut score over the WHOLE shortlist (`probe_score`; the top-5 `floor` could
+  misread a 6th-place winner as never scored); same-winner/different-category is checked
+  as `merged-data`; `no-category` checks either side; the world is stratified (content
+  categories vs the `United States` regional slice).
+- **Decision A (orchestrator): country-named categories are no category.** A DB category
+  equal to any merged DB's `country_name`/`country_code` (`United States`, `United
+  Kingdom`, `Brazil`, `US`, ...) never enters the category map
+  (`categorize::is_country_category`), so categorize never creates or fills a
+  country-named group (fix over CM, writes less). The family's category is its first
+  member (rank order) the map holds, so a regional duplicate (`CNN HD` -> `United
+  States`, `HUNGRY` vs `Hungry`) never hides the real entry, whatever the DB order.
+  Oracle bucket `country-category` (checked on CM's label or the Rust family's merged
+  entries). Names/identity untouched.
+- **Decision B (orchestrator): CM's network-logo fallback is a `core::logos` tier**
+  (`LogoSource::Network`, token `network`, `network_logo` / `search_network_logo`): a
+  station-format name with no station file takes `<network>-<suffix>.png` (else the white
+  variant), only for a channel with NO logo, like CM. Default order follows CM, which
+  consults it last: `epg, logo_manager, tv-logos, network`, then the default safety net.
+  Oracle bucket `network-logo` (vs LU, which has no such tier; checked with CM's real
+  `network_logo`).
+- **tv-logos match name** is the channel name without its leading delimited country
+  marker (`logos::tv_match_name` over the new
+  `country::strip_delimited_country_marker`), not the identity's alias canonical: the
+  canonicals are DB spellings (`HISTORY Channel, The`, `Paramount+ with SHOWTIME EAST`)
+  that missed the right file (`Showtime`, `History` fell to the default).
+- Logos oracle: plugin-side scores are each side's own (CM `_score` with the `+1` plus
+  variant, LU `fuzz.ratio`) and each side's own threshold (LU always 85); `lu-order`
+  is checked on Rust's own EPG/manager evidence against a CM tv-logos pick.
+
+Open for the phase review (orchestrator, after C07)
 - A stream or entry named only by its callsign (`KSDK`, `WABC-TV`) does not join the station's family for a network-led channel (`US: NBC (KSDK) HD`); Stream-Mapparr attaches it. Safe (writes less), attributed to `callsign-anchor` in docs/oracle-reports/streams.md. Likely cause: a bare callsign name resolves without a high-confidence callsign identity. Decide whether a name that is entirely a known station callsign should resolve to that station's callsign identity.

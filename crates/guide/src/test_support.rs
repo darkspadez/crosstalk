@@ -99,18 +99,21 @@ pub fn world() -> World {
                 name: "ESPN HD".to_string(),
                 tvg_id: "espn.us".to_string(),
                 epg_source: Some(SOURCE),
+                icon_url: None,
             },
             EpgEntry {
                 id: CNN_US,
                 name: "CNN [US]".to_string(),
                 tvg_id: "cnn.us".to_string(),
                 epg_source: Some(SOURCE),
+                icon_url: None,
             },
             EpgEntry {
                 id: NACA,
                 name: "Náutica Ñ".to_string(),
                 tvg_id: "naca.mx".to_string(),
                 epg_source: Some(SOURCE),
+                icon_url: None,
             },
         ],
         ..World::default()
