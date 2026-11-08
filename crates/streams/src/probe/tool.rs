@@ -235,6 +235,12 @@ impl ProcessRunner {
             // The belt to the explicit kill's braces: a dropped child is killed, so even a
             // panic mid-probe cannot leave an ffprobe reading a provider stream.
             .kill_on_drop(true);
+        // Its own process group, so a kill reaches every process it started: a tool run
+        // through a shell (dash does not exec its last command) or one that forks would
+        // otherwise leave a grandchild holding the output pipes open, and the reads below
+        // would wait for it long after the timeout.
+        #[cfg(unix)]
+        command.process_group(0);
         let mut child = command
             .spawn()
             .with_context(|| format!("running {}", spec.masked_command_line()))?;
@@ -272,21 +278,54 @@ impl ProcessRunner {
             }
             Stop::TimedOut => {
                 output.timed_out = true;
-                let _ = child.kill().await;
-                let _ = child.wait().await;
+                kill_group(&mut child).await;
             }
             Stop::Cancelled => {
                 output.cancelled = true;
-                let _ = child.kill().await;
-                let _ = child.wait().await;
+                kill_group(&mut child).await;
             }
         }
 
-        let stdout = stdout_task.await.unwrap_or_default();
-        let stderr = stderr_task.await.unwrap_or_default();
+        // After a kill the pipes close once the group is gone; the bound is the backstop
+        // for a process that escaped the group, so a probe never outlives its cap by more.
+        let killed = output.timed_out || output.cancelled;
+        let stdout = collect(stdout_task, killed).await;
+        let stderr = collect(stderr_task, killed).await;
         output.stdout = String::from_utf8_lossy(&stdout).into_owned();
         output.stderr = String::from_utf8_lossy(&stderr).into_owned();
         Ok(output)
+    }
+}
+
+/// How long the pipe readers may run on after a kill before what they hold is given up.
+const AFTER_KILL_READ: Duration = Duration::from_secs(2);
+
+/// Kill the child and every process in its group, then reap it.
+async fn kill_group(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        // SAFETY: `killpg` only sends a signal; the group id is the child's pid because it
+        // was spawned with `process_group(0)`, and a stale id fails harmlessly with ESRCH.
+        unsafe {
+            libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+/// A pipe reader's bytes; after a kill, bounded by [`AFTER_KILL_READ`].
+async fn collect(task: tokio::task::JoinHandle<Vec<u8>>, killed: bool) -> Vec<u8> {
+    if !killed {
+        return task.await.unwrap_or_default();
+    }
+    let abort = task.abort_handle();
+    match tokio::time::timeout(AFTER_KILL_READ, task).await {
+        Ok(bytes) => bytes.unwrap_or_default(),
+        Err(_) => {
+            abort.abort();
+            Vec::new()
+        }
     }
 }
 
@@ -573,7 +612,9 @@ mod tests {
         // A child that outlives its cap is killed, and says so.
         let slow = ToolSpec::new(
             "/bin/sh",
-            vec!["-c".to_string(), "sleep 30".to_string()],
+            // `; true` keeps the shell from exec-ing `sleep`, so the group kill is exercised
+            // (dash never execs; bash does for a lone last command).
+            vec!["-c".to_string(), "sleep 30; true".to_string()],
             Duration::from_millis(50),
         );
         let started = std::time::Instant::now();
@@ -592,7 +633,9 @@ mod tests {
         let runner = ProcessRunner::new(Arc::clone(&flag));
         let spec = ToolSpec::new(
             "/bin/sh",
-            vec!["-c".to_string(), "sleep 30".to_string()],
+            // `; true` keeps the shell from exec-ing `sleep`, so the group kill is exercised
+            // (dash never execs; bash does for a lone last command).
+            vec!["-c".to_string(), "sleep 30; true".to_string()],
             Duration::from_secs(60),
         );
         let waiting = tokio::spawn(async move { runner.run(&spec).await });

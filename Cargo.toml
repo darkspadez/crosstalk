@@ -28,6 +28,7 @@ crosstalk-lineup = { path = "crates/lineup" }
 
 # Async / runtime
 tokio = { version = "1", features = ["full"] }
+libc = "0.2"
 futures = "0.3"
 
 # HTTP
