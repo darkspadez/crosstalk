@@ -140,6 +140,10 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
+          # A pull request builds both platforms but exports nothing: Namespace's remote
+          # builders cannot export a multi-node build locally ("oci for multi-node builds
+          # currently not supported"), so it only fills the cache.
+          outputs: ${{ github.event_name == 'pull_request' && 'type=cacheonly' || '' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
