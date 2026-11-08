@@ -1,8 +1,10 @@
 target
 reference
-# The labelled matching corpus (data/corpus, ~8 MB) is a build-time input to
-# step 6, never needed at runtime: keep it out of the image.
+# The labelled matching corpus (data/corpus, ~8 MB) is never needed at runtime: keep it
+# out of the build context, except decisions.json, which the engine compiles in
+# (crates/crosstalk-matching/src/engine.rs include_str!).
 data/corpus
+!data/corpus/decisions.json
 .git
 .remember
 docs
