@@ -26,6 +26,7 @@ crosstalk-streams = { path = "crates/streams" }
 
 # Async / runtime
 tokio = { version = "1", features = ["full"] }
+libc = "0.2"
 futures = "0.3"
 
 # HTTP

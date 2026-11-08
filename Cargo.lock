@@ -603,6 +603,7 @@ dependencies = [
  "chrono-tz",
  "crosstalk-core",
  "crosstalk-matching",
+ "libc",
  "rayon",
  "regex",
  "reqwest",
