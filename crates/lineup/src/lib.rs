@@ -27,6 +27,7 @@
 //! `crosstalk.toml`, the CSV retention is `[exports]`, the usage counters are not ported,
 //! and `clear_csv_exports` is the host's `exports clear`.
 
+pub mod bench;
 pub mod categorize;
 pub mod clean;
 pub mod create;

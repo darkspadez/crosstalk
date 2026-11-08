@@ -38,7 +38,7 @@ mod types;
 
 pub use types::*;
 
-pub use channels::CHANNEL_EDIT_CHUNK_SIZE;
+pub use channels::{BatchEpgOutcome, CHANNEL_EDIT_CHUNK_SIZE};
 
 use crate::config::DispatcharrConfig;
 use anyhow::{bail, Context, Result};

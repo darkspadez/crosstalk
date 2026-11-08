@@ -192,37 +192,28 @@ impl ChannelDatabase {
         }
     }
 
-    /// The shipped databases for `codes`, in code order, exactly as `_load_channels_data`
-    /// concatenates the enabled files.
+    /// The MERGED databases for `codes`, in code order, concatenated the way
+    /// `_load_channels_data` concatenates the plugin's enabled files.
+    ///
+    /// Phase 3 review: one merged data set for every app. The plugin read its own
+    /// per-country files; the country filter now reads the same union tables the
+    /// unified engine, lineup's names and categorize read
+    /// (`crosstalk_matching::data::merged::merged_channels`), so a name only another
+    /// plugin's table listed resolves to its country here too, and `DO`/`PE`/`PL`/`PT`
+    /// are selectable like every other merged country. The merged entries carry no
+    /// `callsign` field (none of the plugins' files did either), so OTA-ness still
+    /// comes from the station table.
     pub fn shipped(codes: &[&str]) -> Self {
         let mut entries: Vec<DatabaseEntry> = Vec::new();
         for code in codes {
-            let Some(json) = crosstalk_matching::data::stream_mapparr_database_json(code) else {
+            let Some(db) = crosstalk_matching::data::merged::merged_channels(code) else {
                 continue;
             };
-            let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json) else {
-                continue;
-            };
-            let channels = parsed
-                .get("channels")
-                .and_then(|value| value.as_array())
-                .cloned()
-                .unwrap_or_default();
-            for channel in channels {
-                let Some(name) = channel.get("channel_name").and_then(|value| value.as_str())
-                else {
-                    continue;
-                };
-                let callsign = channel
-                    .get("callsign")
-                    .and_then(|value| value.as_str())
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_string);
+            for channel in &db.channels {
                 entries.push(DatabaseEntry {
-                    name: name.to_string(),
+                    name: channel.channel_name.clone(),
                     code: code.to_uppercase(),
-                    callsign,
+                    callsign: None,
                 });
             }
         }

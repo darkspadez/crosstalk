@@ -22,6 +22,9 @@
 //! | C05 `shared` | one `normalize_callsign` | [`normalize_callsign`] (shared) |
 //! | C06 `lu-anchor` | callsign decides at app level via the anchor | [`UnifiedEngine::same`] step 2 (95 floor / hard reject, high-confidence only) |
 //! | C07 `callsign-first` | a network-led station callsign outranks the national entry | [`UnifiedEngine::same`] step 2a (different known callsign excluded) + [`UnifiedEngine::rank_index_in`] (same callsign first, national fallback) |
+//! | C08 `station-callsign-family` | same high-confidence station callsign = one family (subchannels apart) | [`UnifiedEngine::rank_index_in`] family cut via [`crate::identity::station_callsign_family`] |
+//! | C09 `strip-tags` | the callsign ladder reads the name with trailing writer tags stripped | [`UnifiedEngine::callsign_confidence`] |
+//! | A05 `canonical-key` | an alias member's identity key is its canonical's | [`UnifiedEngine::identity_key`] (identity, index, tie-break) |
 //! | D02/T10 `janitor-95` | the decision threshold | [`DEFAULT_THRESHOLD`] = 95, [`sensitivity_preset`] |
 //! | D03 `none` | no channel-number boost | absent by construction (pairs carry no number) |
 //! | D04 `jan-lu-anchor` | high-confidence anchor in `match_all_streams` | step 2, both sides high-confidence |
@@ -107,7 +110,15 @@ pub use crate::country::{extract_zone_noguard, is_group_header};
 ///
 /// Follow-up fix reads a network-led callsign name onto its station (decided C07
 /// `callsign-first`: `ABC (WABC)` ranks the `WABC` family first): `5`.
-pub const ENGINE_VERSION: &str = "5";
+///
+/// Phase 3 review: same-station callsign names are one family whatever spelling
+/// leads (decided C08 `station-callsign-family`: `KSDK` and `NBC 5 St. Louis KSDK`
+/// are in `US: NBC (KSDK) HD`'s family beside `NBC (KSDK)`), the callsign ladder reads
+/// the name with trailing writer tags stripped (decided C09 `strip-tags`: `KSDK HD`
+/// is high-confidence like `KSDK`), an alias member keys as its canonical (decided
+/// A05 `canonical-key`: `CNN USA` is in `CNN`'s family), and identities carry
+/// `callsign_high`: `6`.
+pub const ENGINE_VERSION: &str = "6";
 
 /// How many configurations [`UnifiedEngine::cached`] keeps built.
 pub const ENGINE_CACHE_CAPACITY: usize = 8;
@@ -604,19 +615,53 @@ impl UnifiedEngine {
         self.normalizer.normalize_name(&collapsed, &[])
     }
 
+    /// The identity key of a name (decided A05 `canonical-key`, phase 3 review): the
+    /// lowercased normalize key of its alias canonical when the merged alias table
+    /// resolves it (`CNN USA` -> `cnn`), else of the name itself. `canonical` is
+    /// [`alias_canonical`](Self::alias_canonical) of the same name, passed in so a
+    /// caller that already resolved it does not resolve twice.
+    ///
+    /// The pairwise alias stage already scores `CNN USA` vs `CNN` at 100; without this
+    /// the family cut kept only the top's key-mates, so `CNN USA` joined `CNN`'s family
+    /// only when no `CNN` spelling led the pool.
+    pub fn identity_key(&self, name: &str, canonical: Option<&str>) -> String {
+        let own = self.normalize_key(name);
+        match canonical {
+            Some(canonical) => {
+                let key = self.normalize_key(canonical);
+                if key.is_empty() {
+                    own.to_lowercase()
+                } else {
+                    key.to_lowercase()
+                }
+            }
+            None => own.to_lowercase(),
+        }
+    }
+
     /// The extracted callsign (shared-core ladder over the merged allowlist).
     pub fn callsign_of(&self, name: &str) -> Option<String> {
-        crate::callsign::extract_callsign_for(name, &self.known, CallsignLadder::SharedCoreNoRescue)
+        self.callsign_confident(name).0
     }
 
     /// The extracted callsign plus its positional confidence (priorities 1-4 high).
+    ///
+    /// Decided C09 `strip-tags` (orchestrator, phase 3 review): the ladder reads the
+    /// name with its trailing run of writer tags stripped
+    /// ([`crate::tags::strip_writer_tags`]: the Z08 strip minus the `+N` shift, which
+    /// stays so a time-shifted feed keeps its low-confidence read), so a decoration
+    /// never moves a callsign's confidence: `KSDK HD`, `KSDK [HD]` and `USA | WABC-TV
+    /// FHD` read their callsign at the end of the name (high), as the bare `KSDK` does.
+    /// Before, the quality word hid the end position and the shared core fell to its
+    /// loose any-word read (low), so `KSDK HD` never anchored to `NBC (KSDK)` while
+    /// `KSDK` did.
     pub fn callsign_confidence(&self, name: &str) -> (Option<String>, bool) {
         self.callsign_confident(name)
     }
 
     fn callsign_confident(&self, name: &str) -> (Option<String>, bool) {
         crate::callsign::extract_callsign_with_confidence_for(
-            name,
+            crate::tags::strip_writer_tags(name),
             &self.known,
             CallsignLadder::SharedCoreNoRescue,
         )
@@ -881,9 +926,14 @@ impl UnifiedEngine {
         // Stages 1-3 over the normalized pair (T03 `cm`, T09 `lu`).
         if view.scored {
             let query_nospace = nospace(&prep.lower);
-            if let Some(hit) =
-                self.fuzzy_stages(&prep.lower, &view.norm_lower, &query_nospace, &view.nospace)
-            {
+            if let Some(hit) = self.fuzzy_stages(
+                &prep.lower,
+                &view.norm_lower,
+                &query_nospace,
+                &view.nospace,
+                &prep.processed,
+                &view.processed,
+            ) {
                 consider(hit.0, hit.1, Stage::Fuzzy);
             }
         }
@@ -930,12 +980,18 @@ impl UnifiedEngine {
     /// token-sort fuzzy with the same guards. Guards (T06/T07/ZONE) are NOT
     /// applied here — the caller post-filters the winner once, as Engine.same
     /// post-filters ranked[0].
+    ///
+    /// `processed_q` / `processed_c` are the token-sorted forms of the two lowered
+    /// keys, computed once per query and once per candidate (the phase 3 review bench
+    /// found the per-pair recomputation was most of a 20k-channel plan).
     fn fuzzy_stages(
         &self,
         query_lower: &str,
         candidate_lower: &str,
         query_nospace: &str,
         candidate_nospace: &str,
+        processed_q: &str,
+        processed_c: &str,
     ) -> Option<(u8, EngineMethod)> {
         let query_chars: Vec<char> = query_lower.chars().collect();
         let candidate_chars: Vec<char> = candidate_lower.chars().collect();
@@ -976,15 +1032,13 @@ impl UnifiedEngine {
         // Stage 3: token-sort fuzzy with the same scaled + majority guards.
         // `process_string_for_matching` lowercases internally, so the lowered
         // pair scores exactly as the cased one.
-        let processed_q = process_string_for_matching(query_lower);
-        let processed_c = process_string_for_matching(candidate_lower);
         let pq: Vec<char> = processed_q.chars().collect();
         let pc: Vec<char> = processed_c.chars().collect();
         let ratio = calculate_similarity_chars(&pq, &pc, threshold_ratio);
         let score = (ratio * 100.0) as u8;
         let shorter = pq.len().min(pc.len());
         if score >= length_scaled_threshold(self.threshold, shorter)
-            && has_token_overlap_core(&processed_q, &processed_c, 4, true)
+            && has_token_overlap_core(processed_q, processed_c, 4, true)
         {
             return Some((score, EngineMethod::Fuzzy(score)));
         }
@@ -1179,8 +1233,21 @@ impl UnifiedEngine {
         // The country rule (G03) over EVERY shortlisted candidate — probe hits and
         // fuzzy-block hits alike, as Lineuparr filters all of `all_matches` — then
         // score each survivor once, at the cut.
-        // The query's own identity key, for the tie-break below.
-        let query_key = norm_q.to_lowercase();
+        // The query's own identity (A05: the alias canonical's key when it resolves),
+        // for the tie-break below: the WHOLE family key, so at equal score a candidate
+        // in the query's own zone/shift/callsign leads (`UK: BBC One HD` ties `BBC One`
+        // and `BBC One East HD` at 100; the Default one leads, and the family is the
+        // Default family — phase 3 review, cross-app test).
+        let query_fk = FamilyKey {
+            key: self.identity_key(query, prep.canonical.as_deref()),
+            zone: extract_zone_noguard(query),
+            timeshift: prep.shift,
+            callsign: prep.base.clone(),
+        };
+        // The query's OWN normalize key: among identity-equal candidates (A05 puts
+        // `Cinemax Action` and `ActionMax` in one family) the one spelled as the query
+        // leads a tie (`tie_rank`'s middle component).
+        let query_norm_lower = norm_q.to_lowercase();
         let mut scored: Vec<(EngineRanked, usize, bool)> = Vec::new();
         for i in probe {
             if !self.country_keep_index(query_country, qn, index, i, &mut count) {
@@ -1200,7 +1267,11 @@ impl UnifiedEngine {
                         score,
                         method,
                     },
-                    tie_rank(index.identity_keys[i].key == query_key, overlap),
+                    tie_rank(
+                        index.identity_keys[i] == query_fk,
+                        index.views[i].norm_lower == query_norm_lower,
+                        overlap,
+                    ),
                     first,
                 ));
             }
@@ -1218,10 +1289,11 @@ impl UnifiedEngine {
     /// Candidates whose country is incompatible with the query's never win; the top
     /// fixes the [`FamilyKey`]; the family's ONE country is the query's, else the
     /// top's, else the first known one among the top's key-mates in rank order; the
-    /// family is every ranked candidate with the top's key and a compatible country.
-    /// Every candidate sharing the top's key is already in `ranked` (same key exacts
-    /// at 100 through the hash maps, on the same G03 verdict), so nothing is
-    /// re-scored here.
+    /// family is every ranked candidate with the top's key (or the bare-callsign
+    /// relation to it, decided C08 — [`EngineIndex::same_family`]) and a compatible
+    /// country. Every candidate sharing the top's key is already in `ranked` (same key
+    /// exacts at 100 through the hash maps, on the same G03 verdict; a bare station
+    /// callsign through the callsign map at 95), so nothing is re-scored here.
     fn family_cut(
         &self,
         mut ranked: Vec<(EngineRanked, usize, bool)>,
@@ -1233,17 +1305,17 @@ impl UnifiedEngine {
         let Some((top, _, _)) = ranked.first() else {
             return Vec::new();
         };
-        let top_key = &index.identity_keys[top.index];
+        let top = top.index;
         let family_country = query_country.or_else(|| {
             ranked
                 .iter()
-                .filter(|(r, _, _)| &index.identity_keys[r.index] == top_key)
+                .filter(|(r, _, _)| index.same_family(top, r.index))
                 .find_map(|(r, _, _)| index.identity_country(r.index))
         });
         ranked
             .into_iter()
             .filter(|(r, _, _)| {
-                &index.identity_keys[r.index] == top_key && compatible(family_country, r.index)
+                index.same_family(top, r.index) && compatible(family_country, r.index)
             })
             .map(|(r, _, _)| r)
             .collect()
@@ -1390,6 +1462,8 @@ impl CandidateView {
 /// everything query-side lives here.
 struct QueryPrep {
     lower: String,
+    /// Token-sorted form of `lower` (stage 3), computed once per query.
+    processed: String,
     trailing: Option<u32>,
     designators: HashSet<String>,
     shift: bool,
@@ -1442,6 +1516,7 @@ impl QueryPrep {
             variant_lookup,
             variant_spaced,
             variant_processed,
+            processed: process_string_for_matching(&lower),
             lower,
         })
     }
@@ -1592,8 +1667,15 @@ impl EngineIndex {
                 }
             }
             // Headers carry an empty key: they never score, so never join a family.
+            // The key is the identity key (A05: the alias canonical's normalize key
+            // when the name resolves through the alias table), as `resolve_with`.
+            let key = if view.scored || !view.norm_key.is_empty() {
+                engine.identity_key(name, view.alias_canonical.as_deref())
+            } else {
+                view.norm_lower.clone()
+            };
             index.identity_keys.push(FamilyKey {
-                key: view.norm_lower.clone(),
+                key,
                 zone: view.zone,
                 timeshift: view.shift,
                 callsign: view.base.clone(),
@@ -1610,6 +1692,20 @@ impl EngineIndex {
     /// Candidate `i`'s [`FamilyKey`] (equal to `resolve_with(..).family_key()`).
     pub fn family_key(&self, i: usize) -> &FamilyKey {
         &self.identity_keys[i]
+    }
+
+    /// Whether candidates `a` and `b` are one identity family before the country rule:
+    /// equal [`FamilyKey`]s, or the station-callsign relation (decided C08,
+    /// [`crate::identity::station_callsign_family`]). The same test
+    /// [`crate::identity::Identity::same_family`] applies, read off the index.
+    pub fn same_family(&self, a: usize, b: usize) -> bool {
+        self.identity_keys[a] == self.identity_keys[b]
+            || crate::identity::station_callsign_family(
+                &self.identity_keys[a],
+                self.callsign_high[a],
+                &self.identity_keys[b],
+                self.callsign_high[b],
+            )
     }
 
     /// Candidate `i`'s identity country: the build hint, else its stream marker.
@@ -1702,8 +1798,16 @@ fn ascii_tokens(name_lower: &str) -> HashSet<String> {
     tokens
 }
 
-/// The tie-break among equal scores (step 9 review): a candidate whose identity key IS
-/// the query's comes first, then T12's original-token overlap.
+/// The tie-break among equal scores (step 9 review, phase 3 review): a candidate whose
+/// identity family key IS the query's comes first, then one whose OWN normalize key is
+/// the query's (the same spelling), then T12's original-token overlap.
+///
+/// The spelling component (phase 3 review): decided A05 keys an alias member as its
+/// canonical, so `Cinemax Action` and `ActionMax`, `HBO2` and `HBO Hits`, `Discovery`
+/// and `Discovery Channel` are identity-equal at 100 against a query spelled as either.
+/// The overlap mostly orders them right (`CTN` shares a token with `CTN`, none with
+/// `Christian Television Network`) but not always (`DISCOVERY` overlaps both by one),
+/// and the pool's order must never pick a family's top; the query's own spelling does.
 ///
 /// Without the first half the overlap alone picks the top, and the top fixes the
 /// family: `US: beIN Sports Spanish in English` scores 100 against its own
@@ -1713,9 +1817,12 @@ fn ascii_tokens(name_lower: &str) -> HashSet<String> {
 /// wrong channel's whole family and guide assigned its entry. An identity-equal
 /// candidate never loses a tie to a different identity. Pair verdicts (`same`/`score`,
 /// the corpus gate) are untouched: only the order among equal scores changes.
-fn tie_rank(identity_equal: bool, overlap: usize) -> usize {
-    const IDENTITY: usize = 1 << 20;
-    usize::from(identity_equal) * IDENTITY + overlap.min(IDENTITY - 1)
+fn tie_rank(identity_equal: bool, spelling_equal: bool, overlap: usize) -> usize {
+    const SPELLING: usize = 1 << 20;
+    const IDENTITY: usize = SPELLING << 1;
+    usize::from(identity_equal) * IDENTITY
+        + usize::from(spelling_equal) * SPELLING
+        + overlap.min(SPELLING - 1)
 }
 
 fn token_overlap_count(query_tokens: &HashSet<String>, candidate: &str) -> usize {
@@ -2031,6 +2138,43 @@ mod tests {
             "KSDK" => "NBC",
             "WFOR" => "CBS",
             _ => panic!("unknown station {station}"),
+        }
+    }
+
+    #[test]
+    fn the_query_s_own_spelling_leads_a_tie_among_alias_identity_mates() {
+        // Phase 3 review: decided A05 puts `Cinemax Action` and `ActionMax` (and
+        // `Discovery` / `Discovery Channel`) in one identity, both at 100 against a
+        // query spelled as either; the query's own spelling leads the family, whatever
+        // the pool's order, and the token overlap no longer decides (`DISCOVERY`
+        // overlaps both `Discovery` names by one token).
+        let engine = UnifiedEngine::decided();
+        for (query, pool, want) in [
+            (
+                "Cinemax Action",
+                ["ActionMax", "Cinemax Action"],
+                ["Cinemax Action", "ActionMax"],
+            ),
+            (
+                "ActionMax HD",
+                ["Cinemax Action", "ActionMax"],
+                ["ActionMax", "Cinemax Action"],
+            ),
+            (
+                "DISCOVERY",
+                ["Discovery Channel", "Discovery"],
+                ["Discovery", "Discovery Channel"],
+            ),
+            ("HBO2", ["HBO Hits", "HBO2"], ["HBO2", "HBO Hits"]),
+        ] {
+            let candidates: Vec<String> = pool.iter().map(|name| name.to_string()).collect();
+            let family = engine.rank_in(query, None, &candidates);
+            let names: Vec<&str> = family
+                .iter()
+                .map(|r| candidates[r.index].as_str())
+                .collect();
+            assert_eq!(names, want, "{query}");
+            assert!(family.iter().all(|r| r.score == 100), "{query}: {family:?}");
         }
     }
 

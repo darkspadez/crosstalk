@@ -15,6 +15,19 @@ pub const CHANNEL_EDIT_CHUNK_SIZE: usize = 500;
 /// [`CHANNEL_EDIT_CHUNK_SIZE`].
 const BATCH_SET_EPG_CHUNK_SIZE: usize = 500;
 
+/// What a chunked `batch-set-epg` write achieved (see
+/// [`DispatcharrClient::batch_set_epg_outcome`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BatchEpgOutcome {
+    /// Leading associations whose chunk was confirmed upstream (a prefix length).
+    pub confirmed: usize,
+    /// Channels upstream reports as updated (fewer than `confirmed` is normal: a channel
+    /// already on its entry is not an update).
+    pub updated: usize,
+    /// The first failing chunk's message; `None` when every chunk landed.
+    pub failure: Option<String>,
+}
+
 /// Channels per `profiles/{id}/channels/bulk-update/` request.
 const MEMBERSHIP_CHUNK_SIZE: usize = 500;
 
@@ -573,30 +586,48 @@ impl DispatcharrClient {
     /// counts are summed. A chunk failure names the chunk and how many associations were
     /// already confirmed, so the caller can report partial progress.
     pub async fn batch_set_epg(&self, associations: &[(i64, Option<i64>)]) -> Result<usize> {
+        let outcome = self.batch_set_epg_outcome(associations).await;
+        match outcome.failure {
+            Some(failure) => Err(anyhow::anyhow!(failure)),
+            None => Ok(outcome.updated),
+        }
+    }
+
+    /// [`batch_set_epg`](Self::batch_set_epg) with the per-chunk truth kept: how many
+    /// leading associations landed before a chunk failed, so a caller recording one row
+    /// per association marks the landed rows `ok` and only the rest failed (phase 3
+    /// review: a failed later chunk used to fail the whole batch's rows, and undo then
+    /// skipped writes that had in fact landed). Chunks are posted in order and the walk
+    /// stops at the first failure, so `confirmed` is a prefix length of `associations`.
+    pub async fn batch_set_epg_outcome(
+        &self,
+        associations: &[(i64, Option<i64>)],
+    ) -> BatchEpgOutcome {
+        let mut outcome = BatchEpgOutcome::default();
         if associations.is_empty() {
             // Upstream rejects an empty list with 400; a run with nothing to write is a
             // no-op, not a failure.
-            return Ok(0);
+            return outcome;
         }
 
         let total_chunks = associations.len().div_ceil(BATCH_SET_EPG_CHUNK_SIZE);
-        let mut confirmed: usize = 0;
-        let mut updated: usize = 0;
         for (index, chunk) in associations.chunks(BATCH_SET_EPG_CHUNK_SIZE).enumerate() {
             let chunk_no = index + 1;
             match self.post_epg_chunk(chunk).await {
                 Ok(count) => {
-                    confirmed += chunk.len();
-                    updated += count;
+                    outcome.confirmed += chunk.len();
+                    outcome.updated += count;
                 }
                 Err(error) => {
-                    anyhow::bail!(
+                    let confirmed = outcome.confirmed;
+                    outcome.failure = Some(format!(
                         "chunk {chunk_no}/{total_chunks} failed after {confirmed} associations were confirmed: {error:#}"
-                    );
+                    ));
+                    return outcome;
                 }
             }
         }
-        Ok(updated)
+        outcome
     }
 
     /// POST one chunk of EPG associations.

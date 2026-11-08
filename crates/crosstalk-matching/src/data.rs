@@ -767,6 +767,44 @@ pub mod merged {
             .map(|(_, json)| *json)
     }
 
+    /// One merged per-country channel database, parsed once per process (the ONE
+    /// loader every app reads merged channel names, categories and countries from:
+    /// lineup's names/categorize/create, streams' country filter).
+    ///
+    /// `code` is case-insensitive; `None` for a code no merged database carries.
+    pub fn merged_channels(code: &str) -> Option<&'static MergedChannelDatabase> {
+        static CACHED: [OnceLock<MergedChannelDatabase>; MERGED_CHANNEL_DATABASES.len()] =
+            [const { OnceLock::new() }; MERGED_CHANNEL_DATABASES.len()];
+        let position = MERGED_CHANNEL_DATABASES
+            .iter()
+            .position(|(candidate, _)| candidate.eq_ignore_ascii_case(code))?;
+        Some(CACHED[position].get_or_init(|| {
+            serde_json::from_str(MERGED_CHANNEL_DATABASES[position].1)
+                .expect("merged channel database parse")
+        }))
+    }
+
+    /// Every label a merged database uses for its own country, lowercased: each
+    /// `country_code` and `country_name` (`us`, `united states`, `uk`, `united
+    /// kingdom`, ...). The one definition of "this category is a country, not a
+    /// category" (lineup's categorize).
+    pub fn merged_country_labels() -> &'static HashSet<String> {
+        static CACHED: OnceLock<HashSet<String>> = OnceLock::new();
+        CACHED.get_or_init(|| {
+            let mut labels = HashSet::new();
+            for (code, _) in MERGED_CHANNEL_DATABASES {
+                labels.insert(code.to_lowercase());
+                if let Some(db) = merged_channels(code) {
+                    labels.insert(db.country_code.trim().to_lowercase());
+                    if let Some(name) = db.country_name.as_deref() {
+                        labels.insert(name.trim().to_lowercase());
+                    }
+                }
+            }
+            labels
+        })
+    }
+
     /// The parsed merged station table, cached per process.
     pub fn merged_stations() -> &'static MergedStationsFile {
         static CACHED: OnceLock<MergedStationsFile> = OnceLock::new();

@@ -11,11 +11,16 @@
 //! 3. tv-logos: a station-format file for OTA names (callsign + network,
 //!    [`match_station_logo`]), else the best fuzzy filename match
 //!    ([`match_channel_to_logo`]);
-//! 4. the default logo (lineup's configured fallback).
+//! 4. the network logo ([`LogoSource::Network`], step 16 decision B): a
+//!    station-format name with no station file takes `<network>-<suffix>.png`,
+//!    only for a channel with NO logo, as Channel-Mapparr consults it last;
+//! 5. the default logo (lineup's configured fallback, the safety net even when the
+//!    order does not name it).
 //!
 //! Channel-Mapparr's order differs (station → fuzzy → EPG → network, and it
 //! only consults EPG/network logos for channels with NO logo yet); the unified
-//! order is Lineuparr's 3-tier fallback plus the default, decided for step 7.
+//! order is Lineuparr's 3-tier fallback plus CM's network tier and the default,
+//! decided for step 7 and step 16.
 //! The tiers, their order, the country search ([`search_tv_logos`]) and the
 //! default safety net live here only; creating `Logo` rows is lineup's job (step
 //! 16), which resolves through this module.

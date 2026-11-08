@@ -149,12 +149,12 @@ both sides).
 
 ## Case `defaults-disputed`: disputed set
 
-- 32/51 channels agree on the category
+- 34/51 channels agree on the category
 
 ### Differences by attribution
 
 - `ota`: 0
-- `country-category`: 12
+- `country-category`: 10
 - `merged-data`: 2
 - `cm-prefilter`: 5
 - `cut`: 0
@@ -162,20 +162,18 @@ both sides).
 - `no-category`: 0
 - `unattributed`: 0
 
-#### country-category (12)
+#### country-category (10)
 
 - `Nick Jr (Pacific)`: CM 'United States' (Premium (Exact)) vs Rust None (Premium (Exact))
-- `Nick Jr`: CM 'United States' (Premium (Exact)) vs Rust None (Premium (Exact))
-- `Nickelodeon (Pacific)`: CM 'Kids' (Premium (Exact)) vs Rust None (Premium (Exact))
-- `Paramount+ with Showtime (Pacific)`: CM 'United States' (Premium (Exact)) vs Rust None (Premium (Exact))
-- `Paramount+ with Showtime HD (Pacific)`: CM 'United States' (Premium (Exact)) vs Rust None (Premium (Exact))
+- `Nick Jr`: CM 'United States' (Premium (Exact)) vs Rust 'Kids' (Premium (Fuzzy - score: 100))
+- `Paramount+ with Showtime (Pacific)`: CM 'United States' (Premium (Exact)) vs Rust 'Movies' (Premium (Fuzzy - score: 100))
+- `Paramount+ with Showtime HD (Pacific)`: CM 'United States' (Premium (Exact)) vs Rust 'Movies' (Premium (Fuzzy - score: 100))
 - `TVA SPORTS`: CM 'United States' (Premium (Fuzzy)) vs Rust None (Premium (Fuzzy - score: 100))
 - `TVA Sports 2`: CM 'United States' (Premium (Fuzzy)) vs Rust None (Premium (Exact))
 - `TVA Sports`: CM 'United States' (Premium (Fuzzy)) vs Rust None (Premium (Exact))
 - `TVA SPORTS 2`: CM 'United States' (Premium (Fuzzy)) vs Rust None (Premium (Fuzzy - score: 100))
 - `2M Monde`: CM 'United States' (Premium (Fuzzy)) vs Rust None (Premium (Exact))
 - `Action Movies`: CM 'United States' (Premium (Exact)) vs Rust None (Premium (Exact))
-- `Al Jazeera HD`: CM 'News' (Premium (Fuzzy)) vs Rust None (Premium (Exact))
 
 #### merged-data (2)
 

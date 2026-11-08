@@ -48,7 +48,25 @@ migration diff.
 
 - 20 file comparisons, 0 differing
 - the comparisons above pin the Janitor ORACLE (`--features oracle`, `simulate-streams --oracle janitor`); the production simulator runs the unified engine:
-  - `[unified] 3172 stream(s): 2412 take the same channel as match_sim.py, 154 only the Python tool passes, 0 only the unified engine passes, 72 pass to a different channel (report; the migration diff)`
+  - `[unified] 3172 stream(s): 2385 take the same channel as match_sim.py, 136 only the Python tool passes, 1 only the unified engine passes, 117 pass to a different channel, of which 68 also pass to the Python tool's channel (two spellings of one identity, decided A05; both take the stream) (report; the migration diff)`
+  - reading the `[unified]` line: the simulator inverts channel-as-query results
+    into one `best_channel` per stream, ties in channel order, as `match_sim.py`
+    does. `only the Python tool passes` is the D02/T10 cut (`strict` 95 here
+    versus the tool's 80) and the decided normalizer rows (accents kept, N01-N15);
+    `different channel` splits in two: the `also pass to the Python tool's
+    channel` part is two spellings of ONE identity (decided A05 `canonical-key`:
+    `Cinemax Action`/`ActionMax`, `HBO2`/`HBO Hits`, `MGM+`/`Epix`, `GSN`/`Game
+    Show Network`, `CTN`/`Christian Television Network`), where the engine's family
+    holds the stream for both channels (streams attaches it to both; guide, ranking
+    with the channel as the query, leads with the channel's own spelling — the T12
+    same-spelling tie-break) and the column shows the first in channel order; the
+    rest are zone routing (Z01/Z08: `A&E (Pacific)` leaves bare `A&E`), accents
+    and punctuation kept by the decided normalizer (`UniMás`, `Real America’s
+    Voice`), the country marker read (`ScreenPix US`) and the alias table's own
+    canonicals (`WGN America` -> `NewsNation`). Known wrong family in the alias
+    class: `Al Jazeera (Arabic)` keys as `Al Jazeera English` because the decided
+    normalizer drops the parenthetical and the merged alias table lists bare `Al
+    Jazeera` under the English channel (phase 3 review notes, LEFT).
 
 ## 3. guide end-to-end, representative world: unified engine vs Janitor
 

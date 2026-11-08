@@ -82,6 +82,7 @@ use crosstalk_core::subapp::{JobOutcome, OutcomeBuilder, SubApp};
 use crosstalk_core::wildcard::{expand_patterns, parse_tokens};
 use crosstalk_matching::engine::{EngineRanked, UnifiedEngine};
 use crosstalk_matching::identity::{Identity, ResolveContext};
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -174,32 +175,19 @@ pub struct CategoryOutput {
 pub fn category_map(databases: &[String]) -> HashMap<String, (String, String)> {
     let mut map: HashMap<String, (String, String)> = HashMap::new();
     for code in databases {
-        let Some(raw) = crosstalk_matching::data::merged::merged_database_json(code) else {
+        let Some(db) = crosstalk_matching::data::merged::merged_channels(code) else {
             continue;
         };
-        let parsed: serde_json::Value = serde_json::from_str(raw).unwrap_or_default();
-        let channels = parsed
-            .get("channels")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        for channel in channels {
-            let name = channel
-                .get("channel_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            let category = channel
-                .get("category")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            if name.is_empty() || category.is_empty() || is_country_category(&category) {
+        for channel in &db.channels {
+            let name = channel.channel_name.trim();
+            let category = channel.category.as_deref().unwrap_or("").trim();
+            if name.is_empty() || category.is_empty() || is_country_category(category) {
                 continue;
             }
-            map.insert(name.to_lowercase(), (name, category));
+            map.insert(
+                name.to_lowercase(),
+                (name.to_string(), category.to_string()),
+            );
         }
     }
     map
@@ -214,24 +202,8 @@ pub fn category_map(databases: &[String]) -> HashMap<String, (String, String)> {
 /// (case-insensitive) as no category, so categorize never creates or fills a
 /// country-named group. Strictly safer: it only ever moves fewer channels.
 pub fn is_country_category(category: &str) -> bool {
-    static LABELS: std::sync::OnceLock<HashSet<String>> = std::sync::OnceLock::new();
-    let labels = LABELS.get_or_init(|| {
-        let mut labels = HashSet::new();
-        for code in crosstalk_matching::data::merged::merged_codes() {
-            labels.insert(code.to_lowercase());
-            let Some(raw) = crosstalk_matching::data::merged::merged_database_json(code) else {
-                continue;
-            };
-            let parsed: serde_json::Value = serde_json::from_str(raw).unwrap_or_default();
-            for key in ["country_name", "country_code"] {
-                if let Some(value) = parsed.get(key).and_then(|v| v.as_str()) {
-                    labels.insert(value.trim().to_lowercase());
-                }
-            }
-        }
-        labels
-    });
-    labels.contains(&category.trim().to_lowercase())
+    crosstalk_matching::data::merged::merged_country_labels()
+        .contains(&category.trim().to_lowercase())
 }
 
 /// CM's label: `Premium (Exact)` when the channel's normalize key is the leader's
@@ -602,24 +574,28 @@ pub async fn run_with_creator(
     let index = Arc::new(run_engine.build_index(&db_names));
 
     let ctx = ResolveContext::default();
-    let mut rows: Vec<CategoryRow> = Vec::with_capacity(in_category_scope.len());
-    for channel in &in_category_scope {
-        let scoped_channel = ScopedChannel {
-            id: channel.id,
-            name: channel.name.clone(),
-            number: channel.display_number(),
-            group: world.group_name(channel.channel_group_id),
-        };
-        let identity = run_engine.resolve(&channel.name, &ctx);
-        rows.push(decide_category(
-            &scoped_channel,
-            &identity,
-            &engine,
-            &index,
-            &db_names,
-            &categories,
-        ));
-    }
+    // One resolve and one rank per channel, on every core (phase 3 review bench: a
+    // serial walk over 20k channels cost half a minute).
+    let rows: Vec<CategoryRow> = in_category_scope
+        .par_iter()
+        .map(|channel| {
+            let scoped_channel = ScopedChannel {
+                id: channel.id,
+                name: channel.name.clone(),
+                number: channel.display_number(),
+                group: world.group_name(channel.channel_group_id),
+            };
+            let identity = run_engine.resolve(&channel.name, &ctx);
+            decide_category(
+                &scoped_channel,
+                &identity,
+                &engine,
+                &index,
+                &db_names,
+                &categories,
+            )
+        })
+        .collect();
 
     let moves = planned_moves(&rows, &base.ignore_groups);
     let existing: HashSet<String> = world

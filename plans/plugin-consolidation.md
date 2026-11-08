@@ -301,8 +301,8 @@ pieces each phase adds, and the cross-cutting rules below.
 
 ### Phase 3: `lineup` (Channel-Mapparr + Channel Name Cleaner + Lineuparr's channel half)
 
-> Status: built (steps 1–20 on `plan/phase-3-the-lineup-sub-app`); the phase-end review is
-> pending. Detailed plan: `plans/phase-3-lineup.md`. **Goal reset (2026-11-04):** apps must share one
+> Status: built and reviewed (steps 1–20 plus the phase-end review on
+> `plan/phase-3-the-lineup-sub-app`; see "Phase 3 review notes" in the detailed plan). Detailed plan: `plans/phase-3-lineup.md`. **Goal reset (2026-11-04):** apps must share one
 > implementation and give the same answer, so phase 3 opens by collapsing the per-plugin matcher
 > profiles into one engine (rules chosen on a labelled corpus), one merged data set, a shared
 > channel identity, one tag vocabulary / quality model / template engine / logo resolver, and

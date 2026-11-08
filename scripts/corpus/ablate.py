@@ -463,9 +463,20 @@ def strip_zone_ignorable(name: str) -> str:
     Peels the trailing run of quality/junk/status bracket groups and bare words
     plus `+N` shifts (which stay shifts: the flag reads the original name), never
     regional words and never the whole name."""
+    return _strip_trailing_writer_tags(name, True)
+
+
+def strip_writer_tags(name: str) -> str:
+    """The callsign read's strip (decided C09), mirroring Rust's
+    `tags::strip_writer_tags`: `strip_zone_ignorable` without the `+N` peel, so
+    a time-shifted feed keeps the ladder's low-confidence read."""
+    return _strip_trailing_writer_tags(name, False)
+
+
+def _strip_trailing_writer_tags(name: str, shifts: bool) -> str:
     rest = (name or "").rstrip(_RUST_WS)
     while rest:
-        shifted = _peel_zone_shift(rest)
+        shifted = _peel_zone_shift(rest) if shifts else None
         if shifted is not None:
             if not shifted.rstrip(_RUST_WS):
                 return rest
@@ -790,6 +801,18 @@ class Engine:
         elif ladder in ("janitor", "cm"):
             matcher._extract_callsign_with_confidence = (
                 oracles.get(ladder).matcher._extract_callsign_with_confidence)
+        # Decided C09 `strip-tags` (orchestrator, phase 3 review): the ladder reads
+        # the name with its trailing writer tags stripped (`strip_writer_tags`: the
+        # Z08 strip minus the `+N` shift), mirroring Rust's
+        # `UnifiedEngine::callsign_confident`, so `KSDK HD` reads its callsign at
+        # the end of the name (high) like `KSDK`, and `KMOV +1` stays low.
+        # Part of the base (no plugin variant strips before its ladder), so every
+        # ablated configuration carries it, as Z08 and N15 do.
+        _ladder_read = matcher._extract_callsign_with_confidence
+
+        def _extract_after_strip(name, _read=_ladder_read):
+            return _read(strip_writer_tags(name or ""))
+        matcher._extract_callsign_with_confidence = _extract_after_strip
         self._install_alias(matcher, cfg["A01"], alias_map)
         self.matcher = matcher
         self.alias_map = alias_map
@@ -1443,6 +1466,17 @@ def self_test() -> int:
     check("C07 different low-confidence station excluded",
           decided.same("ABC (WABC)", "KOMO News"), False)
     check("C07 same station pairs", decided.same("ABC (WABC)", "WABC"), True)
+    for name, high in [("KSDK HD", True), ("KSDK [HD]", True), ("USA | WABC-TV FHD", True),
+                       ("US: KSDK HD", True), ("KSDK", True), ("KOMO News HD", False),
+                       ("Hong Kong Fight Club HD", False)]:
+        _raw, got = decided.matcher._extract_callsign_with_confidence(name)
+        check(f"C09 callsign confidence after tag strip {name!r}", bool(got), high)
+    check("C09 decorated bare callsign anchors", decided.same("NBC (KSDK)", "KSDK HD"), True)
+    check("C09 shift keeps the low read",
+          decided.matcher._extract_callsign_with_confidence("Local CBS KMOV +1")[1], False)
+    check("C09 shifted feed stays apart",
+          decided.same("Local CBS KMOV +1", "Local CBS KMOV"), False)
+    check("C09 subchannel still apart", decided.same("KSDK", "KSDK-DT2"), False)
     check("zone lu rejects regionless vs West", engine.same("HBO", "HBO West"), False)
     check("zone none keeps it", Engine({"ZONE": "none"}, 80, alias_map).same(
         "HBO", "HBO West"), True)

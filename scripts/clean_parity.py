@@ -148,6 +148,11 @@ def _load_plugin() -> object:
 
 NC_CASES: list[tuple[str, str]] = [
     # (name, group) — NC test-like cases.
+    # A trailing bare country segment keeps its bar (phase 3 review divergence, see
+    # `_country_segment_divergence`): NC writes `BBC One UK`, crosstalk `BBC One | UK`.
+    ("BBC One | UK", "UK"),
+    ("Sky Sports | HD | UK", "UK"),
+    ("UK | Sky Sports | HD", "UK"),
     ("Sky Atlantic | FHD |", "Sports"),
     ("Sky Atlantic | HD |", "News"),
     ("Rte One +1 | HD |", "News"),
@@ -195,6 +200,23 @@ def _merged_db_names() -> list[tuple[str, str]]:
         for row in data.get("channels", [])[:25]:
             out.append((row["channel_name"], row.get("category", "DB") or "DB"))
     return out
+
+
+#: The country codes the engine keeps delimited in a pipe collapse (decided N15,
+#: `tags::is_pipe_country_code`), mirrored so the oracle can name the one documented
+#: divergence of the pipe step.
+PIPE_COUNTRY_CODES = {"US", "USA", "UK", "CA", "AU", "FR", "DE", "ES", "IT", "NL", "BR", "MX", "IN"}
+
+
+def _country_segment_divergence(nc_new: str, rust_new: str) -> bool:
+    """Phase 3 review: a trailing bare country-code pipe segment keeps its bar in
+    crosstalk (`BBC One | UK`, the engine's own N15 collapse, so the cleaned name
+    keeps its identity) where NC joins it with the separator (`BBC One UK`). True
+    when that is the ONLY difference between the two outputs."""
+    head, sep, code = rust_new.rpartition(" | ")
+    if not sep or code.upper() not in PIPE_COUNTRY_CODES:
+        return False
+    return nc_new.endswith(code) and nc_new[: -len(code)].rstrip(" -:|") == head.rstrip(" -:|")
 
 
 def _corpus_variant_names(limit: int = 40) -> list[tuple[str, str]]:
@@ -380,6 +402,7 @@ def main() -> int:
     channels = _corpus()
     mismatches: list[str] = []
     total = 0
+    country_segment = 0
     for case in CASES:
         expected = {row["id"]: row for row in _nc_rows(plugin, channels, case)}
         got = {row["id"]: row for row in _rust_rows(channels, case)}
@@ -391,6 +414,17 @@ def main() -> int:
                 continue
             # Scope filters before cleaning: a channel NC's scope drops never reaches
             # the Rust dump either (same set) — both lists carry every in-scope row.
+            # The one documented divergence: crosstalk keeps a trailing bare
+            # country-code pipe segment delimited (`BBC One | UK`). When that is the
+            # only difference in the resulting name, the row's status/rules/removed
+            # follow from it (a name left as-is is `nochange`, the pipe rule did not
+            # fire), so the whole row counts once as that divergence.
+            have_new = have["new"] or have["old"]
+            if have["new"] != want["new"] and _country_segment_divergence(want["new"], have_new):
+                rest = [k for k in ("old", "group") if have[k] != want[k]]
+                if not rest:
+                    country_segment += 1
+                    continue
             for key in ("status", "old", "new", "group", "rules", "removed"):
                 if have[key] != want[key]:
                     mismatches.append(
@@ -401,7 +435,8 @@ def main() -> int:
         for id in extra:
             mismatches.append(f"[{case['name']}] id={id}: extra Rust row {got[id]!r}")
 
-    print(f"clean_parity: {total} rows over {len(CASES)} cases, {len(mismatches)} mismatches")
+    print(f"clean_parity: {total} rows over {len(CASES)} cases, {len(mismatches)} mismatches"
+          f" ({country_segment} documented country-segment divergence(s))")
     for line in mismatches[: args.show]:
         print(f"  MISMATCH {line}")
     if len(mismatches) > args.show:

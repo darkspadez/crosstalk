@@ -1450,7 +1450,10 @@ pub async fn apply_with_writer(
     }
 
     // 3. Guides: one `batch-set-epg` call, which chunks and retries internally. A clear and a
-    //    per-channel assignment are the same write, differing only in the id sent.
+    //    per-channel assignment are the same write, differing only in the id sent. The
+    //    chunks land in row order and the client stops at the first failure, so the rows
+    //    before the failing chunk are `ok` (they are in effect upstream, and undo must see
+    //    them) and only the rest fail with the chunk's message.
     let mut epg_rows: Vec<usize> = Vec::new();
     let mut associations: Vec<(i64, Option<i64>)> = Vec::new();
     for (index, change) in plan.changes.iter().enumerate() {
@@ -1467,14 +1470,12 @@ pub async fn apply_with_writer(
                 done,
                 &format!("writing {} guide assignment(s)", associations.len()),
             );
-            match client.batch_set_epg(&associations).await {
-                Ok(_) => mark(&mut changes, &epg_rows, RowStatus::Ok, ""),
-                Err(error) => mark(
-                    &mut changes,
-                    &epg_rows,
-                    RowStatus::Failed,
-                    &format!("{error:#}"),
-                ),
+            let outcome = client.batch_set_epg_outcome(&associations).await;
+            let (landed, rest) = epg_rows.split_at(outcome.confirmed.min(epg_rows.len()));
+            mark(&mut changes, landed, RowStatus::Ok, "");
+            match outcome.failure {
+                Some(failure) => mark(&mut changes, rest, RowStatus::Failed, &failure),
+                None => mark(&mut changes, rest, RowStatus::Ok, ""),
             }
         }
         done += epg_rows.len() as u64;
@@ -6031,6 +6032,63 @@ mod tests {
             .iter()
             .filter(|change| change.field != Field::Membership(2))
             .all(|change| change.status == RowStatus::Ok));
+    }
+
+    #[tokio::test]
+    async fn a_later_failing_epg_chunk_keeps_the_landed_rows_ok() {
+        // Phase 3 review: `batch-set-epg` posts 500 rows per chunk and stops at the first
+        // failure. The rows of the chunks that landed are in effect upstream, so they must
+        // be `ok` (undo re-checks them); only the rows from the failing chunk on fail.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/channels/channels/batch-set-epg/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"success": true, "channels_updated": 500})),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/channels/channels/batch-set-epg/"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let world = World {
+            channels: (1..=600)
+                .map(|id| channel(id, &format!("Channel {id}"), None, Some(1000 + id)))
+                .collect(),
+            ..World::default()
+        };
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        let context = JobContext::for_tests(crate::config::CrosstalkConfig::default());
+        let plan = plan_ops(&world, &Selection::default(), &[Op::ClearEpg]).expect("plans");
+        assert_eq!(plan.changes.len(), 600);
+
+        let report = apply(&client, &plan, &context, "guide.clear_groups_apply").await;
+        assert_eq!(report.ok, 500, "{:?}", report.changes.last());
+        assert_eq!(report.failed, 100);
+        for change in &plan.changes[..500].iter().collect::<Vec<_>>() {
+            let written = report
+                .changes
+                .iter()
+                .find(|c| c.channel_id == change.channel_id)
+                .expect("row");
+            assert_eq!(written.status, RowStatus::Ok, "{written:?}");
+        }
+        let failed: Vec<&Change> = report
+            .changes
+            .iter()
+            .filter(|c| c.status == RowStatus::Failed)
+            .collect();
+        assert_eq!(failed.len(), 100);
+        assert!(
+            failed.iter().all(|c| c.reason.contains("chunk 2/2")),
+            "{:?}",
+            failed[0].reason
+        );
+        assert!(failed.iter().all(|c| c.channel_id > 500));
     }
 
     #[tokio::test]

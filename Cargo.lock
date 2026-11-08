@@ -592,6 +592,7 @@ dependencies = [
  "crosstalk-guide",
  "crosstalk-matching",
  "crosstalk-streams",
+ "rayon",
  "regex",
  "serde",
  "serde_json",

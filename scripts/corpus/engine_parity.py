@@ -156,15 +156,31 @@ def python_alias_resolve(engine: ablate.Engine, name: str) -> str | None:
     return index.get(norm) or index.get(re.sub(r"[\s&\-]+", "", norm))
 
 
+def python_identity_key(engine: ablate.Engine, name: str) -> str:
+    """Rust `UnifiedEngine::identity_key` (decided A05 `canonical-key`): the alias
+    canonical's normalize key when the name resolves through the merged alias
+    table, else the name's own."""
+    with ablate._Swapped(engine.mods["core"], engine.swaps):
+        canonical = python_alias_resolve(engine, name)
+    own = engine.normalize(name).lower()
+    if canonical:
+        key = engine.normalize(canonical).lower()
+        return key or own
+    return own
+
+
 def python_identity(engine: ablate.Engine, name: str) -> dict:
     """The identity fields a family compares on, from the decided configuration."""
     with ablate._Swapped(engine.mods["core"], engine.swaps):
         raw, _high = engine.matcher._extract_callsign_with_confidence(name)
     return {
-        "key": engine.normalize(name).lower(),
+        "key": python_identity_key(engine, name),
         "zone": ablate.sm_zone_noguard(engine.mods, name),
         "timeshift": bool(ablate._PLUS_SHIFT_RE.search(name)),
         "callsign": normalize_callsign_base(raw),
+        # Decided C09: the confidence the ladder reads after the trailing-tag strip
+        # (`Engine` wraps the ladder), carried on the identity for C08.
+        "callsign_high": bool(raw) and bool(_high),
         # Decided N15: the country reads the pipe-collapsed name, like the Rust
         # `lineuparr_stream_country` does internally.
         "country": engine.mods["lu"].detect_stream_country(
@@ -175,6 +191,78 @@ def python_identity(engine: ablate.Engine, name: str) -> dict:
 def _family_key(identity: dict) -> tuple:
     return (identity["key"], identity["zone"], identity["timeshift"],
             identity["callsign"])
+
+
+_SUFFIX_WORDS = {"tv", "dt", "cd", "lp", "ld"}
+_DESIGNATOR_RE = re.compile(r"^(?:dt|d)\d+$")
+_DOTTED_RE = re.compile(r"^\d+\.\d+$")
+
+
+def callsign_residue(key: str, callsign: str) -> str:
+    """identity.rs `callsign_residue` (decided C08): what is left of a callsign
+    identity's key once the callsign, its suffix words and plain numbers go.
+
+    Returns ``"bare"`` (nothing or one plain number), ``"subchannel"`` (a
+    ``dt<N>``/``d<N>`` token, a dotted number, or two or more plain numbers) or
+    ``"other"``."""
+    base = callsign.lower()
+    digits = 0
+    other = False
+    for token in key.split():
+        if token == base or token in _SUFFIX_WORDS:
+            continue
+        if _DESIGNATOR_RE.match(token) or _DOTTED_RE.match(token):
+            return "subchannel"
+        if token.isdigit() and token.isascii():
+            digits += 1
+            continue
+        other = True
+    if digits > 1:
+        return "subchannel"
+    return "other" if other else "bare"
+
+
+def station_callsign_family(a: dict, b: dict) -> bool:
+    """identity.rs `station_callsign_family` (decided C08 `station-callsign-family`):
+    two callsign identities with different keys are one family when they share a
+    high-confidence merged-station callsign, zone and timeshift, and neither is a
+    subchannel."""
+    callsign = a["callsign"]
+    if not callsign or callsign != b["callsign"]:
+        return False
+    if not (a["callsign_high"] and b["callsign_high"]):
+        return False
+    if a["zone"] != b["zone"] or a["timeshift"] != b["timeshift"]:
+        return False
+    if callsign not in ablate._known_set("merged"):
+        return False
+    residues = (callsign_residue(a["key"], callsign), callsign_residue(b["key"], callsign))
+    return "subchannel" not in residues
+
+
+def same_family_keys(a: dict, b: dict) -> bool:
+    """Rust `EngineIndex::same_family`: equal family keys or the C08 relation."""
+    return _family_key(a) == _family_key(b) or station_callsign_family(a, b)
+
+
+#: Decided C08/C09 probes for the family check: a bare station callsign, plain or
+#: decorated, is in the station's family whatever spelling leads the pool, and a
+#: subchannel never is.
+C08_PROBES: list[tuple[str, list[str]]] = [
+    # Tie-break on the whole family key: the Default `BBC One` leads `BBC One East HD`.
+    ("UK: BBC One HD", ["BBC One East HD", "BBC One", "BBC Two", "BBC One HD"]),
+    ("US: NBC (KSDK) HD", ["NBC 5 St. Louis KSDK", "NBC", "KSDK", "KSDK-DT2"]),
+    # A05: alias members share the canonical's family.
+    ("US: CNN HD", ["CNN", "CNN USA", "CNN International", "HLN"]),
+    ("CNN USA", ["CNN", "CNN HD", "CNN International"]),
+    ("US: NBC (KSDK) HD", ["NBC", "KSDK", "KSDK HD", "NBC (KSDK)", "KSDK-DT2", "WABC-TV"]),
+    ("KSDK", ["KSDK HD", "NBC (KSDK)", "NBC 5 St. Louis KSDK", "KSDK-DT2", "NBC"]),
+    ("13 WREX", ["NBC - IL Rockford (WREX)", "WREX-DT", "WREX 13.2", "NBC", "WREX-DT [HD]"]),
+    ("NBC - IL Rockford (WREX)", ["13 WREX", "WREX", "WREX-DT [HD]", "WREX 13.2", "NBC"]),
+    ("ABC (WABC)", ["WABC-TV", "USA | WABC-TV FHD", "ABC 7 New York (WABC)", "ABC", "WABC-DT2"]),
+    ("KOMO News", ["KOMO", "KOMO 4 (ABC)", "KOMO News HD", "ABC"]),
+    ("KSDK-DT2", ["KSDK", "NBC (KSDK)", "KSDK-DT2 HD", "KSDK DT2"]),
+]
 
 
 def _countries_compatible(engine: ablate.Engine, a, b, exempt: bool, key: str) -> bool:
@@ -196,7 +284,9 @@ def python_family(engine: ablate.Engine, threshold: int, query: str,
     (score desc, then original-token overlap with the query, stable in
     candidate order -- T12 `lu`) with the step-9 tie-break in front of the
     overlap (a candidate whose identity key IS the query's wins a tie, so a
-    reordered name scoring 100 by token sort cannot become the top), then the
+    reordered name scoring 100 by token sort cannot become the top; then one
+    spelled as the query -- its OWN normalize key equal -- so an alias canonical
+    never leads a tie over the query's own spelling, phase 3 review), then the
     identity family cut.
 
     Not one ``match_all_streams`` call over the whole set: the base patches
@@ -205,12 +295,16 @@ def python_family(engine: ablate.Engine, threshold: int, query: str,
     (ZONE is the post-filter), not part of the decided configuration.
     """
     query_tokens = set(re.findall(r"[a-z0-9]+", (query or "").lower()))
-    query_key = engine.normalize(query).lower()
+    # The tie-break compares the WHOLE family key (Rust `query_fk`): zone, shift and
+    # callsign too, so a same-zone candidate leads a tie at 100.
+    query_fk = _family_key(python_identity(engine, query))
+    query_own = engine.normalize(query).lower()
     # Decided C07 `callsign-first` (orchestrator): a surviving same-callsign
     # candidate outranks any non-callsign match (`Engine.score` already drops a
     # different KNOWN callsign, mirroring Rust's `score_core` step 2a). Mirrors
     # Rust's `ranked_survivors` ordering exactly: same-callsign first, then score
-    # desc, then the identity-equal tie-break, then overlap, then position.
+    # desc, then the identity-equal tie-break, then the same-spelling tie-break,
+    # then overlap, then position.
     first_base = ablate.callsign_first_base(engine, query)
     scored = []
     for position, name in enumerate(candidates):
@@ -218,11 +312,12 @@ def python_family(engine: ablate.Engine, threshold: int, query: str,
         if hit is None or hit[0] < threshold:
             continue
         overlap = len(query_tokens & set(re.findall(r"[a-z0-9]+", name.lower())))
-        equal = engine.normalize(name).lower() == query_key
+        equal = _family_key(python_identity(engine, name)) == query_fk
+        spelling = engine.normalize(name).lower() == query_own
         first = (first_base is not None
                  and ablate.candidate_known_base(engine, name) == first_base)
-        scored.append((-int(first), -hit[0], -int(equal), -overlap, position,
-                        name, hit[0], hit[1]))
+        scored.append((-int(first), -hit[0], -int(equal), -int(spelling), -overlap,
+                        position, name, hit[0], hit[1]))
     scored.sort()
     family = [(name, score, method) for *_key, name, score, method in scored]
     if not family:
@@ -239,8 +334,10 @@ def python_family(engine: ablate.Engine, threshold: int, query: str,
     family = [entry for entry in family if compatible(query_country, entry[0])]
     if not family:
         return family
-    top_key = _family_key(ids[family[0][0]])
-    mates = [entry for entry in family if _family_key(ids[entry[0]]) == top_key]
+    # Decided C08: a bare station callsign joins the top's family (and vice versa)
+    # beside the key-equal mates — Rust's `EngineIndex::same_family`.
+    top = ids[family[0][0]]
+    mates = [entry for entry in family if same_family_keys(top, ids[entry[0]])]
     family_country = query_country or next(
         (ids[name]["country"] for name, _s, _m in mates if ids[name]["country"]), None)
     return [entry for entry in mates if compatible(family_country, entry[0])]
@@ -414,6 +511,9 @@ def main(argv=None) -> int:
                 shared = [shared[int(i * stride)] for i in range(args.pool_size)]
             candidates = list(dict.fromkeys(shared + truthy[query]))
             family_jobs.append(("pool", query, candidates))
+        # (c) Decided C08/C09 probes (fixed, every run).
+        for query, candidates in C08_PROBES:
+            family_jobs.append(("probe", query, list(candidates)))
         responses = rust.batch([{"kind": "rank", "query": query,
                                  "candidates": candidates,
                                  "threshold": args.threshold}
@@ -429,7 +529,7 @@ def main(argv=None) -> int:
         else:
             expected_families = {i: python_family(engine, args.threshold, query, candidates)
                                  for i, query, candidates in jobs}
-        for shape in ("distractor", "pool"):
+        for shape in ("distractor", "pool", "probe"):
             mismatches = []
             checked = members = multi = 0
             for i, ((job_shape, query, candidates), response) in enumerate(

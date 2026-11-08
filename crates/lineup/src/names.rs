@@ -81,6 +81,7 @@ use crosstalk_matching::engine::{EngineMethod, EngineRanked, UnifiedEngine};
 use crosstalk_matching::identity::{Identity, ResolveContext};
 use crosstalk_matching::pipeline::Scored;
 use crosstalk_matching::tags::{classify_token, TagKind};
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -227,6 +228,17 @@ fn is_callsign_shaped(inner: &str) -> bool {
     re.is_match(inner.trim())
 }
 
+/// The regional words CM re-attaches, as a regex alternation, from the shared tag
+/// vocabulary (`regional` kind, source `CM`: East, West, Pacific, Central, Mountain,
+/// Atlantic).
+fn regional_alternation() -> String {
+    crosstalk_matching::tags::tokens_from(crosstalk_matching::tags::TagKind::Regional, "CM")
+        .iter()
+        .map(|token| regex::escape(token))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
 /// Split CM's re-attachable tags off a query name (`extract_tags`, `plugin.py:975`).
 ///
 /// Returns `(regional, extra_tags, quality_tags)` with original bracket shapes kept:
@@ -237,10 +249,11 @@ fn is_callsign_shaped(inner: &str) -> bool {
 /// bracket groups are all scanned.
 pub fn extract_reattach_tags(name: &str) -> (Option<String>, Vec<String>, Vec<String>) {
     // Regional: paren form first, else the last bare region word (CM's two patterns).
+    // The words are the shared tag vocabulary's `regional` kind as CM lists it
+    // (`data/merged/tags.json`), not a second list here.
     static PAREN_REGION: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let paren_region = PAREN_REGION.get_or_init(|| {
-        regex::Regex::new(r"(?i)\((East|West|Pacific|Central|Mountain|Atlantic)\)")
-            .expect("static regex")
+        regex::Regex::new(&format!(r"(?i)\(({})\)", regional_alternation())).expect("static regex")
     });
     let mut regional: Option<String> = paren_region
         .captures(name)
@@ -258,7 +271,7 @@ pub fn extract_reattach_tags(name: &str) -> (Option<String>, Vec<String>, Vec<St
         // collect every word hit and keep the last.
         static WORD: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
         let word = WORD.get_or_init(|| {
-            regex::Regex::new(r"(?i)\b(East|West|Pacific|Central|Mountain|Atlantic)\b")
+            regex::Regex::new(&format!(r"(?i)\b({})\b", regional_alternation()))
                 .expect("static regex")
         });
         let last = word.captures_iter(name).last().and_then(|caps| caps.get(1));
@@ -410,26 +423,15 @@ pub fn premium_db_names(databases: &[String]) -> Vec<String> {
     let mut names = Vec::new();
     let mut seen = HashSet::new();
     for code in databases {
-        let Some(raw) = crosstalk_matching::data::merged::merged_database_json(code) else {
+        let Some(db) = crosstalk_matching::data::merged::merged_channels(code) else {
             continue;
         };
-        let parsed: serde_json::Value = serde_json::from_str(raw).unwrap_or_default();
-        let channels = parsed
-            .get("channels")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        for channel in channels {
-            let name = channel
-                .get("channel_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            if name.is_empty() || !seen.insert(name.clone()) {
+        for channel in &db.channels {
+            let name = channel.channel_name.trim();
+            if name.is_empty() || !seen.insert(name.to_string()) {
                 continue;
             }
-            names.push(name);
+            names.push(name.to_string());
         }
     }
     names
@@ -543,6 +545,19 @@ pub enum NameTarget {
     Unmatched,
 }
 
+impl NameTarget {
+    /// The name this target would write, when it writes one (`Ota` with a rendered
+    /// template, or `Premium`); `None` for a blocked callsign, an unrenderable OTA
+    /// template and an unmatched name.
+    pub fn target_name(&self) -> Option<String> {
+        match self {
+            NameTarget::Ota { name, .. } => name.clone(),
+            NameTarget::Premium { name, .. } => Some(name.clone()),
+            NameTarget::BlockedCallsign(_) | NameTarget::Unmatched => None,
+        }
+    }
+}
+
 /// Resolve a name's [`NameTarget`]: the OTA decision ([`decide_ota_target`]),
 /// else the premium family.
 pub fn decide_target(
@@ -558,6 +573,21 @@ pub fn decide_target(
     }
     // Premium: the best identity family against the merged DB at the cut.
     let family = engine.rank_index(name, index);
+    decide_target_with_family(name, identity, &family, db_names, settings)
+}
+
+/// [`decide_target`] over a family the caller already ranked (the run ranks each
+/// channel once, for the identity cache and the decision alike).
+pub fn decide_target_with_family(
+    name: &str,
+    identity: &Identity,
+    family: &[EngineRanked],
+    db_names: &[String],
+    settings: &crate::settings::LineupSettings,
+) -> NameTarget {
+    if let Some(target) = decide_ota_target(name, identity, settings) {
+        return target;
+    }
     match family.first() {
         Some(top) => {
             let base = db_names.get(top.index).cloned().unwrap_or_default();
@@ -648,6 +678,18 @@ pub fn decide_heuristic(
     db_names: &[String],
     settings: &crate::settings::LineupSettings,
 ) -> (NameRow, bool) {
+    let family = engine.rank_index(&channel.name, index);
+    decide_heuristic_with_family(channel, identity, &family, db_names, settings)
+}
+
+/// [`decide_heuristic`] over a family the caller already ranked.
+pub fn decide_heuristic_with_family(
+    channel: &ScopedChannel,
+    identity: &Identity,
+    family: &[EngineRanked],
+    db_names: &[String],
+    settings: &crate::settings::LineupSettings,
+) -> (NameRow, bool) {
     let base_row =
         |status: &'static str, new: String, matcher: &str, method: String, reason: String| {
             NameRow {
@@ -673,7 +715,7 @@ pub fn decide_heuristic(
         )
     };
 
-    match decide_target(&channel.name, identity, engine, index, db_names, settings) {
+    match decide_target_with_family(&channel.name, identity, family, db_names, settings) {
         NameTarget::Ota {
             callsign,
             market,
@@ -992,15 +1034,24 @@ pub async fn run_with_service(
 
     // Heuristic decisions + families for the identity warm-up.
     let ctx = ResolveContext::default();
+    // One resolve and one rank per channel, on every core (the plan's multi-threading
+    // rule, as guide and streams score their families): 20k channels rank in seconds,
+    // not the half minute a serial walk costs (phase 3 review bench).
+    let decided: Vec<(Vec<EngineRanked>, NameRow, bool)> = channels
+        .par_iter()
+        .map(|channel| {
+            let identity = run_engine.resolve(&channel.name, &ctx);
+            let family = engine.rank_index(&channel.name, &index);
+            let (row, no_family) =
+                decide_heuristic_with_family(channel, &identity, &family, &db_names, settings);
+            (family, row, no_family)
+        })
+        .collect();
     let mut rows: Vec<NameRow> = Vec::with_capacity(channels.len());
     let mut families: Vec<Vec<EngineRanked>> = Vec::with_capacity(channels.len());
     let mut borderline: Vec<usize> = Vec::new();
-    for (ordinal, channel) in channels.iter().enumerate() {
-        let identity = run_engine.resolve(&channel.name, &ctx);
-        let family = engine.rank_index(&channel.name, &index);
-        families.push(family.clone());
-        let (row, no_family) =
-            decide_heuristic(channel, &identity, &engine, &index, &db_names, settings);
+    for (ordinal, (family, row, no_family)) in decided.into_iter().enumerate() {
+        families.push(family);
         // Borderline = premium path with no family and the AI gate armed. The flag
         // comes from the decision itself, not the row's wording: a tagged unmatched
         // row (`[Unk]`, the default) is borderline, an already-correct premium or
@@ -1526,13 +1577,19 @@ mod tests {
     fn renames_keep_the_identity_family() {
         // The invariant: re-resolving the new name lands in the same family.
         //
-        // Documented OTA exception: the `{NETWORK} - {STATE} {CITY} ({CALLSIGN})`
+        // OTA renames hold it too since the phase 3 review (decided C08
+        // `station-callsign-family`): the `{NETWORK} - {STATE} {CITY} ({CALLSIGN})`
         // template changes the normalize KEY (`13 WREX` keys as `13 wrex`, the
-        // template as `nbc il rockford`), so `same_family` — which compares keys —
-        // does not hold. The callsign IS kept (`WREX` -> `WREX`), and callsign
-        // identity ignores country (bug-161), so the broadcast entity is the same
-        // station under a different display shape. Premium renames always hold the
-        // invariant: the new name re-attaches tags onto the family's DB canonical.
+        // template as `nbc il rockford`), but two same-station callsign names are one
+        // family, so the renamed channel stays in the family it came from. The one
+        // documented exception: a name whose callsign the ladder reads at LOW
+        // confidence (`16 WAPT on Very Local`, the loose any-word read) still takes
+        // the OTA path, as CM's does (C06 `cm-ota-path`: any extracted callsign),
+        // and the template it lands on is a HIGH-confidence spelling — the rename
+        // promotes a weak read the engine's family would not have trusted, so the
+        // family moves onto the station (the point of the rename). The callsign is
+        // kept either way (`WREX` -> `WREX`), and callsign identity ignores country
+        // (bug-161). Premium renames re-attach tags onto the family's DB canonical.
         let (engine, index, db_names) = test_engine();
         let mut checked = 0;
         let mut premium_checked = 0;
@@ -1567,6 +1624,23 @@ mod tests {
                     "OTA keeps the callsign: {name:?} -> {:?}",
                     row.new
                 );
+                if identity.callsign_high {
+                    assert!(
+                        after.same_family(&identity),
+                        "C08: the OTA template stays in the station's family: {name:?} -> {:?}: \
+                         {identity:?} vs {after:?}",
+                        row.new
+                    );
+                } else {
+                    assert!(
+                        after.callsign_high,
+                        "a low-confidence callsign rename lands on a high-confidence spelling: \
+                         {name:?} -> {:?}",
+                        row.new
+                    );
+                    ota_documented.push(format!("low-confidence read {name:?} -> {:?}", row.new));
+                    continue;
+                }
                 ota_documented.push(format!("{name:?} -> {:?}", row.new));
                 continue;
             }

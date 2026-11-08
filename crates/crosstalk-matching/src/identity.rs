@@ -13,7 +13,10 @@
 //! Two identities are the same channel ([`Identity::same_family`]) when their
 //! [`FamilyKey`] agrees AND their countries are compatible:
 //! - `key`: the decided normalize key (lowercased; nospace-insensitive only for alias
-//!   resolution, never for identity);
+//!   resolution, never for identity) of the ALIAS CANONICAL when the name resolves
+//!   through the merged alias table (decided A05, phase 3 review: `CNN USA` and `CNN`
+//!   are one family, as the alias table says and as the pairwise alias stage already
+//!   scored them), else of the name itself ([`UnifiedEngine::identity_key`]);
 //! - `zone`: the routed feed zone ([`FeedZone`], `(P)` = `Default` per Z07);
 //! - `timeshift`: the `+N` marker flag;
 //! - `callsign`: the normalized shared-core callsign (`None` == `None`; a one-sided
@@ -27,6 +30,18 @@
 //!   ([`lineuparr_cross_border_ok`]), and a callsign-bearing identity ignores country
 //!   (Stream-Mapparr bug-161: OTA identity is the FCC callsign; `CA:`/`IN:` state
 //!   prefixes read as foreign countries).
+//!
+//! One more relation rides on top of key equality (decided C08
+//! `station-callsign-family`, orchestrator, phase 3 review): two names carrying the
+//! SAME high-confidence callsign of a merged station are one broadcast entity whatever
+//! else they say — `KSDK`, `KSDK HD`, `13 WREX`, `NBC (KSDK)`, `US: NBC (KSDK) HD`,
+//! `NBC 5 St. Louis KSDK`, `NBC - IL Rockford (WREX)` — unless one of them names a
+//! subchannel (`KSDK-DT2`, `WREX 13.2`), which is a different channel of the station;
+//! see [`station_callsign_family`]. This is the D04 anchor's own verdict (high/high
+//! same callsign = 95, same channel) carried into the family. Without it the answer
+//! depended on the pool: `KSDK` joined `US: NBC (KSDK) HD`'s family only when no
+//! `NBC (KSDK)` spelling was also present to lead it, and the OTA template left a
+//! renamed channel outside the family it came from.
 //!
 //! Country is a compatibility rule rather than a [`FamilyKey`] field because unknown
 //! is a wildcard. A family therefore fixes ONE country: the query's (name marker or
@@ -94,6 +109,102 @@ pub struct Identity {
     pub tags: Vec<String>,
     /// The normalize key this identity compares on (decided normalizer, lowercased).
     pub key: String,
+    /// Whether the callsign was read at high confidence (the shared ladder's positional
+    /// confidence, the D04 anchor's precondition). Read by [`station_callsign_family`].
+    pub callsign_high: bool,
+}
+
+/// What is left of a callsign identity's key once the callsign itself is taken out
+/// (decided C08 `station-callsign-family`: only a subchannel residue keeps two
+/// same-callsign identities apart).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallsignResidue {
+    /// Nothing, or one bare number (`KSDK`, `WABC-TV`, `13 WREX`, `KSDK HD`): the
+    /// station itself, with no network, city or subchannel of its own.
+    Bare,
+    /// A subchannel designator (`KSDK-DT2`, `KSPT-DT3`, `WREX 13.2`): a different
+    /// channel of the same station.
+    Subchannel,
+    /// Anything else (`NBC (KSDK)`, `KOMO News`, `ABC 7 New York (WABC)`).
+    Other,
+}
+
+/// Classify a callsign identity's key (see [`CallsignResidue`]).
+///
+/// Tokens of the lowercased key equal to the callsign base, to one of the
+/// `normalize_callsign` suffix words (`tv`, `dt`, `cd`, `lp`, `ld`, which the
+/// normalizer splits off as their own token: `WABC-TV` keys as `wabc tv`) are dropped;
+/// a `dt<N>`/`d<N>` token or a dotted number (`13.2`) makes it a subchannel; at most
+/// one plain number left is bare; anything else is other. Mirrored byte for byte in
+/// `scripts/corpus/engine_parity.py` (`callsign_residue`).
+pub fn callsign_residue(key: &str, callsign: &str) -> CallsignResidue {
+    let base = callsign.to_lowercase();
+    let mut digits = 0usize;
+    let mut other = false;
+    for token in key.split_whitespace() {
+        if token == base || matches!(token, "tv" | "dt" | "cd" | "lp" | "ld") {
+            continue;
+        }
+        if is_subchannel_token(token) {
+            return CallsignResidue::Subchannel;
+        }
+        if token.chars().all(|c| c.is_ascii_digit()) {
+            digits += 1;
+            continue;
+        }
+        other = true;
+    }
+    if digits > 1 {
+        CallsignResidue::Subchannel
+    } else if other {
+        CallsignResidue::Other
+    } else {
+        CallsignResidue::Bare
+    }
+}
+
+fn is_subchannel_token(token: &str) -> bool {
+    let designator = token
+        .strip_prefix("dt")
+        .or_else(|| token.strip_prefix('d'))
+        .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()));
+    if designator {
+        return true;
+    }
+    match token.split_once('.') {
+        Some((major, minor)) => {
+            !major.is_empty()
+                && !minor.is_empty()
+                && major.chars().all(|c| c.is_ascii_digit())
+                && minor.chars().all(|c| c.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
+/// Decided C08 `station-callsign-family`: whether two callsign identities whose keys
+/// differ are still one family because they are the same station.
+///
+/// Both carry the SAME callsign, read at high confidence on both sides (the D04
+/// anchor's rule, which is also what the pairwise scorer needs to score the pair at
+/// all), the callsign is a station in the merged table, zone and timeshift agree, and
+/// neither side's residue is a [`CallsignResidue::Subchannel`]. Key-equal identities
+/// never need this.
+pub fn station_callsign_family(a: &FamilyKey, a_high: bool, b: &FamilyKey, b_high: bool) -> bool {
+    let (Some(callsign), Some(other)) = (a.callsign.as_deref(), b.callsign.as_deref()) else {
+        return false;
+    };
+    if callsign != other
+        || !a_high
+        || !b_high
+        || a.zone != b.zone
+        || a.timeshift != b.timeshift
+        || !crate::data::merged::is_merged_station(callsign)
+    {
+        return false;
+    }
+    callsign_residue(&a.key, callsign) != CallsignResidue::Subchannel
+        && callsign_residue(&b.key, callsign) != CallsignResidue::Subchannel
 }
 
 impl Identity {
@@ -107,15 +218,23 @@ impl Identity {
         }
     }
 
-    /// Identity equality: [`FamilyKey`] equality plus country compatibility.
+    /// Identity equality: [`FamilyKey`] equality (or the bare-callsign rule, C08) plus
+    /// country compatibility.
     ///
     /// See the module docs for the rule and for why network/category/region/tags are
     /// excluded.
     pub fn same_family(&self, other: &Identity) -> bool {
-        self.key == other.key
+        let keys_equal = self.key == other.key
             && self.zone == other.zone
             && self.timeshift == other.timeshift
-            && self.callsign == other.callsign
+            && self.callsign == other.callsign;
+        (keys_equal
+            || station_callsign_family(
+                &self.family_key(),
+                self.callsign_high,
+                &other.family_key(),
+                other.callsign_high,
+            ))
             && countries_compatible(
                 self.country.as_deref(),
                 other.country.as_deref(),
@@ -145,9 +264,10 @@ pub struct ResolveContext {
 /// name), so resolution reads the trimmed name throughout.
 pub fn resolve_with(engine: &UnifiedEngine, name: &str, ctx: &ResolveContext) -> Identity {
     let name = name.trim();
-    let key = engine.normalize_key(name).to_lowercase();
-    let callsign = engine
-        .callsign_of(name)
+    let canonical = engine.alias_canonical(name);
+    let key = engine.identity_key(name, canonical.as_deref());
+    let (raw_callsign, callsign_high) = engine.callsign_confidence(name);
+    let callsign = raw_callsign
         .as_deref()
         .map(crate::callsign::normalize_callsign);
     let network = crate::callsign::network_keyword(name);
@@ -175,9 +295,7 @@ pub fn resolve_with(engine: &UnifiedEngine, name: &str, ctx: &ResolveContext) ->
             _ => tags.push(format!("[{}]", tag.canonical)),
         }
     }
-    let canonical_name = engine
-        .alias_canonical(name)
-        .unwrap_or_else(|| name.to_string());
+    let canonical_name = canonical.unwrap_or_else(|| name.to_string());
     Identity {
         canonical_name,
         callsign,
@@ -189,6 +307,7 @@ pub fn resolve_with(engine: &UnifiedEngine, name: &str, ctx: &ResolveContext) ->
         timeshift: is_time_shift(name),
         tags,
         key,
+        callsign_high,
     }
 }
 
@@ -330,6 +449,7 @@ impl IdentityCache {
             "timeshift": identity.timeshift,
             "tags": identity.tags,
             "key": identity.key,
+            "callsign_high": identity.callsign_high,
         })
         .to_string()
     }
@@ -373,6 +493,9 @@ impl IdentityCache {
                 .filter_map(|t| t.as_str().map(str::to_string))
                 .collect(),
             key: value.get("key")?.as_str()?.to_string(),
+            // Rows written before the field existed are a different engine version
+            // (the cache namespace misses them), so a missing flag is shape drift.
+            callsign_high: value.get("callsign_high")?.as_bool()?,
         })
     }
 }

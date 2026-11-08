@@ -438,29 +438,25 @@ impl JobContext {
                          needs the run store"
                     )
                 })?;
-                match registry.resolve_named_scope(name, &self.config, world, store)? {
+                let resolved = registry.resolve_named_scope(name, &self.config, world, store)?;
+                match resolved {
                     crate::subapp::NamedScopeResolution::Scope(scope) => Ok(ResolvedScope {
                         tables: scope,
                         limit: None,
                         label: format!("in scope {name:?}"),
                         scope_hints: crate::subapp::NamedScopeHints::none(),
                     }),
-                    crate::subapp::NamedScopeResolution::Channels(ids) => {
-                        let limit: std::collections::HashSet<i64> = ids.into_iter().collect();
+                    // An id set, hinted or not: the ids bound the run and the hints (a
+                    // lineup file's country) ride beside them.
+                    ref ids @ (crate::subapp::NamedScopeResolution::Channels(_)
+                    | crate::subapp::NamedScopeResolution::ChannelsWithHints { .. }) => {
+                        let limit: std::collections::HashSet<i64> =
+                            ids.ids().iter().copied().collect();
                         Ok(ResolvedScope {
                             tables: crate::config::ScopeConfig::default(),
                             limit: Some(limit),
                             label: format!("in scope {name:?}"),
-                            scope_hints: crate::subapp::NamedScopeHints::none(),
-                        })
-                    }
-                    crate::subapp::NamedScopeResolution::ChannelsWithHints { ids, hints } => {
-                        let limit: std::collections::HashSet<i64> = ids.into_iter().collect();
-                        Ok(ResolvedScope {
-                            tables: crate::config::ScopeConfig::default(),
-                            limit: Some(limit),
-                            label: format!("in scope {name:?}"),
-                            scope_hints: hints,
+                            scope_hints: ids.hints(),
                         })
                     }
                 }

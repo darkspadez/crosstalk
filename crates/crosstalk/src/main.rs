@@ -113,6 +113,27 @@ struct BenchArgs {
 enum BenchTarget {
     /// Benchmark the streams sub-app: match, sort, mirror and visibility plans.
     Streams(StreamsBenchArgs),
+    /// Benchmark the lineup sub-app: clean, names, categorize, logos and sync plans.
+    Lineup(LineupBenchArgs),
+}
+
+/// `bench lineup` has one mode, synthetic: the lineup plans read the whole world and
+/// write per-channel values, so a live timing would be the streams bench's `--live` read
+/// again. The flag is still required, so the command says what it measured.
+#[derive(Args, Debug)]
+struct LineupBenchArgs {
+    /// Directory holding the configuration files.
+    #[arg(long, default_value = "config", env = "CROSSTALK_CONFIG_DIR")]
+    config: PathBuf,
+    /// Time a synthetic world built in memory. No network, no Dispatcharr.
+    #[arg(long, required = true)]
+    synthetic: bool,
+    /// Synthetic channels to build for the clean/names/categorize/logos plans.
+    #[arg(long, default_value_t = 20_000)]
+    channels: usize,
+    /// Lineup entries to sync (the first N of the configured lineup file).
+    #[arg(long = "lineup-channels", default_value_t = 500)]
+    lineup_channels: usize,
 }
 
 /// One of `--synthetic` or `--live` must be chosen: a bench that silently measured nothing
@@ -281,6 +302,7 @@ fn main() -> Result<()> {
         Command::Run(args) => run_once(args),
         Command::Bench(args) => match args.target {
             BenchTarget::Streams(args) => bench_streams(args),
+            BenchTarget::Lineup(args) => bench_lineup(args),
         },
         Command::Validate(args) => validate(args),
         Command::Undo(args) => undo_once(args),
@@ -784,6 +806,28 @@ fn bench_streams(args: StreamsBenchArgs) -> Result<()> {
         let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
         runtime.block_on(crosstalk_streams::bench::live(&config, &settings, ids))?
     };
+    report
+        .notes
+        .insert(0, format!("settings: {}", settings_path.display()));
+    report.print();
+    Ok(())
+}
+
+/// `bench lineup --synthetic`: the lineup plans at the plan's scale (20k channels, a
+/// 500-entry lineup), over the lineup settings in front of the operator.
+fn bench_lineup(args: LineupBenchArgs) -> Result<()> {
+    let config = CrosstalkConfig::load(&args.config)?;
+    let registry = registry::builtin();
+    let app = registry
+        .get(crosstalk_lineup::APP_ID)
+        .expect("the lineup app is registered");
+    let settings_path = app.settings_path(&config.config_dir);
+    let settings = crosstalk_lineup::settings::load(&settings_path)?;
+    let options = crosstalk_lineup::bench::SyntheticOptions {
+        channels: args.channels,
+        lineup_channels: args.lineup_channels,
+    };
+    let mut report = crosstalk_lineup::bench::synthetic(&settings, &config.matching, &options)?;
     report
         .notes
         .insert(0, format!("settings: {}", settings_path.display()));
@@ -1402,6 +1446,41 @@ mod cli_tests {
         assert_eq!(args.channels, 500);
         assert_eq!(args.streams, 1_000);
         assert_eq!(args.accounts, 5);
+    }
+
+    #[test]
+    fn bench_lineup_is_synthetic_with_the_plan_sizes() {
+        let args = match parse(&["crosstalk", "bench", "lineup", "--synthetic"]).command {
+            Command::Bench(BenchArgs {
+                target: BenchTarget::Lineup(args),
+            }) => args,
+            other => panic!("expected a bench lineup command, got {other:?}"),
+        };
+        assert!(args.synthetic);
+        assert_eq!(args.channels, 20_000);
+        assert_eq!(args.lineup_channels, 500);
+        assert_eq!(args.config, Path::new("config"));
+        // The mode is spelled out: a bench that measured nothing in particular is refused.
+        assert!(Cli::try_parse_from(["crosstalk", "bench", "lineup"]).is_err());
+        let small = match parse(&[
+            "crosstalk",
+            "bench",
+            "lineup",
+            "--synthetic",
+            "--channels",
+            "300",
+            "--lineup-channels",
+            "40",
+        ])
+        .command
+        {
+            Command::Bench(BenchArgs {
+                target: BenchTarget::Lineup(args),
+            }) => args,
+            other => panic!("expected a bench lineup command, got {other:?}"),
+        };
+        assert_eq!(small.channels, 300);
+        assert_eq!(small.lineup_channels, 40);
     }
 
     #[test]

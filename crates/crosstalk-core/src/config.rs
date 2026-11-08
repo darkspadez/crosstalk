@@ -444,8 +444,10 @@ pub struct MatchingConfig {
     pub ignore_geographic_tags: bool,
     /// Strip other parenthesised tags.
     pub ignore_misc_tags: bool,
-    /// Country database codes the matcher may draw names from. Empty means "the default
-    /// set", which is every shipped database when only one exists, otherwise the US one.
+    /// Country database codes the matcher may draw names from: any of the merged data
+    /// set's countries (`crosstalk_matching::data::merged::merged_codes`: AU, BR, CA, DE,
+    /// DO, ES, FR, IN, MX, NL, NO, PE, PL, PT, UK, US). Empty means "the default set",
+    /// which is every merged database when only one exists, otherwise the US one.
     pub enabled_databases: Vec<String>,
     /// Custom aliases, a table of `name -> [aliases]`. An entry REPLACES the built-in list
     /// for that key rather than adding to it.
@@ -530,12 +532,13 @@ impl MatchingConfig {
         }
     }
 
-    /// Which country databases to load.
+    /// Which country databases to load, out of the MERGED data set (the one table
+    /// every app reads; phase 3 review).
     ///
     /// An explicit list wins. An empty list falls back to the plugin's rule: every
     /// database when only one ships, otherwise the United States one.
     pub fn databases(&self) -> Vec<String> {
-        let available = crosstalk_matching::data::available_database_codes();
+        let available = crosstalk_matching::data::merged::merged_codes();
         if !self.enabled_databases.is_empty() {
             // Deduplicated, restricted to codes that actually ship, and sorted, which is
             // what `_select_enabled_databases` does: a stored code for a database that no
@@ -1436,13 +1439,13 @@ impl CrosstalkConfig {
             ));
         }
 
-        let available = crosstalk_matching::data::available_database_codes();
+        let available = crosstalk_matching::data::merged::merged_codes();
         for code in &self.matching.enabled_databases {
             let upper = code.trim().to_uppercase();
             if !available.contains(&upper.as_str()) {
                 report.warnings.push(format!(
-                    "matching.enabled_databases lists {code:?}, which is not shipped \
-                     (available: {})",
+                    "matching.enabled_databases lists {code:?}, which is not in the merged \
+                     data set (available: {})",
                     available.join(", ")
                 ));
             }

@@ -448,11 +448,23 @@
     },
     {
       "holds": true,
+      "statement": "Same-station callsign names are one family (C08 `station-callsign-family`) only under callsign-first ranking (C07) with the merged allowlist (C02 `merged`) and the high-confidence anchor (D04): the relation reads the same confidence and station table."
+    },
+    {
+      "holds": true,
+      "statement": "The callsign ladder strips trailing tags (C09 `strip-tags`) with the same strip the zone read uses (Z08 `strip-tags`): one definition of a writer tag."
+    },
+    {
+      "holds": true,
       "statement": "The ranker is LU's match_all_streams shape (T09), which carries the always-majority floor (T02), the guarded exact tier (T04), scaled thresholds (T05), the header skip (Z05) and LU's country rule (G01-G03, strict only once a country is configured)."
     },
     {
       "holds": true,
       "statement": "Aliases resolve through one index: `identity` (A01) is CM's reverse index (A02) over the merged table (A03)."
+    },
+    {
+      "holds": true,
+      "statement": "An alias member keys as its canonical (A05 `canonical-key`) only with the identity alias resolve (A01 `identity`): the key reads the same reverse index."
     }
   ],
   "country_conflicts": [
@@ -751,7 +763,7 @@
     "pairs": 28450,
     "rows_decided": {
       "no-evidence": 32,
-      "orchestrator": 4,
+      "orchestrator": 7,
       "strong": 6,
       "weak": 19
     }
@@ -935,6 +947,14 @@
       "reason": "Ablation on the base engine: 0 discriminating construction pairs (< 10): strictest variant. Measured in the alias group: LU's alias-declared callsign rescue never fires on the corpus.",
       "strictest": "none",
       "variant": "none"
+    },
+    "A05": {
+      "confidence": "orchestrator",
+      "evidence_pairs": 0,
+      "method": "orchestrated",
+      "reason": "Orchestrator decision (phase 3 review): a name the merged alias table resolves (A01 `identity`, the reverse index) takes its CANONICAL's normalize key as its identity key (`UnifiedEngine::identity_key`: `CNN USA` -> `cnn`), in the resolved identity, the candidate index and the ranker's identity-equal tie-break alike; a name the table does not resolve keeps its own key. Evidence: the pairwise alias stage already scores `CNN USA` vs `CNN` at 100 (A01), yet the family cut admitted only the top's key-mates, so the stream `CNN USA` joined channel `CNN`'s family only when no `CNN` spelling led the pool — the same pool-dependence C08 removes for callsigns, and the cross-app test (`crates/lineup/tests/cross_app_identity.rs`) failed on it. No plugin groups by identity, so there is no variant to ablate; pair verdicts are unchanged. Mirrored in `engine_parity.py` (`python_identity_key`) and probed by its `family[probe]` kind.",
+      "strictest": "canonical-key",
+      "variant": "canonical-key"
     },
     "C01": {
       "confidence": "weak",
@@ -1273,6 +1293,22 @@
       "strictest": "callsign-first",
       "variant": "callsign-first"
     },
+    "C08": {
+      "confidence": "orchestrator",
+      "evidence_pairs": 0,
+      "method": "orchestrated",
+      "reason": "Orchestrator decision (phase 3 review): two names carrying the SAME high-confidence callsign of a merged station are one identity family whatever else they say — `KSDK`, `KSDK HD`, `13 WREX`, `NBC (KSDK)`, `US: NBC (KSDK) HD`, `NBC 5 St. Louis KSDK`, `NBC - IL Rockford (WREX)` — unless one of them names a subchannel (the key minus the callsign base and its `normalize_callsign` suffix words holds a `dt<N>`/`d<N>` token, a dotted number or two plain numbers: `KSDK-DT2`, `KSPT-DT3`, `WREX 13.2`), which is a different channel of the station. The identity family cut therefore admits a candidate on equal `FamilyKey` OR this relation (`identity::station_callsign_family`: same callsign, high confidence on both sides as the D04 anchor needs, callsign in the merged station table, zone and timeshift equal, neither a subchannel). It is the D04 anchor's own verdict (high/high same callsign scores 95 = same channel) carried into the family. Evidence: `US: NBC (KSDK) HD` scored `KSDK` and `NBC 5 St. Louis KSDK` at Callsign 95 but the family cut dropped them whenever `NBC (KSDK)` was also in the pool (different key), so whether a stream attached depended on the pool's spelling (the `callsign-anchor` rows of docs/oracle-reports/streams.md: SM attached `KSDK`, the engine did not), and names' OTA template (`13 WREX` -> `NBC - IL Rockford (WREX)`) left the renamed channel outside the family it came from (the step-15 'documented exception'). No plugin groups by identity family (every plugin scores pairs), so there is no variant to ablate; pair verdicts are unchanged (corpus costs identical). Mirrored in `engine_parity.py` (`callsign_residue`, `station_callsign_family`, `python_family`) and probed by its `family[probe]` kind.",
+      "strictest": "station-callsign-family",
+      "variant": "station-callsign-family"
+    },
+    "C09": {
+      "confidence": "orchestrator",
+      "evidence_pairs": 0,
+      "method": "orchestrated",
+      "reason": "Orchestrator decision (phase 3 review): the callsign ladder reads the name with its trailing run of writer tags stripped (`tags::strip_writer_tags`: the Z08 strip's quality/junk/status brackets and bare words — regional words, unknown groups and country markers stop the run — WITHOUT the `+N` peel, so a time-shifted feed keeps the shared core's low-confidence read and `Local CBS KMOV +1` is never anchored onto `Local CBS KMOV`: with the shift peeled the corpus gained 10 false positives, all `+1` pairs), in the engine's `callsign_confidence` only (the shared-core transcription the oracles drive is unchanged). Evidence: the shared core's end-of-name read (high confidence) needs the callsign LAST, so `KSDK HD`, `KSDK [HD]`, `KSDK-TV HD` and `USA | WABC-TV FHD` fell to the loose any-word read (low) while `KSDK` and `US: KSDK` read high; the D04 anchor needs high on both sides, so `NBC (KSDK)` anchored `KSDK` at 95 and `KSDK HD` at 0 — a decoration moved the family, against the identity rule that a quality tag never does (`decoration_keeps_the_family_key`). No plugin strips tags before its ladder, so there is no variant to ablate; the decided Python configuration wraps the ladder the same way (`ablate.Engine`), and `engine_parity.py`'s `callsign` kind checks every corpus name.",
+      "strictest": "strip-tags",
+      "variant": "strip-tags"
+    },
     "D01": {
       "confidence": "no-evidence",
       "evidence_pairs": 0,
@@ -1610,8 +1646,8 @@
       "costs": {
         "80": {
           "cm-keep": {
-            "cost": 230,
-            "fn": 230,
+            "cost": 227,
+            "fn": 227,
             "fp": 0,
             "tn": 1,
             "tp": 0
@@ -1621,11 +1657,11 @@
             "fn": 0,
             "fp": 1,
             "tn": 0,
-            "tp": 230
+            "tp": 227
           },
           "janitor": {
-            "cost": 230,
-            "fn": 230,
+            "cost": 227,
+            "fn": 227,
             "fp": 0,
             "tn": 1,
             "tp": 0
@@ -1633,8 +1669,8 @@
         },
         "90": {
           "cm-keep": {
-            "cost": 265,
-            "fn": 265,
+            "cost": 262,
+            "fn": 262,
             "fp": 0,
             "tn": 1,
             "tp": 0
@@ -1644,21 +1680,21 @@
             "fn": 0,
             "fp": 1,
             "tn": 0,
-            "tp": 265
+            "tp": 262
           },
           "janitor": {
-            "cost": 265,
-            "fn": 265,
+            "cost": 262,
+            "fn": 262,
             "fp": 0,
             "tn": 1,
             "tp": 0
           }
         }
       },
-      "evidence_pairs": 231,
-      "evidenced_share": 0.5108,
+      "evidence_pairs": 228,
+      "evidenced_share": 0.5088,
       "method": "ablation",
-      "reason": "Ablation on the base engine: 231 discriminating construction pairs; cost (2*FP+FN) 2 vs 230 for runner-up `cm-keep`; same winner at cut 90; 51% of the deciding pairs on evidenced forms. Rests on positives only: a pair differing only by a quality tag is the same channel by construction (the plan keeps quality as an identity attribute, not identity), so no negative exists; the deciding forms are HEVC (15 real names) and HDR (1).",
+      "reason": "Ablation on the base engine: 228 discriminating construction pairs; cost (2*FP+FN) 2 vs 227 for runner-up `cm-keep`; same winner at cut 90; 51% of the deciding pairs on evidenced forms. Rests on positives only: a pair differing only by a quality tag is the same channel by construction (the plan keeps quality as an identity attribute, not identity), so no negative exists; the deciding forms are HEVC (15 real names) and HDR (1).",
       "strictest": "cm-keep",
       "variant": "core-strip"
     },
@@ -1781,8 +1817,8 @@
       "costs": {
         "80": {
           "cm-strict": {
-            "cost": 1711,
-            "fn": 1711,
+            "cost": 1707,
+            "fn": 1707,
             "fp": 0,
             "tn": 3,
             "tp": 21
@@ -1792,20 +1828,20 @@
             "fn": 22,
             "fp": 3,
             "tn": 0,
-            "tp": 1710
+            "tp": 1706
           },
           "janitor": {
-            "cost": 663,
-            "fn": 661,
+            "cost": 660,
+            "fn": 658,
             "fp": 1,
             "tn": 2,
-            "tp": 1071
+            "tp": 1070
           }
         },
         "90": {
           "cm-strict": {
-            "cost": 1846,
-            "fn": 1846,
+            "cost": 1842,
+            "fn": 1842,
             "fp": 0,
             "tn": 1,
             "tp": 21
@@ -1815,21 +1851,21 @@
             "fn": 22,
             "fp": 1,
             "tn": 0,
-            "tp": 1845
+            "tp": 1841
           },
           "janitor": {
-            "cost": 748,
-            "fn": 748,
+            "cost": 745,
+            "fn": 745,
             "fp": 0,
             "tn": 1,
-            "tp": 1119
+            "tp": 1118
           }
         }
       },
-      "evidence_pairs": 1735,
-      "evidenced_share": 0.4888,
+      "evidence_pairs": 1731,
+      "evidenced_share": 0.4887,
       "method": "ablation",
-      "reason": "Ablation on the base engine: 1735 discriminating construction pairs; cost (2*FP+FN) 28 vs 663 for runner-up `janitor`; same winner at cut 90; 49% of the deciding pairs on evidenced forms. Negatives for bare-country stripping cannot be built safely: the plugins' own example (`UK Gold`) was the old name of `Gold`, and the near-miss filter drops pairs differing only in country tags, so this row leans to the table that strips more; weak.",
+      "reason": "Ablation on the base engine: 1731 discriminating construction pairs; cost (2*FP+FN) 28 vs 660 for runner-up `janitor`; same winner at cut 90; 49% of the deciding pairs on evidenced forms. Negatives for bare-country stripping cannot be built safely: the plugins' own example (`UK Gold`) was the old name of `Gold`, and the near-miss filter drops pairs differing only in country tags, so this row leans to the table that strips more; weak.",
       "strictest": "cm-strict",
       "variant": "core"
     },
@@ -2761,7 +2797,7 @@
       "evidence_pairs": 0,
       "majority_pairs": 0,
       "method": "whole-path",
-      "reason": "Whole-path comparison only: fewer than 10 split pairs (0); default `lu` (strictest).",
+      "reason": "Whole-path comparison only: fewer than 10 split pairs (0); default `lu` (strictest). Engine refinement (step-9 review, phase 3 review): at equal score a candidate whose WHOLE identity family key (key, zone, timeshift, callsign) equals the query's wins before the original-token overlap, so a reordered name scoring 100 by token sort cannot lead, and `UK: BBC One HD` leads with `BBC One` (Default) over `BBC One East HD` (East) although the quality word gives the East spelling one more overlapping token. Then, still before the overlap, a candidate whose OWN normalize key equals the query's (the same spelling): A05 keys an alias member as its canonical, so `Cinemax Action` and `ActionMax` (and `HBO2`/`HBO Hits`, `Discovery`/`Discovery Channel`) are identity-equal at 100 against a query spelled as either, and the query's own spelling leads rather than the pool's order (`DISCOVERY` overlaps both by one token). Mirrored in `engine_parity.py` (`python_family`).",
       "scores": {
         "cm": {
           "f1": 1.0,

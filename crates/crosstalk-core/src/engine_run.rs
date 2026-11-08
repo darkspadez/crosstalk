@@ -196,8 +196,8 @@ mod tests {
         assert_eq!(memory.resolve("US: ESPN HD", &ctx), via_run);
 
         // The version namespaces the rows: a rule change misses every old identity.
-        // `-eng:5`: network-led callsign names rank onto the station (C07, after N15's `-eng:4`).
-        assert!(run.engine().identity_version().contains("-eng:5"));
+        // `-eng:6`: a bare station callsign joins the station's family (C08, after C07's `-eng:5`).
+        assert!(run.engine().identity_version().contains("-eng:6"));
     }
 
     #[tokio::test]

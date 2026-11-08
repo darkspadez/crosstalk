@@ -193,15 +193,24 @@ def rows(path):
     with open(path + "per_stream_matches.csv", newline="", encoding="utf-8") as fh:
         return {row["stream_name"]: row for row in csv.DictReader(fh)}
 py, rs = rows(sys.argv[1]), rows(sys.argv[2])
+# Every channel whose identity family takes the stream in the unified run (two
+# spellings of one identity both take it, decided A05); `best_channel` is the first.
+families = {}
+with open(sys.argv[2] + "families.csv", newline="", encoding="utf-8") as fh:
+    for row in csv.DictReader(fh):
+        families.setdefault(row["stream_name"], set()).add(row["channel"])
 taken = lambda row: row["best_channel"] if row["passed"] == "True" else ""
 both = sum(1 for name in py if taken(py[name]) and taken(py[name]) == taken(rs.get(name, py[name])))
 extra = sum(1 for name in py if taken(rs.get(name, {"best_channel": "", "passed": "False"})) and not taken(py[name]))
 fewer = sum(1 for name in py if taken(py[name]) and not taken(rs.get(name, {"best_channel": "", "passed": "False"})))
-other = sum(1 for name in py if taken(py[name]) and taken(rs.get(name, {"best_channel": "", "passed": "False"}))
-            and taken(py[name]) != taken(rs[name]))
+others = [name for name in py if taken(py[name]) and taken(rs.get(name, {"best_channel": "", "passed": "False"}))
+          and taken(py[name]) != taken(rs[name])]
+same_identity = sum(1 for name in others if taken(py[name]) in families.get(name, ()))
 print(f"[unified] {len(py)} stream(s): {both} take the same channel as match_sim.py, "
       f"{fewer} only the Python tool passes, {extra} only the unified engine passes, "
-      f"{other} pass to a different channel (report; the migration diff)")
+      f"{len(others)} pass to a different channel, of which {same_identity} also pass to the "
+      f"Python tool's channel (two spellings of one identity, decided A05; both take the stream) "
+      f"(report; the migration diff)")
 PY
 
 if [ "$status" -eq 0 ]; then

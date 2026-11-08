@@ -17,6 +17,7 @@ crosstalk-matching.workspace = true
 crosstalk-streams.workspace = true
 
 anyhow.workspace = true
+rayon.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 toml.workspace = true

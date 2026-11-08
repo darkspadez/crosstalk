@@ -340,8 +340,9 @@ Each step: Muse Spark 1.3 Contributor implements → gate → Opus 5.5 reviews a
 - [x] 19. `streams.match` lineup mode + `full_sync` example workflow.
 - [x] 20. Docs: README (one matcher, decisions doc, every app's actions, differences, undo, AI
   chain), example configs, bench numbers.
-- [ ] Phase end: Fable 5.1 review and fixes over the whole phase (cross-app consistency: the
-  same name must yield the same identity and family in guide, streams and lineup).
+- [x] Phase end: Fable 5.1 review and fixes over the whole phase (cross-app consistency: the
+  same name must yield the same identity and family in guide, streams and lineup). See
+  "Phase 3 review notes".
 
 ## Verification
 - Every step: fmt, clippy `-D warnings`, `cargo test --locked --workspace`, all existing parity
@@ -937,3 +938,109 @@ Step 19 implementation notes (Muse Spark, 2026-11-07, unreviewed; sandbox blocke
   - NIT (FIXED) — the lineup-mode report note had a literal `\n` + indentation inside the string; doc for a country-less lineup file said it behaved like the explicit filter (it behaves like an ordinary run); `short` held the full filename.
   - NIT (LEFT) — `NamedScopeResolution::ids()` / `hints()` are used only by tests. `channel_ops::apply` marks a whole EPG batch failed when a later chunk fails although earlier chunks landed (shared with cleanup); undo then skips those landed rows. A per-chunk outcome from `batch_set_epg` would fix both callers. Observation for the phase review: `BBC One UK` does not join `BBC One`'s family (country-qualified identity), so a guide entry spelled that way stays unmatched.
   - Verified: no streams -> lineup edge (hint lives in core); hints never widen the set (the id bound is unchanged, hints ride beside it); `effective_channel_country` = hint default, own identity country wins when different, callsign identities exempt at all three callers (grouping key, `group_country`, `same_country_ids_for`); setting default `true` in code, schema and `streams.example.toml`.
+
+## Phase 3 review notes (Fable 5.1, 2026-11-07)
+
+What phase 4 must know; everything below is in the "Phase 3 review fixes" commit unless
+marked LEFT.
+
+- **Engine rows added (orchestrator-style, `ENGINE_VERSION` 5 → 6, identity cache
+  invalidated; corpus cost unchanged at 844/80 and 835/95).** C08
+  `station-callsign-family`: two names carrying the same HIGH-confidence merged-station
+  callsign (zone and timeshift equal, neither a subchannel: `KSDK-DT2`, `WREX 13.2`) are
+  one identity family whatever else they say (`identity::station_callsign_family`, the
+  family cut's second test beside `FamilyKey` equality, `EngineIndex::same_family`).
+  C09 `strip-tags`: the callsign ladder reads the name through `tags::strip_writer_tags`
+  (the Z08 strip WITHOUT the `+N` peel — peeling the shift cost 10 corpus false
+  positives, all `+1` pairs), so `KSDK HD` / `USA | WABC-TV FHD` are high-confidence like
+  `KSDK`. A05 `canonical-key`: a name the alias table resolves takes its canonical's
+  normalize key as its identity key (`UnifiedEngine::identity_key`; `CNN USA` is in
+  `CNN`'s family). T12 refinement: the equal-score tie-break compares the WHOLE family
+  key (zone/shift/callsign too), so `UK: BBC One HD` leads with `BBC One` rather than
+  `BBC One East HD` (the quality word had given the East spelling one more overlapping
+  token, and the East family won). All four mirrored in `scripts/corpus/engine_parity.py`
+  (`python_identity_key`, `callsign_residue`, `station_callsign_family`, `python_family`;
+  fixed `family[probe]` cases) and `ablate.py` (ladder wrapper, self-test); rows and
+  coherence checks in `decide.py`, inventory rows C08/C09/A05.
+- **Guide simulator regression judged (second pass).** The `[unified]` line of
+  `docs/oracle-reports/guide.md` moved from 72 to 117 "different channel" streams with
+  the rows above. Every moved stream was diffed against the pre-review binary over the
+  full `sim_parity.sh` corpus (35k channels x 10k streams): 182 streams changed, all A05
+  (`identity_key` through the alias reverse index, nospace-tolerant). Three classes: (1)
+  34 streams only the Python tool passed now pass (`ABCNewsLive`, `HBOComedy`,
+  `WGNAmerica` -> `NewsNation`: the run-together spelling resolves through the alias
+  table, and the family cut no longer drops it for having a different own key) —
+  right; (2) 103 streams a SECOND channel also takes: two spellings of one identity
+  (`Cinemax Action`/`ActionMax`, `HBO2`/`HBO Hits`, `MGM+`/`Epix`, `GSN`/`Game Show
+  Network`, `CTN`/`Christian Television Network`, `BBC World News`/`BBC News`,
+  `True Crime Network`/`Justice Central`, `Discovery`/`Discovery Channel`; the merged
+  alias table lists each pair under one canonical, most from all four plugins) — right
+  by the alias data: streams attaches such a stream to both channels, and the simulator's
+  per-stream column, which inverts channel-as-query results and breaks ties in channel
+  order exactly as `match_sim.py` does, shows whichever channel comes first. Real
+  divergences from the tool fell from 276 to 228 on the full corpus. (3) The accented
+  pairs (`UniMás`/`UniMas`, `Galavisión`, `CNN en Español`) moved for the same reason
+  (the alias table joins the spellings). One wrong family inside class 2, LEFT:
+  `Al Jazeera (Arabic)` keys as `Al Jazeera English` because the decided normalizer
+  drops the parenthetical (`Al Jazeera`) and the alias table lists bare `Al Jazeera HD`
+  under the English channel; the pairwise verdict (A01, 100) predates A05, which only
+  made the family agree with it. A data fix (an Arabic canonical in the alias table) is
+  the remedy, not a rule. Also LEFT: a run-together regional spelling (`StarzKidsWest`)
+  loses its zone through the nospace alias lookup (`Starz Kids & Family`'s family, not
+  `Starz Kids West`'s), a synthetic shape no corpus name has.
+  Two fixes came out of the pass, neither a decision row: (a) **T12 gains a
+  same-spelling component** — at equal score, after the identity-equal test and before
+  the overlap, a candidate whose OWN normalize key equals the query's leads, so the
+  query's spelling heads an alias family (`DISCOVERY` -> `Discovery` before `Discovery
+  Channel`; the overlap alone tied them and the pool's order decided; `tie_rank`, mirrored
+  in `engine_parity.py` `python_family`, T12 note in `decide.py`; no `ENGINE_VERSION`
+  bump: identities are unchanged, only an order among equals); guide therefore assigns
+  a channel's own spelling of an entry when the listing carries both. (b) The unified
+  simulator writes **`families.csv`** (every channel whose family takes the stream),
+  and `sim_parity.sh`'s `[unified]` line splits "different channel" into the
+  same-identity part (the Python tool's channel also takes the stream) and the rest;
+  the report script's section 2 carries the reading guide. On the report's quick
+  corpus the line now reads 117 different, of which 68 same-identity: real divergences
+  from the tool went 72 -> 49 over the review.
+- **Open items 3 and 4 as found.** `BBC One UK` was never a country-in-identity failure:
+  the engine reads no country from a trailing bare code (every plugin's detector is
+  leading-only), so `uk` stays in the key. A trailing-code engine rule was measured and
+  rejected: of 107 real names ending in a bare core code, 6 are US state codes (`FNP Eureka
+  CA`, `FNM GRAND JUNCTION CO`, `E ROCKFORD IL`), and the per-country DBs spell `Cartoon
+  Network UK` / `Comedy Central UK` as their own canonicals. The real producer of that
+  spelling was `clean`: NC's pipe step joins `BBC One | UK` to `BBC One UK`, moving the
+  identity. `clean` now keeps a final bare country-code segment delimited (`BBC One | UK`,
+  the engine's own N15 collapse; one code list, `tags::is_pipe_country_code`);
+  `clean_parity.py` attributes it as `country-segment`. The bare-callsign item was the
+  pool-dependence C08 removes (and the streams report's `callsign-anchor` rows).
+- **Cross-app test**: `crates/lineup/tests/cross_app_identity.rs` pushes five entities
+  (CNN, ESPN, BBC One, KSDK, WREX) spelled as channel / stream / guide entry through
+  identity, guide's and streams' family rankers, `names`, `categorize`, create's owner
+  key and `clean`, with distractors; it found A05, the tie-break and the clean
+  divergence above. It runs with `[matching] enabled_databases = ["US", "UK"]`.
+- **One merged data set, really.** `data::merged::merged_channels(code)` is the one parsed
+  loader (`merged_country_labels()` beside it); lineup's names/categorize and streams'
+  `ChannelDatabase::shipped` read it. `[matching] enabled_databases` accepts the merged
+  codes (DO/PE/PL/PT included); `data/channels/` and `data/stream-mapparr/` are now
+  oracle/test data only (the shipped-table accessors stay for the parity harnesses).
+- **Scale.** `crosstalk bench lineup --synthetic` (20k channels, 500-entry lineup; README
+  "Scale") found the lineup plans serial and `names` ranking twice; names/categorize/logos
+  now resolve and rank on rayon, `names` ranks once (`decide_*_with_family`), and the
+  engine's fuzzy stage reads the precomputed token-sorted forms instead of re-tokenising
+  every pair (that alone was most of a 20k plan: names 31 s serial / 38 s parallel →
+  7.7 s; categorize 31 s → 2.5 s). Guide and streams share the engine fix.
+- **Per-chunk `batch-set-epg`.** `DispatcharrClient::batch_set_epg_outcome` returns how many
+  leading associations landed; `channel_ops::apply` marks those rows `ok` and only the
+  failing chunk onward `failed`, so undo sees what is in effect (guide match/heal and
+  cleanup write through it).
+- **README "writes more" rows** each now cite their decision (plan Decisions / parent-plan
+  rules / phase-2 plan) or say why the behaviour is acceptable; the merged-data row's
+  "one exception remains" clause is gone. Nits: `core::logos` module doc lists the network
+  tier; `NamedScopeResolution::ids()/hints()` are used by `jobs.rs`.
+- **LEFT.** The OTA rename of a LOW-confidence callsign read (`16 WAPT on Very Local`, CM's
+  C06 `cm-ota-path`) lands on a high-confidence spelling, so that rename moves the family
+  onto the station by design (pinned in `renames_keep_the_identity_family` as the one
+  exception). `identity::resolve_with` costs ~3 ms CPU per name in release; the identity
+  cache hides it across runs, but a first run over 20k new names spends ~5 s of a 12-core
+  box on it — worth a profile in phase 4. Streams' `write_concurrency` beside the host cap
+  (step 13 LEFT) is unchanged.

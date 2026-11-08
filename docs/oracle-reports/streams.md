@@ -57,11 +57,10 @@ parsing, sort key, mirror plan, tools) and stay gates at 0.
 
 - channels: 225, streams: 631
 - plugin matched: 179, unified matched: 180
-- agreement (identical after-lists): 144/225 (64.0%)
-- direction: 3 channel(s) where unified attaches extra streams (14 stream(s)); 70 where it attaches fewer (107 stream(s))
+- agreement (identical after-lists): 146/225 (64.9%)
+- direction: 3 channel(s) where unified attaches extra streams (14 stream(s)); 68 where it attaches fewer (105 stream(s))
 - attribution:
   - `alias+selection`: 3
-  - `callsign-anchor`: 2
   - `cut-or-family`: 2
   - `decided-rows`: 64
   - `order`: 8
@@ -71,11 +70,11 @@ Against the known answer (streams of the channel's own database name, no contrad
 
 | | Stream-Mapparr | unified |
 |---|---|---|
-| right streams attached (of 682) | 617 | 547 |
+| right streams attached (of 682) | 617 | 549 |
 | wrong streams attached | 31 | 8 |
 
 - extra (only unified): 14 right, 0 wrong
-- fewer (only Stream-Mapparr): 84 right (missed), 23 wrong (dropped)
+- fewer (only Stream-Mapparr): 82 right (missed), 23 wrong (dropped)
 - reading it: a family holds ONE country (G03, `identity.rs`), so
   for a channel whose own country is unknown the unified engine keeps
   the unmarked feeds plus ONE country's and drops the other countries'
@@ -99,17 +98,6 @@ Against the known answer (streams of the channel's own database name, no contrad
   - plugin: ['UK: Sky Sports Football FHD', 'Sky Sports Football HD', 'US: Sky Sports Football (Backup)', 'Sky Sports Football [4K]']
   - unified: ['Sky Sports Football HD', 'US: Sky Sports Football (Backup)', 'Sky Sports Football [4K]']
   - reason: Identity family match (alias, score: 100)
-
-#### `callsign-anchor` (2)
-
-- channel `ABC (WABC)`
-  - plugin: ['WABC-TV', 'ABC 7 New York (WABC) HD']
-  - unified: ['ABC 7 New York (WABC) HD']
-  - reason: Identity family match (callsign, score: 95)
-- channel `US: NBC (KSDK) HD`
-  - plugin: ['NBC 5 St. Louis KSDK', 'KSDK']
-  - unified: ['NBC 5 St. Louis KSDK']
-  - reason: Identity family match (callsign, score: 95)
 
 #### `cut-or-family` (2)
 
@@ -215,11 +203,10 @@ Against the known answer (streams of the channel's own database name, no contrad
 
 - channels: 225, streams: 631
 - plugin matched: 181, unified matched: 179
-- agreement (identical after-lists): 159/225 (70.7%)
-- direction: 0 channel(s) where unified attaches extra streams (0 stream(s)); 58 where it attaches fewer (99 stream(s))
+- agreement (identical after-lists): 161/225 (71.6%)
+- direction: 0 channel(s) where unified attaches extra streams (0 stream(s)); 56 where it attaches fewer (97 stream(s))
 - attribution:
   - `alias+selection`: 3
-  - `callsign-anchor`: 2
   - `cut-or-family`: 2
   - `decided-rows`: 48
   - `order`: 8
@@ -229,11 +216,11 @@ Against the known answer (streams of the channel's own database name, no contrad
 
 | | Stream-Mapparr | unified |
 |---|---|---|
-| right streams attached (of 676) | 616 | 546 |
+| right streams attached (of 676) | 616 | 548 |
 | wrong streams attached | 37 | 8 |
 
 - extra (only unified): 0 right, 0 wrong
-- fewer (only Stream-Mapparr): 70 right (missed), 29 wrong (dropped)
+- fewer (only Stream-Mapparr): 68 right (missed), 29 wrong (dropped)
 - reading it: a family holds ONE country (G03, `identity.rs`), so
   for a channel whose own country is unknown the unified engine keeps
   the unmarked feeds plus ONE country's and drops the other countries'
@@ -257,17 +244,6 @@ Against the known answer (streams of the channel's own database name, no contrad
   - plugin: ['UK: Sky Sports Football FHD', 'Sky Sports Football HD', 'US: Sky Sports Football (Backup)', 'Sky Sports Football [4K]']
   - unified: ['Sky Sports Football HD', 'US: Sky Sports Football (Backup)', 'Sky Sports Football [4K]']
   - reason: Identity family match (alias, score: 100)
-
-#### `callsign-anchor` (2)
-
-- channel `ABC (WABC)`
-  - plugin: ['WABC-TV', 'ABC 7 New York (WABC) HD']
-  - unified: ['ABC 7 New York (WABC) HD']
-  - reason: Identity family match (callsign, score: 95)
-- channel `US: NBC (KSDK) HD`
-  - plugin: ['NBC 5 St. Louis KSDK', 'KSDK']
-  - unified: ['NBC 5 St. Louis KSDK']
-  - reason: Identity family match (callsign, score: 95)
 
 #### `cut-or-family` (2)
 

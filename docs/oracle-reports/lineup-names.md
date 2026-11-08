@@ -28,21 +28,21 @@ other plugins). Two settings cases: `defaults` and `market-fallback` (CM's
 
 ## Case `defaults`: representative world
 
-- 145/252 channels agree on the final name
+- 147/252 channels agree on the final name
 
 ### Differences by attribution
 
 - `ota-format`: 0
 - `ota-vs-premium`: 0
-- `premium-canonical`: 49
+- `premium-canonical`: 48
 - `cm-prefilter`: 0
-- `merged-data`: 5
+- `merged-data`: 4
 - `cut`: 0
 - `tag-reattachment`: 12
 - `unknown-tag`: 41
 - `unattributed`: 0
 
-#### premium-canonical (49)
+#### premium-canonical (48)
 
 - `UNIMAS (K10OG-D)`: CM 'UNIMAS (K10OG-D) [Unk]' (unknown) vs Rust 'UniMas (K10OG-D)' (Premium/Cable)
 - `US: UNIMAS (K10OG-D) HD`: CM 'US: UNIMAS (K10OG-D) HD [Unk]' (unknown) vs Rust 'UniMas East HD (UNIMAS) (K10OG-D)' (Premium/Cable)
@@ -59,13 +59,12 @@ other plugins). Two settings cases: `defaults` and `market-fallback` (CM's
 - `HBO [4K]`: CM 'HBO East' (Premium/Cable) vs Rust 'HBO' (Premium/Cable)
 - `HBO HD (Backup)`: CM 'HBO East (Backup)' (Premium/Cable) vs Rust 'HBO (Backup)' (Premium/Cable)
 - `USA | HBO 2 FHD`: CM 'HBO2' (Premium/Cable) vs Rust 'HBO 2' (Premium/Cable)
-  ... and 34 more
+  ... and 33 more
 
-#### merged-data (5)
+#### merged-data (4)
 
 - `All Women's Sports`: CM "All Women's Sports Network" (Premium/Cable) vs Rust "All Women's Sports" (none)
 - `NBA FAST Channel [FHD]`: CM 'NBA FAST' (Premium/Cable) vs Rust 'NBA FAST Channel' (Premium/Cable)
-- `US| Starz ᴴᴰ`: CM 'Starz' (Premium/Cable) vs Rust 'STARZ (E)' (Premium/Cable)
 - `Starz (West)`: CM 'Starz (West) [Unk]' (unknown) vs Rust 'STARZ (W)' (Premium/Cable)
 - `Nickelodeon East`: CM 'Nickelodeon East [Unk]' (unknown) vs Rust 'Nickelodeon East' (none)
 
@@ -105,21 +104,21 @@ other plugins). Two settings cases: `defaults` and `market-fallback` (CM's
 
 ## Case `market-fallback`: representative world
 
-- 145/252 channels agree on the final name
+- 147/252 channels agree on the final name
 
 ### Differences by attribution
 
 - `ota-format`: 0
 - `ota-vs-premium`: 0
-- `premium-canonical`: 49
+- `premium-canonical`: 48
 - `cm-prefilter`: 0
-- `merged-data`: 5
+- `merged-data`: 4
 - `cut`: 0
 - `tag-reattachment`: 12
 - `unknown-tag`: 41
 - `unattributed`: 0
 
-#### premium-canonical (49)
+#### premium-canonical (48)
 
 - `UNIMAS (K10OG-D)`: CM 'UNIMAS (K10OG-D) [Unk]' (unknown) vs Rust 'UniMas (K10OG-D)' (Premium/Cable)
 - `US: UNIMAS (K10OG-D) HD`: CM 'US: UNIMAS (K10OG-D) HD [Unk]' (unknown) vs Rust 'UniMas East HD (UNIMAS) (K10OG-D)' (Premium/Cable)
@@ -136,13 +135,12 @@ other plugins). Two settings cases: `defaults` and `market-fallback` (CM's
 - `HBO [4K]`: CM 'HBO East' (Premium/Cable) vs Rust 'HBO' (Premium/Cable)
 - `HBO HD (Backup)`: CM 'HBO East (Backup)' (Premium/Cable) vs Rust 'HBO (Backup)' (Premium/Cable)
 - `USA | HBO 2 FHD`: CM 'HBO2' (Premium/Cable) vs Rust 'HBO 2' (Premium/Cable)
-  ... and 34 more
+  ... and 33 more
 
-#### merged-data (5)
+#### merged-data (4)
 
 - `All Women's Sports`: CM "All Women's Sports Network" (Premium/Cable) vs Rust "All Women's Sports" (none)
 - `NBA FAST Channel [FHD]`: CM 'NBA FAST' (Premium/Cable) vs Rust 'NBA FAST Channel' (Premium/Cable)
-- `US| Starz ᴴᴰ`: CM 'Starz' (Premium/Cable) vs Rust 'STARZ (E)' (Premium/Cable)
 - `Starz (West)`: CM 'Starz (West) [Unk]' (unknown) vs Rust 'STARZ (W)' (Premium/Cable)
 - `Nickelodeon East`: CM 'Nickelodeon East [Unk]' (unknown) vs Rust 'Nickelodeon East' (none)
 
@@ -182,7 +180,7 @@ other plugins). Two settings cases: `defaults` and `market-fallback` (CM's
 
 ## Case `defaults-disputed`: disputed set
 
-- 14/51 channels agree on the final name
+- 15/51 channels agree on the final name
 
 ### Differences by attribution
 
@@ -190,7 +188,7 @@ other plugins). Two settings cases: `defaults` and `market-fallback` (CM's
 - `ota-vs-premium`: 0
 - `premium-canonical`: 17
 - `cm-prefilter`: 1
-- `merged-data`: 6
+- `merged-data`: 5
 - `cut`: 0
 - `tag-reattachment`: 0
 - `unknown-tag`: 13
@@ -219,11 +217,10 @@ other plugins). Two settings cases: `defaults` and `market-fallback` (CM's
 
 - `A&E`: CM 'A&E [Unk]' (unknown) vs Rust 'A&E' (none)
 
-#### merged-data (6)
+#### merged-data (5)
 
 - `Action Max`: CM 'ActionMax' (Premium/Cable) vs Rust 'Action Max' (none)
 - `Cartoon Network (W)`: CM 'Cartoon Network (W) [Unk]' (unknown) vs Rust 'Cartoon Network (W)' (none)
-- `SHOWTIME 2`: CM 'Showtime 2' (Premium/Cable) vs Rust 'SHOWTIME 2 East' (Premium/Cable)
 - `Showtime (E)`: CM 'Showtime HD East (E)' (Premium/Cable) vs Rust 'Showtime (E)' (none)
 - `Showtime 2 (East)`: CM 'Showtime 2 East' (Premium/Cable) vs Rust 'SHOWTIME 2 East' (Premium/Cable)
 - `Antena 3`: CM 'Antena 3 [Unk]' (unknown) vs Rust 'Antena 3' (none)

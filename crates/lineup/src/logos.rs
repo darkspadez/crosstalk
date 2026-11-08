@@ -91,6 +91,7 @@ use crosstalk_core::logos::{
 };
 use crosstalk_core::subapp::{JobOutcome, OutcomeBuilder, SubApp};
 use crosstalk_matching::identity::{Identity, ResolveContext};
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -597,14 +598,16 @@ pub async fn run_with(
     let enabled: Vec<String> = config.matching.databases();
     let sources = lookups.sources(order.clone(), tv_index.as_ref(), settings);
 
-    let mut rows: Vec<LogoRow> = Vec::with_capacity(channels.len());
-    for channel in &channels {
-        let identity = run_engine.resolve(&channel.name, &ctx);
-        let codes = tv_countries(settings, &identity, &enabled);
-        rows.push(decide_logo(
-            channel, &identity, &lookups, &sources, &codes, settings,
-        ));
-    }
+    // One resolve per channel, on every core (the tv-logos fuzzy tier is the costly
+    // part: one similarity pass per candidate file per channel).
+    let rows: Vec<LogoRow> = channels
+        .par_iter()
+        .map(|channel| {
+            let identity = run_engine.resolve(&channel.name, &ctx);
+            let codes = tv_countries(settings, &identity, &enabled);
+            decide_logo(channel, &identity, &lookups, &sources, &codes, settings)
+        })
+        .collect();
 
     // Rows that resolve to a URL: an already-carried URL is a skip (CM's
     // `already_set`), everything else assigns.

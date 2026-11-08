@@ -129,7 +129,8 @@ ignore_regional_tags = true
 ignore_geographic_tags = true
 ignore_misc_tags = true
 
-# Which shipped channel databases the matcher may draw reference names from. Empty means
+# Which merged channel databases the matcher may draw reference names from (AU, BR, CA,
+# DE, DO, ES, FR, IN, MX, NL, NO, PE, PL, PT, UK, US; `data/merged/channels/`). Empty means
 # the plugin's rule: every database when only one ships, otherwise the United States one.
 # Enabling a country you do not carry costs accuracy rather than gaining coverage.
 enabled_databases = ["US"]

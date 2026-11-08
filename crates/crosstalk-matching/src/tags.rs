@@ -315,7 +315,10 @@ const PIPE_COUNTRY_CODES: [&str; 13] = [
     "US", "USA", "UK", "CA", "AU", "FR", "DE", "ES", "IT", "NL", "BR", "MX", "IN",
 ];
 
-fn is_pipe_country_code(token: &str) -> bool {
+/// Whether a `|` segment is a bare country code the engine keeps delimited (N15):
+/// the ONE definition lineup's `clean` shares, so a cleaned name never strands the
+/// code the engine would have read as a marker.
+pub fn is_pipe_country_code(token: &str) -> bool {
     token.is_ascii() && PIPE_COUNTRY_CODES.contains(&token.to_ascii_uppercase().as_str())
 }
 
@@ -569,9 +572,22 @@ fn trailing_bracket(name: &str) -> Option<(usize, &str, u8)> {
 /// Only the trailing RUN strips, exactly like [`split_tags`]: the first group that is
 /// not a strippable tag stops the peel.
 pub fn strip_zone_ignorable(name: &str) -> &str {
+    strip_trailing_writer_tags(name, true)
+}
+
+/// Strip the trailing writer tags for the callsign read (decided C09): the same peel
+/// as [`strip_zone_ignorable`] WITHOUT the time-shift marker, which stays in place so
+/// a `+N` feed keeps the shared core's low-confidence read (`Local CBS KMOV +1` is not
+/// anchored onto `Local CBS KMOV`; the shift is identity).
+pub fn strip_writer_tags(name: &str) -> &str {
+    strip_trailing_writer_tags(name, false)
+}
+
+fn strip_trailing_writer_tags(name: &str, shifts: bool) -> &str {
     let mut rest = name.trim_end();
     loop {
-        let next = if let Some(start) = trailing_shift(rest) {
+        let shift = if shifts { trailing_shift(rest) } else { None };
+        let next = if let Some(start) = shift {
             Some(rest[..start].trim_end())
         } else if let Some((open, inner, _)) = trailing_bracket(rest) {
             if inner.contains('[')

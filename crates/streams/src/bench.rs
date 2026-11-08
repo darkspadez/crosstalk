@@ -982,7 +982,7 @@ async fn time_writes(
 // Formatting
 // =======================================================================================
 
-fn seconds(elapsed: Option<Duration>) -> String {
+pub fn seconds(elapsed: Option<Duration>) -> String {
     match elapsed {
         Some(elapsed) => format!("{:.3}s", elapsed.as_secs_f64()),
         None => "-".to_string(),
@@ -991,7 +991,7 @@ fn seconds(elapsed: Option<Duration>) -> String {
 
 /// `20000` as `20,000`: a six-figure count with no separator is one digit away from a
 /// misreading, and these numbers are quoted.
-fn thousands(count: usize) -> String {
+pub fn thousands(count: usize) -> String {
     let digits = count.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, ch) in digits.chars().enumerate() {

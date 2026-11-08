@@ -98,6 +98,10 @@ VARIANTS: dict[str, tuple[dict[str, list[str]], str, str]] = {
             "keep", "Pipe-delimited junk segments in names"),
     "C07": ({"callsign-first": [], "score-first": ALL},
             "callsign-first", "Network-led station callsign precedence"),
+    "C08": ({"station-callsign-family": [], "key-only": ALL},
+            "station-callsign-family", "Station callsign family membership"),
+    "C09": ({"strip-tags": [], "raw": ALL},
+            "strip-tags", "Callsign read after trailing writer tags"),
     "C01": ({"janitor": [JAN], "core-known": [SM], "cm-lookup": [CM],
              "core-naked": [LU]},
             "janitor", "Callsign ladder shape"),
@@ -114,6 +118,8 @@ VARIANTS: dict[str, tuple[dict[str, list[str]], str, str]] = {
             "janitor", "What a callsign decides at the app level"),
     "A01": ({"janitor": [JAN], "sm": [SM], "cm": [CM], "lu": [LU], "identity": []},
             "sm", "Alias lookup rule (exact/folded/fuzzy)"),
+    "A05": ({"canonical-key": [], "own-key": ALL},
+            "canonical-key", "Alias member identity key"),
     "A02": ({"cm-index": [CM], "none": [JAN, SM, LU]},
             "cm-index", "Reverse / token pre-index"),
     "A03": ({"merged-union": ALL}, "merged-union",
@@ -325,6 +331,61 @@ ORCHESTRATED: dict[str, tuple[str, str]] = {
             "network feed's guide is right for the network day and wrong for local "
             "news, which beats no guide, and no evidence asks for an AI/rescue "
             "gate instead."),
+    "C08": ("station-callsign-family", "Orchestrator decision (phase 3 review): two "
+            "names carrying the SAME high-confidence callsign of a merged station are one "
+            "identity family whatever else they say — `KSDK`, `KSDK HD`, `13 WREX`, "
+            "`NBC (KSDK)`, `US: NBC (KSDK) HD`, `NBC 5 St. Louis KSDK`, `NBC - IL Rockford "
+            "(WREX)` — unless one of them names a subchannel (the key minus the callsign "
+            "base and its `normalize_callsign` suffix words holds a `dt<N>`/`d<N>` token, a "
+            "dotted number or two plain numbers: `KSDK-DT2`, `KSPT-DT3`, `WREX 13.2`), which "
+            "is a different channel of the station. The identity family cut therefore "
+            "admits a candidate on equal `FamilyKey` OR this relation "
+            "(`identity::station_callsign_family`: same callsign, high confidence on both "
+            "sides as the D04 anchor needs, callsign in the merged station table, zone and "
+            "timeshift equal, neither a subchannel). It is the D04 anchor's own verdict "
+            "(high/high same callsign scores 95 = same channel) carried into the family. "
+            "Evidence: `US: NBC (KSDK) HD` scored `KSDK` and `NBC 5 St. Louis KSDK` at "
+            "Callsign 95 but the family cut dropped them whenever `NBC (KSDK)` was also in "
+            "the pool (different key), so whether a stream attached depended on the pool's "
+            "spelling (the `callsign-anchor` rows of docs/oracle-reports/streams.md: SM "
+            "attached `KSDK`, the engine did not), and names' OTA template (`13 WREX` -> "
+            "`NBC - IL Rockford (WREX)`) left the renamed channel outside the family it "
+            "came from (the step-15 'documented exception'). No plugin groups by identity "
+            "family (every plugin scores pairs), so there is no variant to ablate; pair "
+            "verdicts are unchanged (corpus costs identical). Mirrored in "
+            "`engine_parity.py` (`callsign_residue`, `station_callsign_family`, "
+            "`python_family`) and probed by its `family[probe]` kind."),
+    "C09": ("strip-tags", "Orchestrator decision (phase 3 review): the callsign ladder "
+            "reads the name with its trailing run of writer tags stripped "
+            "(`tags::strip_writer_tags`: the Z08 strip's quality/junk/status brackets and "
+            "bare words — regional words, unknown groups and country markers stop the "
+            "run — WITHOUT the `+N` peel, so a time-shifted feed keeps the shared core's "
+            "low-confidence read and `Local CBS KMOV +1` is never anchored onto `Local "
+            "CBS KMOV`: with the shift peeled the corpus gained 10 false positives, all "
+            "`+1` pairs), in the engine's `callsign_confidence` only "
+            "(the shared-core transcription the oracles drive is unchanged). Evidence: "
+            "the shared core's end-of-name read (high confidence) needs the callsign "
+            "LAST, so `KSDK HD`, `KSDK [HD]`, `KSDK-TV HD` and `USA | WABC-TV FHD` fell "
+            "to the loose any-word read (low) while `KSDK` and `US: KSDK` read high; the "
+            "D04 anchor needs high on both sides, so `NBC (KSDK)` anchored `KSDK` at 95 "
+            "and `KSDK HD` at 0 — a decoration moved the family, against the identity "
+            "rule that a quality tag never does (`decoration_keeps_the_family_key`). No "
+            "plugin strips tags before its ladder, so there is no variant to ablate; the "
+            "decided Python configuration wraps the ladder the same way (`ablate.Engine`), "
+            "and `engine_parity.py`'s `callsign` kind checks every corpus name."),
+    "A05": ("canonical-key", "Orchestrator decision (phase 3 review): a name the merged "
+            "alias table resolves (A01 `identity`, the reverse index) takes its CANONICAL's "
+            "normalize key as its identity key (`UnifiedEngine::identity_key`: `CNN USA` -> "
+            "`cnn`), in the resolved identity, the candidate index and the ranker's "
+            "identity-equal tie-break alike; a name the table does not resolve keeps its "
+            "own key. Evidence: the pairwise alias stage already scores `CNN USA` vs `CNN` "
+            "at 100 (A01), yet the family cut admitted only the top's key-mates, so the "
+            "stream `CNN USA` joined channel `CNN`'s family only when no `CNN` spelling "
+            "led the pool — the same pool-dependence C08 removes for callsigns, and the "
+            "cross-app test (`crates/lineup/tests/cross_app_identity.rs`) failed on it. No "
+            "plugin groups by identity, so there is no variant to ablate; pair verdicts "
+            "are unchanged. Mirrored in `engine_parity.py` (`python_identity_key`) and "
+            "probed by its `family[probe]` kind."),
     "Z07": ("sm-strict", "Orchestrator decision (phase 3 step 6, Appendix C): "
             "`(P)` is NOT a Pacific zone marker (Stream-Mapparr's stricter reading; "
             "SM `_ZONE_PACIFIC_RE` matches bare PACIFIC and `(Pacific)`/`(PT)` only). "
@@ -376,6 +437,19 @@ CAPPED: dict[str, str] = {
 
 #: Per-row notes appended to the generated reason.
 NOTES: dict[str, str] = {
+    "T12": (" Engine refinement (step-9 review, phase 3 review): at equal score a "
+            "candidate whose WHOLE identity family key (key, zone, timeshift, callsign) "
+            "equals the query's wins before the original-token overlap, so a reordered "
+            "name scoring 100 by token sort cannot lead, and `UK: BBC One HD` leads with "
+            "`BBC One` (Default) over `BBC One East HD` (East) although the quality word "
+            "gives the East spelling one more overlapping token. Then, still before the "
+            "overlap, a candidate whose OWN normalize key equals the query's (the same "
+            "spelling): A05 keys an alias member as its canonical, so `Cinemax Action` "
+            "and `ActionMax` (and `HBO2`/`HBO Hits`, `Discovery`/`Discovery Channel`) "
+            "are identity-equal at 100 against a query spelled as either, and the "
+            "query's own spelling leads rather than the pool's order (`DISCOVERY` "
+            "overlaps both by one token). Mirrored in `engine_parity.py` "
+            "(`python_family`)."),
     "T02": (" The basic-mode floor is in the ablation base (LU's "
             "match_all_streams, always majority); no rule swap isolates it "
             "from T01, whose guard it parameterises."),
@@ -512,6 +586,16 @@ COHERENCE_CHECKS = [
      "merged station table knows it.",
      lambda r: r["C07"] != "callsign-first"
      or (r["C02"] == "merged" and r["D04"] == "jan-lu-anchor")),
+    ("Same-station callsign names are one family (C08 "
+     "`station-callsign-family`) only under callsign-first ranking (C07) with the "
+     "merged allowlist (C02 `merged`) and the high-confidence anchor (D04): the "
+     "relation reads the same confidence and station table.",
+     lambda r: r.get("C08") != "station-callsign-family"
+     or (r["C07"] == "callsign-first" and r["C02"] == "merged"
+         and r["D04"] == "jan-lu-anchor")),
+    ("The callsign ladder strips trailing tags (C09 `strip-tags`) with the same "
+     "strip the zone read uses (Z08 `strip-tags`): one definition of a writer tag.",
+     lambda r: r.get("C09") != "strip-tags" or r.get("Z08") == "strip-tags"),
     ("The ranker is LU's match_all_streams shape (T09), which carries the "
      "always-majority floor (T02), the guarded exact tier (T04), scaled "
      "thresholds (T05), the header skip (Z05) and LU's country rule (G01-G03, "
@@ -521,6 +605,9 @@ COHERENCE_CHECKS = [
     ("Aliases resolve through one index: `identity` (A01) is CM's reverse "
      "index (A02) over the merged table (A03).",
      lambda r: r["A01"] != "identity" or r["A02"] == "cm-index"),
+    ("An alias member keys as its canonical (A05 `canonical-key`) only with the "
+     "identity alias resolve (A01 `identity`): the key reads the same reverse index.",
+     lambda r: r.get("A05") != "canonical-key" or r["A01"] == "identity"),
 ]
 
 

@@ -9,7 +9,10 @@
 //! 1. `unicode`: strip fancy-unicode quality marks (`plugin.py:46 `UNICODE_QUALITY`)
 //! 2. `nfkc`: Unicode NFKC normalize
 //! 3. `bracket`: strip junk-only bracket groups (`BRACKET_JUNK_INNER`, `:49`)
-//! 4. `pipe`: split on `|`, drop empty and quality-only segments, rejoin (`:50-60`)
+//! 4. `pipe`: split on `|`, drop empty and quality-only segments, rejoin (`:50-60`);
+//!    a final bare country-code segment keeps its bar (phase 3 review: `BBC One | UK`
+//!    stays, as the engine's N15 collapse reads it, so the cleaned name keeps its
+//!    identity — the one documented divergence of this step from NC)
 //! 5. `plus_one`: `Channel 4+1` -> `Channel 4 +1` (`re.sub(r"(?<=[A-Za-z0-9])\+1\b", …)`)
 //! 6. `custom`: operator `regex => replacement` lines, in order
 //! 7. `casing`: smart title-case
@@ -386,7 +389,18 @@ pub fn clean_name(
             }
             kept.push(part.to_string());
         }
-        let joined = kept.join(&rules.join_separator);
+        // Phase 3 review (identity invariant): a final segment that is only a country
+        // code keeps its bar, as the engine's own pipe collapse keeps it (decided N15:
+        // `BBC One | UK` keys `bbc 1`). NC joins it with the separator (`BBC One UK`),
+        // which the engine keys `bbc 1 uk` — a cleaned name that no longer matches its
+        // guide entry or streams. Documented divergence (README, `clean_parity.py`
+        // `country-segment`); the ONE code list is `tags::is_pipe_country_code`.
+        let joined = match kept.split_last() {
+            Some((last, head)) if !head.is_empty() && tags::is_pipe_country_code(last) => {
+                format!("{} | {last}", head.join(&rules.join_separator))
+            }
+            _ => kept.join(&rules.join_separator),
+        };
         if joined != s {
             fired.insert("pipe".to_string());
             s = joined;

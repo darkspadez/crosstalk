@@ -20,13 +20,13 @@ blocked callsign). Rust runs are `create_dump` (the action's own
 
 ## Case `streams`: representative stream world
 
-- 20/40 streams agree on the import decision
-- CM creates 30 channels (one per stream); Rust plans 15 (one per family)
+- 19/40 streams agree on the import decision
+- CM creates 30 channels (one per stream); Rust plans 16 (one per family)
 - CM rerun duplicates: 30 (every channel imported AGAIN under a suffix);
   Rust rerun creates: 0 (owned `lineup:create:<identity key>` keys + the
   same-family check against live channels — the fix over CM, pinned by the
   `streams_apply_creates_one_channel_per_family_then_rerun_creates_nothing` test).
-- Numbers: CM [51.0, 52.0, 53.0, 54.0, 55.0, 56.0, 57.0, 58.0, 59.0, 60.0, 61.0, 62.0, 63.0, 64.0, 65.0, 66.0, 67.0, 68.0, 69.0, 70.0, 71.0, 72.0, 73.0, 74.0, 75.0, 76.0, 77.0, 78.0, 79.0, 80.0] vs Rust [51.0, 52.0, 53.0, 54.0, 55.0, 56.0, 57.0, 58.0, 59.0, 60.0, 61.0, 62.0, 63.0, 64.0, 65.0] (max+1 step 1, skipping used)
+- Numbers: CM [51.0, 52.0, 53.0, 54.0, 55.0, 56.0, 57.0, 58.0, 59.0, 60.0, 61.0, 62.0, 63.0, 64.0, 65.0, 66.0, 67.0, 68.0, 69.0, 70.0, 71.0, 72.0, 73.0, 74.0, 75.0, 76.0, 77.0, 78.0, 79.0, 80.0] vs Rust [51.0, 52.0, 53.0, 54.0, 55.0, 56.0, 57.0, 58.0, 59.0, 60.0, 61.0, 62.0, 63.0, 64.0, 65.0, 66.0] (max+1 step 1, skipping used)
 
 ### Differences by attribution
 
@@ -34,7 +34,7 @@ blocked callsign). Rust runs are `create_dump` (the action's own
 - `naming-via-names`: 0
 - `category-via-categorize`: 0
 - `country-category`: 2
-- `engine-via-names`: 2
+- `engine-via-names`: 3
 - `rerun-dedupe`: 0
 - `numbering`: 0
 - `collision`: 0
@@ -64,51 +64,55 @@ blocked callsign). Rust runs are `create_dump` (the action's own
 - `HBO`: CM {'channel_name': 'HBO', 'number': 78.0, 'category': 'United States', 'matched': True} vs Rust {'will_import': True, 'channel': 'HBO', 'category': 'Movies', 'names': 'premium'}
 - `HBO (West)`: CM {'channel_name': 'HBO (West)', 'number': 79.0, 'category': 'United States', 'matched': True} vs Rust {'will_import': False, 'channel': '', 'category': '', 'names': 'premium'}
 
-#### engine-via-names (2)
+#### engine-via-names (3)
 
 - `A&E`: CM {'channel_name': None, 'number': None, 'category': None, 'matched': False} vs Rust {'will_import': True, 'channel': 'A&E', 'category': 'Documentary', 'names': 'premium'}
 - `A&E [FHD]`: CM {'channel_name': None, 'number': None, 'category': None, 'matched': False} vs Rust {'will_import': True, 'channel': 'A&E', 'category': 'Documentary', 'names': 'premium'}
+- `Nickelodeon (West)`: CM {'channel_name': None, 'number': None, 'category': None, 'matched': False} vs Rust {'will_import': True, 'channel': 'Nickelodeon (Pacific)', 'category': 'Kids', 'names': 'premium'}
 
 ## Case `streams-disputed`: disputed stream names
 
 - 18/40 streams agree on the import decision
-- CM creates 26 channels (one per stream); Rust plans 19 (one per family)
+- CM creates 26 channels (one per stream); Rust plans 16 (one per family)
 - CM rerun duplicates: 26 (every channel imported AGAIN under a suffix);
   Rust rerun creates: 0 (owned `lineup:create:<identity key>` keys + the
   same-family check against live channels — the fix over CM, pinned by the
   `streams_apply_creates_one_channel_per_family_then_rerun_creates_nothing` test).
-- Numbers: CM [51.0, 52.0, 53.0, 54.0, 55.0, 56.0, 57.0, 58.0, 59.0, 60.0, 61.0, 62.0, 63.0, 64.0, 65.0, 66.0, 67.0, 68.0, 69.0, 70.0, 71.0, 72.0, 73.0, 74.0, 75.0, 76.0] vs Rust [51.0, 52.0, 53.0, 54.0, 55.0, 56.0, 57.0, 58.0, 59.0, 60.0, 61.0, 62.0, 63.0, 64.0, 65.0, 66.0, 67.0, 68.0, 69.0] (max+1 step 1, skipping used)
+- Numbers: CM [51.0, 52.0, 53.0, 54.0, 55.0, 56.0, 57.0, 58.0, 59.0, 60.0, 61.0, 62.0, 63.0, 64.0, 65.0, 66.0, 67.0, 68.0, 69.0, 70.0, 71.0, 72.0, 73.0, 74.0, 75.0, 76.0] vs Rust [51.0, 52.0, 53.0, 54.0, 55.0, 56.0, 57.0, 58.0, 59.0, 60.0, 61.0, 62.0, 63.0, 64.0, 65.0, 66.0] (max+1 step 1, skipping used)
 
 ### Differences by attribution
 
-- `family-grouping`: 0
-- `naming-via-names`: 4
-- `category-via-categorize`: 4
-- `country-category`: 8
+- `family-grouping`: 6
+- `naming-via-names`: 2
+- `category-via-categorize`: 1
+- `country-category`: 7
 - `engine-via-names`: 6
 - `rerun-dedupe`: 0
 - `numbering`: 0
 - `collision`: 0
 - `unattributed`: 0
 
-#### naming-via-names (4)
+#### family-grouping (6)
 
-- `SHOWTIME 2`: CM {'channel_name': 'SHOWTIME 2', 'number': 60.0, 'category': 'Movies', 'matched': True} vs Rust {'will_import': True, 'channel': 'SHOWTIME 2 East', 'category': 'Movies', 'names': 'premium'}
-- `Showtime 2 (East)`: CM {'channel_name': 'Showtime 2 (East)', 'number': 62.0, 'category': 'Movies', 'matched': True} vs Rust {'will_import': True, 'channel': 'SHOWTIME 2 East', 'category': 'Movies', 'names': 'premium'}
+- `Paramount+ with Showtime HD (Pacific)`: CM {'channel_name': 'Paramount+ with Showtime HD (Pacific)', 'number': 72.0, 'category': 'United States', 'matched': True} vs Rust {'will_import': True, 'channel': 'Paramount+ with Showtime (Pacific)', 'category': 'Movies', 'names': 'premium'}
 - `ABC News`: CM {'channel_name': 'ABC News', 'number': 63.0, 'category': 'News', 'matched': True} vs Rust {'will_import': True, 'channel': 'ABC News Live', 'category': 'News', 'names': 'premium'}
 - `AMC US`: CM {'channel_name': 'AMC US', 'number': 52.0, 'category': 'Entertainment', 'matched': True} vs Rust {'will_import': True, 'channel': 'AMC', 'category': 'Entertainment', 'names': 'premium'}
+- `Cinemax Action`: CM {'channel_name': 'Cinemax Action', 'number': 59.0, 'category': 'Movies', 'matched': True} vs Rust {'will_import': True, 'channel': 'Action Max', 'category': 'Movies', 'names': 'premium'}
+- `Al Jazeera HD`: CM {'channel_name': 'Al Jazeera HD', 'number': 66.0, 'category': 'News', 'matched': True} vs Rust {'will_import': True, 'channel': 'Al Jazeera English', 'category': 'News', 'names': 'premium'}
+- `Antena 3 Internacional`: CM {'channel_name': 'Antena 3 Internacional', 'number': 67.0, 'category': 'Spanish', 'matched': True} vs Rust {'will_import': True, 'channel': 'Antena 3', 'category': 'Spanish', 'names': 'premium'}
 
-#### category-via-categorize (4)
+#### naming-via-names (2)
+
+- `SHOWTIME 2`: CM {'channel_name': 'SHOWTIME 2', 'number': 60.0, 'category': 'Movies', 'matched': True} vs Rust {'will_import': True, 'channel': 'Showtime 2', 'category': 'Movies', 'names': 'premium'}
+- `Showtime 2 (East)`: CM {'channel_name': 'Showtime 2 (East)', 'number': 62.0, 'category': 'Movies', 'matched': True} vs Rust {'will_import': True, 'channel': 'SHOWTIME 2 East', 'category': 'Movies', 'names': 'premium'}
+
+#### category-via-categorize (1)
 
 - `Nick Jr (Pacific)`: CM {'channel_name': 'Nick Jr (Pacific)', 'number': 55.0, 'category': 'Kids', 'matched': True} vs Rust {'will_import': False, 'channel': '', 'category': '', 'names': 'premium'}
-- `Nick Jr`: CM {'channel_name': 'Nick Jr', 'number': 54.0, 'category': 'Kids', 'matched': True} vs Rust {'will_import': False, 'channel': '', 'category': '', 'names': 'premium'}
-- `Nickelodeon (Pacific)`: CM {'channel_name': 'Nickelodeon (Pacific)', 'number': 57.0, 'category': 'Kids', 'matched': True} vs Rust {'will_import': False, 'channel': '', 'category': '', 'names': 'premium'}
-- `Al Jazeera HD`: CM {'channel_name': 'Al Jazeera HD', 'number': 66.0, 'category': 'News', 'matched': True} vs Rust {'will_import': False, 'channel': '', 'category': '', 'names': 'premium'}
 
-#### country-category (8)
+#### country-category (7)
 
-- `Paramount+ with Showtime (Pacific)`: CM {'channel_name': 'Paramount+ with Showtime (Pacific)', 'number': 71.0, 'category': 'United States', 'matched': True} vs Rust {'will_import': False, 'channel': '', 'category': '', 'names': 'premium'}
-- `Paramount+ with Showtime HD (Pacific)`: CM {'channel_name': 'Paramount+ with Showtime HD (Pacific)', 'number': 72.0, 'category': 'United States', 'matched': True} vs Rust {'will_import': False, 'channel': '', 'category': '', 'names': 'premium'}
+- `Paramount+ with Showtime (Pacific)`: CM {'channel_name': 'Paramount+ with Showtime (Pacific)', 'number': 71.0, 'category': 'United States', 'matched': True} vs Rust {'will_import': True, 'channel': 'Paramount+ with Showtime (Pacific)', 'category': 'Movies', 'names': 'premium'}
 - `TVA SPORTS`: CM {'channel_name': 'TVA SPORTS', 'number': 73.0, 'category': 'United States', 'matched': True} vs Rust {'will_import': False, 'channel': '', 'category': '', 'names': 'premium'}
 - `TVA Sports 2`: CM {'channel_name': 'TVA Sports 2 [M3U-1-20015]', 'number': 76.0, 'category': 'United States', 'matched': True} vs Rust {'will_import': False, 'channel': '', 'category': '', 'names': 'premium'}
 - `TVA Sports`: CM {'channel_name': 'TVA Sports [M3U-1-20016]', 'number': 75.0, 'category': 'United States', 'matched': True} vs Rust {'will_import': False, 'channel': '', 'category': '', 'names': 'premium'}

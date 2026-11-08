@@ -201,7 +201,11 @@ pub enum Matching {
 ///
 /// Each stream's rows are its channels in channel order, family members first (a stream
 /// only passes as a family member), each best first by score; the merge is serial in
-/// channel order, so rayon cannot reorder a tie.
+/// channel order, so rayon cannot reorder a tie — the inversion `match_sim.py` does.
+/// Two channels take one stream when they are one identity (decided A05: `Cinemax
+/// Action` and `ActionMax` both hold a stream spelled either way; `HBO2` and `HBO Hits`),
+/// so `best_channel` is the FIRST of them in channel order and `families.csv` lists
+/// every channel that takes the stream.
 pub fn simulate_unified(
     channel_names: &[String],
     stream_names: &[String],
@@ -549,6 +553,17 @@ fn write_reports(
     let mut unmatched = writer("unmatched.csv")?;
     let mut low = writer("low_confidence.csv")?;
     let mut top = writer("top_n.csv")?;
+    // Unified only (the Janitor oracle's files are the Python tool's four): every
+    // channel whose identity family takes the stream, in channel order — what streams
+    // attaches and guide assigns from; `best_channel` is the first of them.
+    let mut families = match options.matching {
+        Matching::Unified => Some(writer("families.csv")?),
+        #[cfg(feature = "oracle")]
+        Matching::Janitor => None,
+    };
+    if let Some(families) = families.as_mut() {
+        families.write_record(["stream_name", "channel", "score", "match_type"])?;
+    }
 
     matches.write_record([
         "stream_name",
@@ -623,11 +638,24 @@ fn write_reports(
                 row.method.as_str(),
             ])?;
         }
+        if let Some(families) = families.as_mut() {
+            for row in rows.iter().filter(|row| row.passed) {
+                families.write_record([
+                    stream_name.as_str(),
+                    row.channel.as_str(),
+                    &row.score.to_string(),
+                    row.method.as_str(),
+                ])?;
+            }
+        }
     }
     matches.flush()?;
     unmatched.flush()?;
     low.flush()?;
     top.flush()?;
+    if let Some(families) = families.as_mut() {
+        families.flush()?;
+    }
 
     let total = per_stream.len();
     let matched = total.saturating_sub(unmatched_count);
@@ -787,6 +815,33 @@ mod tests {
             .iter()
             .all(|row| !row.passed));
         assert!(per_stream.get("Unrelated").expect("present").is_empty());
+    }
+
+    #[test]
+    fn both_spellings_of_one_alias_identity_take_the_stream() {
+        // Decided A05: `Cinemax Action` and `ActionMax` are one identity, so BOTH
+        // channels' families hold a stream spelled either way (streams attaches it to
+        // both); the per-stream column shows the first in channel order, as
+        // `match_sim.py`'s inversion does. `Cinemax Hits` (MoreMax) is another identity.
+        let engine = UnifiedEngine::decided();
+        let channels: Vec<String> = ["ActionMax", "Cinemax Action", "Cinemax Hits"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let streams: Vec<String> = ["Cinemax Action", "ActionMax HD"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let per_stream = simulate_unified(&channels, &streams, &engine, 80);
+        for name in ["Cinemax Action", "ActionMax HD"] {
+            let rows = per_stream.get(name).expect("stream present");
+            let taken: Vec<&str> = rows
+                .iter()
+                .filter(|row| row.passed)
+                .map(|row| row.channel.as_str())
+                .collect();
+            assert_eq!(taken, ["ActionMax", "Cinemax Action"], "{name}");
+        }
     }
 
     #[test]
