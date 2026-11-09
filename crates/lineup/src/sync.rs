@@ -197,6 +197,22 @@ pub fn decide_sync(
     // wins; a later same-named entry is a reported skip, never a second channel.
     let mut seen: HashSet<&str> = HashSet::new();
     let mut rows: Vec<SyncRow> = Vec::with_capacity(lineup.entries.len());
+    // Channels by id and by name, so an entry looks its channel up instead of walking
+    // the world (E-N1). The by-name lists keep world order, so the first clash found is
+    // the one a walk would find; the by-id map keeps the first channel of an id.
+    let by_id: HashMap<i64, &crosstalk_core::dispatcharr::Channel> = world
+        .channels
+        .iter()
+        .rev()
+        .map(|channel| (channel.id, channel))
+        .collect();
+    let mut by_name: HashMap<&str, Vec<&crosstalk_core::dispatcharr::Channel>> = HashMap::new();
+    for channel in &world.channels {
+        by_name
+            .entry(channel.name.as_str())
+            .or_default()
+            .push(channel);
+    }
     for entry in &lineup.entries {
         let base = SyncRow {
             name: entry.name.clone(),
@@ -226,7 +242,7 @@ pub fn decide_sync(
         let key = channel_owner_key(&lineup.file_name, &entry.name);
         match owned.get(&key) {
             Some(id) => {
-                let channel = world.channels.iter().find(|channel| channel.id == *id);
+                let channel = by_id.get(id).copied();
                 match channel {
                     None => rows.push(SyncRow {
                         number: None,
@@ -302,10 +318,12 @@ pub fn decide_sync(
                 // LU's get_or_create(name, group) adopted whatever it found here;
                 // only owned channels are adopted, so a foreign same-named
                 // channel in the target group is a reported skip, never a take.
-                let clash = world.channels.iter().find(|channel| {
-                    channel.name == entry.name
-                        && world.group_name(channel.channel_group_id) == entry.group
-                });
+                let clash = by_name
+                    .get(entry.name.as_str())
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .find(|channel| world.group_name(channel.channel_group_id) == entry.group);
                 match clash {
                     Some(channel) => rows.push(SyncRow {
                         number: None,

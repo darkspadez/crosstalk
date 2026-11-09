@@ -113,8 +113,55 @@ impl RunEngine {
     }
 
     /// Normalize a whole candidate list once, for every query to share.
+    ///
+    /// CPU-bound (parallel inside, E-S3): an async caller uses
+    /// [`build_index_blocking`](Self::build_index_blocking) instead.
     pub fn build_index(&self, names: &[String]) -> EngineIndex {
         EngineIndex::build(names, &self.engine, &ResolveContext::default())
+    }
+
+    /// [`build_index`](Self::build_index) on a blocking thread, so a 50k-name index
+    /// never stalls the async runtime (E-S3).
+    pub async fn build_index_blocking(&self, names: &[String]) -> anyhow::Result<EngineIndex> {
+        let engine = Arc::clone(&self.engine);
+        let names = names.to_vec();
+        tokio::task::spawn_blocking(move || {
+            EngineIndex::build(&names, &engine, &ResolveContext::default())
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("building the candidate index panicked: {error}"))
+    }
+
+    /// Resolve every name once in a batch and leave it memoized: one store read pass,
+    /// the misses on rayon, ONE write transaction ([`CachedIdentities::warm`]). After
+    /// this, [`resolve`](Self::resolve) on those names is a memo hit, so a rayon stage
+    /// never takes the store lock or pays an fsync per name (E-B3). Without a store
+    /// there is nothing to batch: the memo fills on first resolve. Blocking.
+    pub fn warm(&self, names: &[(String, ResolveContext)]) {
+        if let Some(cached) = &self.cached {
+            cached.warm(names.iter().map(|(name, ctx)| (name.as_str(), ctx)));
+        }
+    }
+
+    /// Warm `names`, then run `work` with this engine on a blocking thread (E-B3): the
+    /// rayon stage of an app never runs on the async runtime, and every resolve inside
+    /// it reads the memo the warm filled.
+    pub async fn resolve_stage<T, F>(
+        &self,
+        names: Vec<(String, ResolveContext)>,
+        work: F,
+    ) -> anyhow::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&RunEngine) -> T + Send + 'static,
+    {
+        let engine = self.clone();
+        tokio::task::spawn_blocking(move || {
+            engine.warm(&names);
+            work(&engine)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("the resolve stage panicked: {error}"))
     }
 
     /// Persist the identity of every query and every family member in one batch, so
@@ -133,8 +180,25 @@ impl RunEngine {
         candidates: &[String],
         skip: &[bool],
     ) {
+        self.start_warming_families(queries, families, candidates, skip)
+            .finish()
+            .await;
+    }
+
+    /// [`warm_families`](Self::warm_families), started in the background (E-B2): the
+    /// run never reads these identities back, so it starts the warm as soon as the
+    /// families exist, carries on with its network stages (programme checks, the AI
+    /// gate, the writes) while the warm runs, and only awaits [`Warming::finish`] before
+    /// it returns, so the rows are in the store when the run ends, as before.
+    pub fn start_warming_families(
+        &self,
+        queries: &[String],
+        families: &[Vec<EngineRanked>],
+        candidates: &[String],
+        skip: &[bool],
+    ) -> Warming {
         let Some(cached) = self.cached.clone() else {
-            return;
+            return Warming(None);
         };
         let mut names: Vec<String> = Vec::new();
         for (ordinal, query) in queries.iter().enumerate() {
@@ -150,11 +214,26 @@ impl RunEngine {
         }
         // Queries and family members both resolve without a hint (no lineup country or
         // category in guide/streams), so one context serves every name.
-        let _ = tokio::task::spawn_blocking(move || {
+        Warming(Some(tokio::task::spawn_blocking(move || {
             let ctx = ResolveContext::default();
             cached.warm(names.iter().map(|name| (name.as_str(), &ctx)));
-        })
-        .await;
+        })))
+    }
+}
+
+/// An identity warm running in the background ([`RunEngine::start_warming_families`]).
+///
+/// Dropping it detaches the warm (a cancelled run still persists what it resolved);
+/// [`finish`](Self::finish) waits for it.
+#[must_use = "await `finish` so the identities are stored before the run ends"]
+pub struct Warming(Option<tokio::task::JoinHandle<()>>);
+
+impl Warming {
+    /// Wait for the warm to land in the store.
+    pub async fn finish(self) {
+        if let Some(handle) = self.0 {
+            let _ = handle.await;
+        }
     }
 }
 

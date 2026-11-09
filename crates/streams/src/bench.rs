@@ -64,6 +64,10 @@ pub const WRITE_CHUNK: usize = CHANNEL_EDIT_CHUNK_SIZE;
 /// this is "REST is enough", and one that does not is what a bridge would buy.
 pub const APPLY_BUDGET: Duration = Duration::from_secs(120);
 
+/// The audit's hard SLA (plans/security-audit.md): every action's plan, setup included,
+/// under this at 20k channels. Every bench report ends with a line saying whether it held.
+pub const PLAN_SLA: Duration = Duration::from_secs(10);
+
 /// The world size a synthetic run builds by default: the plan's own numbers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyntheticOptions {
@@ -360,6 +364,29 @@ impl BenchPhase {
         }
     }
 
+    /// What the SLA counts: setup, plan and write plan together.
+    pub fn total(&self) -> Duration {
+        self.setup_time.unwrap_or_default()
+            + self.plan_time.unwrap_or_default()
+            + self.write_plan_time.unwrap_or_default()
+    }
+
+    /// The phase as JSON, for `--json`: seconds as numbers, `null` when not measured.
+    pub fn to_json(&self) -> serde_json::Value {
+        let secs = |elapsed: Option<Duration>| elapsed.map(|elapsed| elapsed.as_secs_f64());
+        serde_json::json!({
+            "action": self.action,
+            "setup_s": secs(self.setup_time),
+            "plan_s": secs(self.plan_time),
+            "write_plan_s": secs(self.write_plan_time),
+            "total_s": self.error.is_none().then(|| self.total().as_secs_f64()),
+            "writes": self.writes,
+            "requests": self.requests,
+            "detail": self.detail,
+            "error": self.error,
+        })
+    }
+
     /// One report line.
     pub fn line(&self) -> String {
         if let Some(error) = &self.error {
@@ -504,6 +531,7 @@ impl BenchReport {
         for phase in &self.phases {
             lines.push(format!("  {}", phase.line()));
         }
+        lines.push(format!("  {}", self.sla_line()));
         if let Some(timing) = &self.write_timing {
             lines.extend(timing.lines());
         }
@@ -517,6 +545,79 @@ impl BenchReport {
         for line in self.lines() {
             println!("{line}");
         }
+    }
+
+    /// The measured phases over [`PLAN_SLA`], slowest first.
+    pub fn over_sla(&self) -> Vec<&BenchPhase> {
+        let mut over: Vec<&BenchPhase> = self
+            .phases
+            .iter()
+            .filter(|phase| phase.error.is_none() && phase.total() >= PLAN_SLA)
+            .collect();
+        over.sort_by_key(|phase| std::cmp::Reverse(phase.total()));
+        over
+    }
+
+    /// Whether every measured phase held [`PLAN_SLA`].
+    pub fn sla_passed(&self) -> bool {
+        self.over_sla().is_empty()
+    }
+
+    /// The SLA verdict in one line: pass with the slowest phase, or fail naming every phase
+    /// over the limit.
+    pub fn sla_line(&self) -> String {
+        let limit = seconds(Some(PLAN_SLA));
+        if self.sla_passed() {
+            let slowest = self
+                .phases
+                .iter()
+                .filter(|phase| phase.error.is_none())
+                .max_by_key(|phase| phase.total());
+            return match slowest {
+                Some(phase) => format!(
+                    "SLA: PASS, every plan under {limit} (slowest: {} {}, setup included)",
+                    phase.action,
+                    seconds(Some(phase.total()))
+                ),
+                None => format!("SLA: PASS, nothing measured against {limit}"),
+            };
+        }
+        let over: Vec<String> = self
+            .over_sla()
+            .iter()
+            .map(|phase| format!("{} {}", phase.action, seconds(Some(phase.total()))))
+            .collect();
+        format!(
+            "SLA: FAIL, over {limit} (setup included): {}",
+            over.join(", ")
+        )
+    }
+
+    /// The whole report as JSON, for `--json`.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "title": self.title,
+            "setup": self
+                .setup
+                .iter()
+                .map(|(label, elapsed)| serde_json::json!({
+                    "label": label,
+                    "seconds": elapsed.as_secs_f64(),
+                }))
+                .collect::<Vec<_>>(),
+            "phases": self.phases.iter().map(BenchPhase::to_json).collect::<Vec<_>>(),
+            "sla": {
+                "limit_s": PLAN_SLA.as_secs_f64(),
+                "passed": self.sla_passed(),
+                "over": self
+                    .over_sla()
+                    .iter()
+                    .map(|phase| phase.action.clone())
+                    .collect::<Vec<_>>(),
+                "line": self.sla_line(),
+            },
+            "notes": self.notes,
+        })
     }
 }
 

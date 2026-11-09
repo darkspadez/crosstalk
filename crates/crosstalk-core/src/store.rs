@@ -377,6 +377,10 @@ impl Store {
             connection.execute_batch(
                 r#"
                 PRAGMA journal_mode = WAL;
+                -- Under WAL, NORMAL syncs at checkpoints rather than on every commit: a
+                -- power cut can lose the last transactions but never corrupts the file,
+                -- and a run writes many small transactions (E-S1).
+                PRAGMA synchronous = NORMAL;
                 PRAGMA foreign_keys = ON;
                 PRAGMA busy_timeout = 5000;
 
@@ -530,6 +534,11 @@ impl Store {
                 "#,
             )?;
             add_run_row_columns(connection)?;
+            // After the column migration: an older `run_rows` gains `field` above. Serves
+            // the field-history and rows-of-fields reads, which filter on it (E-S8).
+            connection.execute_batch(
+                "CREATE INDEX IF NOT EXISTS run_rows_field ON run_rows(run_id, field);",
+            )?;
             add_run_columns(connection)?;
             // A run left `running` by a crash or a restart can never finish, and pruning
             // skips running rows, so it would otherwise show as live forever. Only the
@@ -1354,6 +1363,40 @@ impl Store {
                 "DELETE FROM ownership_intent WHERE kind = ?1 AND app = ?2 AND owner_key = ?3",
                 params![kind, app, owner_key],
             )?;
+            transaction.commit()?;
+            Ok(())
+        })
+    }
+
+    /// [`Self::settle_intent`] for many objects of one kind, in ONE transaction: a create
+    /// stage settles everything it landed together rather than paying a commit per object.
+    /// `settled` is `(object id, owner key)`.
+    pub fn settle_intents(
+        &self,
+        kind: &str,
+        app: &str,
+        run_id: i64,
+        settled: &[(i64, String)],
+    ) -> Result<()> {
+        if settled.is_empty() {
+            return Ok(());
+        }
+        let created = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        self.with_connection(|connection| {
+            let transaction = connection.unchecked_transaction()?;
+            {
+                let mut own = transaction.prepare(
+                    "INSERT OR IGNORE INTO ownership (kind, object_id, app, owner_key, run_id, \
+                     created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                )?;
+                let mut forget = transaction.prepare(
+                    "DELETE FROM ownership_intent WHERE kind = ?1 AND app = ?2 AND owner_key = ?3",
+                )?;
+                for (object_id, owner_key) in settled {
+                    own.execute(params![kind, object_id, app, owner_key, run_id, created])?;
+                    forget.execute(params![kind, app, owner_key])?;
+                }
+            }
             transaction.commit()?;
             Ok(())
         })

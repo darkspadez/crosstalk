@@ -1029,24 +1029,41 @@ pub async fn run_with_service(
     // The unified stack: the same engine + identity cache guide and streams run on.
     let run_engine = RunEngine::for_config(&config.matching, context.store().cloned());
     let engine = Arc::clone(run_engine.engine());
-    let db_names = premium_db_names(&config.matching.databases());
-    let index = Arc::new(run_engine.build_index(&db_names));
+    let db_names = Arc::new(premium_db_names(&config.matching.databases()));
+    let index = Arc::new(run_engine.build_index_blocking(&db_names).await?);
 
     // Heuristic decisions + families for the identity warm-up.
-    let ctx = ResolveContext::default();
     // One resolve and one rank per channel, on every core (the plan's multi-threading
     // rule, as guide and streams score their families): 20k channels rank in seconds,
-    // not the half minute a serial walk costs (phase 3 review bench).
-    let decided: Vec<(Vec<EngineRanked>, NameRow, bool)> = channels
-        .par_iter()
-        .map(|channel| {
-            let identity = run_engine.resolve(&channel.name, &ctx);
-            let family = engine.rank_index(&channel.name, &index);
-            let (row, no_family) =
-                decide_heuristic_with_family(channel, &identity, &family, &db_names, settings);
-            (family, row, no_family)
-        })
-        .collect();
+    // not the half minute a serial walk costs (phase 3 review bench). The stage runs off
+    // the async runtime, after one batch warm of every channel name, so each resolve is
+    // a memo hit rather than a store round trip per name (E-B3).
+    let decided: Vec<(Vec<EngineRanked>, NameRow, bool)> = {
+        let warm: Vec<(String, ResolveContext)> = channels
+            .iter()
+            .map(|channel| (channel.name.clone(), ResolveContext::default()))
+            .collect();
+        let channels = channels.clone();
+        let index = Arc::clone(&index);
+        let db_names = Arc::clone(&db_names);
+        let settings = settings.clone();
+        run_engine
+            .resolve_stage(warm, move |run_engine| {
+                let ctx = ResolveContext::default();
+                channels
+                    .par_iter()
+                    .map(|channel| {
+                        let identity = run_engine.resolve(&channel.name, &ctx);
+                        let family = run_engine.engine().rank_index(&channel.name, &index);
+                        let (row, no_family) = decide_heuristic_with_family(
+                            channel, &identity, &family, &db_names, &settings,
+                        );
+                        (family, row, no_family)
+                    })
+                    .collect()
+            })
+            .await?
+    };
     let mut rows: Vec<NameRow> = Vec::with_capacity(channels.len());
     let mut families: Vec<Vec<EngineRanked>> = Vec::with_capacity(channels.len());
     let mut borderline: Vec<usize> = Vec::new();
@@ -1062,12 +1079,19 @@ pub async fn run_with_service(
         rows.push(row);
     }
 
+    // Persist every query + family identity for the other apps: in the background
+    // while the AI gate and the writes run (E-B2), awaited before the run returns.
+    let skip = vec![false; channels.len()];
+    let queries: Vec<String> = channels.iter().map(|c| c.name.clone()).collect();
+    let warming = run_engine.start_warming_families(&queries, &families, &db_names, &skip);
+
     // The AI gate: re-rank borderline channels at the gate's floor and ask the chain.
     // Only a model accept renames (task "names"); anything else keeps the unmatched row.
     if !borderline.is_empty() {
         if let (Some(shortlist_engine), Some(service)) =
             (run_engine.shortlist_engine(&config.ai.verify), ai)
         {
+            use futures::{stream, StreamExt};
             let candidates: Vec<DbCandidate> = db_names
                 .iter()
                 .enumerate()
@@ -1076,10 +1100,10 @@ pub async fn run_with_service(
                     name: name.clone(),
                 })
                 .collect();
+            // The shortlists are CPU and stay serial; the requests fan out like guide's
+            // (E-S2), bounded by the chain's own cap, and land in channel order.
+            let mut asks = Vec::new();
             for ordinal in borderline {
-                if context.is_cancelled() {
-                    anyhow::bail!("cancelled by the operator");
-                }
                 let channel = &channels[ordinal];
                 let shortlist = shortlist_engine.shortlist_index_in(&channel.name, None, &index);
                 if shortlist.is_empty() {
@@ -1095,25 +1119,46 @@ pub async fn run_with_service(
                     name: channel.name.clone(),
                     number: channel.number,
                 };
-                let outcome = ai_gate::ask(
-                    Some(service),
-                    &query,
-                    &candidates,
-                    &scored,
-                    &offered,
-                    reason,
-                    engine.known(),
-                    &config.ai.verify,
-                    || context.is_cancelled(),
-                    Some("names"),
-                )
-                .await;
+                asks.push((ordinal, scored, reason, offered, query));
+            }
+            let bound = ai_gate::fanout_bound_for(config, &config.ai.verify.effective_chain());
+            let candidates_ref = &candidates;
+            let known = engine.known();
+            let mut answers: Vec<(usize, Vec<Scored>, ai_gate::GateOutcome)> = stream::iter(
+                asks.into_iter()
+                    .map(|(ordinal, scored, reason, offered, query)| async move {
+                        let outcome = if context.is_cancelled() {
+                            ai_gate::GateOutcome::cancelled(reason, config.ai.verify.model.clone())
+                        } else {
+                            ai_gate::ask(
+                                Some(service),
+                                &query,
+                                candidates_ref,
+                                &scored,
+                                &offered,
+                                reason,
+                                known,
+                                &config.ai.verify,
+                                || context.is_cancelled(),
+                                Some("names"),
+                            )
+                            .await
+                        };
+                        (ordinal, scored, outcome)
+                    }),
+            )
+            .buffer_unordered(bound)
+            .collect()
+            .await;
+            answers.sort_by_key(|(ordinal, _, _)| *ordinal);
+            for (ordinal, scored, outcome) in answers {
                 context.record_ai_decision(
                     &outcome.to_store(ordinal as i64, &config.ai.verify.provider),
                 )?;
                 if !outcome.answered {
                     continue;
                 }
+                let channel = &channels[ordinal];
                 if let Some(position) = outcome.accepted {
                     if let Some(pick) = scored
                         .get(position)
@@ -1160,15 +1205,11 @@ pub async fn run_with_service(
                     }
                 }
             }
+            if context.is_cancelled() {
+                anyhow::bail!("cancelled by the operator");
+            }
         }
     }
-
-    // Persist every query + family identity for the other apps.
-    let skip = vec![false; channels.len()];
-    let queries: Vec<String> = channels.iter().map(|c| c.name.clone()).collect();
-    run_engine
-        .warm_families(&queries, &families, &db_names, &skip)
-        .await;
 
     let plan = plan_names(&world, &base, &rows, settings)?;
 
@@ -1296,6 +1337,7 @@ pub async fn run_with_service(
     if let Some(note) = channel_ops::cancelled_note(context, &plan, applied.as_ref()) {
         built = built.cancelled().note(note);
     }
+    warming.finish().await;
     Ok(built.build())
 }
 

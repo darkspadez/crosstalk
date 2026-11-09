@@ -200,7 +200,7 @@ pub async fn run(
         .iter()
         .map(|entry| entry.name.clone())
         .collect();
-    let index = Arc::new(run_engine.build_index(&names));
+    let index = Arc::new(run_engine.build_index_blocking(&names).await?);
 
     let total = scoped_channels.channels.len() as u64;
     context.progress(&ProgressEvent::new(
@@ -324,9 +324,9 @@ pub async fn run(
 
     // Every non-skipped query and its family persist through the identity cache in one
     // batch, so the store holds the identity any other app resolves the same name to.
-    run_engine
-        .warm_families(&channel_names, &families, &names, &skipped)
-        .await;
+    // The warm runs in the background while the network stages below do (E-B2) and is
+    // awaited before the run returns.
+    let warming = run_engine.start_warming_families(&channel_names, &families, &names, &skipped);
 
     // The AI gate fans out (P2), bounded by the provider's own cap; the programme
     // validation walk fans out per channel (P1), bounded by the Dispatcharr concurrency
@@ -334,6 +334,21 @@ pub async fn run(
     // serial, which preserves the ranked-order winner semantics exactly, and both phases
     // resolve in channel order. Work runs in batches so a cancel is honoured between
     // them rather than only after the whole scope.
+    // Every family member a walk could ask about, settled up front where one request per
+    // source and per 50 entries can (E-B1); the walks then search only the rest.
+    if rules.validate {
+        let mut seen = HashSet::new();
+        let asked: Vec<&EpgEntry> = scored
+            .iter()
+            .zip(skipped.iter())
+            .filter(|(_, skipped)| !**skipped)
+            .flat_map(|(ranked, _)| ranked.iter())
+            .filter(|candidate| candidate.score >= threshold && seen.insert(candidate.index))
+            .filter_map(|candidate| scoped_entries.entries.get(candidate.index))
+            .collect();
+        crate::programs::seed(context, client, world, asked, &probe.window, "guide.match").await;
+    }
+
     let ai_bound = ai_gate::fanout_bound_for(context.config(), &ai_settings.effective_chain());
     let validation_bound = config.dispatcharr.concurrency.max(1);
     // Copyable borrows for the `async move` futures below: `&probe` inline would capture
@@ -640,6 +655,7 @@ pub async fn run(
         );
     }
 
+    warming.finish().await;
     Ok(MatchOutcome {
         rows,
         report,

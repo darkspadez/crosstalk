@@ -9,6 +9,7 @@
 //!     the Janitor oracle with `--features oracle --oracle janitor`)
 //!   * `bench` — time the parts of a run, to decide whether REST is fast enough
 
+mod bench_guide;
 mod registry;
 mod simulate;
 
@@ -113,8 +114,39 @@ struct BenchArgs {
 enum BenchTarget {
     /// Benchmark the streams sub-app: match, sort, mirror and visibility plans.
     Streams(StreamsBenchArgs),
-    /// Benchmark the lineup sub-app: clean, names, categorize, logos and sync plans.
+    /// Benchmark the lineup sub-app: clean, names, categorize, logos, sync, create, tidy and
+    /// undo plans.
     Lineup(LineupBenchArgs),
+    /// Benchmark the guide sub-app: match, scan and heal against a fake Dispatcharr.
+    Guide(GuideBenchArgs),
+}
+
+/// `bench guide` has one mode, synthetic: a world built in memory, served by an
+/// in-process fake Dispatcharr that counts every request. The flag is still required, so
+/// the command says what it measured.
+#[derive(Args, Debug)]
+struct GuideBenchArgs {
+    /// Directory holding the configuration files.
+    #[arg(long, default_value = "config", env = "CROSSTALK_CONFIG_DIR")]
+    config: PathBuf,
+    /// Time a synthetic world against a fake Dispatcharr. No network beyond loopback.
+    #[arg(long, required = true)]
+    synthetic: bool,
+    /// Synthetic channels to build.
+    #[arg(long, default_value_t = 20_000)]
+    channels: usize,
+    /// Synthetic EPG entries to build.
+    #[arg(long, default_value_t = 55_000)]
+    entries: usize,
+    /// EPG sources the entries are spread over.
+    #[arg(long, default_value_t = 20)]
+    sources: usize,
+    /// What every fake request waits before it answers, in milliseconds.
+    #[arg(long = "delay-ms", default_value_t = 2)]
+    delay_ms: u64,
+    /// Print the report as JSON instead of lines.
+    #[arg(long)]
+    json: bool,
 }
 
 /// `bench lineup` has one mode, synthetic: the lineup plans read the whole world and
@@ -134,6 +166,15 @@ struct LineupBenchArgs {
     /// Lineup entries to sync (the first N of the configured lineup file).
     #[arg(long = "lineup-channels", default_value_t = 500)]
     lineup_channels: usize,
+    /// Streams the create plan imports from.
+    #[arg(long, default_value_t = 50_000)]
+    streams: usize,
+    /// Synthetic tv-logos files per country directory, for the logos fuzzy tier.
+    #[arg(long = "tv-logos-per-country", default_value_t = 1_500)]
+    tv_logos_per_country: usize,
+    /// Print the report as JSON instead of lines.
+    #[arg(long)]
+    json: bool,
 }
 
 /// One of `--synthetic` or `--live` must be chosen: a bench that silently measured nothing
@@ -303,6 +344,7 @@ fn main() -> Result<()> {
         Command::Bench(args) => match args.target {
             BenchTarget::Streams(args) => bench_streams(args),
             BenchTarget::Lineup(args) => bench_lineup(args),
+            BenchTarget::Guide(args) => bench_guide(args),
         },
         Command::Validate(args) => validate(args),
         Command::Undo(args) => undo_once(args),
@@ -833,12 +875,50 @@ fn bench_lineup(args: LineupBenchArgs) -> Result<()> {
     let options = crosstalk_lineup::bench::SyntheticOptions {
         channels: args.channels,
         lineup_channels: args.lineup_channels,
+        streams: args.streams,
+        tv_logos_per_country: args.tv_logos_per_country,
     };
     let mut report = crosstalk_lineup::bench::synthetic(&settings, &config.matching, &options)?;
     report
         .notes
         .insert(0, format!("settings: {}", settings_path.display()));
-    report.print();
+    print_bench(&report, args.json)
+}
+
+/// `bench guide --synthetic`: match, scan and heal at the plan's scale (20k channels, 55k
+/// EPG entries) against an in-process fake Dispatcharr, with request counts.
+fn bench_guide(args: GuideBenchArgs) -> Result<()> {
+    let config = CrosstalkConfig::load(&args.config)?;
+    let registry = registry::builtin();
+    let app = registry
+        .get(crosstalk_guide::APP_ID)
+        .expect("the guide app is registered");
+    let settings_path = app.settings_path(&config.config_dir);
+    let settings = crosstalk_guide::settings::load(&settings_path)?;
+    let options = bench_guide::GuideBenchOptions {
+        channels: args.channels,
+        entries: args.entries,
+        sources: args.sources,
+        delay_ms: args.delay_ms,
+    };
+    let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
+    let mut report = runtime.block_on(bench_guide::synthetic(&config, &settings, &options))?;
+    report
+        .notes
+        .insert(0, format!("settings: {}", settings_path.display()));
+    print_bench(&report, args.json)
+}
+
+/// A bench report as lines, or as one JSON document with `--json`.
+fn print_bench(report: &crosstalk_streams::bench::BenchReport, json: bool) -> Result<()> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report.to_json()).context("serializing the report")?
+        );
+    } else {
+        report.print();
+    }
     Ok(())
 }
 
@@ -1488,6 +1568,24 @@ mod cli_tests {
         };
         assert_eq!(small.channels, 300);
         assert_eq!(small.lineup_channels, 40);
+        assert_eq!(small.streams, 50_000);
+        assert!(!small.json);
+    }
+
+    #[test]
+    fn bench_guide_is_synthetic_with_the_plan_sizes() {
+        let args = match parse(&["crosstalk", "bench", "guide", "--synthetic", "--json"]).command {
+            Command::Bench(BenchArgs {
+                target: BenchTarget::Guide(args),
+            }) => args,
+            other => panic!("expected a bench guide command, got {other:?}"),
+        };
+        assert!(args.synthetic);
+        assert!(args.json);
+        assert_eq!(args.channels, 20_000);
+        assert_eq!(args.entries, 55_000);
+        assert_eq!(args.delay_ms, 2);
+        assert!(Cli::try_parse_from(["crosstalk", "bench", "guide"]).is_err());
     }
 
     #[test]

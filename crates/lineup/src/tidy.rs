@@ -97,14 +97,31 @@ pub fn decide_tidy(
     let mut rows: Vec<TidyRow> = Vec::new();
     let mut ids: Vec<i64> = owned_ids.iter().copied().collect();
     ids.sort_unstable();
+    // One lookup per owned id instead of a walk over the world per id (E-S5);
+    // reversed so a duplicated id keeps the first entry, as `find` did.
+    let channels: HashMap<i64, &crosstalk_core::dispatcharr::Channel> = world
+        .channels
+        .iter()
+        .rev()
+        .map(|channel| (channel.id, channel))
+        .collect();
+    let groups: HashMap<i64, &str> = world
+        .groups
+        .iter()
+        .rev()
+        .map(|group| (group.id, group.name.as_str()))
+        .collect();
     for id in ids {
-        let Some(channel) = world.channels.iter().find(|channel| channel.id == id) else {
+        let Some(channel) = channels.get(&id).copied() else {
             continue;
         };
         let base = TidyRow {
             id,
             name: channel.name.clone(),
-            group: world.group_name(channel.channel_group_id),
+            group: channel
+                .channel_group_id
+                .and_then(|group| groups.get(&group))
+                .map_or_else(|| "No Group".to_string(), |name| (*name).to_string()),
             number: channel.display_number(),
             streams: channel.streams.len(),
             hidden: channel.hidden_from_output,
@@ -192,7 +209,8 @@ pub fn hid_by_tidy_runs(store: &crosstalk_core::store::Store) -> Result<HashSet<
     let mut hid: HashSet<i64> = HashSet::new();
     for run in writers {
         let restores_tidy = run.action == crate::ACTION_TIDY_APPLY || tidy_chain(run.id);
-        for row in store.rows(run.id)? {
+        // Only the visibility rows, filtered in SQL (E-S5/E-S8: the run_rows_field index).
+        for row in store.rows_of_fields(run.id, &["hidden_from_output"])? {
             if row.status != "ok"
                 || row.subject != crosstalk_core::store::Subject::Channel
                 || row.field != "hidden_from_output"
@@ -244,8 +262,10 @@ pub async fn run(
             }
         }
     }
-    // Deleted upstream is gone, not an error: only live ids decide.
-    owned_ids.retain(|id| world.channels.iter().any(|channel| channel.id == *id));
+    // Deleted upstream is gone, not an error: only live ids decide. A set, not a walk
+    // over the channels per owned id (E-S5).
+    let live: HashSet<i64> = world.channels.iter().map(|channel| channel.id).collect();
+    owned_ids.retain(|id| live.contains(id));
     let hid_by_tidy: HashSet<i64> = match context.store() {
         Some(store) => hid_by_tidy_runs(store)?,
         None => HashSet::new(),

@@ -209,6 +209,18 @@ impl Fixture {
                 .mount(&server)
                 .await;
         }
+        // The per-source horizon probe of the programme pre-seed (`fields=end_time`, no
+        // tvg_id): the one source carries something in the window when any entry does.
+        if !with_programmes.is_empty() {
+            Mock::given(method("GET"))
+                .and(path("/api/epg/programs/search/"))
+                .and(query_param("fields", "end_time"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"count": 1, "results": [{"end_time": "2099-01-01T00:00:00Z"}]}),
+                ))
+                .mount(&server)
+                .await;
+        }
         Mock::given(method("GET"))
             .and(path("/api/epg/programs/search/"))
             .respond_with(

@@ -666,6 +666,15 @@ async fn run_with_tree_url(
     let truncated = tv_index.as_ref().is_some_and(|index| index.truncated);
     let without_tv = lookups.sources(order.clone(), None, settings);
 
+    // Every channel name resolved in one batch first, off the async runtime (E-B3): one
+    // store read, the misses on rayon, ONE write transaction. The rayon stage below then
+    // reads the memo instead of taking the store lock per name.
+    let warm: Vec<(String, ResolveContext)> = channels
+        .iter()
+        .map(|channel| (channel.name.clone(), ResolveContext::default()))
+        .collect();
+    run_engine.resolve_stage(warm, |_| ()).await?;
+
     // One resolve per channel, on every core (the tv-logos fuzzy tier is the costly
     // part: one similarity pass per candidate file per channel).
     let rows: Vec<LogoRow> = channels
@@ -686,14 +695,20 @@ async fn run_with_tree_url(
     // `already_set`), everything else assigns.
     let mut assign: Vec<&LogoRow> = Vec::new();
     let mut skipped_same: HashSet<i64> = HashSet::new();
+    // Reversed so a duplicated id keeps its first channel, as a `find` would (E-S5).
+    let logo_of: HashMap<i64, Option<i64>> = channels
+        .iter()
+        .rev()
+        .map(|channel| (channel.id, channel.logo_id))
+        .collect();
     for row in &rows {
         let Some(url) = row.url.as_deref() else {
             continue;
         };
-        let current = channels
-            .iter()
-            .find(|channel| channel.id == row.id)
-            .and_then(|channel| channel.logo_id)
+        let current = logo_of
+            .get(&row.id)
+            .copied()
+            .flatten()
             .and_then(|id| lookups.by_id.get(&id))
             .map(|(_, url)| (*url).to_string());
         if current.as_deref() == Some(url) {
@@ -759,11 +774,10 @@ async fn run_with_tree_url(
     // just created (same URLs, real ids).
     let mut planned_world = world.clone();
     if let Some(report) = create_report.as_ref() {
+        let mut known: HashSet<i64> = planned_world.logos.iter().map(|logo| logo.id).collect();
         for (logo, outcome) in create_plan.logos.iter().zip(report.logos.iter()) {
             if let Some(id) = outcome.id {
-                if logo.existing_id.is_none()
-                    && !planned_world.logos.iter().any(|known| known.id == id)
-                {
+                if logo.existing_id.is_none() && known.insert(id) {
                     planned_world.logos.push(crosstalk_core::dispatcharr::Logo {
                         id,
                         name: logo.name.clone(),
@@ -803,9 +817,11 @@ async fn run_with_tree_url(
             .copied()
             .collect()
     };
+    // A set, not a scan of `assignable` per row (E-S4).
+    let assignable_ids: HashSet<i64> = assignable.iter().map(|planned| planned.id).collect();
     let refused: HashSet<i64> = assign
         .iter()
-        .filter(|row| !assignable.iter().any(|planned| planned.id == row.id))
+        .filter(|row| !assignable_ids.contains(&row.id))
         .map(|row| row.id)
         .collect();
     let plan = plan_assignments(&planned_world, &base, &assignable, &logo_ids)?;

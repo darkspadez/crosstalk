@@ -2865,8 +2865,8 @@ async fn apply_ai_gate(
     })
     .await
     .context("the AI shortlist stage panicked")?;
-    // The gate + ask, one group at a time: borderline groups are rare, and a cancel
-    // lands between groups rather than after the whole scope.
+    // The gate decisions are CPU and stay serial; the asks fan out like guide's (E-S2),
+    // bounded by the chain's own cap, and are recorded in group order.
     let known = run_engine.engine().known().clone();
     // The audit row is the REPORT row the answer labels: the leader's assignment (the
     // CSV writes one row per assignment, in `assignments` order), as guide records the
@@ -2877,11 +2877,14 @@ async fn apply_ai_gate(
         .enumerate()
         .map(|(row, assignment)| (assignment.channel_id, row))
         .collect();
-    let mut accepts: Vec<(usize, usize)> = Vec::new();
+    // Reversed so a duplicated id keeps its first channel, as a `find` would.
+    let scoped_by_id: HashMap<i64, &Channel> = scoped
+        .iter()
+        .rev()
+        .map(|channel| (channel.id, channel))
+        .collect();
+    let mut asks = Vec::new();
     for (position, &ordinal) in empty.iter().enumerate() {
-        if context.is_cancelled() {
-            anyhow::bail!("cancelled by the operator");
-        }
         let group = &outcome.gate_groups[ordinal];
         let Some(&row) = report_row.get(&group.leader_channel_id) else {
             continue;
@@ -2890,34 +2893,63 @@ async fn apply_ai_gate(
         let Some((reason, offered)) = ai_gate::shortlist(&scored, &candidates, ai_settings) else {
             continue;
         };
-        let Some(leader) = scoped
-            .iter()
-            .find(|channel| channel.id == group.leader_channel_id)
-        else {
+        let Some(leader) = scoped_by_id.get(&group.leader_channel_id).copied() else {
             continue;
         };
-        let gate_outcome = ai_gate::ask(
-            ai,
-            leader,
-            &candidates,
-            &scored,
-            &offered,
-            reason,
-            &known,
-            ai_settings,
-            || context.is_cancelled(),
-            // The task prefix changes a chat model's prompt and the audited request, so
-            // only a configured chain gets it (guide's rule): shorthand installs ask
-            // exactly what they asked before the chain existed.
-            (!ai_settings.chain.is_empty()).then_some("streams"),
-        )
-        .await;
+        asks.push((position, ordinal, row, leader, scored, reason, offered));
+    }
+    let bound = ai_gate::fanout_bound_for(context.config(), &ai_settings.effective_chain());
+    let candidates_ref = &candidates;
+    let known_ref = &known;
+    let mut answers: Vec<(usize, usize, usize, ai_gate::GateOutcome)> = {
+        use futures::{stream, StreamExt};
+        // Built in a loop rather than through `map`, so the borrows of the world the
+        // futures carry get one concrete lifetime (a closure would be asked to be generic
+        // over it and fail to type-check).
+        let mut pending = Vec::with_capacity(asks.len());
+        for (position, ordinal, row, leader, scored, reason, offered) in asks {
+            pending.push(async move {
+                let gate_outcome = if context.is_cancelled() {
+                    ai_gate::GateOutcome::cancelled(reason, ai_settings.model.clone())
+                } else {
+                    ai_gate::ask(
+                        ai,
+                        leader,
+                        candidates_ref,
+                        &scored,
+                        &offered,
+                        reason,
+                        known_ref,
+                        ai_settings,
+                        || context.is_cancelled(),
+                        // The task prefix changes a chat model's prompt and the audited
+                        // request, so only a configured chain gets it (guide's rule):
+                        // shorthand installs ask exactly what they asked before the chain
+                        // existed.
+                        (!ai_settings.chain.is_empty()).then_some("streams"),
+                    )
+                    .await
+                };
+                (position, ordinal, row, gate_outcome)
+            });
+        }
+        stream::iter(pending)
+            .buffer_unordered(bound)
+            .collect()
+            .await
+    };
+    answers.sort_by_key(|(position, ..)| *position);
+    let mut accepts: Vec<(usize, usize, usize)> = Vec::new();
+    for (position, ordinal, row, gate_outcome) in answers {
         context.record_ai_decision(&gate_outcome.to_store(row as i64, &ai_settings.provider))?;
         if gate_outcome.answered {
             if let Some(accepted) = gate_outcome.accepted {
-                accepts.push((ordinal, accepted));
+                accepts.push((position, ordinal, accepted));
             }
         }
+    }
+    if context.is_cancelled() {
+        anyhow::bail!("cancelled by the operator");
     }
     if accepts.is_empty() {
         return Ok(());
@@ -2925,9 +2957,8 @@ async fn apply_ai_gate(
     // The accepted candidate's identity family at the floor: the whole family promotes,
     // never a lone stream (D07). Family keys read off the run's own index.
     let mut families: Vec<(usize, Vec<i64>, String)> = Vec::with_capacity(accepts.len());
-    for &(ordinal, accepted) in &accepts {
-        let position = empty.iter().position(|&o| o == ordinal);
-        let Some(shortlist) = position.and_then(|position| shortlists.get(position)) else {
+    for &(position, ordinal, accepted) in &accepts {
+        let Some(shortlist) = shortlists.get(position) else {
             continue;
         };
         let Some(accepted_member) = shortlist.get(accepted) else {

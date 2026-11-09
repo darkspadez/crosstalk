@@ -20,6 +20,7 @@ pub mod cleanup;
 pub mod engine;
 pub mod heal;
 pub mod matching;
+mod programs;
 pub mod scan;
 pub mod scope;
 pub mod settings;

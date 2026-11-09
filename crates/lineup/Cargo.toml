@@ -17,6 +17,8 @@ crosstalk-matching.workspace = true
 crosstalk-streams.workspace = true
 
 anyhow.workspace = true
+# The AI gate fans out like guide's (audit E-S2).
+futures.workspace = true
 rayon.workspace = true
 async-trait.workspace = true
 serde.workspace = true
