@@ -61,6 +61,10 @@ services:
       # CROSSTALK_DISPATCHARR__BASE_URL: "http://dispatcharr:9191"
       # TypeSafe, for AI verification. Leave it unset to match purely heuristically.
       # TYPESAFE_API_KEY: ""
+      # The crosstalk-bridge secret ([bridge] secret_env), when it lives in the environment
+      # rather than config/crosstalk.toml. Give the Dispatcharr service the same value (see
+      # docs/bridge.md, "Keeping the secret out of Dispatcharr's database").
+      # CROSSTALK_BRIDGE_SECRET: "${CROSSTALK_BRIDGE_SECRET}"
       RUST_LOG: "info"
     # On the same compose network as Dispatcharr, so [dispatcharr] base_url can be
     # "http://dispatcharr:9191".

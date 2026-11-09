@@ -1,8 +1,9 @@
-//! SHA-256 (FIPS 180-4), for comparing secrets as fixed-length digests.
+//! SHA-256 (FIPS 180-4) and HMAC-SHA256 (RFC 2104), for comparing and signing with secrets.
 //!
-//! The token comparison hashes both sides first so the constant-time loop always runs over 32
-//! bytes, whatever the presented length. Written out rather than pulled in: it is one function
-//! the daemon calls on short inputs, and the test vectors below pin it.
+//! The web UI's token comparison hashes both sides first so the constant-time loop always runs
+//! over 32 bytes, whatever the presented length; the bridge client signs every request body with
+//! [`hmac_sha256`]. Written out rather than pulled in: `sha2`/`hmac` are not in Cargo.lock, the
+//! inputs are short, and the FIPS and RFC 4231 vectors below pin both.
 
 const K: [u32; 64] = [
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -45,6 +46,45 @@ pub fn digest(data: &[u8]) -> [u8; 32] {
         chunk.copy_from_slice(&word.to_be_bytes());
     }
     out
+}
+
+/// HMAC-SHA256 of `message` under `key` (RFC 2104 with SHA-256's 64-byte block).
+pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    // A key longer than the block is hashed first; a shorter one is zero-padded.
+    let mut block = [0u8; 64];
+    if key.len() > 64 {
+        block[..32].copy_from_slice(&digest(key));
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+    let mut inner = Vec::with_capacity(64 + message.len());
+    inner.extend(block.iter().map(|byte| byte ^ 0x36));
+    inner.extend_from_slice(message);
+    let inner = digest(&inner);
+    let mut outer = Vec::with_capacity(64 + 32);
+    outer.extend(block.iter().map(|byte| byte ^ 0x5c));
+    outer.extend_from_slice(&inner);
+    digest(&outer)
+}
+
+/// Lowercase hex, two digits per byte.
+pub fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut text = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        text.push(DIGITS[(byte >> 4) as usize] as char);
+        text.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    text
+}
+
+/// Constant-time equality of two digests.
+pub fn digests_match(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    let mut difference = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        difference |= x ^ y;
+    }
+    difference == 0
 }
 
 fn compress(state: &mut [u32; 8], block: &[u8]) {
@@ -93,10 +133,6 @@ fn compress(state: &mut [u32; 8], block: &[u8]) {
 mod tests {
     use super::*;
 
-    fn hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-    }
-
     #[test]
     fn the_fips_vectors_match() {
         assert_eq!(
@@ -119,6 +155,35 @@ mod tests {
             hex(&digest(&vec![b'a'; 1_000_000])),
             "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
         );
+    }
+
+    #[test]
+    fn the_rfc_4231_hmac_vectors_match() {
+        // Test case 1: a 20-byte key.
+        assert_eq!(
+            hex(&hmac_sha256(&[0x0b; 20], b"Hi There")),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+        // Test case 2: a key shorter than the block.
+        assert_eq!(
+            hex(&hmac_sha256(b"Jefe", b"what do ya want for nothing?")),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        // Test case 6: a key longer than the block is hashed first.
+        assert_eq!(
+            hex(&hmac_sha256(
+                &[0xaa; 131],
+                b"Test Using Larger Than Block-Size Key - Hash Key First"
+            )),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
+    }
+
+    #[test]
+    fn digests_match_only_when_equal() {
+        let one = digest(b"one");
+        assert!(digests_match(&one, &digest(b"one")));
+        assert!(!digests_match(&one, &digest(b"two")));
     }
 
     #[test]

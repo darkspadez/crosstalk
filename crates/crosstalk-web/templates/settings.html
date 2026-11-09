@@ -23,6 +23,8 @@
       <input id="{{ field.id }}" name="{{ field.id }}" type="number" step="any" value="{{ field.value }}">
       {% else if field.kind == "json" %}
       <textarea id="{{ field.id }}" name="{{ field.id }}" rows="4">{{ field.value }}</textarea>
+      {% else if field.kind == "secret" %}
+      <input id="{{ field.id }}" type="password" value="" placeholder="{{ field.value }}" autocomplete="off" disabled>
       {% else %}
       <input id="{{ field.id }}" name="{{ field.id }}" type="text" value="{{ field.value }}">
       {% endif %}

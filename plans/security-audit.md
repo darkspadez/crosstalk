@@ -43,7 +43,9 @@ D. Input handling: webhook body, lineup JSON, tv-logos tree, settings regexes, f
 E. Performance: all plans at scale, request counts, memory, SQLite batching, rayon use.
 F. Supply chain and deployment: cargo audit, Dockerfile (non-root, ffmpeg), CI secrets,
    release artifacts, Renovate.
-G. Bridge: design + build (after A-F fixes land).
+G. Bridge: design + build (after A-F fixes land). Built: contract `docs/bridge.md`, plugin
+   `bridge/`, client `crosstalk_core::bridge`; status and deviations in
+   `docs/audit/G-bridge.md`.
 
 ## Fix commits (one per class, in this order)
 1. Write safety. 2. Auth/proxy/limiter/webhook. 3. Secrets and URLs at rest. 4. Input parsers +

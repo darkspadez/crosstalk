@@ -324,11 +324,7 @@ pub fn tokens_match(expected: &str, presented: &str) -> bool {
 
 /// Constant-time equality of two digests.
 pub fn digests_match(a: &[u8; 32], b: &[u8; 32]) -> bool {
-    let mut difference = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        difference |= x ^ y;
-    }
-    difference == 0
+    crate::sha256::digests_match(a, b)
 }
 
 /// Whether a request is reachable without a credential.

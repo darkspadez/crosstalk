@@ -5,6 +5,7 @@
 //!   * `run`     — run one sub-app action once, without the daemon
 //!   * `validate` — check configuration against Dispatcharr
 //!   * `exports clear` — delete the CSV reports the sub-apps wrote
+//!   * `bridge secret|rotate|ping` — the `crosstalk-bridge` plugin's secret, and a signed ping
 //!   * `simulate-streams` — offline stream-to-channel match simulation (the unified engine;
 //!     the Janitor oracle with `--features oracle --oracle janitor`)
 //!   * `bench` — time the parts of a run, to decide whether REST is fast enough
@@ -47,6 +48,8 @@ enum Command {
     Exports(ExportsArgs),
     /// Undo a finished apply run: reverse the rows that are still in effect.
     Undo(UndoArgs),
+    /// The crosstalk-bridge Dispatcharr plugin: its shared secret, and a signed ping.
+    Bridge(BridgeArgs),
     /// Time the parts of a sub-app's run: the plan phases, and the writes they would issue.
     Bench(BenchArgs),
     /// Offline stream-to-channel match simulation, on the unified engine.
@@ -220,6 +223,31 @@ struct ConfigArgs {
 }
 
 #[derive(Args, Debug)]
+struct BridgeArgs {
+    #[command(subcommand)]
+    command: BridgeCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum BridgeCommand {
+    /// Generate the bridge secret, write it to crosstalk.toml [bridge] and print it once.
+    Secret(BridgeSecretArgs),
+    /// Replace the bridge secret with a new one, and print how to roll it into the plugin.
+    Rotate(ConfigArgs),
+    /// Send the plugin a signed ping and say whether this crosstalk can use it.
+    Ping(ConfigArgs),
+}
+
+#[derive(Args, Debug)]
+struct BridgeSecretArgs {
+    #[arg(long, default_value = "config", env = "CROSSTALK_CONFIG_DIR")]
+    config: PathBuf,
+    /// Replace a secret that is already set. `bridge rotate` is the usual way to do that.
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Args, Debug)]
 struct ExportsArgs {
     #[command(subcommand)]
     command: ExportsCommand,
@@ -353,6 +381,11 @@ fn main() -> Result<()> {
         Command::Exports(args) => match args.command {
             ExportsCommand::Clear(args) => clear_exports(args),
         },
+        Command::Bridge(args) => match args.command {
+            BridgeCommand::Secret(args) => bridge_secret(args),
+            BridgeCommand::Rotate(args) => bridge_rotate(args),
+            BridgeCommand::Ping(args) => bridge_ping(args),
+        },
     }
 }
 
@@ -389,6 +422,13 @@ fn serve(args: ServeArgs) -> Result<()> {
         // no modes), but a token or key in a file every account can read is worth a line.
         for warning in snapshot.exposed_secret_warnings() {
             tracing::warn!("{warning}");
+        }
+
+        // The bridge is checked once, here: a plugin that is missing, too old or does not
+        // verify crosstalk's signature leaves the bridge-backed paths on REST for this run of
+        // the daemon, and the line below says why. A settings save does not re-check it.
+        if snapshot.bridge.enabled {
+            println!("{}", activate_bridge(&snapshot).await.describe());
         }
 
         let store = Store::open(snapshot.data_dir().join("crosstalk.db"))?;
@@ -623,8 +663,12 @@ fn run_workflow_once(args: RunArgs, name: &str) -> Result<()> {
             current.started_at,
         );
     }
-    let runner = JobRunner::new(registry, SharedConfig::new(config), store);
+    let bridge_enabled = config.bridge.enabled;
     let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
+    if bridge_enabled {
+        println!("{}", runtime.block_on(activate_bridge(&config)).describe());
+    }
+    let runner = JobRunner::new(registry, SharedConfig::new(config), store);
     let options = if args.fresh {
         crosstalk_core::runner::RunOptions::default().fresh()
     } else {
@@ -754,8 +798,12 @@ fn run_once(args: RunArgs) -> Result<()> {
             action.id
         );
     }
-    let runner = JobRunner::new(registry, SharedConfig::new(config), store);
+    let bridge_enabled = config.bridge.enabled;
     let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
+    if bridge_enabled {
+        println!("{}", runtime.block_on(activate_bridge(&config)).describe());
+    }
+    let runner = JobRunner::new(registry, SharedConfig::new(config), store);
     let mut options = if args.fresh {
         crosstalk_core::runner::RunOptions::default().fresh()
     } else {
@@ -823,8 +871,12 @@ fn undo_once(args: UndoArgs) -> Result<()> {
             current.started_at,
         );
     }
-    let runner = JobRunner::new(registry, SharedConfig::new(config), store);
+    let bridge_enabled = config.bridge.enabled;
     let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
+    if bridge_enabled {
+        println!("{}", runtime.block_on(activate_bridge(&config)).describe());
+    }
+    let runner = JobRunner::new(registry, SharedConfig::new(config), store);
     let outcome = runtime.block_on(runner.run_undo_to_completion_with(
         &target.app,
         args.run_id,
@@ -1064,6 +1116,116 @@ fn clear_exports(args: ExportsClearArgs) -> Result<()> {
     Ok(())
 }
 
+/// Ping the bridge and remember the verdict for this process (see
+/// [`crosstalk_core::bridge::check_and_activate`]).
+async fn activate_bridge(config: &CrosstalkConfig) -> crosstalk_core::bridge::BridgeStatus {
+    match crosstalk_core::DispatcharrClient::new(&config.dispatcharr) {
+        Ok(client) => crosstalk_core::bridge::check_and_activate(config, &client).await,
+        Err(error) => crosstalk_core::bridge::BridgeStatus::Unavailable {
+            reason: format!("{error:#}"),
+        },
+    }
+}
+
+/// The file-only configuration a bridge command may write a secret into, refusing when the
+/// environment supplies the secret: the environment wins, so a secret written to the file
+/// would never be used, and the environment value must never be written to the file.
+fn bridge_file_config(dir: &std::path::Path) -> Result<CrosstalkConfig> {
+    let config = CrosstalkConfig::load_file(dir)?;
+    if config.bridge.secret_from_env() {
+        anyhow::bail!(
+            "the bridge secret comes from ${} in this environment, which wins over \
+             crosstalk.toml: put the new secret there instead (`openssl rand -hex 32` makes \
+             one), and nothing is written to the file",
+            config.bridge.secret_env.trim()
+        );
+    }
+    Ok(config)
+}
+
+/// `bridge secret`: generate the shared secret, save it to `[bridge] secret` (the file is
+/// written 0600) and print it once, with where to paste it.
+fn bridge_secret(args: BridgeSecretArgs) -> Result<()> {
+    let mut config = bridge_file_config(&args.config)?;
+    if !config.bridge.secret.trim().is_empty() && !args.force {
+        anyhow::bail!(
+            "crosstalk.toml already has a bridge secret: `crosstalk bridge rotate` replaces it \
+             without breaking the bridge, or add --force to overwrite it"
+        );
+    }
+    let secret = crosstalk_core::bridge::generate_secret()?;
+    config.bridge.secret = secret.clone();
+    let path = args.config.join("crosstalk.toml");
+    config.save(&path)?;
+    println!("wrote [bridge] secret to {} (mode 0600)", path.display());
+    println!();
+    println!("{secret}");
+    println!();
+    println!("This is the only time it is printed. Next:");
+    println!(
+        "  1. In Dispatcharr, Plugins -> crosstalk bridge: paste it into Secret, or set \
+         CROSSTALK_BRIDGE_SECRET in Dispatcharr's environment (keeps it out of its database)"
+    );
+    println!("  2. Enable the plugin, then set [bridge] enabled = true in crosstalk.toml");
+    println!("  3. `crosstalk bridge ping` checks the result");
+    Ok(())
+}
+
+/// `bridge rotate`: a new secret in `[bridge] secret`, and the order to roll it into the plugin
+/// so nothing breaks: the plugin accepts the old one as its previous secret until the grace
+/// time while crosstalk restarts on the new one.
+fn bridge_rotate(args: ConfigArgs) -> Result<()> {
+    let mut config = bridge_file_config(&args.config)?;
+    if config.bridge.secret.trim().is_empty() {
+        anyhow::bail!(
+            "crosstalk.toml has no bridge secret yet: `crosstalk bridge secret` makes one"
+        );
+    }
+    let secret = crosstalk_core::bridge::generate_secret()?;
+    config.bridge.secret = secret.clone();
+    let path = args.config.join("crosstalk.toml");
+    config.save(&path)?;
+    let grace = (chrono::Utc::now() + chrono::Duration::hours(24))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    println!(
+        "wrote the new [bridge] secret to {} (mode 0600)",
+        path.display()
+    );
+    println!();
+    println!("{secret}");
+    println!();
+    println!("This is the only time it is printed. Roll it in this order:");
+    println!(
+        "  1. In the plugin, move the current Secret into Previous secret and set \"Accept \
+         the previous secret until\" to {grace}"
+    );
+    println!("     (or CROSSTALK_BRIDGE_PREVIOUS_SECRET / CROSSTALK_BRIDGE_GRACE_UNTIL)");
+    println!("  2. Paste the new secret into Secret (or CROSSTALK_BRIDGE_SECRET)");
+    println!("  3. Restart crosstalk: it signs with the new secret from then on");
+    println!("  4. `crosstalk bridge ping`, then clear Previous secret in the plugin");
+    Ok(())
+}
+
+/// `bridge ping`: a signed ping with the configured secret, whether or not `[bridge]` is
+/// enabled, so an install can be checked before it is switched on.
+fn bridge_ping(args: ConfigArgs) -> Result<()> {
+    let mut config = CrosstalkConfig::load(&args.config)?;
+    let enabled = config.bridge.enabled;
+    config.bridge.enabled = true;
+    let client = crosstalk_core::DispatcharrClient::new(&config.dispatcharr)?;
+    let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
+    let status = runtime.block_on(crosstalk_core::bridge::check(&config, &client));
+    println!("{}", status.describe());
+    if let crosstalk_core::bridge::BridgeStatus::Unavailable { .. } = status {
+        anyhow::bail!("the bridge plugin is not usable");
+    }
+    if !enabled {
+        println!("[bridge] enabled is false: set it to true to use the plugin");
+    }
+    Ok(())
+}
+
 fn validate(args: ConfigArgs) -> Result<()> {
     let config = CrosstalkConfig::load(&args.config)?;
     let registry = registry::builtin();
@@ -1171,6 +1333,33 @@ fn validate(args: ConfigArgs) -> Result<()> {
         }
     }
 
+    // A configuration error (enabled without a secret...) is already reported above; this is
+    // whether the plugin itself answers. Not a failure: a run falls back to REST without it.
+    if config.bridge.enabled && config.bridge.errors().is_empty() {
+        let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
+        let status = match crosstalk_core::DispatcharrClient::new(&config.dispatcharr) {
+            Ok(client) => runtime.block_on(crosstalk_core::bridge::check(&config, &client)),
+            Err(error) => crosstalk_core::bridge::BridgeStatus::Unavailable {
+                reason: format!("{error:#}"),
+            },
+        };
+        match status {
+            crosstalk_core::bridge::BridgeStatus::Unavailable { .. } => {
+                println!("warning: {}", status.describe());
+            }
+            _ => println!("{}", status.describe()),
+        }
+    } else {
+        println!(
+            "bridge: {}",
+            if config.bridge.enabled {
+                "enabled but misconfigured (see the errors)"
+            } else {
+                "disabled"
+            }
+        );
+    }
+
     for app in registry.iter() {
         let path = app.settings_path(&config.config_dir);
         match app.validate_settings(&path) {
@@ -1249,6 +1438,102 @@ mod cli_tests {
 
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(args).expect("the command line parses")
+    }
+
+    fn bridge_command(args: &[&str]) -> BridgeCommand {
+        match parse(args).command {
+            Command::Bridge(BridgeArgs { command }) => command,
+            other => panic!("expected a bridge command, got {other:?}"),
+        }
+    }
+
+    /// The `[bridge]` table as the file holds it.
+    fn file_bridge(dir: &Path) -> crosstalk_core::config::BridgeConfig {
+        CrosstalkConfig::load_file(dir).expect("load").bridge
+    }
+
+    #[test]
+    fn bridge_secret_writes_once_and_rotate_replaces_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A file the operator wrote, with a comment the save must keep. `secret_env` names a
+        // variable nothing sets, so the machine running the tests cannot shadow the file.
+        std::fs::write(
+            dir.path().join("crosstalk.toml"),
+            "# mine\n[bridge]\nsecret_env = \"CROSSTALK_TEST_UNSET_BRIDGE_SECRET\"\n",
+        )
+        .expect("write");
+        let config = dir.path().to_str().expect("utf-8 path");
+
+        let BridgeCommand::Secret(args) =
+            bridge_command(&["crosstalk", "bridge", "secret", "--config", config])
+        else {
+            panic!("not the secret command");
+        };
+        bridge_secret(args).expect("generated");
+        let first = file_bridge(dir.path()).secret;
+        assert_eq!(first.len(), 64);
+        let text = std::fs::read_to_string(dir.path().join("crosstalk.toml")).expect("read");
+        assert!(text.contains("# mine"), "{text}");
+        #[cfg(unix)]
+        assert_eq!(
+            crosstalk_core::perms::mode(&dir.path().join("crosstalk.toml")),
+            Some(0o600)
+        );
+
+        // A second `secret` would break the plugin's copy: refused without --force.
+        let BridgeCommand::Secret(args) =
+            bridge_command(&["crosstalk", "bridge", "secret", "--config", config])
+        else {
+            panic!("not the secret command");
+        };
+        let error = bridge_secret(args).expect_err("refused");
+        assert!(format!("{error}").contains("bridge rotate"), "{error}");
+        assert_eq!(file_bridge(dir.path()).secret, first);
+
+        let BridgeCommand::Rotate(args) =
+            bridge_command(&["crosstalk", "bridge", "rotate", "--config", config])
+        else {
+            panic!("not the rotate command");
+        };
+        bridge_rotate(args).expect("rotated");
+        let second = file_bridge(dir.path()).secret;
+        assert_eq!(second.len(), 64);
+        assert_ne!(second, first);
+    }
+
+    #[test]
+    fn a_bridge_secret_from_the_environment_is_never_written_to_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("crosstalk.toml"),
+            "[bridge]\nsecret_env = \"CROSSTALK_TEST_SET_BRIDGE_SECRET\"\n",
+        )
+        .expect("write");
+        std::env::set_var("CROSSTALK_TEST_SET_BRIDGE_SECRET", "ENV-ONLY-SECRET");
+        let result = bridge_secret(BridgeSecretArgs {
+            config: dir.path().to_path_buf(),
+            force: true,
+        });
+        let rotated = bridge_rotate(ConfigArgs {
+            config: dir.path().to_path_buf(),
+        });
+        std::env::remove_var("CROSSTALK_TEST_SET_BRIDGE_SECRET");
+        let error = result.expect_err("refused");
+        assert!(format!("{error}").contains("CROSSTALK_TEST_SET_BRIDGE_SECRET"));
+        assert!(rotated.is_err());
+        let text = std::fs::read_to_string(dir.path().join("crosstalk.toml")).expect("read");
+        assert!(!text.contains("ENV-ONLY-SECRET"), "{text}");
+        assert!(file_bridge(dir.path()).secret.is_empty());
+    }
+
+    #[test]
+    fn bridge_ping_takes_a_config_dir() {
+        let BridgeCommand::Ping(args) =
+            bridge_command(&["crosstalk", "bridge", "ping", "--config", "/etc/crosstalk"])
+        else {
+            panic!("not the ping command");
+        };
+        assert_eq!(args.config, Path::new("/etc/crosstalk"));
     }
 
     fn clear_args(args: &[&str]) -> ExportsClearArgs {

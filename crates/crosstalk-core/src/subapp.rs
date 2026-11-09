@@ -214,6 +214,10 @@ pub enum FieldKind {
     JsonObject,
     /// A non-editable explanatory block.
     Info,
+    /// A secret, shown masked: the form renders a status line (set, from which variable,
+    /// missing) in a disabled password control and never the value, and a submitted form never
+    /// sets it. Secrets are made and rotated from the CLI.
+    Secret,
 }
 
 /// One setting, as the UI form and the CSV preamble need it.
