@@ -529,20 +529,16 @@ impl Store {
                 );
                 "#,
             )?;
-            // A run left `running` by a crash or a restart can never finish, and pruning
-            // skips running rows, so it would otherwise show as live forever. Only the
-            // daemon's own open retires: a second process cannot tell a live run from a
-            // stale one, and retiring a live run rewrites history under it.
-            if retire_running {
-                connection.execute(
-                    "UPDATE runs SET status = 'failed', \
-                     summary = COALESCE(summary, 'the daemon restarted while this run was in progress'), \
-                     finished_at = COALESCE(finished_at, ?1) WHERE status = 'running'",
-                    params![chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)],
-                )?;
-            }
             add_run_row_columns(connection)?;
             add_run_columns(connection)?;
+            // A run left `running` by a crash or a restart can never finish, and pruning
+            // skips running rows, so it would otherwise show as live forever. Only the
+            // daemon's own open retires, and only the rows it can PROVE dead (see
+            // `retire_dead_runs`): a CLI run in another process is live, and retiring it
+            // would rewrite history under it and free its app's slot while it writes.
+            if retire_running {
+                retire_dead_runs(connection)?;
+            }
             add_ai_decision_columns(connection)?;
             // Before the index below: the rename turns `janitor` rows into `guide` rows, and
             // must not be the statement that trips over it.
@@ -602,6 +598,18 @@ impl Store {
         self.insert_run(app, action, dry_run, false, None)
     }
 
+    /// [`Store::start_run`] for a run tied to another: a workflow step to its workflow, or an
+    /// undo to the run it reverses (see [`Store::insert_run`]).
+    pub fn start_child_run(
+        &self,
+        app: &str,
+        action: &str,
+        dry_run: bool,
+        parent_run_id: i64,
+    ) -> Result<i64> {
+        self.insert_run(app, action, dry_run, false, Some(parent_run_id))
+    }
+
     /// Start a run that does not take the app's one-live-run slot.
     ///
     /// For an action that only reads the run store (`status`, the dashboard's own questions):
@@ -632,7 +640,8 @@ impl Store {
         self.with_connection(|connection| {
             connection.execute(
                 "INSERT INTO runs (app, action, dry_run, started_at, status, counts, unguarded, \
-                 parent_run_id) VALUES (?1, ?2, ?3, ?4, ?5, '{}', ?6, ?7)",
+                 parent_run_id, pid, host, heartbeat_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, '{}', ?6, ?7, ?8, ?9, ?4)",
                 params![
                     app,
                     action,
@@ -641,9 +650,24 @@ impl Store {
                     RunStatus::Running.as_str(),
                     i64::from(unguarded),
                     parent_run_id,
+                    i64::from(std::process::id()),
+                    host_id(),
                 ],
             )?;
             Ok(connection.last_insert_rowid())
+        })
+    }
+
+    /// Stamp a live run's `heartbeat_at`, which is how another process's daemon start tells
+    /// it from a run a crash left `running`. A finished run is left alone.
+    pub fn heartbeat(&self, run_id: i64) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        self.with_connection(|connection| {
+            connection.execute(
+                "UPDATE runs SET heartbeat_at = ?2 WHERE id = ?1 AND status = 'running'",
+                params![run_id, now],
+            )?;
+            Ok(())
         })
     }
 
@@ -1610,6 +1634,90 @@ fn add_column(connection: &Connection, table: &str, name: &str, definition: &str
 /// allowed to run while another run of the same app is live. The DEFAULT is the backfill — every
 /// row written before this column existed was a guarded run — so the partial index can be built
 /// on top of it without a pass over history.
+/// How often a live run stamps its `heartbeat_at`.
+pub const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A `running` row whose heartbeat is older than this is dead, whoever ran it: ten missed
+/// beats.
+fn stale_heartbeat() -> chrono::Duration {
+    chrono::Duration::seconds(300)
+}
+
+/// This machine, as a run row records it: the kernel's boot id where there is one (a
+/// container shares its host's, and a reboot changes it), otherwise the host name.
+fn host_id() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .filter(|name| !name.trim().is_empty())
+        // Neither: one machine is the only setup that shares a store file anyway.
+        .unwrap_or_else(|| "local".to_string())
+}
+
+/// Whether process `pid` exists, where the platform can say (`/proc`); `None` elsewhere.
+fn pid_alive(pid: i64) -> Option<bool> {
+    if !std::path::Path::new("/proc/self").exists() {
+        return None;
+    }
+    Some(std::path::Path::new(&format!("/proc/{pid}")).exists())
+}
+
+/// Retire the `running` rows that are provably dead, at the daemon's start.
+///
+/// A row is dead when it predates the liveness columns (no heartbeat), when its heartbeat is
+/// older than [`stale_heartbeat`], or when it was started on THIS machine by a process that is
+/// gone — including this very pid, because nothing of this process has started a run yet
+/// (a container's daemon is pid 1 on every start). Anything else is a live run of another
+/// process (a CLI run) and keeps its row and its app's slot.
+/// One `running` row's liveness columns: id, pid, host, heartbeat.
+type RunningRow = (i64, Option<i64>, Option<String>, Option<String>);
+
+fn retire_dead_runs(connection: &Connection) -> Result<()> {
+    let now = chrono::Utc::now();
+    let host = host_id();
+    let own_pid = i64::from(std::process::id());
+    let mut statement = connection
+        .prepare("SELECT id, pid, host, heartbeat_at FROM runs WHERE status = 'running'")?;
+    let running: Vec<RunningRow> = statement
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let dead: Vec<i64> = running
+        .into_iter()
+        .filter(|(_, pid, row_host, heartbeat)| {
+            let beat = heartbeat
+                .as_deref()
+                .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+                .map(|beat| beat.with_timezone(&chrono::Utc));
+            let Some(beat) = beat else {
+                return true;
+            };
+            if now - beat > stale_heartbeat() {
+                return true;
+            }
+            let same_host = row_host.as_deref() == Some(host.as_str());
+            match pid {
+                Some(pid) if same_host => *pid == own_pid || pid_alive(*pid) == Some(false),
+                _ => false,
+            }
+        })
+        .map(|(id, ..)| id)
+        .collect();
+    let finished = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    for id in dead {
+        connection.execute(
+            "UPDATE runs SET status = 'failed', \
+             summary = COALESCE(summary, 'the daemon restarted while this run was in progress'), \
+             finished_at = COALESCE(finished_at, ?2) WHERE id = ?1 AND status = 'running'",
+            params![id, finished],
+        )?;
+    }
+    Ok(())
+}
+
 fn add_run_columns(connection: &Connection) -> Result<()> {
     let mut statement = connection.prepare("PRAGMA table_info(runs)")?;
     let existing: std::collections::HashSet<String> = statement
@@ -1623,6 +1731,12 @@ fn add_run_columns(connection: &Connection) -> Result<()> {
         // The action's single free-text input. Nullable, so every run recorded before
         // inputs existed reads back as "no input", which is what it had.
         ("action_input", "TEXT"),
+        // Who runs it and whether it is alive: the process id, the machine (boot id or host
+        // name) and the last heartbeat. A row without them predates them, and a daemon start
+        // treats it as dead, which is what the old rule did for every running row.
+        ("pid", "INTEGER"),
+        ("host", "TEXT"),
+        ("heartbeat_at", "TEXT"),
     ] {
         if !existing.contains(name) {
             // A daemon and a CLI opening together can both see the column missing: the second
@@ -2665,6 +2779,40 @@ mod tests {
             store.run(run_id).expect("run").expect("present").status,
             RunStatus::Failed
         );
+    }
+
+    #[test]
+    fn a_daemon_start_keeps_a_live_cli_run_and_retires_a_dead_one() {
+        // S2: the CLI's run (another live process, heartbeat fresh) keeps its row and its
+        // app's slot; a run whose heartbeat stopped long ago is retired.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("crosstalk.db");
+        let cli = Store::open_shared(&path).expect("shared open");
+        let live = cli.start_run("guide", "match_apply", false).expect("live");
+        let dead = cli.start_run("streams", "sort_apply", false).expect("dead");
+        cli.with_connection(|connection| {
+            // pid 1 is always alive where `/proc` can say, and never this test process.
+            connection.execute("UPDATE runs SET pid = 1 WHERE id = ?1", params![live])?;
+            connection.execute(
+                "UPDATE runs SET heartbeat_at = '2020-01-01T00:00:00Z' WHERE id = ?1",
+                params![dead],
+            )?;
+            Ok(())
+        })
+        .expect("arrange");
+        cli.heartbeat(live).expect("beat");
+
+        let daemon = Store::open(&path).expect("daemon open");
+        assert_eq!(
+            daemon.run(live).expect("run").expect("present").status,
+            RunStatus::Running
+        );
+        assert_eq!(
+            daemon.run(dead).expect("run").expect("present").status,
+            RunStatus::Failed
+        );
+        // The live run still holds guide's slot across processes.
+        assert!(daemon.start_run("guide", "scan", true).is_err());
     }
 
     #[test]

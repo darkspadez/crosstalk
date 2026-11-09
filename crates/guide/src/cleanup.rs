@@ -27,12 +27,14 @@ use crate::scan::{self, LastScan};
 use crate::settings::GuideSettings;
 use anyhow::{bail, Result};
 use crosstalk_core::channel_ops::{
-    self, Field, Op, Plan, PlanOptions, RenameKind, ReportSpec, Selection,
+    self, Field, Op, Plan, PlanOptions, RenameKind, ReportSpec, Selection, Skip,
 };
 use crosstalk_core::config::ScopeConfig;
 use crosstalk_core::csv_report;
+use crosstalk_core::dispatcharr::{EpgEntry, HasPrograms, ProgramWindow, World};
 use crosstalk_core::jobs::JobContext;
 use crosstalk_core::subapp::{JobOutcome, OutcomeBuilder, SubApp};
+use std::collections::{HashMap, HashSet};
 
 /// The five cleanup presets, one per plugin action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,14 +144,19 @@ pub async fn run(
         &resolved.tables
     };
     let (selection, ops, options) = build(action, settings, tables, &base, scan.as_ref())?;
-    let plan = channel_ops::plan_with_options(&world, &selection, &ops, &options)?;
+    let mut plan = channel_ops::plan_with_options(&world, &selection, &ops, &options)?;
+    if action.from_scan() && !dry_run {
+        // The scan may be of any age, or have run mid-refresh: a guide that carries
+        // programmes now is not "missing" any more, whatever the scan saw.
+        recheck_programmes(context, settings, &world, &mut plan).await?;
+    }
 
     // An apply re-plans from the world this run loaded, so a channel that changed since the
     // scan is either skipped (its guide moved) or planned from its current name (a rename).
     let applied = if dry_run {
         None
     } else {
-        Some(channel_ops::apply(client, &plan, context, &action_id).await)
+        Some(channel_ops::apply_recorded(client, &plan, context, &action_id).await?)
     };
 
     let schema = crate::settings::schema();
@@ -194,6 +201,100 @@ pub async fn run(
         built = built.cancelled().note(note);
     }
     Ok(built.build())
+}
+
+/// Drop every planned change of a channel whose guide carries programme data NOW, or whose
+/// guide cannot be re-checked, and report it as a skip.
+///
+/// The scan-derived presets act on a result set of any age; re-asking the same question the
+/// scan asked, right before writing, is what keeps an old (or mid-refresh) scan from clearing
+/// or tagging a guide that works. A failed check leaves the channel alone, like the scan's own
+/// rule: unknown is never "missing".
+async fn recheck_programmes(
+    context: &JobContext,
+    settings: &GuideSettings,
+    world: &World,
+    plan: &mut Plan,
+) -> Result<()> {
+    use futures::{stream, StreamExt};
+
+    let client = context.dispatcharr()?;
+    let window = ProgramWindow::ahead(settings.check_hours);
+    let entries: HashMap<i64, &EpgEntry> = world
+        .entries
+        .iter()
+        .map(|entry| (entry.id, entry))
+        .collect();
+    let planned: HashSet<i64> = plan
+        .changes
+        .iter()
+        .map(|change| change.channel_id)
+        .collect();
+    let asks: Vec<(i64, Option<(String, i64)>)> = world
+        .channels
+        .iter()
+        .filter(|channel| planned.contains(&channel.id))
+        .filter_map(|channel| {
+            let epg = channel.current_epg_id()?;
+            let ask = entries.get(&epg).and_then(|entry| {
+                entry
+                    .epg_source
+                    .map(|source| (entry.tvg_id.clone(), source))
+            });
+            Some((channel.id, ask))
+        })
+        .collect();
+    let concurrency = context.config().dispatcharr.concurrency.max(1);
+    let window_ref = &window;
+    let answers: Vec<(i64, Option<String>)> = stream::iter(asks)
+        .map(|(channel_id, ask)| async move {
+            let reason = match ask {
+                // The plugin's own query finds nothing for a source-less entry either.
+                None => None,
+                Some((tvg_id, source)) => {
+                    match client.has_programs(&tvg_id, source, window_ref).await {
+                        Ok(HasPrograms::No) => None,
+                        Ok(HasPrograms::Yes) => Some(
+                            "its guide carries programme data now, so the scan is out of date \
+                             for it and it is left alone"
+                                .to_string(),
+                        ),
+                        Err(error) => Some(format!(
+                            "its programme data could not be re-checked before writing \
+                             ({error:#}), so it is left alone"
+                        )),
+                    }
+                }
+            };
+            (channel_id, reason)
+        })
+        .buffer_unordered(concurrency)
+        .collect()
+        .await;
+    let left_alone: HashMap<i64, String> = answers
+        .into_iter()
+        .filter_map(|(channel_id, reason)| reason.map(|reason| (channel_id, reason)))
+        .collect();
+    if left_alone.is_empty() {
+        return Ok(());
+    }
+    let mut kept = Vec::with_capacity(plan.changes.len());
+    for change in plan.changes.drain(..) {
+        match left_alone.get(&change.channel_id) {
+            Some(reason) => plan.skipped.push(Skip {
+                channel_id: change.channel_id,
+                channel_name: change.channel_name.clone(),
+                channel_number: change.channel_number,
+                channel_group: change.channel_group.clone(),
+                op: Some(change.op),
+                field: Some(change.field),
+                reason: reason.clone(),
+            }),
+            None => kept.push(change),
+        }
+    }
+    plan.changes = kept;
+    Ok(())
 }
 
 /// The selection, the operations and the plan options for one preset.
@@ -342,6 +443,12 @@ fn scan_rows(scan: Option<&LastScan>) -> Result<Vec<crosstalk_core::store::RunRo
     }
 }
 
+/// Why a `clear_hidden` preview can list more channels than the plugin would touch.
+const HIDDEN_WRITES_MORE: &str =
+    "clear_hidden counts every channel NOT enabled in the profile as disabled: Dispatcharr's \
+     REST API lists only enabled channels, so a channel with no membership row at all (which \
+     the plugin left alone) is cleared too. Check the list before applying.";
+
 /// The outcome the runner records.
 fn outcome(
     action: Cleanup,
@@ -376,6 +483,12 @@ fn outcome(
             builder = builder
                 .count("tagged", renames as i64)
                 .count("guides_cleared", clears as i64);
+        }
+        Cleanup::ClearHidden => {
+            builder = builder.count("guides_cleared", clears as i64);
+            if dry_run {
+                builder = builder.note(HIDDEN_WRITES_MORE);
+            }
         }
         _ => {
             builder = builder.count("guides_cleared", clears as i64);
@@ -726,6 +839,30 @@ mod tests {
             "{}",
             outcome.summary
         );
+    }
+
+    #[tokio::test]
+    async fn a_guide_that_carries_programmes_by_apply_time_is_left_alone() {
+        // S7: the scan saw CNN's guide empty (mid-refresh, or long ago); at apply time it
+        // carries programmes, so clearing it would throw a working guide away.
+        let world = test_support::world();
+        let fixture = Fixture::start(&world, &[ESPN_HD, test_support::CNN_US]).await;
+        let (_store, context) = recorded_scan(&fixture, &world, "clear_missing_apply");
+
+        let outcome = run(
+            &GuideApp::new(),
+            &context,
+            &GuideSettings::default(),
+            Cleanup::ClearMissing,
+            false,
+        )
+        .await
+        .expect("apply");
+
+        assert_eq!(cleared(&fixture).await, vec![(4, None)]);
+        assert_eq!(outcome.counts.get("guides_cleared"), Some(&1));
+        let text = std::fs::read_to_string(outcome.report_path.expect("report")).expect("read");
+        assert!(text.contains("carries programme data now"), "{text}");
     }
 
     #[tokio::test]

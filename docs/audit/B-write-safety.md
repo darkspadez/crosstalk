@@ -1,0 +1,35 @@
+# Audit area B: write safety
+
+Findings of the write-safety audit (every Dispatcharr write path, undo coverage, ownership,
+the cross-process guard, partial failures, concurrency, confirm gates, dry runs) and what
+fix commit 1 did about each. Decisions are in `plans/security-audit.md`.
+
+Commit: ba3aa81. The fixes are in the `audit/fixes` worktree, uncommitted, because
+`cargo` could not run in the sandbox that wrote them; the gate has to pass before the
+"Audit fix 1 (write safety)" commit is made.
+
+| Id | Finding | Status | What changed |
+|---|---|---|---|
+| B1 | An empty or partial EPG-entry read made every assigned guide look missing | FIXED | `epg_entries` goes through `get_list`, so an object without `results` (`200 {}`) is an error, not zero entries. Scan counts a channel whose entry is not in the listing as `unchecked`; heal skips it. Both refuse when the listing is empty while in-scope channels carry guides. |
+| B2 | `load_owned` forgot ownership for any id missing from a loaded slice, on previews too | FIXED | `load_owned` is async and takes `dry_run`: a preview writes nothing (adoptions, drops and forgets are reported, and an adopted channel's key still reaches the plan). An owned id is forgotten only after its own `GET` answers 404; one that still answers, or whose check fails, stays owned (`OwnedState::kept`). The reconcile refuses when a loaded slice is empty while the app owns objects of that kind, or when more than `max(25, 5%)` of one kind are missing. New client methods: `channel_exists`, `group_exists`, `logo_exists`. |
+| B3 | A failed edit or membership chunk marked every row of the stage failed | FIXED | `edit_channels_each` / `set_profile_membership_each` answer per edit, chunk by chunk: rows are marked by channel id (one channel can carry several rows), a 400 chunk is retried one row at a time, any other failure fails only its chunk, and cancellation is checked before every request (an unsent row says it was cancelled). |
+| B4 | `clear_hidden` treated "not in the profile's enabled list" as disabled | FIXED | `ChannelProfile.channels` is required. A profile that leaves more channels out than both 25 and its own enabled list is refused, with a message explaining that REST lists only enabled channels. Every `clear_hidden` preview carries a note, and README Differences has the "writes more, bounded" row. |
+| S1 | A failed programme check counted as "no programmes" in heal and match | FIXED | `CandidateProbe::carries_data` answers `Probed::{Yes, No, Unknown}`. `Unknown` stops that channel's walk (`WalkResult::unknown`), so match and heal never settle for the next candidate; heal also counts a failed check on the current guide as `unchecked` and leaves the channel alone. |
+| S2 | A daemon start retired every `running` row, including a live CLI run | FIXED | Runs record `pid`, `host` (boot id, host name, or `local`) and `heartbeat_at`, and the runner stamps a heartbeat every 30 s. A daemon start retires only rows that have no heartbeat (older builds), a heartbeat older than 5 minutes, or a dead or reused pid on the same machine. The one-run-per-app index keeps covering live runs. |
+| S3 | Run rows were written only after the whole apply, and the edit/membership loops ignored cancel between chunks | FIXED (cleanup, names, tidy, undo) | `channel_ops::apply_recorded` records the planned rows before the first write and re-records them after every stage (same ordinals). The four sites named in the finding use it. Cancel checks between chunks come with B3. Other apply sites still record once at the end. |
+| S4 | Undo planned without `number_conflicts` | FIXED | The undo's reversal plan (`undo::reversal_plan`) plans with `number_conflicts: true`, so putting back a number that another channel has taken since is a skip. |
+| S5 | Plans were not re-checked against live state before writing | FIXED | `apply` lists the channels once right before writing and does not send a change whose `before` no longer holds (reason "changed since the plan"). A failed listing writes nothing. Profile memberships are not in the channel listing and are not re-checked, and a channel missing from the listing is left to the write itself. |
+| S6 | An `ignore_groups` token matching no group excluded nothing | FIXED | `ScopedChannels::unmatched_ignore` lists such tokens. A plan carries `scope_warnings`, which the report shows as a warning line, and `apply` refuses a plan that has any. |
+| S7 | `clear_missing` acted on a scan of any age, or one taken mid-refresh | FIXED | Before a scan-derived apply (`clear_missing`, and `tag_missing` for the same reason), every planned channel's guide is checked again. A channel whose guide now carries programmes, or whose check fails, becomes a skip. |
+| S8 | `Channel.streams` defaulted to empty when missing | FIXED (listing) | The channel listing requires `streams` on every row, and `channel_stream_ids` requires it on the detail row. `Channel` itself keeps the default, because write answers and fixtures carry partial channels. |
+| S10 | `bench --write-timing` wrote with no app slot and no run record | FIXED | The timing runs inside a recorded `streams` run (`bench_write_timing`), which takes the app's slot, and reads each list from the channel's own row. |
+| D-W1 | The client followed redirects, so a 301/302 on a PATCH/POST came back as a GET whose 200 counted as a confirmed write | FIXED | The client uses `redirect::Policy::none()`, and any 3xx is an error that says to point `base_url` at the final URL. Only the Dispatcharr client changed. |
+| D-W2 | Confirms S8 | FIXED | See S8. |
+| N1 | `rename_group` was retried, and the group rename row cannot be undone | PARTIAL | `rename_group` is `Retry::Once`. LEFT: an undoable group-rename row needs a group subject in undo (a new write path), which is out of scope for a NIT. |
+| N3 | `bulk_set_channel_streams` fell back to one PATCH per channel on any failure | FIXED | It falls back only on a 400 (a rejected row). Any other failure fails the chunk. |
+| N4 | A failed `record_ownership` failed the row, so undo could not hide the channel | FIXED | The row stays `ok` with its id and a reason. The intent stays, the next reconcile adopts the channel under this run, and undo can then hide it. |
+| N6 | `full_sync` ran tidy after a failed `streams.match` | FIXED (documented) | The shipped `full_sync` (example config and README) no longer sets `continue_on_failure` on `streams.match_apply`, so a failed match stops the workflow before tidy can hide channels left without streams. |
+| N7 | `hid_by_tidy_runs` ignored undo runs | FIXED | Undo runs of the app count, in order: an undo unhide removes the channel from tidy's set, and an undo re-hide counts only when the undone run was a tidy, or an undo of one. |
+
+New tests: 28, plus one test that was made async. None of them have been run yet (see the
+commit note above).

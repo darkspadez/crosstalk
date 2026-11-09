@@ -52,8 +52,8 @@ async fn channels_ask_for_hidden_ones_too() {
         .and(query_param("visibility_filter", "all"))
         .and(header("Authorization", "ApiKey test-key"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-            {"id": 1, "name": "ESPN HD", "channel_number": 101, "channel_group_id": 3, "epg_data_id": 9},
-            {"id": 2, "name": "CNN", "channel_number": "102", "epg_data_id": null}
+            {"id": 1, "name": "ESPN HD", "channel_number": 101, "channel_group_id": 3, "epg_data_id": 9, "streams": []},
+            {"id": 2, "name": "CNN", "channel_number": "102", "epg_data_id": null, "streams": [4]}
         ])))
         .mount(&server)
         .await;
@@ -592,7 +592,7 @@ async fn load_world_fetches_everything() {
     Mock::given(method("GET"))
         .and(path("/api/channels/channels/"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-            {"id": 1, "name": "ESPN", "channel_group_id": 2}
+            {"id": 1, "name": "ESPN", "channel_group_id": 2, "streams": []}
         ])))
         .mount(&server)
         .await;
@@ -645,7 +645,7 @@ async fn list_endpoints_accept_a_results_envelope() {
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "count": 1,
             "next": null,
-            "results": [{"id": 1, "name": "ESPN HD"}]
+            "results": [{"id": 1, "name": "ESPN HD", "streams": []}]
         })))
         .mount(&server)
         .await;
@@ -692,7 +692,7 @@ async fn list_endpoints_follow_a_non_null_next_page() {
         .and(query_param("page", "1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "next": "http://x/api/channels/channels/?page=2",
-            "results": [{"id": 1, "name": "ESPN HD"}]
+            "results": [{"id": 1, "name": "ESPN HD", "streams": []}]
         })))
         .mount(&server)
         .await;
@@ -701,7 +701,7 @@ async fn list_endpoints_follow_a_non_null_next_page() {
         .and(query_param("page", "2"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "next": null,
-            "results": [{"id": 2, "name": "CNN"}]
+            "results": [{"id": 2, "name": "CNN", "streams": []}]
         })))
         .mount(&server)
         .await;
@@ -730,6 +730,94 @@ async fn a_list_object_without_results_is_an_error_not_an_empty_list() {
     let error = client.channels().await.expect_err("no results");
     let message = format!("{error:#}");
     assert!(message.contains("listing channels"), "{message}");
+}
+
+#[tokio::test]
+async fn an_epg_entry_object_without_results_is_an_error_not_zero_entries() {
+    // B1: `200 {}` used to parse as an empty page, and zero entries read as "every assigned
+    // guide is gone" to scan and heal.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/epg/epgdata/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .mount(&server)
+        .await;
+
+    let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+    let error = client.epg_entries().await.expect_err("no results");
+    let message = format!("{error:#}");
+    assert!(message.contains("listing EPG entries"), "{message}");
+}
+
+#[tokio::test]
+async fn a_listed_channel_without_streams_fails_the_listing() {
+    // S8/D-W2: stream-list writes replace the whole list, so a row that left `streams` out
+    // must not read as "no streams" (tidy would hide it, a sort would write over it).
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/channels/channels/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {"id": 1, "name": "ESPN", "streams": [10]},
+            {"id": 2, "name": "CNN"}
+        ])))
+        .mount(&server)
+        .await;
+
+    let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+    let error = client.channels().await.expect_err("no streams key");
+    assert!(
+        format!("{error:#}").contains("listing channels"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn a_profile_without_its_channel_list_is_an_error() {
+    // B4: a missing `channels` key would read as "enables nothing", which clear_hidden
+    // turns into "every channel is disabled".
+    let parsed = serde_json::from_value::<ChannelProfile>(serde_json::json!({
+        "id": 2, "name": "Favorites"
+    }));
+    assert!(parsed.is_err());
+}
+
+#[tokio::test]
+async fn a_redirected_write_is_an_error_and_never_resent_as_a_get() {
+    // D-W1: following a 301 on a PATCH re-sends it as a GET whose 200 would read as a
+    // confirmed write. Redirects are not followed; the 3xx is the error.
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/epg/sources/4/"))
+        .respond_with(
+            ResponseTemplate::new(301)
+                .insert_header("Location", format!("{}/elsewhere/", server.uri()).as_str()),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/elsewhere/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": 4})))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+    let error = client
+        .update_epg_source(4, &EpgSourceEdit::default())
+        .await
+        .expect_err("a redirect is not a write");
+    let message = format!("{error:#}");
+    assert!(message.contains("base_url redirects"), "{message}");
+    assert!(message.contains("/elsewhere/"), "{message}");
+
+    // Reads are refused the same way.
+    Mock::given(method("GET"))
+        .and(path("/api/channels/groups/"))
+        .respond_with(ResponseTemplate::new(302).insert_header("Location", "/elsewhere/"))
+        .mount(&server)
+        .await;
+    let error = client.groups().await.expect_err("a redirected read");
+    assert!(format!("{error:#}").contains("base_url redirects"));
 }
 
 #[test]
@@ -2168,11 +2256,9 @@ async fn a_selected_world_fetches_only_what_was_asked_for() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/api/channels/channels/"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(
-                serde_json::json!([{"id": 1, "name": "ESPN", "channel_group_id": 2}]),
-            ),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            serde_json::json!([{"id": 1, "name": "ESPN", "channel_group_id": 2, "streams": []}]),
+        ))
         .mount(&server)
         .await;
 

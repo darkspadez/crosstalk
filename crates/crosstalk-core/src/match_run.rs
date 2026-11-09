@@ -93,11 +93,33 @@ impl Candidate for Stream {
 /// The app-specific half of a walk: does this candidate actually carry something usable?
 ///
 /// Guide asks Dispatcharr whether the entry has programme data; streams will ask whether the
-/// stream is alive. A failed check is "no", never an error: one broken candidate must not fail
-/// a run that can still match the rest.
+/// stream is alive. A failed check is [`Probed::Unknown`], never an error and never "no": one
+/// broken candidate must not fail a run that can still match the rest, and a REST blip must
+/// not make the walk settle for a lower-ranked candidate.
 #[async_trait::async_trait]
 pub trait CandidateProbe<C: Candidate>: Send + Sync {
-    async fn carries_data(&self, candidate: &C) -> bool;
+    async fn carries_data(&self, candidate: &C) -> Probed;
+}
+
+/// What a [`CandidateProbe`] found out about one candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Probed {
+    /// The candidate carries data.
+    Yes,
+    /// The candidate was checked and carries nothing.
+    No,
+    /// The check failed: the candidate may or may not carry data.
+    Unknown,
+}
+
+impl From<bool> for Probed {
+    fn from(has: bool) -> Self {
+        if has {
+            Probed::Yes
+        } else {
+            Probed::No
+        }
+    }
 }
 
 /// A probe for callers with nothing to check: always carries data.
@@ -110,8 +132,8 @@ pub struct NoProbe;
 
 #[async_trait::async_trait]
 impl<C: Candidate + Sync> CandidateProbe<C> for NoProbe {
-    async fn carries_data(&self, _candidate: &C) -> bool {
-        true
+    async fn carries_data(&self, _candidate: &C) -> Probed {
+        Probed::Yes
     }
 }
 
@@ -135,6 +157,9 @@ pub struct WalkResult {
     /// The model's pick and its score, when it accepted a name whose every same-name
     /// candidate is empty.
     pub ai_empty: Option<(String, u8)>,
+    /// The candidate whose check failed and stopped the walk, if one did. The channel is left
+    /// unmatched rather than settling for a lower-ranked candidate.
+    pub unknown: Option<String>,
 }
 
 impl WalkResult {
@@ -190,18 +215,27 @@ where
                     continue;
                 }
                 let has = if !rules.validate {
-                    true
+                    Probed::Yes
                 } else {
                     if context.is_cancelled() {
                         return WalkResult::empty();
                     }
                     probe.carries_data(entry).await
                 };
-                if has {
-                    return WalkResult {
-                        chosen: Some(rank_position),
-                        ..WalkResult::empty()
-                    };
+                match has {
+                    Probed::Yes => {
+                        return WalkResult {
+                            chosen: Some(rank_position),
+                            ..WalkResult::empty()
+                        };
+                    }
+                    Probed::Unknown => {
+                        return WalkResult {
+                            unknown: Some(entry.name().to_string()),
+                            ..WalkResult::empty()
+                        };
+                    }
+                    Probed::No => {}
                 }
             }
             let score = ranked.get(position).map(|candidate| candidate.score);
@@ -209,6 +243,7 @@ where
                 chosen: None,
                 best_rejected: score,
                 ai_empty: score.map(|score| (picked_name, score)),
+                unknown: None,
             };
         }
         return WalkResult::empty();
@@ -229,25 +264,37 @@ where
             return WalkResult {
                 chosen: Some(rank_position),
                 best_rejected,
-                ai_empty: None,
+                ..WalkResult::empty()
             };
         }
         if context.is_cancelled() {
             return WalkResult::empty();
         }
-        if probe.carries_data(entry).await {
-            return WalkResult {
-                chosen: Some(rank_position),
-                best_rejected,
-                ai_empty: None,
-            };
+        match probe.carries_data(entry).await {
+            Probed::Yes => {
+                return WalkResult {
+                    chosen: Some(rank_position),
+                    best_rejected,
+                    ..WalkResult::empty()
+                };
+            }
+            // A failed check stops the walk: the next candidate is only "better" than this
+            // one if this one is really empty, which nobody knows.
+            Probed::Unknown => {
+                return WalkResult {
+                    best_rejected,
+                    unknown: Some(entry.name().to_string()),
+                    ..WalkResult::empty()
+                };
+            }
+            Probed::No => {}
         }
         best_rejected = Some(candidate.score);
     }
     WalkResult {
         chosen: None,
         best_rejected,
-        ai_empty: None,
+        ..WalkResult::empty()
     }
 }
 
@@ -411,17 +458,33 @@ mod tests {
         }
     }
 
-    /// Answer from the candidate's own flag, and count the calls.
+    /// Answer from the candidate's own flag, and count the calls. A candidate named
+    /// `"Broken"` answers [`Probed::Unknown`], like a failed lookup.
     struct FlagProbe {
         calls: Arc<AtomicUsize>,
     }
 
     #[async_trait::async_trait]
     impl CandidateProbe<Entry> for FlagProbe {
-        async fn carries_data(&self, candidate: &Entry) -> bool {
+        async fn carries_data(&self, candidate: &Entry) -> Probed {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            candidate.live
+            if candidate.name == "Broken" {
+                return Probed::Unknown;
+            }
+            Probed::from(candidate.live)
         }
+    }
+
+    #[tokio::test]
+    async fn a_failed_check_stops_the_walk_instead_of_settling_for_the_next_candidate() {
+        let context = JobContext::for_tests(Default::default());
+        let probe = probe();
+        let candidates = vec![entry(1, "Broken", true), entry(2, "B", true)];
+        let ranked = vec![scored(100, 0), scored(99, 1)];
+        let walked = walk(&context, &candidates, &ranked, None, rules(85), &probe).await;
+        assert_eq!(walked.chosen, None, "the second candidate is not taken");
+        assert_eq!(walked.unknown, Some("Broken".to_string()));
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
     }
 
     fn probe() -> FlagProbe {

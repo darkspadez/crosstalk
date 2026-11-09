@@ -728,12 +728,13 @@ keep each one on one line, or write the steps as an array of tables:
 # The shipped Lineuparr replacement (see config/crosstalk.example.toml): sync the channel
 # list, match streams and guides over exactly those channels, assign logos, then hide the
 # owned channels left with no streams. `scope = "lineup"` is lineup's owned channels for
-# its configured file; `continue_on_failure` carries the sequence past a failed
-# match/guide/logo step (a failed sync still stops it).
+# its configured file; `continue_on_failure` carries the sequence past a failed guide/logo
+# step. A failed sync or stream match stops it: tidy hides the owned channels left with no
+# streams, so it must never run after a stream match that did not happen.
 [workflows.full_sync]
 steps = [
   "lineup.sync_apply",
-  { action = "streams.match_apply", scope = "lineup", continue_on_failure = true },
+  { action = "streams.match_apply", scope = "lineup" },
   { action = "guide.match_apply", scope = "lineup", continue_on_failure = true },
   { action = "lineup.logos_apply", scope = "lineup", continue_on_failure = true },
   "lineup.tidy_apply",
@@ -746,7 +747,6 @@ steps = [
 # [[workflows.full_sync.steps]]
 # action = "streams.match_apply"
 # scope = "lineup"
-# continue_on_failure = true
 ```
 
 - `scope = { profiles = ..., groups = ..., ignore_groups = ... }` **replaces** `[scope]` for that
@@ -942,6 +942,7 @@ in `docs/oracle-reports/`.
 | guide | A channel whose guide changed since the scan is skipped | The plan re-reads every channel, so an old scan can only be out of date — never double-tagged, and never clearing a guide that was reassigned (writes less) |
 | guide | Tag-suffix presence is bracket-aware and case-insensitive | `CNN [badepg]` and `CNN (BadEPG)` count as tagged through the shared vocabulary, where the plugin's exact `ends_with` re-tagged case/bracket variants (writes less) |
 | guide | `clear_hidden` only unassigns | The plugin also deleted each entry's `ProgramData` rows, which blanks the guide of every *visible* channel sharing that entry. crosstalk never deletes programme data (writes less) |
+| guide | `clear_hidden` counts "not enabled" as disabled, and refuses a sparse profile | The plugin selected only membership rows with `enabled=False`. Dispatcharr's REST API lists only a profile's ENABLED channels, so crosstalk cannot tell a disabled row from no row at all: a channel with no membership row (a profile created empty, or channels added after it) is cleared too. To keep that from reaching a whole install, a profile that leaves more channels out than both 25 and its own enabled list is refused, and every preview says so (writes more, bounded) |
 | guide | `clear_hidden` keeps `[scope] groups` / `ignore_groups` | The plugin selected every disabled membership of the profile whatever its group. crosstalk still bounds it by the groups every other action is held to (writes less) |
 | guide | `clear_groups` refuses an empty `[scope] groups` | The plugin treats the same empty filter as “every channel”, which makes one press unassign every guide in the install (writes less) |
 | guide | Clearing a guide skips a channel with an EPG override | Clearing the channel's own column would not change what is shown, which is the same reason match skips one (writes less) |
@@ -1033,7 +1034,7 @@ in `docs/oracle-reports/`.
 | lineup | `streams.match` lineup mode is an owned-id bound with a country default | LU matched within group names with per-channel US↔MX exceptions and a provider-group pass; crosstalk matches exactly the owned channels of the configured file, defaulting to the lineup file's country (a foreign-identity entry keeps its own; callsign identities exempt), attaching the identity family at the one cut (writes same-or-less, scoped) |
 | lineup | Lineuparr's matcher is not ported | Its stream half is `streams.match` lineup mode over the unified engine; its EPG half is `guide.match`. LU's own scorers run only inside the Python oracle scripts (`scripts/corpus/oracles.py`) behind the reports (writes per the unified rules) |
 | host | `crosstalk undo <run-id>` reverses still-in-effect rows | Any finished apply run: `Set` fields back to before-values where current equals after, unhide what tidy hid, hide what create made. Refuses previews, reads, running/paused runs and runs with nothing undoable; the undo is itself a recorded, undoable run (writes reverse) |
-| host | Workflow steps override scope and survive failure by flag | A step is `"<app>.<action>"` or `{action, scope, continue_on_failure}`; `scope` (a table or a named scope like `lineup`) replaces `[scope]` for that step; `continue_on_failure` carries `full_sync` past a failed match/guide/logo step (sync failing still stops), and the workflow ends failed listing each step (writes as the steps write) |
+| host | Workflow steps override scope and survive failure by flag | A step is `"<app>.<action>"` or `{action, scope, continue_on_failure}`; `scope` (a table or a named scope like `lineup`) replaces `[scope]` for that step; `continue_on_failure` carries `full_sync` past a failed guide/logo step (a failed sync or stream match still stops it, so tidy never hides channels a failed match left without streams), and the workflow ends failed listing each step (writes as the steps write) |
 | host | CSV cells that look like formulas are quoted | A cell starting with `=`, `+`, `-` or `@` gets a leading single quote, so such names differ from the plugin's CSV. It is a spreadsheet display instruction: a text editor shows the quote as part of the value (writes same) |
 | host | The plugins' action ids and usage counters are not carried over | `janitor` became `guide` and `automatch_*` became `match_*`; CM/LU/NC ids (`load_and_process_channels`, `sync_channels`, `preview`, `email_report_now`) appear in no schedule, URL or CSV. Anonymous usage reporting and phone-home counts are not ported: a run is recorded in crosstalk's own store and sent nowhere (writes same) |
 | host | The plugins' actions crosstalk does not carry | IPTV Checker's `delete_dead_channels` (deletes are out of scope), `view_*` / `export_results` (the run page and its CSV), `cancel_check` (the run page's cancel); CM/LU `email_report*`, LU `resort_streams` (a `streams.sort_apply` lineup step), LU `plugin_status` (`status`), NC's scheduler (`[schedules]`/`[hooks]`); every plugin's notification, scheduler housekeeping and `clear_csv_exports` (host `exports clear`). A retired key is refused with the pointer to where its meaning went (writes same) |

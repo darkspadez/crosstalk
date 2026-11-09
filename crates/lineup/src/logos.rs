@@ -648,7 +648,7 @@ pub async fn run_with(
         }
     }
 
-    let owned = channel_ops::load_owned(context, &world, crate::APP_ID)?;
+    let owned = channel_ops::load_owned(context, &world, crate::APP_ID, dry_run).await?;
     let request = CreateRequest {
         app: crate::APP_ID.to_string(),
         groups: Vec::new(),

@@ -187,15 +187,15 @@ run_history_days = 15
 # `scope = "lineup"` is lineup's owned channels for its configured lineup file (the
 # named scope replaces [scope] for that step); streams' lineup mode additionally
 # restricts those steps to the lineup file's country. `continue_on_failure` carries
-# the sequence past a failed match/guide/logo step (a failed sync still stops it),
-# and the workflow itself ends failed, with each step listed.
+# the sequence past a failed guide/logo step, and the workflow itself ends failed, with
+# each step listed. A failed sync or stream match stops it: tidy hides the owned channels
+# left with no streams, so it must never run after a stream match that did not happen.
 # [workflows.full_sync]
 # [[workflows.full_sync.steps]]
 # action = "lineup.sync_apply"
 # [[workflows.full_sync.steps]]
 # action = "streams.match_apply"
 # scope = "lineup"
-# continue_on_failure = true
 # [[workflows.full_sync.steps]]
 # action = "guide.match_apply"
 # scope = "lineup"

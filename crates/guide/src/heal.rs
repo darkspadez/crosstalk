@@ -129,6 +129,9 @@ pub struct HealOutcome {
     pub broken: usize,
     pub replacements: usize,
     pub applied: usize,
+    /// Assigned channels heal could not judge: the programme check failed, or the assigned
+    /// entry is missing from the entry listing. They are left exactly as they are.
+    pub unchecked: usize,
 }
 
 /// Run scan & heal.
@@ -146,6 +149,8 @@ pub async fn run(
     // The ONE cut (D02/T10): `[matching]` sensitivity via the run engine below.
     // Heal's own threshold is retired (step 8).
     let allow_without_programs = settings.allow_epg_without_programs;
+
+    crate::scan::refuse_without_entries(world, scoped_channels)?;
 
     let entry_by_id: HashMap<i64, &EpgEntry> = world
         .entries
@@ -170,6 +175,8 @@ pub async fn run(
 
     enum Detection {
         Unassigned,
+        /// The assigned entry is not in the listing: a short read, not proof of emptiness.
+        Unknown,
         Decided(HasPrograms),
         Check(String, i64),
     }
@@ -189,16 +196,17 @@ pub async fn run(
                 Some(_) => plans.push(Detection::Decided(HasPrograms::Yes)),
                 None => plans.push(Detection::Decided(HasPrograms::No)),
             },
-            None => plans.push(Detection::Decided(HasPrograms::No)),
+            None => plans.push(Detection::Unknown),
         }
     }
 
     let validation_bound = context.config().dispatcharr.concurrency.max(1);
     let window_ref = &window;
-    let mut detected: Vec<Option<HasPrograms>> = (0..plans.len()).map(|_| None).collect();
+    // `None` inside: the check failed, which is "unknown", never "no".
+    let mut detected: Vec<Option<Option<HasPrograms>>> = (0..plans.len()).map(|_| None).collect();
     {
         use futures::{stream, StreamExt};
-        let resolved: Vec<(usize, HasPrograms)> =
+        let resolved: Vec<(usize, Option<HasPrograms>)> =
             stream::iter((0..plans.len()).filter_map(|ordinal| {
                 // Owned up front: the future must not borrow the plan, and the
                 // closure argument is an owned index so no borrowed-iterator
@@ -210,15 +218,14 @@ pub async fn run(
                 let cancel = context.clone();
                 Some(async move {
                     // Checked inside the future so a cancel lands within one
-                    // in-flight round instead of after the whole phase. `No` is
+                    // in-flight round instead of after the whole phase. `None` is
                     // the "no result" value; the cancel check below aborts.
                     if cancel.is_cancelled() {
-                        return (ordinal, HasPrograms::No);
+                        return (ordinal, None);
                     }
-                    let has = client
-                        .has_programs(&tvg_id, source, window_ref)
-                        .await
-                        .unwrap_or(HasPrograms::No);
+                    // A failed check is unknown: treating it as "no" would replace a
+                    // working guide on REST-blip evidence.
+                    let has = client.has_programs(&tvg_id, source, window_ref).await.ok();
                     (ordinal, has)
                 })
             }))
@@ -234,6 +241,7 @@ pub async fn run(
     }
 
     let mut broken = Vec::new();
+    let mut unchecked = 0;
     for (ordinal, (channel, plan)) in scoped_channels
         .channels
         .iter()
@@ -242,8 +250,19 @@ pub async fn run(
     {
         let has = match plan {
             Detection::Unassigned => continue,
+            Detection::Unknown => {
+                unchecked += 1;
+                continue;
+            }
             Detection::Decided(has) => *has,
-            Detection::Check(..) => detected[ordinal].expect("every checked channel was resolved"),
+            Detection::Check(..) => {
+                let checked = detected[ordinal].expect("every checked channel was resolved");
+                let Some(has) = checked else {
+                    unchecked += 1;
+                    continue;
+                };
+                has
+            }
         };
         if has == HasPrograms::No {
             broken.push(channel.clone());
@@ -322,6 +341,8 @@ pub async fn run(
     let searched_ref = &searched;
     let entries_ref = &scoped_entries.entries;
     let mut picks: Vec<Option<usize>> = (0..broken.len()).map(|_| None).collect();
+    // The candidate whose programme check failed and stopped a channel's walk.
+    let mut unknown_picks: Vec<Option<String>> = (0..broken.len()).map(|_| None).collect();
     for batch_start in (0..broken.len()).step_by(BATCH_CHANNELS) {
         if context.is_cancelled() {
             anyhow::bail!("cancelled by the operator");
@@ -350,6 +371,7 @@ pub async fn run(
                 .await;
             for (ordinal, walked) in resolved {
                 picks[ordinal] = walked.chosen;
+                unknown_picks[ordinal] = walked.unknown;
             }
         }
         context.progress(&ProgressEvent::new(
@@ -419,6 +441,12 @@ pub async fn run(
             };
         }
         row.reason = reason_for(&row, threshold, allow_without_programs);
+        if let Some(unknown) = unknown_picks[position].as_ref() {
+            row.reason = format!(
+                "The programme check for {unknown} failed; left as it is instead of settling \
+                 for a lower-ranked replacement"
+            );
+        }
         rows.push(row);
 
         if position % 50 == 0 {
@@ -497,6 +525,7 @@ pub async fn run(
         broken: broken.len(),
         replacements,
         applied,
+        unchecked,
     })
 }
 
@@ -643,6 +672,15 @@ pub fn outcome(result: &HealOutcome, dry_run: bool, threshold: u8) -> JobOutcome
     if low_confidence > 0 {
         outcome = outcome.note(format!("{low_confidence} below threshold"));
     }
+    if result.unchecked > 0 {
+        outcome = outcome
+            .count("unchecked", result.unchecked as i64)
+            .note(format!(
+                "{} assigned channel(s) could not be judged (programme check failed, or the \
+                 guide is missing from the entry listing) and were left as they are",
+                result.unchecked
+            ));
+    }
     if dry_run {
         let would_apply = result
             .rows
@@ -702,7 +740,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/channels/channels/"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {"id": 1, "name": channel_name, "channel_number": 101, "channel_group_id": 10, "epg_data_id": 7}
+                {"id": 1, "name": channel_name, "channel_number": 101, "channel_group_id": 10, "epg_data_id": 7, "streams": []}
             ])))
             .mount(&server)
             .await;
@@ -1147,6 +1185,7 @@ mod tests {
             broken: 2,
             replacements: 1,
             applied: 1,
+            unchecked: 0,
         };
         let recorded = outcome(&result, false, 95);
         assert!(recorded.summary.contains("scanned 10"));
@@ -1164,10 +1203,116 @@ mod tests {
             broken: 1,
             replacements: 1,
             applied: 0,
+            unchecked: 0,
         };
         let recorded = outcome(&result, true, 95);
         assert!(recorded.summary.contains("1 would be applied"));
         assert_eq!(recorded.counts.get("applied"), Some(&0));
+    }
+
+    #[tokio::test]
+    async fn an_assigned_guide_missing_from_the_entry_listing_is_never_healed() {
+        // B1: a short entry read must not read as "this guide is gone". The assigned entry is
+        // absent from the world, so the channel is unchecked and left alone.
+        let (_server, mut world, context) = fixture(false, true).await;
+        world.entries.retain(|entry| entry.id != 7);
+        let (channels, entries) = scoped(&world);
+        let result = run(
+            &GuideApp::new(),
+            &context,
+            &GuideSettings::default(),
+            &world,
+            &channels,
+            &entries,
+            true,
+        )
+        .await
+        .expect("preview");
+        assert_eq!(result.broken, 0);
+        assert!(result.rows.is_empty());
+        assert_eq!(result.unchecked, 1);
+    }
+
+    #[tokio::test]
+    async fn an_empty_entry_listing_with_assigned_channels_refuses_heal() {
+        let (_server, mut world, context) = fixture(false, true).await;
+        world.entries.clear();
+        let (channels, entries) = scoped(&world);
+        let error = run(
+            &GuideApp::new(),
+            &context,
+            &GuideSettings::default(),
+            &world,
+            &channels,
+            &entries,
+            true,
+        )
+        .await
+        .expect_err("refused");
+        assert!(format!("{error:#}").contains("no EPG entries"), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_programme_check_leaves_the_assignment_alone() {
+        // S1: a transient failure on the CURRENT guide is unknown, not "no programmes".
+        let (server, world, context) = fixture(false, true).await;
+        Mock::given(method("GET"))
+            .and(path("/api/epg/programs/search/"))
+            .and(query_param("tvg_id", "old.us"))
+            .respond_with(ResponseTemplate::new(500))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let (channels, entries) = scoped(&world);
+        let result = run(
+            &GuideApp::new(),
+            &context,
+            &GuideSettings::default(),
+            &world,
+            &channels,
+            &entries,
+            false,
+        )
+        .await
+        .expect("apply");
+        assert_eq!(result.broken, 0);
+        assert_eq!(result.applied, 0);
+        assert_eq!(result.unchecked, 1);
+        let recorded = outcome(&result, false, 95);
+        assert_eq!(recorded.counts.get("unchecked"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn a_failed_replacement_check_stops_the_walk() {
+        // S1: a failed check on the best replacement must not settle for the next one.
+        let (server, world, context) = fixture(false, true).await;
+        Mock::given(method("GET"))
+            .and(path("/api/epg/programs/search/"))
+            .and(query_param("tvg_id", "new.us"))
+            .respond_with(ResponseTemplate::new(500))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let (channels, entries) = scoped(&world);
+        let result = run(
+            &GuideApp::new(),
+            &context,
+            &GuideSettings::default(),
+            &world,
+            &channels,
+            &entries,
+            false,
+        )
+        .await
+        .expect("apply");
+        assert_eq!(result.broken, 1);
+        assert_eq!(result.rows[0].new_epg_id, None);
+        assert_eq!(result.applied, 0);
+        assert!(
+            result.rows[0].reason.contains("programme check"),
+            "{}",
+            result.rows[0].reason
+        );
     }
 
     #[tokio::test]

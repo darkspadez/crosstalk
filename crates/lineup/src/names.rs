@@ -1175,7 +1175,7 @@ pub async fn run_with_service(
     let applied = if dry_run {
         None
     } else {
-        Some(channel_ops::apply(client, &plan, context, action_id).await)
+        Some(channel_ops::apply_recorded(client, &plan, context, action_id).await?)
     };
 
     let outputs = final_outputs(&rows, &plan);

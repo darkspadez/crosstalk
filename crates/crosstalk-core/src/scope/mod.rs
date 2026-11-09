@@ -26,6 +26,9 @@ pub struct ScopedChannels {
     pub filter_description: String,
     /// The profile names that were found, for the log.
     pub profiles_used: Vec<String>,
+    /// `ignore_groups` tokens that matched no group. Such a token excludes nothing, so a
+    /// write refuses to run on it (see `channel_ops::Plan::scope_warnings`).
+    pub unmatched_ignore: Vec<String>,
 }
 
 /// Resolve the channel scope.
@@ -46,6 +49,7 @@ pub fn scope_channels(world: &World, scope: &ScopeConfig) -> Result<ScopedChanne
     let mut channels = world.channels.clone();
     let mut filter_description = String::new();
     let mut profiles_used = Vec::new();
+    let mut unmatched_ignore = Vec::new();
 
     // Profiles first: they are the coarsest filter and the plugin applied them in this order.
     let want_profiles = parse_tokens(&scope.profiles);
@@ -86,7 +90,8 @@ pub fn scope_channels(world: &World, scope: &ScopeConfig) -> Result<ScopedChanne
         filter_description.push_str(&phrase(&matched, "in", "groups", false));
     } else if !ignored.is_empty() {
         let tokens = parse_tokens(ignored);
-        let (matched, _unmatched) = expand_patterns(&tokens, &group_names, false);
+        let (matched, unmatched) = expand_patterns(&tokens, &group_names, false);
+        unmatched_ignore = unmatched;
         let ids: HashSet<i64> = matched
             .iter()
             .filter_map(|name| group_by_name.get(name.as_str()).map(|group| group.id))
@@ -103,6 +108,7 @@ pub fn scope_channels(world: &World, scope: &ScopeConfig) -> Result<ScopedChanne
         channels,
         filter_description,
         profiles_used,
+        unmatched_ignore,
     })
 }
 
@@ -331,6 +337,8 @@ mod tests {
         };
         let scoped = scope_channels(&world(), &settings).expect("ok");
         assert_eq!(scoped.channels.len(), 4);
+        // S6: the token is kept, so a write can refuse to run on a scope that excludes nothing.
+        assert_eq!(scoped.unmatched_ignore, vec!["Nope".to_string()]);
     }
 
     #[test]

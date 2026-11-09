@@ -588,46 +588,7 @@ pub async fn run_undo(
         .await?;
     let undo = plan_undo(&store, &world, target_run_id, registry)?;
 
-    // One per-channel value map per field, through channel_ops.
-    let mut by_field: HashMap<crate::channel_ops::Field, HashMap<i64, SetValue>> = HashMap::new();
-    for change in &undo.changes {
-        by_field
-            .entry(change.field)
-            .or_default()
-            .insert(change.channel_id, change.reverse.clone());
-    }
-    let mut operations: Vec<Op> = by_field
-        .into_iter()
-        .map(|(field, values)| Op::Set { field, values })
-        .collect();
-    operations.sort_by_key(|op| match op {
-        Op::Set { field, .. } => field.label(),
-        _ => String::new(),
-    });
-    if operations.is_empty() {
-        // `plan` needs at least one operation; an empty undo plans nothing to write.
-        operations.push(Op::Set {
-            field: crate::channel_ops::Field::Name,
-            values: HashMap::new(),
-        });
-    }
-    // Undo reverses exactly the rows it read: no scope filter, so a channel that has since
-    // left the app's scope is still put back.
-    let ids: Vec<i64> = {
-        let mut ids: Vec<i64> = undo
-            .changes
-            .iter()
-            .map(|change| change.channel_id)
-            .collect();
-        ids.sort_unstable();
-        ids.dedup();
-        ids
-    };
-    let selection = Selection {
-        channel_ids: Some(ids),
-        ..Selection::default()
-    };
-    let mut op_plan = channel_ops::plan(&world, &selection, &operations)?;
+    let mut op_plan = reversal_plan(&world, &undo)?;
     // The rows the chain rule left alone, and the created objects left in place, ride along
     // as skips so the report answers both what happened and what was left alone.
     for skip in &undo.skipped {
@@ -645,7 +606,7 @@ pub async fn run_undo(
     let applied = if dry_run || op_plan.changes.is_empty() {
         None
     } else {
-        Some(channel_ops::apply(client, &op_plan, context, &action_id).await)
+        Some(channel_ops::apply_recorded(client, &op_plan, context, &action_id).await?)
     };
 
     let schema = app.schema().clone();
@@ -745,6 +706,58 @@ pub async fn run_undo(
         builder = builder.cancelled().note(note);
     }
     Ok(builder.report(Some(report)).build())
+}
+
+/// The channel-ops plan that puts an undo's changes back: one `Op::Set` per field over exactly
+/// the channels the undo read, with no scope filter (a channel that has since left the app's
+/// scope is still put back).
+fn reversal_plan(world: &World, undo: &UndoPlan) -> Result<channel_ops::Plan> {
+    // One per-channel value map per field, through channel_ops.
+    let mut by_field: HashMap<crate::channel_ops::Field, HashMap<i64, SetValue>> = HashMap::new();
+    for change in &undo.changes {
+        by_field
+            .entry(change.field)
+            .or_default()
+            .insert(change.channel_id, change.reverse.clone());
+    }
+    let mut operations: Vec<Op> = by_field
+        .into_iter()
+        .map(|(field, values)| Op::Set { field, values })
+        .collect();
+    operations.sort_by_key(|op| match op {
+        Op::Set { field, .. } => field.label(),
+        _ => String::new(),
+    });
+    if operations.is_empty() {
+        // `plan` needs at least one operation; an empty undo plans nothing to write.
+        operations.push(Op::Set {
+            field: crate::channel_ops::Field::Name,
+            values: HashMap::new(),
+        });
+    }
+    // Undo reverses exactly the rows it read: no scope filter, so a channel that has since
+    // left the app's scope is still put back.
+    let ids: Vec<i64> = {
+        let mut ids: Vec<i64> = undo
+            .changes
+            .iter()
+            .map(|change| change.channel_id)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    };
+    let selection = Selection {
+        channel_ids: Some(ids),
+        ..Selection::default()
+    };
+    // A number put back is still checked against the numbers in use now: another channel may
+    // have taken it since, and neither REST nor `edit/bulk` refuses a duplicate.
+    let options = channel_ops::PlanOptions {
+        number_conflicts: true,
+        ..channel_ops::PlanOptions::default()
+    };
+    channel_ops::plan_with_options(world, &selection, &operations, &options)
 }
 
 fn by_id_number(world: &World, channel_id: i64) -> Option<f64> {
@@ -1364,6 +1377,22 @@ mod tests {
                 field => panic!("unexpected field {field:?}"),
             }
         }
+    }
+
+    #[test]
+    fn a_number_taken_since_is_not_put_back() {
+        // S4: channel 1 was renumbered 1 -> 201, and channel 2 took number 1 afterwards. Putting
+        // 1 back would land a duplicate (no write path refuses one), so it is a skip.
+        let (store, world, id) = plan_with(&[row(1, "channel_number", "1", "201")], |world| {
+            world.channels[0].channel_number = Some(serde_json::json!(201.0));
+            world.channels[1].channel_number = Some(serde_json::json!(1.0));
+        });
+        let undo = plan_undo(&store, &world, id, &registry()).expect("plans");
+        assert_eq!(undo.changes.len(), 1);
+        let plan = reversal_plan(&world, &undo).expect("plans");
+        assert!(plan.changes.is_empty(), "{:?}", plan.changes);
+        assert_eq!(plan.skipped.len(), 1, "{:?}", plan.skipped);
+        assert_eq!(plan.skipped[0].channel_id, 1);
     }
 
     /// One app under another name: undo is a host path, so the app id is only a label.

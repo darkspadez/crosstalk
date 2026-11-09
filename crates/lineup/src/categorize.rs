@@ -617,7 +617,7 @@ pub async fn run_with_creator(
 
     // Crash-safe creates (intents + ownership, step 10 review): reconcile before
     // planning so an earlier run's landed group is reused, never duplicated.
-    let owned = channel_ops::load_owned(context, &world, crate::APP_ID)?;
+    let owned = channel_ops::load_owned(context, &world, crate::APP_ID, dry_run).await?;
     let request = CreateRequest {
         app: crate::APP_ID.to_string(),
         groups: missing

@@ -42,6 +42,12 @@ pub struct Channel {
     #[serde(default)]
     pub hidden_from_output: bool,
     /// The channel's streams, in playback order.
+    ///
+    /// Defaulted here because write answers and test fixtures carry partial channels, but
+    /// REQUIRED in the channel listing (`DispatcharrClient::channels`): stream-list writes
+    /// REPLACE the list, so a listing that left the key out must fail rather than read as "no
+    /// streams" (tidy would hide every channel, and a sort or match would write a list built
+    /// on an empty one).
     #[serde(default)]
     pub streams: Vec<i64>,
     /// The channel this one is attached to, when the build has the column.
@@ -102,12 +108,15 @@ pub struct ChannelGroup {
 /// `channels` is the list of channel ids ENABLED in the profile, which Dispatcharr's profile
 /// serializer computes server-side (`ChannelProfileSerializer.get_channels`). That makes the
 /// profile scope filter a single request rather than one per channel.
+///
+/// `channels` is REQUIRED: a profile without the key would read as "enables nothing", which
+/// `clear_hidden` turns into "every channel is disabled" and the profile scope into "no
+/// channel is in scope".
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ChannelProfile {
     pub id: i64,
     #[serde(default)]
     pub name: String,
-    #[serde(default)]
     pub channels: Vec<i64>,
 }
 

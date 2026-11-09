@@ -155,6 +155,10 @@ impl DispatcharrClient {
             // large instance is a few megabytes, not a hang.
             .timeout(Duration::from_secs(config.timeout_secs.max(1)))
             .user_agent(concat!("crosstalk/", env!("CARGO_PKG_VERSION")))
+            // Never follow a redirect: a 301/302 on a PATCH or POST is re-sent as a GET, and
+            // that GET's 200 would read as a confirmed write. Any 3xx is an error instead
+            // (see [`redirect_error`]).
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .context("building the HTTP client")?;
 
@@ -336,6 +340,9 @@ impl DispatcharrClient {
                         continue;
                     }
 
+                    if status.is_redirection() {
+                        return Err(redirect_error("GET", &url, status, response.headers()));
+                    }
                     if status == reqwest::StatusCode::UNAUTHORIZED
                         || status == reqwest::StatusCode::FORBIDDEN
                     {
@@ -349,7 +356,11 @@ impl DispatcharrClient {
                     }
                     if !status.is_success() {
                         let body = response.text().await.unwrap_or_default();
-                        bail!("GET {url} failed with {status}: {}", truncate(&body, 300));
+                        return Err(StatusError::new(
+                            status,
+                            format!("GET {url} failed with {status}: {}", truncate(&body, 300)),
+                        )
+                        .into());
                     }
                     return response
                         .json::<T>()
@@ -414,6 +425,14 @@ impl DispatcharrClient {
                         continue;
                     }
 
+                    if status.is_redirection() {
+                        return Err(redirect_error(
+                            method.as_str(),
+                            &url,
+                            status,
+                            response.headers(),
+                        ));
+                    }
                     if status == reqwest::StatusCode::UNAUTHORIZED
                         || status == reqwest::StatusCode::FORBIDDEN
                     {
@@ -427,10 +446,14 @@ impl DispatcharrClient {
                     }
                     if !status.is_success() {
                         let body = response.text().await.unwrap_or_default();
-                        bail!(
-                            "{method} {url} failed with {status}: {}",
-                            truncate(&body, 300)
-                        );
+                        return Err(StatusError::new(
+                            status,
+                            format!(
+                                "{method} {url} failed with {status}: {}",
+                                truncate(&body, 300)
+                            ),
+                        )
+                        .into());
                     }
                     return response
                         .text()
@@ -475,6 +498,16 @@ impl DispatcharrClient {
         retry: Retry,
     ) -> Result<()> {
         self.send_write(method, path, None, retry).await.map(|_| ())
+    }
+
+    /// Whether `GET path` finds the object: `Ok(false)` only for a 404, which is the one
+    /// answer that proves it is gone. Any other failure is an error, never "gone".
+    async fn exists(&self, path: &str) -> Result<bool> {
+        match self.get_json::<serde_json::Value>(path, &[]).await {
+            Ok(_) => Ok(true),
+            Err(error) if http_status(&error) == Some(reqwest::StatusCode::NOT_FOUND) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     /// The signed-in user's level, `10` being administrator.
@@ -680,6 +713,54 @@ async fn fetch_if<T>(
     } else {
         Ok(Vec::new())
     }
+}
+
+/// A non-success HTTP answer, kept typed so a caller can tell a 404 (gone) or a 400 (one
+/// rejected row) from the rest. Displays as the plain `METHOD url failed with STATUS: body`.
+#[derive(Debug)]
+pub struct StatusError {
+    pub status: reqwest::StatusCode,
+    message: String,
+}
+
+impl StatusError {
+    fn new(status: reqwest::StatusCode, message: String) -> Self {
+        Self { status, message }
+    }
+}
+
+impl std::fmt::Display for StatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for StatusError {}
+
+/// The HTTP status behind a client error, when the server answered one.
+pub fn http_status(error: &anyhow::Error) -> Option<reqwest::StatusCode> {
+    error
+        .downcast_ref::<StatusError>()
+        .map(|status| status.status)
+}
+
+/// The error for a 3xx answer. Redirects are never followed (a re-sent PATCH would arrive as a
+/// GET), so the fix is on the operator's side: point `dispatcharr.base_url` at the final URL.
+fn redirect_error(
+    method: &str,
+    url: &str,
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+) -> anyhow::Error {
+    let location = headers
+        .get(reqwest::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("(no Location header)");
+    anyhow::anyhow!(
+        "{method} {url} answered {status}, redirecting to {}: dispatcharr.base_url redirects; \
+         use the final URL (redirects are not followed, so a write is never re-sent as a GET)",
+        truncate(location, 200)
+    )
 }
 
 fn truncate(text: &str, limit: usize) -> String {

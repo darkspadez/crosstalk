@@ -516,8 +516,9 @@ fn full_sync_config(dir: &std::path::Path) -> CrosstalkConfig {
     let mut config = CrosstalkConfig::load(dir).expect("the example workflow loads");
     config.jobs.exports_dir = dir.join("exports").display().to_string();
     config.jobs.data_dir = dir.join("data").display().to_string();
-    // The shipped shape: sync stops the sequence, the three middle steps carry on, and
-    // every step between sync and tidy reads the lineup's owned channels.
+    // The shipped shape: sync and the stream match stop the sequence (tidy hides owned
+    // channels without streams, so it must not run after a failed match), guide and logos
+    // carry on, and every step between sync and tidy reads the lineup's owned channels.
     let scope = || Some(WorkflowStepScope::Named("lineup".to_string()));
     let shipped: Vec<(String, Option<WorkflowStepScope>, bool)> = config.workflows["full_sync"]
         .steps
@@ -534,7 +535,7 @@ fn full_sync_config(dir: &std::path::Path) -> CrosstalkConfig {
         shipped,
         vec![
             ("lineup.sync_apply".to_string(), None, false),
-            ("streams.match_apply".to_string(), scope(), true),
+            ("streams.match_apply".to_string(), scope(), false),
             ("guide.match_apply".to_string(), scope(), true),
             ("lineup.logos_apply".to_string(), scope(), true),
             ("lineup.tidy_apply".to_string(), None, false),

@@ -999,7 +999,7 @@ pub async fn run(
     let owned = if dry_run {
         channel_ops::OwnedState::default()
     } else {
-        channel_ops::load_owned(context, &world, "streams")?
+        channel_ops::load_owned(context, &world, "streams", false).await?
     };
     let create_plan = channel_ops::plan_creates(
         &world,

@@ -157,24 +157,62 @@ pub fn decide_tidy(
 /// The LATEST tidy write per channel decides: a channel tidy hid, then
 /// unhid, then the operator hid again was last written `false` by tidy, so
 /// the current hide is the operator's and stays.
+///
+/// Host undo runs of this app count too, in order with the tidy runs: an undo
+/// that unhid a channel took it out of tidy's hands (whatever it undid), and an
+/// undo that re-hid one restores tidy's hide only when the run it undid was a
+/// tidy (or an undo of one) — an undo of `create` hides channels tidy never did.
 pub fn hid_by_tidy_runs(store: &crosstalk_core::store::Store) -> Result<HashSet<i64>> {
+    use crosstalk_core::undo::ACTION_UNDO;
+
+    let runs = store.recent_runs_for(crate::APP_ID, TIDY_HISTORY_RUNS)?;
+    let action_of: HashMap<i64, (&str, Option<i64>)> = runs
+        .iter()
+        .map(|run| (run.id, (run.action.as_str(), run.parent_run_id)))
+        .collect();
+    // Whether `run_id` is a tidy apply, or an undo (of an undo ...) of one.
+    let tidy_chain = |mut run_id: i64| -> bool {
+        for _ in 0..TIDY_HISTORY_RUNS {
+            match action_of.get(&run_id) {
+                Some((action, _)) if *action == crate::ACTION_TIDY_APPLY => return true,
+                Some((action, Some(parent))) if *action == ACTION_UNDO => run_id = *parent,
+                _ => return false,
+            }
+        }
+        false
+    };
     // Oldest run first, rows in order: a later write replaces an earlier one.
-    let rows = store.field_history(
-        crate::APP_ID,
-        &[crate::ACTION_TIDY_APPLY],
-        &["hidden_from_output"],
-        100,
-    )?;
+    let mut writers: Vec<&crosstalk_core::store::RunRecord> = runs
+        .iter()
+        .filter(|run| !run.dry_run && !run.status.is_running())
+        .filter(|run| run.action == crate::ACTION_TIDY_APPLY || run.action == ACTION_UNDO)
+        .collect();
+    writers.sort_by(|a, b| (&a.started_at, a.id).cmp(&(&b.started_at, b.id)));
+
     let mut hid: HashSet<i64> = HashSet::new();
-    for row in rows.into_iter().filter(|row| row.status == "ok") {
-        if row.after_value.as_deref() == Some("true") {
-            hid.insert(row.channel_id);
-        } else {
-            hid.remove(&row.channel_id);
+    for run in writers {
+        let restores_tidy = run.action == crate::ACTION_TIDY_APPLY || tidy_chain(run.id);
+        for row in store.rows(run.id)? {
+            if row.status != "ok"
+                || row.subject != crosstalk_core::store::Subject::Channel
+                || row.field != "hidden_from_output"
+            {
+                continue;
+            }
+            if row.after_value.as_deref() == Some("true") {
+                if restores_tidy {
+                    hid.insert(row.channel_id);
+                }
+            } else {
+                hid.remove(&row.channel_id);
+            }
         }
     }
     Ok(hid)
 }
+
+/// How many of the app's newest runs [`hid_by_tidy_runs`] reads.
+const TIDY_HISTORY_RUNS: usize = 200;
 
 /// Run `tidy_preview` / `tidy_apply`.
 ///
@@ -247,7 +285,7 @@ pub async fn run(
     let applied = if dry_run {
         None
     } else {
-        Some(channel_ops::apply(client, &plan, context, action_id).await)
+        Some(channel_ops::apply_recorded(client, &plan, context, action_id).await?)
     };
 
     // After an apply the statuses live in the report (the plan's copies stay `planned`).
@@ -665,6 +703,71 @@ mod tests {
             .expect("rows");
         let hid = hid_by_tidy_runs(&store).expect("reads");
         assert_eq!(hid, [3].into_iter().collect(), "{hid:?}");
+    }
+
+    #[test]
+    fn an_undo_of_tidy_takes_the_channel_out_of_tidys_hands() {
+        // N7: tidy hid 3; an undo of that run unhid it, so 3 is no longer tidy's hide. An
+        // undo of a create run hides 7, which tidy never hid.
+        let store = Store::in_memory().expect("store");
+        let hide = |channel_id: i64, after: &str| RunRow {
+            subject: Subject::Channel,
+            channel_id,
+            channel_name: format!("Channel {channel_id}"),
+            field: "hidden_from_output".to_string(),
+            before_value: Some(if after == "true" { "false" } else { "true" }.to_string()),
+            after_value: Some(after.to_string()),
+            status: "ok".to_string(),
+            ..RunRow::default()
+        };
+        let finish = |run: i64| {
+            store
+                .finish_run(
+                    run,
+                    RunStatus::Succeeded,
+                    None,
+                    &serde_json::json!({}),
+                    None,
+                )
+                .expect("finish");
+        };
+        let tidy = store
+            .start_run(crate::APP_ID, crate::ACTION_TIDY_APPLY, false)
+            .expect("tidy");
+        store.append_rows(tidy, &[hide(3, "true")]).expect("rows");
+        finish(tidy);
+        let create = store
+            .start_run(crate::APP_ID, crate::ACTION_CREATE_APPLY, false)
+            .expect("create");
+        finish(create);
+
+        let undo_tidy = store
+            .start_child_run(
+                crate::APP_ID,
+                crosstalk_core::undo::ACTION_UNDO,
+                false,
+                tidy,
+            )
+            .expect("undo tidy");
+        store
+            .append_rows(undo_tidy, &[hide(3, "false")])
+            .expect("rows");
+        finish(undo_tidy);
+        let undo_create = store
+            .start_child_run(
+                crate::APP_ID,
+                crosstalk_core::undo::ACTION_UNDO,
+                false,
+                create,
+            )
+            .expect("undo create");
+        store
+            .append_rows(undo_create, &[hide(7, "true")])
+            .expect("rows");
+        finish(undo_create);
+
+        let hid = hid_by_tidy_runs(&store).expect("reads");
+        assert!(hid.is_empty(), "{hid:?}");
     }
 
     async fn serve(world: &World) -> (MockServer, CrosstalkConfig, tempfile::TempDir) {

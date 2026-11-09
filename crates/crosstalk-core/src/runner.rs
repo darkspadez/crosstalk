@@ -163,6 +163,40 @@ struct RunSlot {
     busy: Arc<Mutex<HashMap<String, i64>>>,
     finish: Arc<Mutex<HashMap<i64, Arc<AtomicBool>>>>,
     finished: bool,
+    /// Dropped with the slot, which stops the beat.
+    _heartbeat: Heartbeat,
+}
+
+/// Keeps a live run's `heartbeat_at` fresh, so a daemon starting beside it (a CLI run, say)
+/// can tell it from a run a crash left `running` (see `Store::open`). Stops when dropped,
+/// which is when the run's slot is.
+struct Heartbeat(Option<tokio::task::JoinHandle<()>>);
+
+impl Heartbeat {
+    fn start(store: Store, run_id: i64) -> Self {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return Self(None);
+        };
+        Self(Some(runtime.spawn(async move {
+            let mut interval = tokio::time::interval(crate::store::HEARTBEAT_INTERVAL);
+            // The first tick is immediate, and `insert_run` already stamped the row.
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                if let Err(error) = store.heartbeat(run_id) {
+                    tracing::warn!(run_id, "could not record the run's heartbeat: {error:#}");
+                }
+            }
+        })))
+    }
+}
+
+impl Drop for Heartbeat {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
 }
 
 impl RunSlot {
@@ -535,6 +569,7 @@ impl JobRunner {
                 busy: Arc::clone(&runner.busy),
                 finish: Arc::clone(&runner.finish),
                 finished: false,
+                _heartbeat: Heartbeat::start(runner.store.clone(), run_id),
             };
 
             let sink = Arc::new(BroadcastSink {
@@ -634,6 +669,7 @@ impl JobRunner {
             busy: Arc::clone(&self.busy),
             finish: Arc::clone(&self.finish),
             finished: false,
+            _heartbeat: Heartbeat::start(self.store.clone(), run_id),
         };
 
         let sink = Arc::new(BroadcastSink {
@@ -741,6 +777,7 @@ impl JobRunner {
                 busy: Arc::clone(&runner.busy),
                 finish: Arc::clone(&runner.finish),
                 finished: false,
+                _heartbeat: Heartbeat::start(runner.store.clone(), run_id),
             };
 
             let sink = Arc::new(BroadcastSink {
@@ -820,6 +857,7 @@ impl JobRunner {
             busy: Arc::clone(&self.busy),
             finish: Arc::clone(&self.finish),
             finished: false,
+            _heartbeat: Heartbeat::start(self.store.clone(), run_id),
         };
 
         let sink = Arc::new(BroadcastSink {
@@ -990,6 +1028,7 @@ impl JobRunner {
                 busy: Arc::clone(&self.busy),
                 finish: Arc::clone(&self.finish),
                 finished: false,
+                _heartbeat: Heartbeat::start(self.store.clone(), run_id),
             }),
             runner: self.clone(),
         })

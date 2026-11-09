@@ -45,7 +45,9 @@ use crosstalk_core::ai_gate;
 use crosstalk_core::csv_report;
 use crosstalk_core::dispatcharr::{DispatcharrClient, EpgEntry, HasPrograms, ProgramWindow, World};
 use crosstalk_core::jobs::{JobContext, ProgressEvent};
-use crosstalk_core::match_run::{self, CandidateProbe, ConfidenceBand, ScoreProgress, WalkRules};
+use crosstalk_core::match_run::{
+    self, CandidateProbe, ConfidenceBand, Probed, ScoreProgress, WalkRules,
+};
 use crosstalk_core::scope::ScopedChannels;
 use crosstalk_core::store::RunRow;
 use crosstalk_core::subapp::{JobOutcome, OutcomeBuilder, SubApp};
@@ -503,6 +505,14 @@ pub async fn run(
                 }
             }
         }
+        if let Some(unknown) = walked.unknown.as_ref() {
+            // A failed programme check is not "empty": the channel stays unmatched this run
+            // rather than taking a lower-ranked guide over one that may be fine.
+            row.reason = format!(
+                "The programme check for {unknown} failed, so the channel is left unmatched \
+                 this run instead of settling for a lower-ranked guide"
+            );
+        }
         if let Some((picked_name, score)) = walked.ai_empty.as_ref() {
             // The model said yes and every same-name guide is empty: say that, rather
             // than reusing the "below threshold" wording the score would suggest.
@@ -707,8 +717,9 @@ pub(crate) async fn write_assignments(
 
 /// Whether a scoped EPG entry carries programme data in the run's window.
 ///
-/// The one EPG-specific half of the shared walk. A failed check is "no", never an error: one
-/// broken entry must not fail a run that can still match the rest. Shared with heal, which
+/// The one EPG-specific half of the shared walk. A failed check is "unknown", never an error
+/// and never "no": one broken entry must not fail a run that can still match the rest, and a
+/// REST blip must not make the walk settle for the next candidate. Shared with heal, which
 /// walks the same family shape.
 pub(crate) struct EpgProbe<'a> {
     pub(crate) client: &'a DispatcharrClient,
@@ -717,17 +728,21 @@ pub(crate) struct EpgProbe<'a> {
 
 #[async_trait::async_trait]
 impl CandidateProbe<EpgEntry> for EpgProbe<'_> {
-    async fn carries_data(&self, entry: &EpgEntry) -> bool {
+    async fn carries_data(&self, entry: &EpgEntry) -> Probed {
         // Without a source there is nothing to ask about; the plugin's own query would find
         // nothing either.
         let Some(source) = entry.epg_source else {
-            return false;
+            return Probed::No;
         };
-        self.client
+        match self
+            .client
             .has_programs(&entry.tvg_id, source, &self.window)
             .await
-            .unwrap_or(HasPrograms::No)
-            == HasPrograms::Yes
+        {
+            Ok(HasPrograms::Yes) => Probed::Yes,
+            Ok(HasPrograms::No) => Probed::No,
+            Err(_) => Probed::Unknown,
+        }
     }
 }
 
@@ -990,8 +1005,8 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/channels/channels/"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {"id": 1, "name": channel_name, "channel_number": 101, "channel_group_id": 10},
-                {"id": 2, "name": "Nothing Like It", "channel_number": 102, "channel_group_id": 10}
+                {"id": 1, "name": channel_name, "channel_number": 101, "channel_group_id": 10, "streams": []},
+                {"id": 2, "name": "Nothing Like It", "channel_number": 102, "channel_group_id": 10, "streams": []}
             ])))
             .mount(&server)
             .await;
@@ -1985,7 +2000,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/channels/channels/"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {"id": 1, "name": channel_name, "channel_number": 101, "channel_group_id": 10}
+                {"id": 1, "name": channel_name, "channel_number": 101, "channel_group_id": 10, "streams": []}
             ])))
             .mount(&server)
             .await;

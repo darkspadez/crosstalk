@@ -696,7 +696,7 @@ pub async fn run_with_creator(
 
     // Crash-safe creates (intents + ownership, step 10 review): reconcile before
     // planning so an earlier run's landed channel is reused, never duplicated.
-    let owned = channel_ops::load_owned(context, &world, crate::APP_ID)?;
+    let owned = channel_ops::load_owned(context, &world, crate::APP_ID, dry_run).await?;
     let owned_groups: HashSet<i64> = match context.store() {
         Some(store) => store
             .owned_keys(crate::APP_ID)?

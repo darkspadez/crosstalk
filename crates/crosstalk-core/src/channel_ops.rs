@@ -784,6 +784,9 @@ pub struct Plan {
     pub skipped: Vec<Skip>,
     /// The scope and selection in words, for the report preamble and the log.
     pub description: String,
+    /// Scope settings that did not do what they say (an `ignore_groups` token matching no
+    /// group excludes nothing). A preview reports them; [`apply`] refuses a plan carrying any.
+    pub scope_warnings: Vec<String>,
 }
 
 /// What [`apply`] did, row by row.
@@ -1017,11 +1020,22 @@ pub fn plan_with_options(
         drop_number_conflicts(world, &mut changes, &mut skipped);
     }
 
+    let scope_warnings = if scoped.unmatched_ignore.is_empty() {
+        Vec::new()
+    } else {
+        vec![format!(
+            "[scope] ignore_groups names {} that match no channel group, so they exclude \
+             nothing: fix the names (they are case-sensitive) before applying",
+            quote_list(&scoped.unmatched_ignore)
+        )]
+    };
+
     Ok(Plan {
         description: selection.describe(&scoped.filter_description),
         selected: selected_rows,
         changes,
         skipped,
+        scope_warnings,
     })
 }
 
@@ -1338,6 +1352,238 @@ pub async fn apply_with_writer(
     action: &str,
     writer: &dyn StreamListWriter,
 ) -> ApplyReport {
+    apply_inner(client, plan, context, action, writer, false).await
+}
+
+/// [`apply`] for a run whose rows are exactly [`run_rows`] of `plan`, keeping those rows in
+/// step with the writes.
+///
+/// The planned rows are recorded BEFORE the first write and re-recorded after every stage
+/// (same ordinals, so each replaces the last), so a run killed mid-apply still says what it
+/// was about to do and which stages landed: undo reads the `ok` rows, and without this a
+/// crash after the writes but before the end-of-run record would leave nothing to undo.
+pub async fn apply_recorded(
+    client: &DispatcharrClient,
+    plan: &Plan,
+    context: &JobContext,
+    action: &str,
+) -> Result<ApplyReport> {
+    context.record_rows(&run_rows(plan, None))?;
+    let writer = RestStreamListWriter::new(client.clone());
+    let report = apply_inner(client, plan, context, action, &writer, true).await;
+    context.record_rows(&run_rows(plan, Some(&report)))?;
+    Ok(report)
+}
+
+async fn apply_inner(
+    client: &DispatcharrClient,
+    plan: &Plan,
+    context: &JobContext,
+    action: &str,
+    writer: &dyn StreamListWriter,
+    record: bool,
+) -> ApplyReport {
+    let mut changes = plan.changes.clone();
+    if !plan.scope_warnings.is_empty() {
+        // The scope does not mean what it says: write nothing rather than reach channels
+        // the operator meant to exclude.
+        let reason = format!("not applied: {}", plan.scope_warnings.join("; "));
+        return refuse_all_changes(changes, &reason);
+    }
+
+    // Plans are not re-checked by anything else between planning and writing, and several
+    // apps (and people) write the same fields, so the channels are listed once more right
+    // here: a change whose `before` no longer holds would revert somebody else's edit, so it
+    // is not sent. A cancelled run writes nothing anyway and skips the listing.
+    let stale = if context.is_cancelled() {
+        HashMap::new()
+    } else {
+        match changed_since_plan(client, &plan.changes).await {
+            Ok(stale) => stale,
+            Err(error) => {
+                return refuse_all_changes(changes, &format!("not applied: {error:#}"));
+            }
+        }
+    };
+    let mut fresh = Plan::default();
+    let mut origin: Vec<usize> = Vec::with_capacity(plan.changes.len());
+    for (index, change) in plan.changes.iter().enumerate() {
+        match stale.get(&index) {
+            Some(reason) => {
+                changes[index].status = RowStatus::Failed;
+                changes[index].reason = reason.clone();
+            }
+            None => {
+                fresh.changes.push(change.clone());
+                origin.push(index);
+            }
+        }
+    }
+    let checkpoint = Checkpoint {
+        plan,
+        base: changes,
+        origin,
+        record,
+    };
+    let report = apply_stages(client, &fresh, context, action, writer, &checkpoint).await;
+    let changes = checkpoint.merged(&report.changes);
+    let ok = changes
+        .iter()
+        .filter(|change| change.status == RowStatus::Ok)
+        .count();
+    let failed = changes
+        .iter()
+        .filter(|change| change.status == RowStatus::Failed)
+        .count();
+    ApplyReport {
+        changes,
+        ok,
+        failed,
+    }
+}
+
+/// Every change failed with one reason, nothing sent.
+fn refuse_all_changes(mut changes: Vec<Change>, reason: &str) -> ApplyReport {
+    for change in &mut changes {
+        change.status = RowStatus::Failed;
+        change.reason = reason.to_string();
+    }
+    let failed = changes.len();
+    ApplyReport {
+        changes,
+        ok: 0,
+        failed,
+    }
+}
+
+/// Where [`apply_stages`] reports each finished stage: the full plan's rows (the ones not sent
+/// already carry their reason) and where each sent change sits in them.
+struct Checkpoint<'a> {
+    plan: &'a Plan,
+    base: Vec<Change>,
+    /// For each change [`apply_stages`] was given, its index in `base`.
+    origin: Vec<usize>,
+    /// Re-record the run rows after every stage ([`apply_recorded`]).
+    record: bool,
+}
+
+impl Checkpoint<'_> {
+    /// The full plan's changes with the sent ones' current outcomes.
+    fn merged(&self, sent: &[Change]) -> Vec<Change> {
+        let mut all = self.base.clone();
+        for (position, change) in sent.iter().enumerate() {
+            all[self.origin[position]] = change.clone();
+        }
+        all
+    }
+
+    /// Record the rows as they stand after a stage, when this apply records them.
+    fn stage(&self, context: &JobContext, sent: &[Change]) {
+        if !self.record {
+            return;
+        }
+        let report = ApplyReport {
+            changes: self.merged(sent),
+            ok: 0,
+            failed: 0,
+        };
+        if let Err(error) = context.record_rows(&run_rows(self.plan, Some(&report))) {
+            tracing::warn!("recording the run rows after a write stage failed: {error:#}");
+        }
+    }
+}
+
+/// The changes whose channel no longer holds the plan's `before`, by index, with the reason.
+///
+/// One channel listing. A channel missing from it is not judged here (the write itself says
+/// whether it is gone), and a profile membership is not either: memberships are not in the
+/// channel listing. A failed listing is an error, because writing unchecked is what this
+/// exists to prevent.
+async fn changed_since_plan(
+    client: &DispatcharrClient,
+    changes: &[Change],
+) -> Result<HashMap<usize, String>> {
+    if changes
+        .iter()
+        .all(|change| matches!(change.field, Field::Membership(_)))
+    {
+        return Ok(HashMap::new());
+    }
+    let live = client
+        .channels()
+        .await
+        .context("re-reading the channels right before writing")?;
+    let by_id: HashMap<i64, &Channel> = live.iter().map(|channel| (channel.id, channel)).collect();
+    let mut stale = HashMap::new();
+    for (index, change) in changes.iter().enumerate() {
+        let Some(channel) = by_id.get(&change.channel_id) else {
+            continue;
+        };
+        if let Some(now) = moved_since_plan(channel, change) {
+            stale.insert(
+                index,
+                format!(
+                    "not applied: changed since the plan ({} was {:?} when planned and is {now} \
+                     now), so writing it would revert someone else's edit",
+                    change.field.label(),
+                    change.before.display(),
+                ),
+            );
+        }
+    }
+    Ok(stale)
+}
+
+/// What the live channel holds for `change`'s field, when that is no longer its `before`.
+fn moved_since_plan(channel: &Channel, change: &Change) -> Option<String> {
+    let id_of = |value: &Option<(i64, String)>| value.as_ref().map(|(id, _)| *id);
+    let id_text = |id: Option<i64>| id.map_or_else(|| "none".to_string(), |id| format!("#{id}"));
+    let (holds, now) = match (&change.field, &change.before) {
+        (Field::Name, Value::Name(name)) => (channel.name == *name, format!("{:?}", channel.name)),
+        (Field::Group, Value::Group(group)) => (
+            channel.channel_group_id == id_of(group),
+            id_text(channel.channel_group_id),
+        ),
+        (Field::HiddenFromOutput, Value::Flag(flag)) => (
+            channel.hidden_from_output == *flag,
+            channel.hidden_from_output.to_string(),
+        ),
+        (Field::Number, Value::Number(number)) => {
+            let live = channel_number_of(channel);
+            (
+                live.map(number_key) == number.map(number_key),
+                live.map_or_else(|| "none".to_string(), |number| format!("{number}")),
+            )
+        }
+        (Field::Logo, Value::Logo(logo)) => {
+            (channel.logo_id == id_of(logo), id_text(channel.logo_id))
+        }
+        (Field::Epg, Value::Epg(epg)) => (
+            channel.current_epg_id() == id_of(epg),
+            id_text(channel.current_epg_id()),
+        ),
+        (Field::Streams, before) => {
+            let ids = before.stream_ids()?;
+            (
+                channel.streams == ids,
+                format!("a list of {} stream(s)", channel.streams.len()),
+            )
+        }
+        _ => return None,
+    };
+    (!holds).then_some(now)
+}
+
+/// The write stages of [`apply_with_writer`], over changes already checked against the live
+/// channels.
+async fn apply_stages(
+    client: &DispatcharrClient,
+    plan: &Plan,
+    context: &JobContext,
+    action: &str,
+    writer: &dyn StreamListWriter,
+    checkpoint: &Checkpoint<'_>,
+) -> ApplyReport {
     let mut changes = plan.changes.clone();
     let total = changes.len() as u64;
     let mut progress = context.paced(action, total, PROGRESS_INTERVAL);
@@ -1391,17 +1637,17 @@ pub async fn apply_with_writer(
         } else {
             let payload: Vec<ChannelEdit> = edits.into_values().collect();
             progress.set(done, &format!("editing {} channel(s)", payload.len()));
-            match client.edit_channels(&payload).await {
-                Ok(_) => mark(&mut changes, &edit_rows, RowStatus::Ok, ""),
-                Err(error) => mark(
-                    &mut changes,
-                    &edit_rows,
-                    RowStatus::Failed,
-                    &format!("{error:#}"),
-                ),
-            }
+            // One answer per channel: a later chunk failing must not mark the landed chunks
+            // failed (undo would skip writes that are in effect), and the payload is one edit
+            // per channel while a channel can carry several rows, so rows map by channel id.
+            let cancelled = || context.is_cancelled();
+            let answers = client.edit_channels_each(&payload, &cancelled).await;
+            let by_channel: HashMap<i64, Option<Result<()>>> =
+                payload.iter().map(|edit| edit.id).zip(answers).collect();
+            mark_by_channel(&mut changes, &edit_rows, &by_channel);
         }
         done += edit_rows.len() as u64;
+        checkpoint.stage(context, &changes);
     }
     if !no_group_rows.is_empty() {
         // A cancelled run says so, like every other batch it never reached; otherwise the
@@ -1436,17 +1682,19 @@ pub async fn apply_with_writer(
                 })
                 .collect();
             progress.set(done, &format!("updating profile {profile_id} membership"));
-            match client.set_profile_membership(profile_id, &payload).await {
-                Ok(_) => mark(&mut changes, &rows, RowStatus::Ok, ""),
-                Err(error) => mark(
-                    &mut changes,
-                    &rows,
-                    RowStatus::Failed,
-                    &format!("{error:#}"),
-                ),
-            }
+            let cancelled = || context.is_cancelled();
+            let answers = client
+                .set_profile_membership_each(profile_id, &payload, &cancelled)
+                .await;
+            let by_channel: HashMap<i64, Option<Result<()>>> = payload
+                .iter()
+                .map(|(channel_id, _)| *channel_id)
+                .zip(answers)
+                .collect();
+            mark_by_channel(&mut changes, &rows, &by_channel);
         }
         done += rows.len() as u64;
+        checkpoint.stage(context, &changes);
     }
 
     // 3. Guides: one `batch-set-epg` call, which chunks and retries internally. A clear and a
@@ -1479,6 +1727,7 @@ pub async fn apply_with_writer(
             }
         }
         done += epg_rows.len() as u64;
+        checkpoint.stage(context, &changes);
     }
 
     // 4. Stream lists: one batched write through the writer, which is the seam a
@@ -1559,6 +1808,30 @@ pub async fn apply_with_writer(
     }
 }
 
+/// Mark `rows` from per-channel answers: `Some(Ok)` landed, `Some(Err)` failed with its own
+/// message, `None` was never sent because the run was cancelled. A row whose channel has no
+/// answer at all fails loudly rather than sitting at `planned`.
+fn mark_by_channel(
+    changes: &mut [Change],
+    rows: &[usize],
+    answers: &HashMap<i64, Option<Result<()>>>,
+) {
+    for index in rows {
+        let change = &mut changes[*index];
+        let (status, reason) = match answers.get(&change.channel_id) {
+            Some(Some(Ok(()))) => (RowStatus::Ok, String::new()),
+            Some(Some(Err(error))) => (RowStatus::Failed, format!("{error:#}")),
+            Some(None) => (RowStatus::Failed, CANCELLED.to_string()),
+            None => (
+                RowStatus::Failed,
+                "the write returned no result for this channel".to_string(),
+            ),
+        };
+        change.status = status;
+        change.reason = reason;
+    }
+}
+
 /// What a batch of rows gets when the run was cancelled before it ran.
 const CANCELLED: &str = "not applied: the run was cancelled";
 
@@ -1634,6 +1907,10 @@ pub fn write_ops_report(
             },
         )
         .result("Skipped", plan.skipped.len());
+    let report = plan
+        .scope_warnings
+        .iter()
+        .fold(report, |report, warning| report.result("Warning", warning));
     let report = spec
         .notes
         .iter()
@@ -3015,9 +3292,11 @@ fn unanswered(context: &JobContext) -> String {
 /// Settles the intent recorded before the POST (ownership row in, intent out, one
 /// transaction). A run without a store (unit tests, and any caller outside the runner) skips
 /// this: the row is still recorded by [`create_run_rows`], only the cross-run dedup entry is
-/// missing. A store write that fails does NOT lose the object — it fails the outcome with
-/// the id it got, so the run page says the object exists but is not tracked; the intent
-/// stays, and the next [`load_owned`] adopts the object.
+/// missing. A store write that fails does NOT lose the object, and does not fail its row
+/// either: the object exists, so the row stays `ok` with its id (an undo of this run can still
+/// hide it once the ownership is in, and the rest of the plan may build on it) and the reason
+/// says it is not tracked yet. The intent stays, and the next [`load_owned`] adopts the
+/// object under this run.
 fn record_ownership(
     context: &JobContext,
     plan: &CreatePlan,
@@ -3031,9 +3310,10 @@ fn record_ownership(
         return;
     };
     if let Err(error) = store.settle_intent(kind.label(), id, &plan.app, &outcome.key, run_id) {
-        outcome.status = RowStatus::Failed;
-        outcome.reason =
-            format!("created as id {id} but ownership could not be recorded: {error:#}");
+        outcome.reason = format!(
+            "created as id {id} but ownership could not be recorded yet ({error:#}); the next \
+             run adopts it"
+        );
     }
 }
 
@@ -3047,8 +3327,12 @@ pub struct OwnedState {
     pub recovered: Vec<(String, i64, String)>,
     /// Intents whose object never landed, dropped: `(kind, owner_key)`.
     pub dropped: Vec<(String, String)>,
-    /// Owned ids gone from Dispatcharr (deleted by a user), forgotten: `(kind, id, key)`.
+    /// Owned ids gone from Dispatcharr (deleted by a user, confirmed by a 404), forgotten:
+    /// `(kind, id, key)`. On a dry run, the ones that WOULD be forgotten.
     pub forgotten: Vec<(String, i64, String)>,
+    /// Owned ids missing from the listing that were NOT forgotten, because their own `GET`
+    /// still answered or failed: `(kind, id, key)`.
+    pub kept: Vec<(String, i64, String)>,
 }
 
 /// Reconcile and list what `app` owns, against a freshly loaded world, before planning
@@ -3062,17 +3346,33 @@ pub struct OwnedState {
 ///    newest match is adopted under the intent's key and run; no match means the POST never
 ///    landed, and the intent is dropped. An intent of a run that is still going is left to
 ///    that run, and a kind the world did not load is left for a later reconcile.
-/// 2. **Stale ownership**: an owned id missing from a loaded slice was deleted upstream
-///    (ids are never reused), so its row is forgotten and its key can be created again.
-///    Hidden objects are still in the world, so undo's hide keeps ownership.
+/// 2. **Stale ownership**: an owned id missing from a loaded slice MAY have been deleted
+///    upstream, or the listing was short (a proxy, a page cut, a scoped read). Only a 404
+///    from the object's own `GET` proves it gone; then its row is forgotten and its key can be
+///    created again. An id that answers, or whose check fails, stays owned. Hidden objects
+///    are still in the world, so undo's hide keeps ownership. Forgetting the ownership of a
+///    whole install would make the next create duplicate it, so the reconcile refuses when a
+///    loaded slice is empty while this app owns objects of that kind, or when more than
+///    [`max_forget`] ids of one kind are missing at once.
 /// 3. The owned channels' keys, for [`plan_creates`].
 ///
+/// A `dry_run` (every preview) writes nothing: what would be adopted, dropped or forgotten is
+/// reported in the state and as a progress line, and an adopted channel's key is still
+/// returned so the preview plans exactly what the apply would.
+///
 /// A context without a store owns nothing and changes nothing.
-pub fn load_owned(context: &JobContext, world: &World, app: &str) -> Result<OwnedState> {
+pub async fn load_owned(
+    context: &JobContext,
+    world: &World,
+    app: &str,
+    dry_run: bool,
+) -> Result<OwnedState> {
     let mut state = OwnedState::default();
     let Some(store) = context.store() else {
         return Ok(state);
     };
+    // Adopted by this (dry) reconcile, so two intents never claim the same object.
+    let mut adopted_now: HashSet<(String, i64)> = HashSet::new();
     let loaded = |kind: &str| match kind {
         "group" => world.has(WorldKind::Groups),
         "logo" => world.has(WorldKind::Logos),
@@ -3123,6 +3423,9 @@ pub fn load_owned(context: &JobContext, world: &World, app: &str) -> Result<Owne
         candidates.sort_unstable_by(|a, b| b.cmp(a));
         let mut adopted = None;
         for id in candidates {
+            if adopted_now.contains(&(intent.kind.clone(), id)) {
+                continue;
+            }
             if !store.is_owned(&intent.kind, id)? {
                 adopted = Some(id);
                 break;
@@ -3130,11 +3433,22 @@ pub fn load_owned(context: &JobContext, world: &World, app: &str) -> Result<Owne
         }
         match adopted {
             Some(id) => {
-                store.settle_intent(&intent.kind, id, app, &intent.owner_key, intent.run_id)?;
+                if dry_run {
+                    // Nothing is recorded, so the owned-keys walk below will not see it:
+                    // hand the key to the plan here.
+                    if intent.kind == "channel" {
+                        state.channels.insert(intent.owner_key.clone(), id);
+                    }
+                } else {
+                    store.settle_intent(&intent.kind, id, app, &intent.owner_key, intent.run_id)?;
+                }
+                adopted_now.insert((intent.kind.clone(), id));
                 state.recovered.push((intent.kind, id, intent.owner_key));
             }
             None => {
-                store.drop_intent(&intent.kind, app, &intent.owner_key)?;
+                if !dry_run {
+                    store.drop_intent(&intent.kind, app, &intent.owner_key)?;
+                }
                 state.dropped.push((intent.kind, intent.owner_key));
             }
         }
@@ -3144,23 +3458,122 @@ pub fn load_owned(context: &JobContext, world: &World, app: &str) -> Result<Owne
         "logo" => world.logos.iter().any(|logo| logo.id == id),
         _ => world.channels.iter().any(|channel| channel.id == id),
     };
+    let slice_len = |kind: &str| match kind {
+        "group" => world.groups.len(),
+        "logo" => world.logos.len(),
+        _ => world.channels.len(),
+    };
+    let mut owned_per_kind: BTreeMap<String, usize> = BTreeMap::new();
+    let mut missing: Vec<(String, i64, String)> = Vec::new();
     for (kind, id, key) in store.owned_keys(app)? {
-        if !loaded(&kind) {
-            if kind == "channel" {
-                state.channels.insert(key, id);
-            }
-            continue;
-        }
-        if !live(&kind, id) {
-            store.forget_ownership(&kind, id)?;
-            state.forgotten.push((kind, id, key));
+        *owned_per_kind.entry(kind.clone()).or_default() += 1;
+        if loaded(&kind) && !live(&kind, id) {
+            missing.push((kind, id, key));
             continue;
         }
         if kind == "channel" {
             state.channels.insert(key, id);
         }
     }
+
+    // A short or empty read must never look like a mass deletion.
+    for (kind, owned) in &owned_per_kind {
+        if !loaded(kind) {
+            continue;
+        }
+        let gone = missing.iter().filter(|(k, _, _)| k == kind).count();
+        if gone == 0 {
+            continue;
+        }
+        if slice_len(kind) == 0 {
+            bail!(
+                "Dispatcharr listed no {kind}s, yet {app} owns {owned} of them: refusing to \
+                 treat an empty listing as a deletion (the next create would duplicate them). \
+                 Check that Dispatcharr answers the {kind} listing, then run again."
+            );
+        }
+        let cap = max_forget(*owned);
+        if gone > cap {
+            bail!(
+                "{gone} of the {owned} {kind}s {app} owns are missing from Dispatcharr's \
+                 listing, more than the {cap} a run may forget at once: refusing, because a \
+                 short listing would otherwise make the next create duplicate them. Check \
+                 the listing (a proxy, a scope or a page limit) and run again."
+            );
+        }
+    }
+
+    // Each missing id is confirmed by its own GET: only a 404 proves it gone.
+    let client = context.dispatcharr().ok();
+    for (kind, id, key) in missing {
+        let exists = match (client, kind.as_str()) {
+            (Some(client), "group") => client.group_exists(id).await,
+            (Some(client), "logo") => client.logo_exists(id).await,
+            (Some(client), _) => client.channel_exists(id).await,
+            (None, _) => Err(anyhow::anyhow!("this run has no Dispatcharr session")),
+        };
+        match exists {
+            Ok(false) => {
+                if !dry_run {
+                    store.forget_ownership(&kind, id)?;
+                }
+                state.forgotten.push((kind, id, key));
+            }
+            // Still there (the listing was short) or unknown: keep it owned, so the plan
+            // never creates a second copy of an object that may well exist.
+            Ok(true) | Err(_) => {
+                if kind == "channel" {
+                    state.channels.insert(key.clone(), id);
+                }
+                state.kept.push((kind, id, key));
+            }
+        }
+    }
+    if let Some(line) = state.describe(dry_run) {
+        context.progress(&crate::jobs::ProgressEvent::new(
+            context.action().unwrap_or("ownership"),
+            0,
+            0,
+            line,
+        ));
+    }
     Ok(state)
+}
+
+/// How many owned ids of one kind a reconcile may forget at once: 25, or 5% of what the app
+/// owns of that kind when that is more.
+pub fn max_forget(owned: usize) -> usize {
+    (owned / 20).max(25)
+}
+
+impl OwnedState {
+    /// One line saying what the reconcile did, or would do on a dry run; `None` when it had
+    /// nothing to do.
+    pub fn describe(&self, dry_run: bool) -> Option<String> {
+        if self.recovered.is_empty()
+            && self.dropped.is_empty()
+            && self.forgotten.is_empty()
+            && self.kept.is_empty()
+        {
+            return None;
+        }
+        let verb = if dry_run { "would " } else { "" };
+        let mut line = format!(
+            "ownership reconcile: {verb}adopt {}, {verb}drop {} intent(s), {verb}forget {} \
+             deleted object(s)",
+            self.recovered.len(),
+            self.dropped.len(),
+            self.forgotten.len(),
+        );
+        if !self.kept.is_empty() {
+            line.push_str(&format!(
+                "; {} owned object(s) missing from the listing are kept (they still answer, \
+                 or the check failed)",
+                self.kept.len()
+            ));
+        }
+        Some(line)
+    }
 }
 
 /// Post every item concurrently, bounded by `concurrency`, checking cancellation between
@@ -4529,6 +4942,13 @@ fn narrow<'a>(
 /// The lookup is an EXACT match, like the plugin's `ChannelProfile.objects.get(name=pname)`:
 /// `sports` does not find `Sports`. (The scope's own `profiles` filter IS case-insensitive,
 /// like the plugin's scope filter at 1724-1727; the two actions genuinely differ here.)
+///
+/// That inference WRITES MORE than the plugin: a channel with no membership row at all (a
+/// profile created "start empty", or channels added after it) is not in the plugin's set but
+/// is here, because REST cannot tell "disabled" from "no row". So a profile whose derived
+/// hidden set is larger than both [`HIDDEN_GUARD_FLOOR`] and its own enabled list is refused:
+/// that shape is a sparse profile, where clearing "everything not enabled" would unassign
+/// nearly every guide in the install.
 fn hidden_channels(world: &World, profiles: &str) -> Result<HashSet<i64>> {
     let mut hidden: HashSet<i64> = HashSet::new();
     for name in parse_tokens(profiles) {
@@ -4538,16 +4958,32 @@ fn hidden_channels(world: &World, profiles: &str) -> Result<HashSet<i64>> {
             .find(|profile| profile.name == name)
             .with_context(|| format!("Channel profile '{name}' not found"))?;
         let enabled: HashSet<i64> = profile.channels.iter().copied().collect();
-        hidden.extend(
-            world
-                .channels
-                .iter()
-                .map(|channel| channel.id)
-                .filter(|id| !enabled.contains(id)),
-        );
+        let disabled: Vec<i64> = world
+            .channels
+            .iter()
+            .map(|channel| channel.id)
+            .filter(|id| !enabled.contains(id))
+            .collect();
+        if disabled.len() > HIDDEN_GUARD_FLOOR.max(enabled.len()) {
+            bail!(
+                "Channel profile '{name}' enables {} channel(s) and leaves {} not enabled: \
+                 refusing to clear the guides of all of them. Dispatcharr's REST API lists only \
+                 a profile's ENABLED channels, so a channel with no membership row (a profile \
+                 created empty, or channels added after it) looks the same as one disabled on \
+                 purpose. Clear these guides from the Dispatcharr UI, or use a profile that \
+                 enables most channels and disables a few.",
+                enabled.len(),
+                disabled.len()
+            );
+        }
+        hidden.extend(disabled);
     }
     Ok(hidden)
 }
+
+/// The most not-enabled channels `clear_hidden` accepts from a profile that enables fewer than
+/// that, before it reads the profile as sparse rather than curated (see [`hidden_channels`]).
+const HIDDEN_GUARD_FLOOR: usize = 25;
 
 /// Mark rows with an outcome.
 fn mark(changes: &mut [Change], rows: &[usize], status: RowStatus, reason: &str) {
@@ -4719,6 +5155,49 @@ mod tests {
         // CNN has a guide, PPV 1 and Local do not.
         assert_eq!(plan.changes.len(), 1);
         assert_eq!(plan.changes[0].channel_id, 2);
+    }
+
+    #[test]
+    fn a_sparse_profile_refuses_clear_hidden() {
+        // B4: REST lists only a profile's enabled channels, so a profile created empty (or
+        // a short listing) would make "not enabled" mean nearly every channel. A profile
+        // that leaves more channels out than max(25, enabled) is refused.
+        let world = World {
+            channels: (1..=100)
+                .map(|id| channel(id, &format!("Channel {id}"), None, Some(1000 + id)))
+                .collect(),
+            profiles: vec![
+                ChannelProfile {
+                    id: 2,
+                    name: "Favorites".to_string(),
+                    channels: vec![1, 2, 3],
+                },
+                ChannelProfile {
+                    id: 3,
+                    name: "Curated".to_string(),
+                    channels: (1..=80).collect(),
+                },
+            ],
+            ..World::default()
+        };
+        let error = plan_ops(
+            &world,
+            &Selection::hidden_in("Favorites", &scope()),
+            &[Op::ClearEpg],
+        )
+        .expect_err("refused");
+        let message = format!("{error:#}");
+        assert!(message.contains("lists only"), "{message}");
+        assert!(message.contains("leaves 97 not enabled"), "{message}");
+
+        // A curated profile (most enabled, 20 disabled) still plans.
+        let plan = plan_ops(
+            &world,
+            &Selection::hidden_in("Curated", &scope()),
+            &[Op::ClearEpg],
+        )
+        .expect("plans");
+        assert_eq!(plan.changes.len(), 20);
     }
 
     #[test]
@@ -5891,6 +6370,29 @@ mod tests {
         }
     }
 
+    /// Serve `world`'s channels as the live listing [`apply`] re-reads before writing.
+    async fn serve_channels(server: &MockServer, world: &World) {
+        Mock::given(method("GET"))
+            .and(path("/api/channels/channels/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::to_value(&world.channels).expect("channels")),
+            )
+            .mount(server)
+            .await;
+    }
+
+    /// How many write requests (anything but a GET) the server received.
+    async fn writes(server: &MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|request| request.method.as_str() != "GET")
+            .count()
+    }
+
     #[tokio::test]
     async fn applying_batches_one_request_per_endpoint() {
         let server = MockServer::start().await;
@@ -5958,6 +6460,7 @@ mod tests {
         .expect("plans");
         assert_eq!(plan.changes.len(), 7);
 
+        serve_channels(&server, &world()).await;
         let report = apply(&client, &plan, &context, "guide.tag_missing_apply").await;
         assert!(report.all_ok(), "{:#?}", report.changes);
         assert_eq!(report.ok, 7);
@@ -6016,6 +6519,7 @@ mod tests {
         )
         .expect("plans");
 
+        serve_channels(&server, &world()).await;
         let report = apply(&client, &plan, &context, "guide.tag_missing_apply").await;
         assert!(!report.all_ok());
         assert_eq!(report.failed, 1);
@@ -6066,6 +6570,7 @@ mod tests {
         let plan = plan_ops(&world, &Selection::default(), &[Op::ClearEpg]).expect("plans");
         assert_eq!(plan.changes.len(), 600);
 
+        serve_channels(&server, &world).await;
         let report = apply(&client, &plan, &context, "guide.clear_groups_apply").await;
         assert_eq!(report.ok, 500, "{:?}", report.changes.last());
         assert_eq!(report.failed, 100);
@@ -6089,6 +6594,306 @@ mod tests {
             failed[0].reason
         );
         assert!(failed.iter().all(|c| c.channel_id > 500));
+    }
+
+    /// 501 channels, each with a rename (and on the first one a hide as well, so one channel
+    /// carries two rows of the same `edit/bulk` edit).
+    fn edit_world() -> World {
+        World {
+            channels: (1..=501)
+                .map(|id| channel(id, &format!("Channel {id}"), None, None))
+                .collect(),
+            profiles: vec![ChannelProfile {
+                id: 2,
+                name: "Favorites".to_string(),
+                channels: (1..=501).collect(),
+            }],
+            ..World::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_later_failing_edit_chunk_keeps_the_landed_rows_ok() {
+        // B3: chunk 1 (500 channels) lands, chunk 2 (1 channel) is rejected. The landed
+        // rows are in effect upstream, so they are `ok` and undo sees them.
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/channels/channels/edit/bulk/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"message": "ok", "channels": []})),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/channels/channels/edit/bulk/"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("{\"detail\":\"bad row\"}"))
+            .mount(&server)
+            .await;
+
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        let context = JobContext::for_tests(crate::config::CrosstalkConfig::default());
+        let plan = plan_ops(
+            &edit_world(),
+            &Selection::default(),
+            &[
+                Op::Rename {
+                    kind: RenameKind::Suffix(" [X]".to_string()),
+                },
+                Op::SetHiddenFromOutput { hidden: true },
+            ],
+        )
+        .expect("plans");
+        assert_eq!(plan.changes.len(), 1002);
+
+        serve_channels(&server, &edit_world()).await;
+        let report = apply(&client, &plan, &context, "lineup.names_apply").await;
+        assert_eq!(report.ok, 1000, "{:?}", report.changes.last());
+        assert_eq!(report.failed, 2);
+        let failed: Vec<&Change> = report
+            .changes
+            .iter()
+            .filter(|change| change.status == RowStatus::Failed)
+            .collect();
+        // Both rows of the one channel in the rejected chunk, and only those.
+        assert!(failed.iter().all(|change| change.channel_id == 501));
+        assert!(failed[0].reason.contains("bad row"), "{}", failed[0].reason);
+        // What undo plans from: the ok rows.
+        let undoable: HashSet<i64> = report
+            .changes
+            .iter()
+            .filter(|change| change.status == RowStatus::Ok)
+            .map(|change| change.channel_id)
+            .collect();
+        assert_eq!(undoable.len(), 500);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_edit_chunk_is_retried_one_channel_at_a_time() {
+        // B3: one bad row (400) rejects the whole chunk before anything lands; the chunk is
+        // retried per channel so only the bad one fails.
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/channels/channels/edit/bulk/"))
+            .respond_with(|request: &wiremock::Request| {
+                let edits: Vec<serde_json::Value> =
+                    serde_json::from_slice(&request.body).expect("json");
+                if edits.len() > 1 || edits[0]["id"] == 2 {
+                    return ResponseTemplate::new(400)
+                        .set_body_string("{\"errors\":[{\"channel_id\":2}]}");
+                }
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"message": "ok", "channels": edits}))
+            })
+            .mount(&server)
+            .await;
+
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        let context = JobContext::for_tests(crate::config::CrosstalkConfig::default());
+        let plan = plan_ops(
+            &world(),
+            &Selection {
+                channel_ids: Some(vec![1, 2, 4]),
+                ..Selection::default()
+            },
+            &[Op::Rename {
+                kind: RenameKind::Suffix(" [X]".to_string()),
+            }],
+        )
+        .expect("plans");
+        assert_eq!(plan.changes.len(), 3);
+
+        serve_channels(&server, &world()).await;
+        let report = apply(&client, &plan, &context, "lineup.names_apply").await;
+        assert_eq!(report.ok, 2);
+        assert_eq!(report.failed, 1);
+        let failed = report
+            .changes
+            .iter()
+            .find(|change| change.status == RowStatus::Failed)
+            .expect("one failure");
+        assert_eq!(failed.channel_id, 2);
+        assert!(failed.reason.contains("channel 2"), "{}", failed.reason);
+    }
+
+    #[tokio::test]
+    async fn a_later_failing_membership_chunk_keeps_the_landed_rows_ok() {
+        // B3, memberships: the same per-chunk truth as the edit stage.
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/channels/profiles/2/channels/bulk-update/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"status": "success", "updated": 500, "created": 0}),
+            ))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/channels/profiles/2/channels/bulk-update/"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("{\"detail\":\"nope\"}"))
+            .mount(&server)
+            .await;
+
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        let context = JobContext::for_tests(crate::config::CrosstalkConfig::default());
+        let plan = plan_ops(
+            &edit_world(),
+            &Selection::default(),
+            &[Op::SetMembership {
+                profile_id: 2,
+                enabled: false,
+            }],
+        )
+        .expect("plans");
+        assert_eq!(plan.changes.len(), 501);
+
+        let report = apply(&client, &plan, &context, "lineup.tidy_apply").await;
+        assert_eq!(report.ok, 500);
+        assert_eq!(report.failed, 1);
+        let failed = report
+            .changes
+            .iter()
+            .find(|change| change.status == RowStatus::Failed)
+            .expect("one failure");
+        assert_eq!(failed.channel_id, 501);
+    }
+
+    #[tokio::test]
+    async fn a_cancel_between_edit_chunks_stops_the_rest() {
+        // B3/S3: cancellation is checked between chunks, and an unsent chunk says so.
+        let server = MockServer::start().await;
+        let context = JobContext::for_tests(crate::config::CrosstalkConfig::default());
+        let cancel = context.clone();
+        Mock::given(method("PATCH"))
+            .and(path("/api/channels/channels/edit/bulk/"))
+            .respond_with(move |_: &wiremock::Request| {
+                // The first chunk lands and the operator cancels while it is in flight.
+                cancel.cancel();
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"message": "ok", "channels": []}))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        let plan = plan_ops(
+            &edit_world(),
+            &Selection::default(),
+            &[Op::Rename {
+                kind: RenameKind::Suffix(" [X]".to_string()),
+            }],
+        )
+        .expect("plans");
+        serve_channels(&server, &edit_world()).await;
+        let report = apply(&client, &plan, &context, "lineup.names_apply").await;
+        assert_eq!(report.ok, 500);
+        assert_eq!(report.failed, 1);
+        let failed = report
+            .changes
+            .iter()
+            .find(|change| change.status == RowStatus::Failed)
+            .expect("the unsent row");
+        assert_eq!(failed.reason, CANCELLED);
+    }
+
+    #[tokio::test]
+    async fn a_channel_changed_between_plan_and_apply_is_not_written() {
+        // S5: somebody renamed channel 1 after the plan was made. Writing the planned rename
+        // would revert that edit, so it is not sent; channel 4 still is.
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/channels/channels/edit/bulk/"))
+            .and(body_json(serde_json::json!([
+                {"id": 4, "name": "Télé-Québec [X]"}
+            ])))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"message": "ok", "channels": [{"id": 4}]})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut live = world();
+        live.channels[0].name = "ESPN 2".to_string();
+        serve_channels(&server, &live).await;
+
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        let context = JobContext::for_tests(crate::config::CrosstalkConfig::default());
+        let plan = plan_ops(
+            &world(),
+            &Selection {
+                channel_ids: Some(vec![1, 4]),
+                ..Selection::default()
+            },
+            &[Op::Rename {
+                kind: RenameKind::Suffix(" [X]".to_string()),
+            }],
+        )
+        .expect("plans");
+        assert_eq!(plan.changes.len(), 2);
+
+        let report = apply(&client, &plan, &context, "lineup.names_apply").await;
+        assert_eq!(report.ok, 1);
+        assert_eq!(report.failed, 1);
+        let stale = report
+            .changes
+            .iter()
+            .find(|change| change.channel_id == 1)
+            .expect("channel 1");
+        assert_eq!(stale.status, RowStatus::Failed);
+        assert!(
+            stale.reason.contains("changed since the plan"),
+            "{}",
+            stale.reason
+        );
+        assert!(stale.reason.contains("ESPN 2"), "{}", stale.reason);
+    }
+
+    #[tokio::test]
+    async fn a_failed_listing_before_writing_writes_nothing() {
+        // S5: the re-read is what keeps a stale plan from reverting edits, so without it
+        // nothing is written.
+        let server = MockServer::start().await;
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        let context = JobContext::for_tests(crate::config::CrosstalkConfig::default());
+        let plan = plan_ops(&world(), &Selection::default(), &[Op::ClearEpg]).expect("plans");
+        let report = apply(&client, &plan, &context, "guide.clear_groups_apply").await;
+        assert_eq!(report.ok, 0);
+        assert_eq!(report.failed, plan.changes.len());
+        assert!(report.changes[0].reason.contains("re-reading the channels"));
+        assert_eq!(writes(&server).await, 0);
+    }
+
+    #[tokio::test]
+    async fn an_ignore_token_that_matches_nothing_refuses_the_apply() {
+        // S6: `ignore_groups = "PPV Lve"` (a typo) excludes nothing. A preview says so; an
+        // apply writes nothing rather than reach the channels the operator meant to exclude.
+        let server = MockServer::start().await;
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        let context = JobContext::for_tests(crate::config::CrosstalkConfig::default());
+        let mut scoped = scope();
+        scoped.ignore_groups = "PPV Lve".to_string();
+        let plan =
+            plan_ops(&world(), &Selection::in_scope(&scoped), &[Op::ClearEpg]).expect("plans");
+        assert_eq!(plan.scope_warnings.len(), 1);
+        assert!(
+            plan.scope_warnings[0].contains("'PPV Lve'"),
+            "{:?}",
+            plan.scope_warnings
+        );
+        assert!(!plan.changes.is_empty());
+
+        let report = apply(&client, &plan, &context, "guide.clear_groups_apply").await;
+        assert_eq!(report.ok, 0);
+        assert_eq!(report.failed, plan.changes.len());
+        assert!(report.changes[0].reason.contains("ignore_groups"));
+        assert!(server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -6255,6 +7060,7 @@ mod tests {
         assert_eq!(plan.changes.len(), 2);
 
         let writer = RecordingWriter::new();
+        serve_channels(&server, &stream_world()).await;
         let report =
             apply_with_writer(&client, &plan, &context, "streams.sort_apply", &writer).await;
         assert!(report.all_ok(), "{:#?}", report.changes);
@@ -6262,11 +7068,8 @@ mod tests {
             writer.batches(),
             vec![vec![(1, vec![101, 100]), (3, vec![102, 100])]]
         );
-        // Nothing was sent to the API: the writer owns that decision.
-        assert_eq!(
-            server.received_requests().await.unwrap_or_default().len(),
-            0
-        );
+        // Nothing was written through the API: the writer owns that decision.
+        assert_eq!(writes(&server).await, 0);
     }
 
     #[tokio::test]
@@ -6291,6 +7094,7 @@ mod tests {
             ..RecordingWriter::new()
         };
 
+        serve_channels(&server, &stream_world()).await;
         let report =
             apply_with_writer(&client, &plan, &context, "streams.sort_apply", &writer).await;
         assert_eq!(report.ok, 1);
@@ -6355,6 +7159,7 @@ mod tests {
             ..RecordingWriter::new()
         };
 
+        serve_channels(&server, &stream_world()).await;
         let report =
             apply_with_writer(&client, &plan, &context, "streams.sort_apply", &writer).await;
         assert_eq!(report.ok, 1);
@@ -6400,12 +7205,10 @@ mod tests {
         )
         .expect("plans");
 
+        serve_channels(&server, &stream_world()).await;
         let report = apply(&client, &plan, &context, "streams.sort_apply").await;
         assert!(report.all_ok(), "{:#?}", report.changes);
-        assert_eq!(
-            server.received_requests().await.unwrap_or_default().len(),
-            1
-        );
+        assert_eq!(writes(&server).await, 1);
     }
 
     #[tokio::test]
@@ -6443,6 +7246,7 @@ mod tests {
         .expect("plans");
 
         let writer = RecordingWriter::new();
+        serve_channels(&server, &world()).await;
         let report =
             apply_with_writer(&client, &plan, &context, "guide.restore_apply", &writer).await;
         assert!(report.all_ok(), "{:#?}", report.changes);
@@ -6496,6 +7300,7 @@ mod tests {
             .any(|change| change.field == Field::Group && change.after.wire() == "none"));
 
         let writer = RecordingWriter::new();
+        serve_channels(&server, &world()).await;
         let report =
             apply_with_writer(&client, &plan, &context, "guide.restore_apply", &writer).await;
         assert_eq!(report.ok, 1);
@@ -6844,6 +7649,7 @@ mod tests {
         .expect("plans");
         // Two number changes and one logo change fold into one edit row per channel.
         assert_eq!(plan.changes.len(), 3);
+        serve_channels(&server, &numbered_world()).await;
         let report = apply(&client, &plan, &context, "test.numbers").await;
         assert!(report.all_ok(), "{:#?}", report.changes);
         // A cleared logo sends an explicit null, like a cleared guide.
@@ -7513,6 +8319,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_recorded_apply_writes_its_rows_before_the_first_write() {
+        // S3: the planned rows are in the store before anything is sent, and every stage's
+        // outcome is recorded as it lands, so a run killed mid-apply leaves a record undo
+        // can use.
+        let store = crate::store::Store::in_memory().expect("store");
+        let (context, run_id) = run_context(&store, "lineup");
+        let server = MockServer::start().await;
+        serve_channels(&server, &world()).await;
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (seen_in, store_in) = (Arc::clone(&seen), store.clone());
+        Mock::given(method("PATCH"))
+            .and(path("/api/channels/channels/edit/bulk/"))
+            .respond_with(move |_: &wiremock::Request| {
+                let rows = store_in.rows(run_id).unwrap_or_default();
+                let planned = rows.iter().filter(|row| row.status == "planned").count();
+                seen_in.store(planned, std::sync::atomic::Ordering::SeqCst);
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"message": "ok", "channels": []}))
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/channels/channels/batch-set-epg/"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        let plan = plan_ops(
+            &world(),
+            &Selection {
+                channel_ids: Some(vec![1, 4]),
+                ..Selection::default()
+            },
+            &[
+                Op::Rename {
+                    kind: RenameKind::Suffix(" [X]".to_string()),
+                },
+                Op::ClearEpg,
+            ],
+        )
+        .expect("plans");
+        assert_eq!(plan.changes.len(), 4);
+
+        let report = apply_recorded(&client, &plan, &context, "lineup.names_apply")
+            .await
+            .expect("records");
+        assert_eq!(report.ok, 2);
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "every row was recorded as planned before the first write"
+        );
+        let rows = store.rows(run_id).expect("rows");
+        assert_eq!(rows.len(), 4);
+        let count = |field: &str, status: &str| {
+            rows.iter()
+                .filter(|row| row.field == field && row.status == status)
+                .count()
+        };
+        assert_eq!(count("name", "ok"), 2);
+        assert_eq!(count("epg_data_id", "failed"), 2);
+    }
+
+    #[tokio::test]
     async fn a_crash_between_post_and_ownership_is_adopted_not_duplicated() {
         let store = crate::store::Store::in_memory().expect("store");
         let world = create_world();
@@ -7575,7 +8446,18 @@ mod tests {
             ..Channel::default()
         });
         let (next, _) = run_context(&store, "lineup");
-        let owned = load_owned(&next, &after, "lineup").expect("reconciles");
+        // A preview of the reconcile writes nothing, but plans with the adopted key.
+        let preview = load_owned(&next, &after, "lineup", true)
+            .await
+            .expect("previews");
+        assert_eq!(preview.channels.get("lineup:file:news:cnn"), Some(&102));
+        assert_eq!(preview.dropped.len(), 1);
+        assert_eq!(store.pending_intents("lineup").expect("query").len(), 3);
+        assert!(!store.is_owned("channel", 102).expect("query"));
+
+        let owned = load_owned(&next, &after, "lineup", false)
+            .await
+            .expect("reconciles");
         let mut recovered = owned.recovered.clone();
         recovered.sort();
         assert_eq!(
@@ -7611,15 +8493,38 @@ mod tests {
         assert!(!store.is_owned("channel", 2).expect("query"));
     }
 
+    /// [`run_context`] with a session on `server`, so a reconcile can confirm a deletion.
+    fn connected_run_context(
+        store: &crate::store::Store,
+        app: &str,
+        server: &MockServer,
+    ) -> (JobContext, i64) {
+        let (context, run_id) = run_context(store, app);
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        (context.with_dispatcharr(client), run_id)
+    }
+
     #[tokio::test]
     async fn a_deleted_owned_channel_is_forgotten_and_created_again() {
         let store = crate::store::Store::in_memory().expect("store");
-        let (context, run_id) = run_context(&store, "lineup");
+        // Nothing mounted: `GET /channels/channels/55/` answers 404, the proof it is gone.
+        let server = MockServer::start().await;
+        let (context, run_id) = connected_run_context(&store, "lineup", &server);
         store
             .record_ownership("channel", 55, "lineup", "lineup:file:news:cnn", run_id)
             .expect("record");
         // 55 is not in the world: a user deleted it.
-        let owned = load_owned(&context, &create_world(), "lineup").expect("loads");
+        let preview = load_owned(&context, &create_world(), "lineup", true)
+            .await
+            .expect("previews");
+        assert_eq!(preview.forgotten.len(), 1);
+        assert!(
+            store.is_owned("channel", 55).expect("query"),
+            "a preview forgets nothing"
+        );
+        let owned = load_owned(&context, &create_world(), "lineup", false)
+            .await
+            .expect("loads");
         assert_eq!(
             owned.forgotten,
             vec![(
@@ -7647,8 +8552,80 @@ mod tests {
         store
             .record_ownership("channel", 1, "lineup", "lineup:k:one", run_id)
             .expect("record");
-        let owned = load_owned(&context, &world, "lineup").expect("loads");
+        let owned = load_owned(&context, &world, "lineup", false)
+            .await
+            .expect("loads");
         assert_eq!(owned.channels.get("lineup:k:one"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn an_owned_channel_that_still_answers_is_kept_though_the_listing_missed_it() {
+        // B2: a short listing is not a deletion. 55 is missing from the world but its own
+        // GET answers, so it stays owned and its key still dedupes the plan.
+        let store = crate::store::Store::in_memory().expect("store");
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/channels/channels/55/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": 55, "name": "CNN"})),
+            )
+            .mount(&server)
+            .await;
+        let (context, run_id) = connected_run_context(&store, "lineup", &server);
+        store
+            .record_ownership("channel", 55, "lineup", "lineup:file:news:cnn", run_id)
+            .expect("record");
+        let owned = load_owned(&context, &create_world(), "lineup", false)
+            .await
+            .expect("loads");
+        assert!(owned.forgotten.is_empty());
+        assert_eq!(owned.kept.len(), 1);
+        assert_eq!(owned.channels.get("lineup:file:news:cnn"), Some(&55));
+        assert!(store.is_owned("channel", 55).expect("query"));
+    }
+
+    #[tokio::test]
+    async fn an_empty_channel_listing_never_forgets_ownership() {
+        // B2: an empty read while the app owns channels is refused, not a mass forget.
+        let store = crate::store::Store::in_memory().expect("store");
+        let server = MockServer::start().await;
+        let (context, run_id) = connected_run_context(&store, "lineup", &server);
+        for id in 1..=3 {
+            store
+                .record_ownership("channel", id, "lineup", &format!("lineup:k:{id}"), run_id)
+                .expect("record");
+        }
+        let mut world = create_world();
+        world.channels.clear();
+        let error = load_owned(&context, &world, "lineup", false)
+            .await
+            .expect_err("refused");
+        assert!(
+            format!("{error:#}").contains("listed no channels"),
+            "{error:#}"
+        );
+        assert_eq!(store.owned_keys("lineup").expect("query").len(), 3);
+    }
+
+    #[tokio::test]
+    async fn too_many_missing_owned_channels_are_refused() {
+        // B2: more than max(25, 5%) missing at once reads as a short listing.
+        let store = crate::store::Store::in_memory().expect("store");
+        let server = MockServer::start().await;
+        let (context, run_id) = connected_run_context(&store, "lineup", &server);
+        for id in 1_000..1_026 {
+            store
+                .record_ownership("channel", id, "lineup", &format!("lineup:k:{id}"), run_id)
+                .expect("record");
+        }
+        let error = load_owned(&context, &create_world(), "lineup", false)
+            .await
+            .expect_err("refused");
+        assert!(format!("{error:#}").contains("26 of the 26"), "{error:#}");
+        assert_eq!(store.owned_keys("lineup").expect("query").len(), 26);
+        assert_eq!(max_forget(100), 25);
+        assert_eq!(max_forget(1_000), 50);
     }
 
     #[tokio::test]

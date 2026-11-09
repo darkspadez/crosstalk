@@ -31,23 +31,70 @@ pub struct BatchEpgOutcome {
 /// Channels per `profiles/{id}/channels/bulk-update/` request.
 const MEMBERSHIP_CHUNK_SIZE: usize = 500;
 
+/// Whether a failed write was the server rejecting a row (400), which is worth retrying one
+/// row at a time; anything else (an outage, a lost answer) would only repeat per row.
+fn is_rejected_row(error: &anyhow::Error) -> bool {
+    http_status(error) == Some(reqwest::StatusCode::BAD_REQUEST)
+}
+
 impl DispatcharrClient {
     /// Every channel, hidden ones included.
     ///
     /// `visibility_filter=all` is not optional: the list endpoint hides channels whose
     /// `hidden_from_output` is set unless it is sent, and the plugin read every channel.
+    ///
+    /// Every row must carry `streams` (the list serializer always sends it). A row without
+    /// the key fails the listing instead of reading as a channel with no streams, because the
+    /// stream-list writes replace the whole list.
     pub async fn channels(&self) -> Result<Vec<Channel>> {
-        let channels: Vec<Channel> = self
+        #[derive(Deserialize)]
+        struct Listed {
+            #[serde(flatten)]
+            channel: Channel,
+            streams: Vec<i64>,
+        }
+
+        let listed: Vec<Listed> = self
             .get_list(
                 "/channels/channels/",
                 &[("visibility_filter", "all".to_string())],
                 "listing channels",
             )
             .await?;
+        let channels: Vec<Channel> = listed
+            .into_iter()
+            .map(|row| Channel {
+                streams: row.streams,
+                ..row.channel
+            })
+            .collect();
         for channel in &channels {
             self.channel_cache.insert(channel.id, channel.clone());
         }
         Ok(channels)
+    }
+
+    /// Whether channel `id` still exists: `GET /channels/channels/{id}/`, where only a 404
+    /// answers `false`. A listing that misses a channel proves nothing (a short page, a
+    /// proxy, a scoped read); this does.
+    pub async fn channel_exists(&self, id: i64) -> Result<bool> {
+        self.exists(&format!("/channels/channels/{id}/"))
+            .await
+            .with_context(|| format!("checking whether channel {id} exists"))
+    }
+
+    /// [`Self::channel_exists`] for a channel group.
+    pub async fn group_exists(&self, id: i64) -> Result<bool> {
+        self.exists(&format!("/channels/groups/{id}/"))
+            .await
+            .with_context(|| format!("checking whether channel group {id} exists"))
+    }
+
+    /// [`Self::channel_exists`] for a logo.
+    pub async fn logo_exists(&self, id: i64) -> Result<bool> {
+        self.exists(&format!("/channels/logos/{id}/"))
+            .await
+            .with_context(|| format!("checking whether logo {id} exists"))
     }
 
     /// A channel by id, from the cache the last listing filled.
@@ -108,6 +155,26 @@ impl DispatcharrClient {
             // The view answers a bare array; a build that paginates it would answer this.
             Payload::Paged { results } => results,
         })
+    }
+
+    /// One channel's stream ids in playback order, from the channel's own row
+    /// (`GET /channels/channels/{id}/`).
+    ///
+    /// Unlike [`Self::channel_streams`], which lists stream rows (through a stream serializer
+    /// and whatever filters that view applies), this is exactly the list a stream-list write
+    /// replaces. The row must carry `streams`: a row without it is an error, never an empty
+    /// list.
+    pub async fn channel_stream_ids(&self, channel_id: i64) -> Result<Vec<i64>> {
+        #[derive(Deserialize)]
+        struct Row {
+            streams: Vec<i64>,
+        }
+
+        let row: Row = self
+            .get_json(&format!("/channels/channels/{channel_id}/"), &[])
+            .await
+            .with_context(|| format!("reading channel {channel_id}"))?;
+        Ok(row.streams)
     }
 
     /// Every M3U account.
@@ -201,13 +268,16 @@ impl DispatcharrClient {
     /// renamed by creating a manual group, moving the manual channels onto it and demoting the
     /// provider rows, so the group that comes back can carry a different id than `group_id`
     /// (the demoted one is in the response's `demoted_group`, which this type does not read).
+    ///
+    /// Not retried: that create-and-move path is not idempotent, so a re-sent rename after a
+    /// lost answer could split the group a second time.
     pub async fn rename_group(&self, group_id: i64, name: &str) -> Result<ChannelGroup> {
         let body = serde_json::json!({ "name": name });
         self.write_json(
             &reqwest::Method::PATCH,
             &format!("/channels/groups/{group_id}/"),
             Some(&body),
-            Retry::Idempotent,
+            Retry::Once,
         )
         .await
         .with_context(|| format!("renaming channel group {group_id} to {name:?}"))
@@ -296,6 +366,53 @@ impl DispatcharrClient {
             }
         }
         Ok(updated)
+    }
+
+    /// [`Self::edit_channels`] with one answer per edit, in input order.
+    ///
+    /// A confirmed chunk answers `Some(Ok)` for each of its edits. A chunk rejected with 400
+    /// (one invalid row rejects the whole transaction, so nothing of it landed) is retried
+    /// one edit at a time, so the bad row fails alone instead of taking ~500 good ones down
+    /// with it. Any other failure fails that chunk's edits and the walk goes on to the next
+    /// chunk. `cancelled` is asked before every request: an edit never sent answers `None`.
+    pub async fn edit_channels_each(
+        &self,
+        edits: &[ChannelEdit],
+        cancelled: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Vec<Option<Result<()>>> {
+        let mut results: Vec<Option<Result<()>>> = Vec::with_capacity(edits.len());
+        for chunk in edits.chunks(CHANNEL_EDIT_CHUNK_SIZE) {
+            if cancelled() {
+                results.extend(chunk.iter().map(|_| None));
+                continue;
+            }
+            match self.patch_channel_edits(chunk).await {
+                Ok(_) => results.extend(chunk.iter().map(|_| Some(Ok(())))),
+                Err(error) if is_rejected_row(&error) && chunk.len() > 1 => {
+                    for edit in chunk {
+                        if cancelled() {
+                            results.push(None);
+                            continue;
+                        }
+                        let result = self
+                            .patch_channel_edits(std::slice::from_ref(edit))
+                            .await
+                            .map(|_| ())
+                            .with_context(|| format!("editing channel {}", edit.id));
+                        results.push(Some(result));
+                    }
+                }
+                Err(error) => {
+                    let message = format!("the bulk channel edit failed: {error:#}");
+                    results.extend(
+                        chunk
+                            .iter()
+                            .map(|_| Some(Err(anyhow::anyhow!("{message}")))),
+                    );
+                }
+            }
+        }
+        results
     }
 
     /// PATCH one chunk of channel edits.
@@ -398,6 +515,54 @@ impl DispatcharrClient {
             }
         }
         Ok(written)
+    }
+
+    /// [`Self::set_profile_membership`] with one answer per channel, in input order, the way
+    /// [`Self::edit_channels_each`] answers: a 400 chunk (an unknown channel id rejects the
+    /// whole request) is retried one channel at a time, any other failure fails its chunk
+    /// only, and a channel never sent because `cancelled` answered true is `None`.
+    pub async fn set_profile_membership_each(
+        &self,
+        profile_id: i64,
+        channels: &[(i64, bool)],
+        cancelled: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Vec<Option<Result<()>>> {
+        let mut results: Vec<Option<Result<()>>> = Vec::with_capacity(channels.len());
+        for chunk in channels.chunks(MEMBERSHIP_CHUNK_SIZE) {
+            if cancelled() {
+                results.extend(chunk.iter().map(|_| None));
+                continue;
+            }
+            match self.patch_membership_chunk(profile_id, chunk).await {
+                Ok(_) => results.extend(chunk.iter().map(|_| Some(Ok(())))),
+                Err(error) if is_rejected_row(&error) && chunk.len() > 1 => {
+                    for membership in chunk {
+                        if cancelled() {
+                            results.push(None);
+                            continue;
+                        }
+                        let result = self
+                            .patch_membership_chunk(profile_id, std::slice::from_ref(membership))
+                            .await
+                            .map(|_| ())
+                            .with_context(|| {
+                                format!("updating channel {} in profile {profile_id}", membership.0)
+                            });
+                        results.push(Some(result));
+                    }
+                }
+                Err(error) => {
+                    let message =
+                        format!("the profile {profile_id} membership update failed: {error:#}");
+                    results.extend(
+                        chunk
+                            .iter()
+                            .map(|_| Some(Err(anyhow::anyhow!("{message}")))),
+                    );
+                }
+            }
+        }
+        results
     }
 
     /// PATCH one chunk of profile memberships.
@@ -512,8 +677,18 @@ impl DispatcharrClient {
                 .collect();
             match self.patch_channel_edits(&edits).await {
                 Ok(_) => results.extend(chunk.iter().map(|(id, _)| (*id, Ok(())))),
+                Err(error) if !is_rejected_row(&error) => {
+                    // Not a rejected row (a 5xx after retries, a timeout, a lost answer):
+                    // 500 single PATCHes would only repeat the outage. The chunk fails.
+                    let message = format!("the bulk stream-list write failed: {error:#}");
+                    results.extend(
+                        chunk
+                            .iter()
+                            .map(|(id, _)| (*id, Err(anyhow::anyhow!("{message}")))),
+                    );
+                }
                 Err(_) => {
-                    // The chunk was rejected whole; attribute it per channel.
+                    // The chunk was rejected whole (400); attribute it per channel.
                     for (channel_id, stream_ids) in chunk {
                         let result = self
                             .set_channel_streams(*channel_id, stream_ids)

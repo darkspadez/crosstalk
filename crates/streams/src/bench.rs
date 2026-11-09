@@ -51,7 +51,7 @@ use crosstalk_core::dispatcharr::{
     Channel, ChannelGroup, ChannelProfile, DispatcharrClient, M3uAccount, Stream, World, WorldKind,
     WorldKinds, CHANNEL_EDIT_CHUNK_SIZE,
 };
-use crosstalk_core::store::Store;
+use crosstalk_core::store::{RunStatus, Store};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -874,11 +874,7 @@ pub async fn live(
     );
 
     let write_timing = match write_ids {
-        Some(ids) => Some(
-            time_writes(&client, &world, ids)
-                .await
-                .context("timing stream-list writes")?,
-        ),
+        Some(ids) => Some(timed_writes_in_a_run(&client, &world, ids, &store_path).await?),
         None => None,
     };
 
@@ -907,6 +903,45 @@ pub async fn live(
         write_timing,
         notes,
     })
+}
+
+/// The action id a `--write-timing` run is recorded under.
+pub const ACTION_WRITE_TIMING: &str = "bench_write_timing";
+
+/// [`time_writes`] inside a recorded streams run.
+///
+/// The timing WRITES stream lists, so it takes the streams app's one-live-run slot like any
+/// other writer: a streams run in progress (here or in the daemon) refuses it instead of
+/// racing it, and the run page records that it happened and how it went.
+async fn timed_writes_in_a_run(
+    client: &DispatcharrClient,
+    world: &World,
+    ids: &[i64],
+    store_path: &std::path::Path,
+) -> Result<WriteTiming> {
+    let store = Store::open_shared(store_path)
+        .with_context(|| format!("opening {}", store_path.display()))?;
+    let run_id = store
+        .start_run(crate::APP_ID, ACTION_WRITE_TIMING, false)
+        .context(
+            "--write-timing rewrites stream lists, so it needs the streams app's run slot, and \
+             a streams run is already in progress (here or in another process): wait for it to \
+             finish",
+        )?;
+    let timed = time_writes(client, world, ids).await;
+    let (status, summary) = match &timed {
+        Ok(timing) => (
+            RunStatus::Succeeded,
+            format!(
+                "write timing over {} channel(s): {} failed write(s), each list rewritten to the \
+                 value read back just before",
+                timing.sample, timing.failed
+            ),
+        ),
+        Err(error) => (RunStatus::Failed, format!("{error:#}")),
+    };
+    store.finish_run(run_id, status, Some(&summary), &serde_json::json!({}), None)?;
+    timed.context("timing stream-list writes")
 }
 
 /// `--write-timing`: the two request patterns, measured on the same lists.
@@ -941,16 +976,18 @@ async fn time_writes(
     // The lists are read back AFTER the four plans ran, one GET per channel, immediately
     // before the writes — never from the world above. That world was loaded before the
     // plans, so its lists are minutes stale on a busy box; rewriting them would revert a
-    // concurrent edit instead of being the no-op this timing promises.
+    // concurrent edit instead of being the no-op this timing promises. They come from the
+    // channel's own row (its `streams` ids, exactly the list the write replaces), not from a
+    // stream listing, whose filters could leave a stream out and so unlink it.
     let mut lists: Vec<(i64, Vec<i64>)> = Vec::with_capacity(ids.len());
     for id in ids {
-        let streams = client.channel_streams(*id).await.with_context(|| {
+        let streams = client.channel_stream_ids(*id).await.with_context(|| {
             format!(
                 "reading the current stream list of channel {id} immediately before the \
                  write timing"
             )
         })?;
-        lists.push((*id, streams.iter().map(|stream| stream.id).collect()));
+        lists.push((*id, streams));
     }
 
     let mut failed = 0usize;
@@ -1256,10 +1293,10 @@ mod tests {
             .mount(&fixture.server)
             .await;
         // `--write-timing` reads each sampled channel's list back immediately before the
-        // writes (never from the loaded world), so the mock serves those reads from the
-        // same world the load saw.
+        // writes (never from the loaded world), from the channel's own row, so the mock
+        // serves those reads from the same world the load saw.
         Mock::given(method("GET"))
-            .and(path_regex(r"^/api/channels/channels/\d+/streams/$"))
+            .and(path_regex(r"^/api/channels/channels/\d+/$"))
             .respond_with(move |request: &wiremock::Request| {
                 let id: i64 = request
                     .url
@@ -1268,20 +1305,11 @@ mod tests {
                     .nth(4)
                     .and_then(|id| id.parse().ok())
                     .unwrap_or(-1);
-                let streams: Vec<serde_json::Value> = world
-                    .channels
-                    .iter()
-                    .find(|channel| channel.id == id)
-                    .map(|channel| {
-                        channel
-                            .streams
-                            .iter()
-                            .filter_map(|id| world.streams.iter().find(|stream| stream.id == *id))
-                            .map(|stream| serde_json::to_value(stream).expect("stream"))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                ResponseTemplate::new(200).set_body_json(streams)
+                match world.channels.iter().find(|channel| channel.id == id) {
+                    Some(channel) => ResponseTemplate::new(200)
+                        .set_body_json(serde_json::to_value(channel).expect("channel")),
+                    None => ResponseTemplate::new(404),
+                }
             })
             .mount(&fixture.server)
             .await;
@@ -1363,15 +1391,51 @@ mod tests {
             .unwrap_or_default()
             .into_iter()
             .filter(|request| {
+                let path = request.url.path();
                 request.method.as_str() == "GET"
-                    && request.url.path().ends_with("/streams/")
-                    && request.url.path().starts_with("/api/channels/channels/")
+                    && path.starts_with("/api/channels/channels/")
+                    && path != "/api/channels/channels/"
             })
             .count();
         assert_eq!(
             rereads,
             sampled.len(),
             "one fresh list read per sampled channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_timing_waits_for_the_streams_slot() {
+        // S10: the timing writes stream lists, so a streams run in progress (here, or a
+        // daemon's) refuses it instead of racing it.
+        use crate::test_support::{sort_world, ServerFixture, CHANNEL_SORTED};
+
+        let fixture = ServerFixture::start(&sort_world()).await;
+        let store =
+            Store::open_shared(fixture.config.data_dir().join("crosstalk.db")).expect("store");
+        let running = store
+            .start_run(crate::APP_ID, "sort_apply", false)
+            .expect("a live streams run");
+        let error = live(
+            &fixture.config,
+            &StreamsSettings::default(),
+            Some(&[CHANNEL_SORTED]),
+        )
+        .await
+        .expect_err("refused");
+        assert!(format!("{error:#}").contains("run slot"), "{error:#}");
+        let writes = fixture
+            .server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|request| request.method.as_str() != "GET")
+            .count();
+        assert_eq!(writes, 0, "nothing was written");
+        assert_eq!(
+            store.run(running).expect("run").expect("present").status,
+            RunStatus::Running
         );
     }
 

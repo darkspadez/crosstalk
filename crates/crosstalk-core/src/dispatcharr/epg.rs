@@ -123,54 +123,13 @@ impl DispatcharrClient {
     /// builds put it behind a page envelope, so both shapes are accepted; a page parameter is
     /// sent because a build that does paginate would otherwise silently return only the first
     /// page.
+    ///
+    /// `results` is required in the envelope: an object without it (`200 {}` from a proxy or
+    /// a half-started server) is an error, not zero entries, because "no entries" reads as
+    /// "every assigned guide is gone" to the scan and heal actions.
     pub async fn epg_entries(&self) -> Result<Vec<EpgEntry>> {
-        #[derive(Deserialize)]
-        struct Page {
-            #[serde(default)]
-            results: Vec<EpgEntry>,
-            #[serde(default)]
-            next: Option<serde_json::Value>,
-        }
-
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Payload {
-            Bare(Vec<EpgEntry>),
-            Paged(Page),
-        }
-
-        let mut entries = Vec::new();
-        let mut page = 1u32;
-        loop {
-            let payload: Payload = self
-                .get_json(
-                    "/epg/epgdata/",
-                    &[
-                        ("page", page.to_string()),
-                        ("page_size", "1000".to_string()),
-                    ],
-                )
-                .await
-                .context("listing EPG entries")?;
-
-            match payload {
-                Payload::Bare(list) => {
-                    entries.extend(list);
-                    break;
-                }
-                Payload::Paged(envelope) => {
-                    entries.extend(envelope.results);
-                    if envelope.next.is_none_or(|next| next.is_null()) {
-                        break;
-                    }
-                    page += 1;
-                    if page > 1_000 {
-                        bail!("the EPG entry list did not terminate after 1000 pages");
-                    }
-                }
-            }
-        }
-        Ok(entries)
+        self.get_list("/epg/epgdata/", &[], "listing EPG entries")
+            .await
     }
 
     /// Whether an EPG entry has any programme inside the window.

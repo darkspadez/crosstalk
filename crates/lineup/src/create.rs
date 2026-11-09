@@ -1137,7 +1137,7 @@ async fn run_streams(
 
     // Crash-safe creates (intents + ownership, step 10 review): reconcile before
     // planning so an earlier run's landed channel is reused, never duplicated.
-    let owned = channel_ops::load_owned(context, &world, crate::APP_ID)?;
+    let owned = channel_ops::load_owned(context, &world, crate::APP_ID, dry_run).await?;
     let world_names = world_identities(&run_engine, &world);
     let mut rows = decide_streams(&candidates, &stack, settings, &owned.channels, &world_names);
 
@@ -1450,7 +1450,7 @@ async fn run_stations(
 
     let run_engine = RunEngine::for_config(&config.matching, context.store().cloned());
     let engine = Arc::clone(run_engine.engine());
-    let owned = channel_ops::load_owned(context, &world, crate::APP_ID)?;
+    let owned = channel_ops::load_owned(context, &world, crate::APP_ID, dry_run).await?;
     let existing: HashSet<String> = world
         .channels
         .iter()
@@ -2584,8 +2584,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn intent_recovery_adopts_the_landed_channel() {
+    #[tokio::test]
+    async fn intent_recovery_adopts_the_landed_channel() {
         // A crash between the POST and the ownership row leaves an intent; the
         // next run's load_owned adopts the landed object instead of duplicating it.
         let store = Store::in_memory().expect("store");
@@ -2627,7 +2627,9 @@ mod tests {
             }],
             ..World::default()
         };
-        let owned = channel_ops::load_owned(&context, &world, crate::APP_ID).expect("reconcile");
+        let owned = channel_ops::load_owned(&context, &world, crate::APP_ID, false)
+            .await
+            .expect("reconcile");
         assert_eq!(owned.channels.get(&key), Some(&50));
         assert_eq!(owned.recovered.len(), 1);
         // And the adopted key dedupes the next plan.
