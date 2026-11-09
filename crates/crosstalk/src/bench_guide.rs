@@ -16,7 +16,39 @@ use crosstalk_core::config::{CrosstalkConfig, ScopeConfig};
 use crosstalk_core::dispatcharr::{
     Channel, ChannelGroup, DispatcharrClient, EpgEntry, EpgSource, World,
 };
-use crosstalk_core::jobs::{JobContext, NullSink};
+use crosstalk_core::jobs::{JobContext, ProgressEvent, ProgressSink};
+
+/// Prints every progress event with the time since the plan started, when
+/// `CROSSTALK_BENCH_TRACE` is set; otherwise silent. The timeline is how a slow plan is
+/// broken down into its stages without a profiler.
+struct TraceSink {
+    started: Instant,
+    enabled: bool,
+}
+
+impl TraceSink {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            enabled: std::env::var_os("CROSSTALK_BENCH_TRACE").is_some(),
+        }
+    }
+}
+
+impl ProgressSink for TraceSink {
+    fn publish(&self, event: &ProgressEvent) {
+        if self.enabled {
+            eprintln!(
+                "{:>8.3}s  {} {}/{} {}",
+                self.started.elapsed().as_secs_f64(),
+                event.action,
+                event.current,
+                event.total,
+                event.phase
+            );
+        }
+    }
+}
 use crosstalk_core::store::{RunStatus, Store};
 use crosstalk_guide::settings::GuideSettings;
 use crosstalk_streams::bench::{thousands, BenchPhase, BenchReport};
@@ -331,7 +363,7 @@ pub async fn synthetic(
         fake.counts.take();
         let run_id = store.start_run(crosstalk_guide::APP_ID, plan.action(), true)?;
         // A fresh client per plan: its programme memo starts empty, as a run's does.
-        let context = JobContext::new(Arc::clone(&config), Arc::new(NullSink))
+        let context = JobContext::new(Arc::clone(&config), Arc::new(TraceSink::new()))
             .with_dispatcharr(DispatcharrClient::new(&config.dispatcharr)?)
             .for_run(
                 crosstalk_guide::APP_ID,
