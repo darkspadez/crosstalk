@@ -13,6 +13,8 @@ crosstalk-matching.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
+# The AI gate fans out like guide's (audit E-S2).
+futures.workspace = true
 regex.workspace = true
 reqwest.workspace = true
 serde.workspace = true

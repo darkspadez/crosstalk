@@ -34,7 +34,7 @@ use crate::jobs::JobContext;
 use crate::store::{RunRecord, RunRow, RunStatus, Store, Subject};
 use crate::subapp::{ActionKind, JobOutcome, OutcomeBuilder, Registry};
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// The action every undo run is recorded under.
 ///
@@ -95,14 +95,29 @@ impl UndoPlan {
     }
 }
 
+/// Each profile's channels as a set, keyed by profile id; the first profile of a duplicated
+/// id wins, as a `find` would.
+fn profile_members(world: &World) -> HashMap<i64, HashSet<i64>> {
+    let mut members: HashMap<i64, HashSet<i64>> = HashMap::new();
+    for profile in &world.profiles {
+        members
+            .entry(profile.id)
+            .or_insert_with(|| profile.channels.iter().copied().collect());
+    }
+    members
+}
+
 /// The wire value the channel holds now for `field`, in the shape a run row records.
 ///
 /// `None` is "the world does not say" (a membership whose profile is gone), which the
 /// caller skips rather than comparing.
+///
+/// `members` is each profile's channel set ([`profile_members`]), so a membership row is
+/// one lookup rather than a walk over the profile's list (E-N5).
 fn current_wire(
     channel: &crate::dispatcharr::Channel,
     field: crate::channel_ops::Field,
-    world: &World,
+    members: &HashMap<i64, HashSet<i64>>,
 ) -> Option<String> {
     match field {
         crate::channel_ops::Field::Name => Some(channel.name.clone()),
@@ -115,11 +130,9 @@ fn current_wire(
             None => NONE_WIRE.to_string(),
         }),
         crate::channel_ops::Field::HiddenFromOutput => Some(channel.hidden_from_output.to_string()),
-        crate::channel_ops::Field::Membership(profile_id) => world
-            .profiles
-            .iter()
-            .find(|profile| profile.id == profile_id)
-            .map(|profile| profile.channels.contains(&channel.id).to_string()),
+        crate::channel_ops::Field::Membership(profile_id) => members
+            .get(&profile_id)
+            .map(|channels| channels.contains(&channel.id).to_string()),
         crate::channel_ops::Field::Streams => Some(if channel.streams.is_empty() {
             NONE_WIRE.to_string()
         } else {
@@ -295,6 +308,7 @@ pub fn plan_undo(
         .iter()
         .map(|channel| (channel.id, channel))
         .collect();
+    let members = profile_members(world);
     let mut plan = UndoPlan {
         target_run_id: run.id,
         app: run.app.clone(),
@@ -356,7 +370,7 @@ pub fn plan_undo(
             });
             continue;
         };
-        let Some(current) = current_wire(channel, field, world) else {
+        let Some(current) = current_wire(channel, field, &members) else {
             plan.skipped.push(UndoSkip {
                 channel_id: row.channel_id,
                 channel_name: channel.name.clone(),

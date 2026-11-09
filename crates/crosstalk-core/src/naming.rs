@@ -463,6 +463,7 @@ pub fn resolve_collisions(
         );
     }
     // Pass 2: collisions, in channel-id order.
+    let mut next_suffix: HashMap<String, usize> = HashMap::new();
     for row in deferred.iter().chain(rows.iter()) {
         if resolved.contains_key(&row.id) {
             continue;
@@ -492,14 +493,18 @@ pub fn resolve_collisions(
         let final_name = match candidate {
             Some(candi) => candi,
             None => {
-                let mut i = 2;
-                loop {
+                // Occupancy only grows, so a suffix found taken stays taken: the next row
+                // with the same name resumes after the last one tried (E-N3, k² -> k).
+                let mut i = next_suffix.get(&row.new_name).copied().unwrap_or(2);
+                let found = loop {
                     let candi = format!("{} ({i})", row.new_name);
                     if !is_occupied(&occupied, &fold(&candi)) {
                         break candi;
                     }
                     i += 1;
-                }
+                };
+                next_suffix.insert(row.new_name.clone(), i + 1);
+                found
             }
         };
         *occupied.entry(fold(&final_name)).or_insert(0) += 1;

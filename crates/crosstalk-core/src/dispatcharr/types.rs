@@ -682,6 +682,33 @@ pub enum HasPrograms {
     No,
 }
 
+/// What a programme pre-seed ([`crate::dispatcharr::DispatcharrClient::seed_programs`]) did:
+/// the request counts a bench reports, and how many answers it settled without a search.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProgramSeed {
+    /// Distinct entries the seed was asked about (with a `tvg_id`, not already memoised).
+    pub entries: usize,
+    /// Per-source horizon requests (`epg_ends_at_or_after`), one per source.
+    pub source_requests: usize,
+    /// Sources with nothing ending inside the window.
+    pub empty_sources: usize,
+    /// `POST /epg/current-programs/` requests.
+    pub batch_requests: usize,
+    /// Entries answered "no" because their source has nothing in the window.
+    pub seeded_no: usize,
+    /// Entries answered "yes" because a programme is airing on them inside the window.
+    pub seeded_yes: usize,
+    /// A cancel stopped the seed before it asked everything.
+    pub cancelled: bool,
+}
+
+impl ProgramSeed {
+    /// Every request the seed made.
+    pub fn requests(&self) -> usize {
+        self.source_requests + self.batch_requests
+    }
+}
+
 /// The programme-data window: programmes overlapping `[start, end)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProgramWindow {

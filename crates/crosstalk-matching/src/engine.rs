@@ -625,7 +625,12 @@ impl UnifiedEngine {
     /// the family cut kept only the top's key-mates, so `CNN USA` joined `CNN`'s family
     /// only when no `CNN` spelling led the pool.
     pub fn identity_key(&self, name: &str, canonical: Option<&str>) -> String {
-        let own = self.normalize_key(name);
+        self.identity_key_of(&self.normalize_key(name), canonical)
+    }
+
+    /// [`identity_key`](Self::identity_key) from the name's own normalize key, for a
+    /// caller that already normalised the name (one normalisation per name, E-S6).
+    pub fn identity_key_of(&self, own: &str, canonical: Option<&str>) -> String {
         match canonical {
             Some(canonical) => {
                 let key = self.normalize_key(canonical);
@@ -687,7 +692,12 @@ impl UnifiedEngine {
     /// Resolve `name` through the reverse index (A01 `identity`): the canonical both
     /// the query and the candidate must share. Colliding keys yield `None`.
     pub fn alias_canonical(&self, name: &str) -> Option<String> {
-        let normalized = self.normalize_key(name);
+        self.alias_canonical_of(&self.normalize_key(name))
+    }
+
+    /// [`alias_canonical`](Self::alias_canonical) from the name's normalize key, for a
+    /// caller that already normalised the name (one normalisation per name, E-S6).
+    pub fn alias_canonical_of(&self, normalized: &str) -> Option<String> {
         if normalized.is_empty() {
             return None;
         }
@@ -785,7 +795,7 @@ impl UnifiedEngine {
                 _ => None,
             };
         }
-        let prep = QueryPrep::build(query, self)?;
+        let prep = QueryPrep::build(query, norm_q, self)?;
         self.score_core(&prep, &view)
     }
 
@@ -1175,7 +1185,7 @@ impl UnifiedEngine {
                 index,
             );
         }
-        let Some(prep) = QueryPrep::build(query, self) else {
+        let Some(prep) = QueryPrep::build(query, norm_q.clone(), self) else {
             return Vec::new();
         };
         // Decided C07 `callsign-first`: a same-callsign candidate outranks any
@@ -1239,7 +1249,7 @@ impl UnifiedEngine {
         // and `BBC One East HD` at 100; the Default one leads, and the family is the
         // Default family — phase 3 review, cross-app test).
         let query_fk = FamilyKey {
-            key: self.identity_key(query, prep.canonical.as_deref()),
+            key: self.identity_key_of(&norm_q, prep.canonical.as_deref()),
             zone: extract_zone_noguard(query),
             timeshift: prep.shift,
             callsign: prep.base.clone(),
@@ -1435,7 +1445,7 @@ impl CandidateView {
         Self {
             nospace: nospace(&norm_lower),
             processed: process_string_for_matching(&norm_lower),
-            alias_canonical: engine.alias_canonical(name),
+            alias_canonical: engine.alias_canonical_of(&norm_key),
             designators: norm_lower
                 .split_whitespace()
                 .filter(|t| crate::tokens::is_designator_token(t))
@@ -1477,8 +1487,8 @@ struct QueryPrep {
 }
 
 impl QueryPrep {
-    fn build(query: &str, engine: &UnifiedEngine) -> Option<Self> {
-        let norm = engine.normalize_key(query);
+    /// `norm` is `engine.normalize_key(query)`, which every caller has already computed.
+    fn build(query: &str, norm: String, engine: &UnifiedEngine) -> Option<Self> {
         if norm.is_empty() {
             return None;
         }
@@ -1512,13 +1522,80 @@ impl QueryPrep {
             west: extract_zone_noguard(query) == FeedZone::West,
             base: callsign.as_deref().map(normalize_callsign),
             high,
-            canonical: engine.alias_canonical(query),
+            canonical: engine.alias_canonical_of(&norm),
             variant_lookup,
             variant_spaced,
             variant_processed,
             processed: process_string_for_matching(&lower),
             lower,
         })
+    }
+}
+
+/// One candidate's index inputs, computed independently of every other candidate so
+/// [`EngineIndex::build`] can prepare them in parallel (E-S3).
+struct PreparedCandidate {
+    view: CandidateView,
+    /// Meaningful tokens of the raw and processed keys (empty for an unscored view).
+    raw: Vec<String>,
+    proc: Vec<String>,
+    family_key: FamilyKey,
+    country: Option<&'static str>,
+}
+
+impl PreparedCandidate {
+    fn build(name: &str, engine: &UnifiedEngine) -> Self {
+        let view = if is_group_header(name) {
+            // Headers never score; keep an unscored view so family cuts
+            // still see a (never-winning) identity.
+            CandidateView {
+                norm_key: String::new(),
+                norm_lower: String::new(),
+                scored: false,
+                nospace: String::new(),
+                processed: String::new(),
+                callsign: None,
+                high: false,
+                base: None,
+                alias_canonical: None,
+                shift: false,
+                designators: HashSet::new(),
+                trailing: None,
+                zone: FeedZone::Default,
+                west: false,
+            }
+        } else {
+            CandidateView::build(name, engine)
+        };
+        let (raw, proc) = if view.scored {
+            (
+                crate::tokens::meaningful_tokens_owned(&view.norm_lower),
+                crate::tokens::meaningful_tokens_owned(&view.processed),
+            )
+        } else {
+            (HashSet::new(), HashSet::new())
+        };
+        // Headers carry an empty key: they never score, so never join a family.
+        // The key is the identity key (A05: the alias canonical's normalize key
+        // when the name resolves through the alias table), as `resolve_with`.
+        let key = if view.scored || !view.norm_key.is_empty() {
+            engine.identity_key_of(&view.norm_key, view.alias_canonical.as_deref())
+        } else {
+            view.norm_lower.clone()
+        };
+        let family_key = FamilyKey {
+            key,
+            zone: view.zone,
+            timeshift: view.shift,
+            callsign: view.base.clone(),
+        };
+        Self {
+            raw: raw.into_iter().collect(),
+            proc: proc.into_iter().collect(),
+            family_key,
+            country: lineuparr_stream_country(name),
+            view,
+        }
     }
 }
 
@@ -1597,30 +1674,22 @@ impl EngineIndex {
             countries: Vec::with_capacity(names.len()),
             country_hint: ctx.country_hint.clone(),
         };
-        for (i, name) in names.iter().enumerate() {
-            if is_group_header(name) {
-                // Headers never score; keep an unscored view so family cuts
-                // still see a (never-winning) identity.
-                index.views.push(CandidateView {
-                    norm_key: String::new(),
-                    norm_lower: String::new(),
-                    scored: false,
-                    nospace: String::new(),
-                    processed: String::new(),
-                    callsign: None,
-                    high: false,
-                    base: None,
-                    alias_canonical: None,
-                    shift: false,
-                    designators: HashSet::new(),
-                    trailing: None,
-                    zone: FeedZone::Default,
-                    west: false,
-                });
-            } else {
-                index.views.push(CandidateView::build(name, engine));
-            }
-            let view = &index.views[i];
+        // Everything per name is independent (E-S3): views, token sets, identity keys
+        // and countries are computed on rayon, in order; only the shared maps are filled
+        // serially below, in the same order as before, so the index is identical.
+        use rayon::prelude::*;
+        let prepared: Vec<PreparedCandidate> = names
+            .par_iter()
+            .map(|name| PreparedCandidate::build(name, engine))
+            .collect();
+        for (i, prepared) in prepared.into_iter().enumerate() {
+            let PreparedCandidate {
+                view,
+                raw,
+                proc,
+                family_key,
+                country,
+            } = prepared;
             if view.scored {
                 index
                     .spaced_map
@@ -1632,7 +1701,6 @@ impl EngineIndex {
                     .entry(view.nospace.clone())
                     .or_default()
                     .push(i);
-                let raw = crate::tokens::meaningful_tokens_owned(&view.norm_lower);
                 if raw.is_empty() {
                     index.raw_empty.push(i);
                 } else {
@@ -1640,7 +1708,6 @@ impl EngineIndex {
                         index.raw_token_block.entry(token).or_default().push(i);
                     }
                 }
-                let proc = crate::tokens::meaningful_tokens_owned(&view.processed);
                 if proc.is_empty() {
                     index.proc_empty.push(i);
                 } else {
@@ -1666,21 +1733,9 @@ impl EngineIndex {
                         .push(i);
                 }
             }
-            // Headers carry an empty key: they never score, so never join a family.
-            // The key is the identity key (A05: the alias canonical's normalize key
-            // when the name resolves through the alias table), as `resolve_with`.
-            let key = if view.scored || !view.norm_key.is_empty() {
-                engine.identity_key(name, view.alias_canonical.as_deref())
-            } else {
-                view.norm_lower.clone()
-            };
-            index.identity_keys.push(FamilyKey {
-                key,
-                zone: view.zone,
-                timeshift: view.shift,
-                callsign: view.base.clone(),
-            });
-            index.countries.push(lineuparr_stream_country(name));
+            index.identity_keys.push(family_key);
+            index.countries.push(country);
+            index.views.push(view);
         }
         index
     }

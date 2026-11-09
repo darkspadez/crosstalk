@@ -1057,12 +1057,17 @@ pub fn plan_with_options(
 /// pass repeats until no refusal frees or re-takes a number (each round re-takes at least
 /// one, so it ends).
 fn drop_number_conflicts(world: &World, changes: &mut Vec<Change>, skipped: &mut Vec<Skip>) {
+    // Reversed so a duplicated id keeps its first channel, as a `find` would (E-N3).
+    let names: HashMap<i64, &str> = world
+        .channels
+        .iter()
+        .rev()
+        .map(|channel| (channel.id, channel.name.as_str()))
+        .collect();
     let name_of = |id: i64| -> String {
-        world
-            .channels
-            .iter()
-            .find(|channel| channel.id == id)
-            .map(|channel| format!("channel {} ({})", channel.id, channel.name))
+        names
+            .get(&id)
+            .map(|name| format!("channel {id} ({name})"))
             .unwrap_or_else(|| format!("channel {id}"))
     };
     let planned_number = |change: &Change| match (&change.field, &change.after) {
@@ -2943,6 +2948,7 @@ pub async fn apply_creates(
             }
             Err(reason) => refuse_all(&group_posts, &reason),
         };
+        let mut landed: Vec<usize> = Vec::new();
         for (index, outcome) in report.groups.iter_mut().enumerate() {
             if outcome.status != RowStatus::Planned {
                 continue;
@@ -2952,7 +2958,7 @@ pub async fn apply_creates(
                     outcome.id = Some(created.id);
                     outcome.created = true;
                     outcome.status = RowStatus::Ok;
-                    record_ownership(context, plan, outcome, CreatedKind::Group);
+                    landed.push(index);
                 }
                 Some(Err(error)) => {
                     outcome.status = RowStatus::Failed;
@@ -2964,6 +2970,13 @@ pub async fn apply_creates(
                 }
             }
         }
+        record_ownership(
+            context,
+            plan,
+            &mut report.groups,
+            &landed,
+            CreatedKind::Group,
+        );
     }
     done += plan.groups.len() as u64;
     // 2. Logos: same shape, after the groups (a logo never depends on a group, but the
@@ -3033,6 +3046,7 @@ pub async fn apply_creates(
             }
             Err(reason) => refuse_all(&logo_posts, &reason),
         };
+        let mut landed: Vec<usize> = Vec::new();
         for (index, outcome) in report.logos.iter_mut().enumerate() {
             if outcome.status != RowStatus::Planned {
                 continue;
@@ -3042,7 +3056,7 @@ pub async fn apply_creates(
                     outcome.id = Some(created.id);
                     outcome.created = true;
                     outcome.status = RowStatus::Ok;
-                    record_ownership(context, plan, outcome, CreatedKind::Logo);
+                    landed.push(index);
                 }
                 Some(Err(error)) => {
                     outcome.status = RowStatus::Failed;
@@ -3054,6 +3068,7 @@ pub async fn apply_creates(
                 }
             }
         }
+        record_ownership(context, plan, &mut report.logos, &landed, CreatedKind::Logo);
     }
     done += plan.logos.len() as u64;
     // 3. Channels: refs resolve against the two stages above; a failed dependency refuses
@@ -3186,6 +3201,7 @@ pub async fn apply_creates(
             }
             Err(reason) => refuse_all(&channel_posts, &reason),
         };
+        let mut landed: Vec<usize> = Vec::new();
         for (index, outcome) in report.channels.iter_mut().enumerate() {
             if outcome.status != RowStatus::Planned {
                 continue;
@@ -3195,7 +3211,7 @@ pub async fn apply_creates(
                     outcome.id = Some(created.id);
                     outcome.created = true;
                     outcome.status = RowStatus::Ok;
-                    record_ownership(context, plan, outcome, CreatedKind::Channel);
+                    landed.push(index);
                 }
                 Some(Err(error)) => {
                     outcome.status = RowStatus::Failed;
@@ -3207,6 +3223,13 @@ pub async fn apply_creates(
                 }
             }
         }
+        record_ownership(
+            context,
+            plan,
+            &mut report.channels,
+            &landed,
+            CreatedKind::Channel,
+        );
     }
 
     let ok = report
@@ -3302,23 +3325,43 @@ fn unanswered(context: &JobContext) -> String {
 /// hide it once the ownership is in, and the rest of the plan may build on it) and the reason
 /// says it is not tracked yet. The intent stays, and the next [`load_owned`] adopts the
 /// object under this run.
+///
+/// A stage's creates (`landed`, positions in `outcomes`) settle together, in ONE store
+/// transaction (E-S1b): a 20k-channel create would otherwise pay a commit per object. A
+/// failed batch leaves every intent in place and marks each row, as one failure did.
 fn record_ownership(
     context: &JobContext,
     plan: &CreatePlan,
-    outcome: &mut CreatedOutcome,
+    outcomes: &mut [CreatedOutcome],
+    landed: &[usize],
     kind: CreatedKind,
 ) {
     let (Some(store), Some(run_id)) = (context.store(), context.run_id()) else {
         return;
     };
-    let Some(id) = outcome.id else {
+    let settled: Vec<(i64, String)> = landed
+        .iter()
+        .filter_map(|&position| {
+            let outcome = outcomes.get(position)?;
+            outcome.id.map(|id| (id, outcome.key.clone()))
+        })
+        .collect();
+    if settled.is_empty() {
         return;
-    };
-    if let Err(error) = store.settle_intent(kind.label(), id, &plan.app, &outcome.key, run_id) {
-        outcome.reason = format!(
-            "created as id {id} but ownership could not be recorded yet ({error:#}); the next \
-             run adopts it"
-        );
+    }
+    if let Err(error) = store.settle_intents(kind.label(), &plan.app, run_id, &settled) {
+        for &position in landed {
+            let Some(outcome) = outcomes.get_mut(position) else {
+                continue;
+            };
+            let Some(id) = outcome.id else {
+                continue;
+            };
+            outcome.reason = format!(
+                "created as id {id} but ownership could not be recorded yet ({error:#}); the \
+                 next run adopts it"
+            );
+        }
     }
 }
 
@@ -3384,6 +3427,27 @@ pub async fn load_owned(
         "channel" => world.has(WorldKind::Channels),
         _ => false,
     };
+    // What an intent is matched by, indexed once (E-S5): a crash in the middle of a big
+    // create leaves thousands of intents, and a walk over the world per intent is
+    // quadratic. The filters below are unchanged; only the walk is narrowed.
+    let mut groups_named: HashMap<&str, Vec<i64>> = HashMap::new();
+    for group in &world.groups {
+        groups_named
+            .entry(group.name.as_str())
+            .or_default()
+            .push(group.id);
+    }
+    let mut logos_at: HashMap<&str, Vec<i64>> = HashMap::new();
+    for logo in &world.logos {
+        logos_at.entry(logo.url.as_str()).or_default().push(logo.id);
+    }
+    let mut channels_named: HashMap<&str, Vec<&crate::dispatcharr::Channel>> = HashMap::new();
+    for channel in &world.channels {
+        channels_named
+            .entry(channel.name.as_str())
+            .or_default()
+            .push(channel);
+    }
     for intent in store.pending_intents(app)? {
         if !loaded(&intent.kind) {
             continue;
@@ -3397,23 +3461,26 @@ pub async fn load_owned(
             }
         }
         let mut candidates: Vec<i64> = match intent.kind.as_str() {
-            "group" => world
-                .groups
-                .iter()
-                .filter(|group| group.id > intent.after_id && group.name == intent.name)
-                .map(|group| group.id)
+            "group" => groups_named
+                .get(intent.name.as_str())
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|id| *id > intent.after_id)
                 .collect(),
-            "logo" => world
-                .logos
-                .iter()
-                .filter(|logo| {
-                    logo.id > intent.after_id && Some(logo.url.as_str()) == intent.url.as_deref()
-                })
-                .map(|logo| logo.id)
+            "logo" => intent
+                .url
+                .as_deref()
+                .and_then(|url| logos_at.get(url))
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|id| *id > intent.after_id)
                 .collect(),
-            _ => world
-                .channels
-                .iter()
+            _ => channels_named
+                .get(intent.name.as_str())
+                .into_iter()
+                .flatten()
                 .filter(|channel| {
                     channel.id > intent.after_id
                         && channel.name == intent.name
@@ -3458,10 +3525,15 @@ pub async fn load_owned(
             }
         }
     }
+    // Id sets, so the live check is one lookup per owned object rather than a walk over
+    // the world's listing (E-S5).
+    let live_groups: HashSet<i64> = world.groups.iter().map(|group| group.id).collect();
+    let live_logos: HashSet<i64> = world.logos.iter().map(|logo| logo.id).collect();
+    let live_channels: HashSet<i64> = world.channels.iter().map(|channel| channel.id).collect();
     let live = |kind: &str, id: i64| match kind {
-        "group" => world.groups.iter().any(|group| group.id == id),
-        "logo" => world.logos.iter().any(|logo| logo.id == id),
-        _ => world.channels.iter().any(|channel| channel.id == id),
+        "group" => live_groups.contains(&id),
+        "logo" => live_logos.contains(&id),
+        _ => live_channels.contains(&id),
     };
     let slice_len = |kind: &str| match kind {
         "group" => world.groups.len(),

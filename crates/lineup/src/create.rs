@@ -110,7 +110,7 @@ use crosstalk_core::jobs::JobContext;
 use crosstalk_core::subapp::{JobOutcome, OutcomeBuilder, SubApp};
 use crosstalk_core::wildcard::parse_tokens;
 use crosstalk_matching::engine::{EngineIndex, UnifiedEngine};
-use crosstalk_matching::identity::{Identity, ResolveContext};
+use crosstalk_matching::identity::{FamilyKey, Identity, ResolveContext};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
@@ -233,19 +233,24 @@ pub fn streams_candidates(
         .into_iter()
         .map(|token| token.to_lowercase())
         .collect();
+    // Group id -> name, reversed so a duplicated id keeps its first group as a scan
+    // would (E-N2: one lookup per stream, not a walk over the groups).
+    let group_names: HashMap<i64, &str> = world
+        .groups
+        .iter()
+        .rev()
+        .map(|group| (group.id, group.name.as_str()))
+        .collect();
     let mut candidates: Vec<CandidateStream> = Vec::new();
     for id in &pool.eligible {
         let Some(stream) = pool.get(*id) else {
             continue;
         };
         if !filter.is_empty() {
-            let name = stream.channel_group.and_then(|group_id| {
-                world
-                    .groups
-                    .iter()
-                    .find(|group| group.id == group_id)
-                    .map(|group| group.name.to_lowercase())
-            });
+            let name = stream
+                .channel_group
+                .and_then(|group_id| group_names.get(&group_id))
+                .map(|name| name.to_lowercase());
             if name.as_deref().is_none_or(|name| !filter.contains(name)) {
                 continue;
             }
@@ -259,7 +264,10 @@ pub fn streams_candidates(
                 .to_string(),
             priority: pool.priority.get(&stream.id).copied().unwrap_or(999),
             account: pool.account_name(stream),
-            group: world.group_name(stream.channel_group),
+            group: stream
+                .channel_group
+                .and_then(|group_id| group_names.get(&group_id))
+                .map_or_else(|| "No Group".to_string(), |name| (*name).to_string()),
         });
     }
     candidates.sort_by_key(|candidate| (candidate.priority, candidate.id));
@@ -268,17 +276,25 @@ pub fn streams_candidates(
 
 /// Every live channel's identity, for the foreign same-identity check.
 pub fn world_identities(run_engine: &RunEngine, world: &World) -> Vec<(i64, String, Identity)> {
-    let ctx = ResolveContext::default();
-    world
+    let channels: Vec<(i64, String)> = world
         .channels
         .iter()
-        .map(|channel| {
-            (
-                channel.id,
-                channel.name.clone(),
-                run_engine.resolve(&channel.name, &ctx),
-            )
-        })
+        .map(|channel| (channel.id, channel.name.clone()))
+        .collect();
+    identities_of(run_engine, &channels)
+}
+
+/// [`world_identities`] over `(id, name)` pairs, on rayon (E-B5). Warm the names
+/// first ([`RunEngine::warm`]) so every resolve is a memo hit. In input order.
+pub fn identities_of(
+    run_engine: &RunEngine,
+    channels: &[(i64, String)],
+) -> Vec<(i64, String, Identity)> {
+    use rayon::prelude::*;
+    let ctx = ResolveContext::default();
+    channels
+        .par_iter()
+        .map(|(id, name)| (*id, name.clone(), run_engine.resolve(name, &ctx)))
         .collect()
 }
 
@@ -313,110 +329,148 @@ pub fn decide_streams(
         category: Option<String>,
         no_match_reason: Option<String>,
     }
-    let mut matched: Vec<Matched> = Vec::with_capacity(candidates.len());
-    for candidate in candidates {
-        let ctx = ResolveContext::default();
-        let identity =
-            crosstalk_matching::identity::resolve_with(stack.engine, &candidate.match_name, &ctx);
-        // The name and the category come from the SAME decisions names and
-        // categorize make (one function each), so a created channel is named
-        // exactly as `names_apply` would name it and filed where `categorize`
-        // would file it.
-        let target = crate::names::decide_target(
-            &candidate.match_name,
-            &identity,
-            stack.engine,
-            stack.index,
-            stack.db_names,
-            settings,
-        );
-        let (matcher, method, target, category, no_match_reason) = match target {
-            // OTA stations take CM's import category (`plugin.py:3557`); categorize
-            // never classifies OTA (no callsign branch), this is the one place CM
-            // writes it.
-            crate::names::NameTarget::Ota {
-                name: Some(name), ..
-            } => (
-                "Broadcast (OTA)".to_string(),
-                "OTA - Callsign Match".to_string(),
-                Some(name),
-                Some(OTA_IMPORT_CATEGORY.to_string()),
-                None,
-            ),
-            crate::names::NameTarget::Ota {
-                callsign,
-                name: None,
-                ..
-            } => (
-                "Broadcast (OTA)".to_string(),
-                "OTA - Callsign Match".to_string(),
-                None,
-                None,
-                Some(format!(
-                    "OTA station {callsign}: missing required fields for the OTA format"
-                )),
-            ),
-            // CM's import tried premium after a station-less callsign; names never
-            // does (`ABC (WZZZ)` must not become the national `ABC`), so neither
-            // does create.
-            crate::names::NameTarget::BlockedCallsign(callsign) => (
-                "none".to_string(),
-                "No Match".to_string(),
-                None,
-                None,
-                Some(format!(
-                    "callsign {callsign} is not in the station table, and a printed \
-                     callsign never matches premium"
-                )),
-            ),
-            crate::names::NameTarget::Premium {
-                name,
-                score: _,
-                method,
-            } => {
-                let scoped = crate::categorize::ScopedChannel {
-                    id: candidate.id,
-                    name: candidate.match_name.clone(),
-                    number: None,
-                    group: candidate.group.clone(),
-                };
-                // A country label or a family with no category is none, like
-                // categorize (step-16 decision A).
-                let category = crate::categorize::decide_category(
-                    &scoped,
-                    &identity,
-                    stack.engine,
-                    stack.index,
-                    stack.db_names,
-                    stack.categories,
-                )
-                .category;
-                (
-                    "Premium/Cable".to_string(),
-                    crate::names::method_label(&method),
+    // Independent per candidate, so on rayon (E-B5); collected in candidate order.
+    use rayon::prelude::*;
+    let matched: Vec<Matched> = candidates
+        .par_iter()
+        .map(|candidate| {
+            let ctx = ResolveContext::default();
+            let identity = crosstalk_matching::identity::resolve_with(
+                stack.engine,
+                &candidate.match_name,
+                &ctx,
+            );
+            // The name and the category come from the SAME decisions names and
+            // categorize make (one function each), so a created channel is named
+            // exactly as `names_apply` would name it and filed where `categorize`
+            // would file it.
+            let target = crate::names::decide_target(
+                &candidate.match_name,
+                &identity,
+                stack.engine,
+                stack.index,
+                stack.db_names,
+                settings,
+            );
+            let (matcher, method, target, category, no_match_reason) = match target {
+                // OTA stations take CM's import category (`plugin.py:3557`); categorize
+                // never classifies OTA (no callsign branch), this is the one place CM
+                // writes it.
+                crate::names::NameTarget::Ota {
+                    name: Some(name), ..
+                } => (
+                    "Broadcast (OTA)".to_string(),
+                    "OTA - Callsign Match".to_string(),
                     Some(name),
-                    category,
+                    Some(OTA_IMPORT_CATEGORY.to_string()),
                     None,
-                )
+                ),
+                crate::names::NameTarget::Ota {
+                    callsign,
+                    name: None,
+                    ..
+                } => (
+                    "Broadcast (OTA)".to_string(),
+                    "OTA - Callsign Match".to_string(),
+                    None,
+                    None,
+                    Some(format!(
+                        "OTA station {callsign}: missing required fields for the OTA format"
+                    )),
+                ),
+                // CM's import tried premium after a station-less callsign; names never
+                // does (`ABC (WZZZ)` must not become the national `ABC`), so neither
+                // does create.
+                crate::names::NameTarget::BlockedCallsign(callsign) => (
+                    "none".to_string(),
+                    "No Match".to_string(),
+                    None,
+                    None,
+                    Some(format!(
+                        "callsign {callsign} is not in the station table, and a printed \
+                     callsign never matches premium"
+                    )),
+                ),
+                crate::names::NameTarget::Premium {
+                    name,
+                    score: _,
+                    method,
+                } => {
+                    let scoped = crate::categorize::ScopedChannel {
+                        id: candidate.id,
+                        name: candidate.match_name.clone(),
+                        number: None,
+                        group: candidate.group.clone(),
+                    };
+                    // A country label or a family with no category is none, like
+                    // categorize (step-16 decision A).
+                    let category = crate::categorize::decide_category(
+                        &scoped,
+                        &identity,
+                        stack.engine,
+                        stack.index,
+                        stack.db_names,
+                        stack.categories,
+                    )
+                    .category;
+                    (
+                        "Premium/Cable".to_string(),
+                        crate::names::method_label(&method),
+                        Some(name),
+                        category,
+                        None,
+                    )
+                }
+                crate::names::NameTarget::Unmatched => (
+                    "none".to_string(),
+                    "No Match".to_string(),
+                    None,
+                    None,
+                    Some("no match in the channel databases at the host cut".to_string()),
+                ),
+            };
+            Matched {
+                candidate: candidate.clone(),
+                identity,
+                matcher,
+                method,
+                target,
+                category,
+                no_match_reason,
             }
-            crate::names::NameTarget::Unmatched => (
-                "none".to_string(),
-                "No Match".to_string(),
-                None,
-                None,
-                Some("no match in the channel databases at the host cut".to_string()),
-            ),
-        };
-        matched.push(Matched {
-            candidate: candidate.clone(),
-            identity,
-            matcher,
-            method,
-            target,
-            category,
-            no_match_reason,
-        });
+        })
+        .collect();
+
+    // The foreign same-identity check, indexed (E-B5). `same_family` needs an equal
+    // `FamilyKey` or (C08) the same callsign, so only those two buckets can hold a
+    // match; the lowest world position among the matches wins, exactly the channel a
+    // scan of `world_names` in order would find.
+    let mut by_key: HashMap<FamilyKey, Vec<usize>> = HashMap::new();
+    let mut by_callsign: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (position, (_, _, identity)) in world_names.iter().enumerate() {
+        by_key
+            .entry(identity.family_key())
+            .or_default()
+            .push(position);
+        if let Some(callsign) = identity.callsign.as_deref() {
+            by_callsign.entry(callsign).or_default().push(position);
+        }
     }
+    let same_identity = |head: &Identity| -> Option<&(i64, String, Identity)> {
+        let keyed = by_key.get(&head.family_key()).into_iter().flatten();
+        let called = head
+            .callsign
+            .as_deref()
+            .and_then(|callsign| by_callsign.get(callsign))
+            .into_iter()
+            .flatten();
+        keyed
+            .chain(called)
+            .copied()
+            .filter(|&position| world_names[position].2.same_family(head))
+            .min()
+            .map(|position| &world_names[position])
+    };
 
     // Group by identity family (first-seen order = pool-priority order).
     let mut families: Vec<(String, Vec<usize>)> = Vec::new();
@@ -452,10 +506,7 @@ pub fn decide_streams(
             decision = Some(format!(
                 "key {key:?} was already created as channel {id}, so no duplicate is made"
             ));
-        } else if let Some((id, name, _)) = world_names
-            .iter()
-            .find(|(_, _, identity)| identity.same_family(&head.identity))
-        {
+        } else if let Some((id, name, _)) = same_identity(&head.identity) {
             decision = Some(format!(
                 "a channel with the same identity already exists (channel {id} {name:?}), \
                  so nothing is created"
@@ -590,15 +641,25 @@ pub fn build_streams_request(
             });
         }
     }
+    // Each family's rows, in row order: one pass, not a scan of every row per family
+    // (E-B5).
+    let mut family_rows: HashMap<String, Vec<usize>> = HashMap::new();
+    for (position, row) in rows.iter().enumerate() {
+        family_rows
+            .entry(row.family.clone())
+            .or_default()
+            .push(position);
+    }
     let mut channels: Vec<NewChannel> = Vec::new();
     for (&ordinal, number) in heads.iter().zip(numbers.iter()) {
-        let family = rows[ordinal].family.clone();
+        let positions: &[usize] = family_rows
+            .get(rows[ordinal].family.as_str())
+            .map_or(&[], Vec::as_slice);
         // Members arrive in candidate order (M3U priority, then id); the
         // streams app's sort decides the final order.
-        let members: Vec<i64> = rows
+        let members: Vec<i64> = positions
             .iter()
-            .filter(|row| row.family == family)
-            .map(|row| row.stream_id)
+            .map(|&position| rows[position].stream_id)
             .collect();
         let streams = order(&members);
         let group = *group_index.get(&rows[ordinal].target_group).unwrap_or(&0);
@@ -614,8 +675,8 @@ pub fn build_streams_request(
             key: create_owner_key(&rows[ordinal].identity),
         });
         rows[ordinal].number = Some(*number);
-        for row in rows.iter_mut().filter(|row| row.family == family) {
-            row.number = Some(*number);
+        for &position in positions {
+            rows[position].number = Some(*number);
         }
     }
     Ok(CreateRequest {
@@ -806,25 +867,37 @@ pub fn decide_stations(
     // Resolved facts per candidate: (proposed, callsign, affiliation, identity).
     type Resolved = (String, String, Option<String>, Identity);
     let mut resolved: Vec<Option<Resolved>> = Vec::with_capacity(candidates.len());
-    for candidate in candidates {
-        let identity = crosstalk_matching::identity::resolve_with(engine, &candidate.name, &ctx);
-        // The OTA decision names makes (callsign station, then the opt-in
-        // market fallback; a station-less callsign never goes premium): CM's
-        // `_seed_resolver` renders "the same OTA name format the rename action
-        // uses". A template missing a field is unresolved, like a rename skip.
-        let hit = match crate::names::decide_ota_target(&candidate.name, &identity, settings) {
-            Some(crate::names::NameTarget::Ota {
-                callsign,
-                station,
-                name: Some(name),
-                ..
-            }) => Some((name, callsign, station.network_affiliation)),
-            _ => None,
-        };
+    // The per-candidate decisions are independent, so on rayon (E-B5); the grouping
+    // below stays serial, in candidate order.
+    use rayon::prelude::*;
+    type Decided = (Identity, Option<(String, String, Option<String>)>, bool);
+    let decided: Vec<Decided> = candidates
+        .par_iter()
+        .map(|candidate| {
+            let identity =
+                crosstalk_matching::identity::resolve_with(engine, &candidate.name, &ctx);
+            // The OTA decision names makes (callsign station, then the opt-in
+            // market fallback; a station-less callsign never goes premium): CM's
+            // `_seed_resolver` renders "the same OTA name format the rename action
+            // uses". A template missing a field is unresolved, like a rename skip.
+            let hit = match crate::names::decide_ota_target(&candidate.name, &identity, settings) {
+                Some(crate::names::NameTarget::Ota {
+                    callsign,
+                    station,
+                    name: Some(name),
+                    ..
+                }) => Some((name, callsign, station.network_affiliation)),
+                _ => None,
+            };
+            let excluded = hit.as_ref().is_some_and(|(_, _, affiliation)| {
+                station_excluded(affiliation.as_deref(), &candidate.name, &skip_networks)
+            });
+            (identity, hit, excluded)
+        })
+        .collect();
+    for (candidate, (identity, hit, excluded)) in candidates.iter().zip(decided) {
         match hit {
             Some((proposed, callsign, affiliation)) => {
-                let excluded =
-                    station_excluded(affiliation.as_deref(), &candidate.name, &skip_networks);
                 resolved.push(Some((proposed.clone(), callsign, affiliation, identity)));
                 let ordinal = resolved.len() - 1;
                 if excluded {
@@ -1124,22 +1197,41 @@ async fn run_streams(
 
     // The unified stack: the same engine + identity cache guide and streams run on.
     let run_engine = RunEngine::for_config(&config.matching, context.store().cloned());
-    let engine = Arc::clone(run_engine.engine());
     let db_names = crate::names::premium_db_names(&config.matching.databases());
     let categories = crate::categorize::category_map(&config.matching.databases());
-    let index = Arc::new(run_engine.build_index(&db_names));
-    let stack = EngineStack {
-        engine: &engine,
-        index: &index,
-        db_names: &db_names,
-        categories: &categories,
-    };
+    let index = run_engine.build_index_blocking(&db_names).await?;
 
     // Crash-safe creates (intents + ownership, step 10 review): reconcile before
     // planning so an earlier run's landed channel is reused, never duplicated.
     let owned = channel_ops::load_owned(context, &world, crate::APP_ID, dry_run).await?;
-    let world_names = world_identities(&run_engine, &world);
-    let mut rows = decide_streams(&candidates, &stack, settings, &owned.channels, &world_names);
+    // Every live channel's identity, then every candidate's decision, on rayon off the
+    // async runtime, after one batch warm of the live channel names (E-B3/E-B5).
+    let live: Vec<(i64, String)> = world
+        .channels
+        .iter()
+        .map(|channel| (channel.id, channel.name.clone()))
+        .collect();
+    let warm: Vec<(String, ResolveContext)> = live
+        .iter()
+        .map(|(_, name)| (name.clone(), ResolveContext::default()))
+        .collect();
+    let mut rows = {
+        let candidates = candidates.clone();
+        let settings = settings.clone();
+        let owned = owned.channels.clone();
+        run_engine
+            .resolve_stage(warm, move |run_engine| {
+                let world_names = identities_of(run_engine, &live);
+                let stack = EngineStack {
+                    engine: run_engine.engine(),
+                    index: &index,
+                    db_names: &db_names,
+                    categories: &categories,
+                };
+                decide_streams(&candidates, &stack, &settings, &owned, &world_names)
+            })
+            .await?
+    };
 
     // CM refuses to write into an ignored group (GroupScopeError): fail the run
     // naming the groups rather than creating half the plan.

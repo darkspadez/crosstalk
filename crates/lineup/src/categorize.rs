@@ -568,34 +568,55 @@ pub async fn run_with_creator(
 
     // The unified stack: the same engine + identity cache guide and streams run on.
     let run_engine = RunEngine::for_config(&config.matching, context.store().cloned());
-    let engine = Arc::clone(run_engine.engine());
     let db_names = crate::names::premium_db_names(&config.matching.databases());
     let categories = category_map(&config.matching.databases());
-    let index = Arc::new(run_engine.build_index(&db_names));
+    let index = run_engine.build_index_blocking(&db_names).await?;
 
-    let ctx = ResolveContext::default();
     // One resolve and one rank per channel, on every core (phase 3 review bench: a
-    // serial walk over 20k channels cost half a minute).
-    let rows: Vec<CategoryRow> = in_category_scope
-        .par_iter()
-        .map(|channel| {
-            let scoped_channel = ScopedChannel {
-                id: channel.id,
-                name: channel.name.clone(),
-                number: channel.display_number(),
-                group: world.group_name(channel.channel_group_id),
-            };
-            let identity = run_engine.resolve(&channel.name, &ctx);
-            decide_category(
-                &scoped_channel,
-                &identity,
-                &engine,
-                &index,
-                &db_names,
-                &categories,
-            )
+    // serial walk over 20k channels cost half a minute), off the async runtime and
+    // after one batch warm of every channel name (E-B3).
+    // Reversed so a duplicated id keeps its first group, as `World::group_name` does.
+    let group_names: HashMap<i64, &str> = world
+        .groups
+        .iter()
+        .rev()
+        .map(|group| (group.id, group.name.as_str()))
+        .collect();
+    let scoped_channels: Vec<ScopedChannel> = in_category_scope
+        .iter()
+        .map(|channel| ScopedChannel {
+            id: channel.id,
+            name: channel.name.clone(),
+            number: channel.display_number(),
+            group: channel
+                .channel_group_id
+                .and_then(|id| group_names.get(&id))
+                .map_or_else(|| "No Group".to_string(), |name| (*name).to_string()),
         })
         .collect();
+    let warm: Vec<(String, ResolveContext)> = scoped_channels
+        .iter()
+        .map(|channel| (channel.name.clone(), ResolveContext::default()))
+        .collect();
+    let rows: Vec<CategoryRow> = run_engine
+        .resolve_stage(warm, move |run_engine| {
+            let ctx = ResolveContext::default();
+            scoped_channels
+                .par_iter()
+                .map(|channel| {
+                    let identity = run_engine.resolve(&channel.name, &ctx);
+                    decide_category(
+                        channel,
+                        &identity,
+                        run_engine.engine(),
+                        &index,
+                        &db_names,
+                        &categories,
+                    )
+                })
+                .collect()
+        })
+        .await?;
 
     let moves = planned_moves(&rows, &base.ignore_groups);
     let existing: HashSet<String> = world
@@ -695,9 +716,11 @@ pub async fn run_with_creator(
             .copied()
             .collect()
     };
+    // A set, not a scan of `plannable` per move (E-S4).
+    let plannable_ids: HashSet<i64> = plannable.iter().map(|planned| planned.id).collect();
     let refused: HashSet<i64> = moves
         .iter()
-        .filter(|row| !plannable.iter().any(|planned| planned.id == row.id))
+        .filter(|row| !plannable_ids.contains(&row.id))
         .map(|row| row.id)
         .collect();
     let plan = plan_moves(&planned_world, &base, &plannable, &group_ids)?;

@@ -191,20 +191,58 @@ fn is_subchannel_token(token: &str) -> bool {
 /// neither side's residue is a [`CallsignResidue::Subchannel`]. Key-equal identities
 /// never need this.
 pub fn station_callsign_family(a: &FamilyKey, a_high: bool, b: &FamilyKey, b_high: bool) -> bool {
-    let (Some(callsign), Some(other)) = (a.callsign.as_deref(), b.callsign.as_deref()) else {
+    station_family_of(FamilyRef::of(a, a_high), FamilyRef::of(b, b_high))
+}
+
+/// A borrowed [`FamilyKey`] plus its callsign confidence: what the C08 rule reads,
+/// without cloning the key (E-B5: [`Identity::same_family`] runs in hot loops).
+#[derive(Clone, Copy)]
+struct FamilyRef<'a> {
+    key: &'a str,
+    zone: FeedZone,
+    timeshift: bool,
+    callsign: Option<&'a str>,
+    high: bool,
+}
+
+impl<'a> FamilyRef<'a> {
+    fn of(key: &'a FamilyKey, high: bool) -> Self {
+        Self {
+            key: &key.key,
+            zone: key.zone,
+            timeshift: key.timeshift,
+            callsign: key.callsign.as_deref(),
+            high,
+        }
+    }
+
+    fn of_identity(identity: &'a Identity) -> Self {
+        Self {
+            key: &identity.key,
+            zone: identity.zone,
+            timeshift: identity.timeshift,
+            callsign: identity.callsign.as_deref(),
+            high: identity.callsign_high,
+        }
+    }
+}
+
+/// [`station_callsign_family`] over borrowed keys.
+fn station_family_of(a: FamilyRef<'_>, b: FamilyRef<'_>) -> bool {
+    let (Some(callsign), Some(other)) = (a.callsign, b.callsign) else {
         return false;
     };
     if callsign != other
-        || !a_high
-        || !b_high
+        || !a.high
+        || !b.high
         || a.zone != b.zone
         || a.timeshift != b.timeshift
         || !crate::data::merged::is_merged_station(callsign)
     {
         return false;
     }
-    callsign_residue(&a.key, callsign) != CallsignResidue::Subchannel
-        && callsign_residue(&b.key, callsign) != CallsignResidue::Subchannel
+    callsign_residue(a.key, callsign) != CallsignResidue::Subchannel
+        && callsign_residue(b.key, callsign) != CallsignResidue::Subchannel
 }
 
 impl Identity {
@@ -229,12 +267,7 @@ impl Identity {
             && self.timeshift == other.timeshift
             && self.callsign == other.callsign;
         (keys_equal
-            || station_callsign_family(
-                &self.family_key(),
-                self.callsign_high,
-                &other.family_key(),
-                other.callsign_high,
-            ))
+            || station_family_of(FamilyRef::of_identity(self), FamilyRef::of_identity(other)))
             && countries_compatible(
                 self.country.as_deref(),
                 other.country.as_deref(),
@@ -264,8 +297,10 @@ pub struct ResolveContext {
 /// name), so resolution reads the trimmed name throughout.
 pub fn resolve_with(engine: &UnifiedEngine, name: &str, ctx: &ResolveContext) -> Identity {
     let name = name.trim();
-    let canonical = engine.alias_canonical(name);
-    let key = engine.identity_key(name, canonical.as_deref());
+    // One normalisation of the name serves both the alias lookup and the key (E-S6).
+    let own = engine.normalize_key(name);
+    let canonical = engine.alias_canonical_of(&own);
+    let key = engine.identity_key_of(&own, canonical.as_deref());
     let (raw_callsign, callsign_high) = engine.callsign_confidence(name);
     let callsign = raw_callsign
         .as_deref()

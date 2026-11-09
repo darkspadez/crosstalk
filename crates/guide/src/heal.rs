@@ -200,14 +200,30 @@ pub async fn run(
         }
     }
 
+    // Settle what one request per source and per 50 entries can (E-B1); the checks below
+    // then answer those from the memo and search only the rest.
+    if !allow_without_programs {
+        let asked: Vec<&EpgEntry> = scoped_channels
+            .channels
+            .iter()
+            .filter_map(|channel| entry_by_id.get(&channel.current_epg_id()?).copied())
+            .collect();
+        crate::programs::seed(context, client, world, asked, &window, "guide.heal").await;
+    }
+
     let validation_bound = context.config().dispatcharr.concurrency.max(1);
     let window_ref = &window;
     // `None` inside: the check failed, which is "unknown", never "no".
     let mut detected: Vec<Option<Option<HasPrograms>>> = (0..plans.len()).map(|_| None).collect();
-    {
+    // In batches, so a cancel lands between them and a big scope is not silent.
+    for batch_start in (0..plans.len()).step_by(BATCH_CHANNELS) {
+        if context.is_cancelled() {
+            anyhow::bail!("cancelled by the operator");
+        }
+        let batch_end = (batch_start + BATCH_CHANNELS).min(plans.len());
         use futures::{stream, StreamExt};
         let resolved: Vec<(usize, Option<HasPrograms>)> =
-            stream::iter((0..plans.len()).filter_map(|ordinal| {
+            stream::iter((batch_start..batch_end).filter_map(|ordinal| {
                 // Owned up front: the future must not borrow the plan, and the
                 // closure argument is an owned index so no borrowed-iterator
                 // lifetime leaks into the future's type.
@@ -235,6 +251,12 @@ pub async fn run(
         for (ordinal, has) in resolved {
             detected[ordinal] = Some(has);
         }
+        context.progress(&ProgressEvent::new(
+            "guide.heal",
+            batch_end as u64,
+            plans.len() as u64,
+            "checking existing assignments",
+        ));
     }
     if context.is_cancelled() {
         anyhow::bail!("cancelled by the operator");
@@ -281,7 +303,7 @@ pub async fn run(
         .iter()
         .map(|entry| entry.name.clone())
         .collect();
-    let index = Arc::new(run_engine.build_index(&names));
+    let index = Arc::new(run_engine.build_index_blocking(&names).await?);
 
     // Step 2a: score every broken channel's identity family off the async runtime (P3),
     // through the shared family stage: no progress bar, because only the broken channels
@@ -295,10 +317,9 @@ pub async fn run(
     )
     .await?;
     // The query identities resolve through the shared cache, so the store holds the
-    // identity any other app resolves the same name to.
-    run_engine
-        .warm_families(&broken_names, &families_all, &names, &[])
-        .await;
+    // identity any other app resolves the same name to. In the background while the
+    // walks below run (E-B2), awaited before the run returns.
+    let warming = run_engine.start_warming_families(&broken_names, &families_all, &names, &[]);
 
     // Exclude the entry already assigned from each family: proposing the same broken
     // guide is not a fix. Positions below are into these searched lists, not the raw
@@ -337,6 +358,17 @@ pub async fn run(
         client,
         window: ProgramWindow::ahead(settings.check_hours),
     };
+    if rules.validate {
+        // Every member a walk could ask about, settled up front where it can be (E-B1).
+        let mut seen = std::collections::HashSet::new();
+        let asked: Vec<&EpgEntry> = searched
+            .iter()
+            .flatten()
+            .filter(|candidate| candidate.score >= threshold && seen.insert(candidate.index))
+            .filter_map(|candidate| scoped_entries.entries.get(candidate.index))
+            .collect();
+        crate::programs::seed(context, client, world, asked, &probe.window, "guide.heal").await;
+    }
     let probe_ref = &probe;
     let searched_ref = &searched;
     let entries_ref = &scoped_entries.entries;
@@ -518,6 +550,7 @@ pub async fn run(
         );
     }
 
+    warming.finish().await;
     Ok(HealOutcome {
         rows,
         report,

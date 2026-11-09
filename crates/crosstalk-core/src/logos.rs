@@ -62,6 +62,7 @@
 
 use crosstalk_matching::similarity::calculate_similarity_chars;
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 /// The tv-logos repo both plugins read.
 pub const TV_LOGOS_REPO: &str = "tv-logo/tv-logos";
@@ -244,6 +245,60 @@ pub struct TvLogosIndex {
     pub files: HashMap<String, Vec<String>>,
     /// GitHub's `truncated` flag: the tree listed only part of the repo.
     pub truncated: bool,
+    /// Each `(dir, country suffix)`'s files, normalised once for the fuzzy tier (E-B4).
+    /// Filled lazily by [`TvLogosIndex::normalized`]; shared by clones of the index.
+    normalized: NormalizedCache,
+}
+
+/// The lazily filled `(dir, suffix)` -> normalised files memo of a [`TvLogosIndex`].
+type NormalizedMemo = HashMap<(String, String), Arc<NormalizedFiles>>;
+
+#[derive(Debug, Clone, Default)]
+struct NormalizedCache(Arc<RwLock<NormalizedMemo>>);
+
+/// One directory's files, normalised for one country suffix (E-B4).
+///
+/// The fuzzy tier compares every channel with every file of a directory; normalising
+/// the filenames (and collecting their chars, spaced and space-free) once per run rather
+/// than once per channel per file is most of its cost.
+#[derive(Debug, Default)]
+pub struct NormalizedFiles {
+    /// Per file, in list order; `None` for a file that normalises to nothing.
+    entries: Vec<Option<NormalizedFile>>,
+    /// Space-free form -> the first file with it: the files that score 100 (an equal
+    /// space-free form is the only way to), found without a scan.
+    by_joined: HashMap<String, usize>,
+}
+
+#[derive(Debug)]
+struct NormalizedFile {
+    spaced: Vec<char>,
+    joined: Vec<char>,
+}
+
+impl NormalizedFiles {
+    /// Normalise `files` (one directory's list, in order) for `country_suffix`.
+    pub fn new(files: &[String], country_suffix: &str) -> Self {
+        let mut by_joined: HashMap<String, usize> = HashMap::new();
+        let entries = files
+            .iter()
+            .enumerate()
+            .map(|(position, file)| {
+                let norm = normalize_logo_filename(file, country_suffix);
+                if norm.is_empty() {
+                    return None;
+                }
+                let joined: String = norm.chars().filter(|c| *c != ' ').collect();
+                let file = NormalizedFile {
+                    spaced: norm.chars().collect(),
+                    joined: joined.chars().collect(),
+                };
+                by_joined.entry(joined).or_insert(position);
+                Some(file)
+            })
+            .collect();
+        Self { entries, by_joined }
+    }
 }
 
 fn is_image(name: &str) -> bool {
@@ -331,6 +386,20 @@ impl TvLogosIndex {
             files.sort();
         }
         index
+    }
+
+    /// `dir`'s files normalised for `country_suffix`, computed once per index (E-B4).
+    ///
+    /// Memoised on the index, so `files` must not change after the first call (an
+    /// index is parsed once and read from then on).
+    pub fn normalized(&self, dir: &str, country_suffix: &str) -> Arc<NormalizedFiles> {
+        let key = (dir.to_string(), country_suffix.to_string());
+        if let Some(hit) = self.normalized.0.read().expect("tv-logos memo").get(&key) {
+            return Arc::clone(hit);
+        }
+        let built = Arc::new(NormalizedFiles::new(self.files_for(dir), country_suffix));
+        let mut memo = self.normalized.0.write().expect("tv-logos memo");
+        Arc::clone(memo.entry(key).or_insert(built))
     }
 
     /// A directory's direct image children (country files for a country dir).
@@ -539,36 +608,59 @@ pub fn logo_similarity(normalized_channel: &str, normalized_logo: &str) -> f64 {
     (spaced.max(flat) * 100.0).min(100.0)
 }
 
-/// The filename scoring highest against the channel name, or `None` below threshold.
-fn best_logo(
-    normalized_channel: &str,
-    logo_filenames: &[String],
-    country_suffix: &str,
-    threshold: u8,
-) -> Option<String> {
+/// How far below a cutoff the pruned similarity may stop (E-B4): the cutoffs are
+/// derived from 0-100 scores, so a hair of slack keeps a float rounding at the boundary
+/// from pruning a file the unpruned comparison would have kept.
+const CUTOFF_SLACK: f64 = 1e-9;
+
+/// The position of the file scoring highest against the channel name, or `None` below
+/// threshold: the first file with the highest score, exactly as a full scan scoring
+/// every file with [`logo_similarity`] would pick (E-B4).
+///
+/// A file whose space-free form equals the channel's scores 100 and ends the scan, so
+/// it is looked up instead. Every other file is scored with the similarity's early exit
+/// at the higher of the threshold and the best score so far: a file that cannot reach
+/// either can neither win nor be accepted, and its length alone usually rules it out.
+fn best_logo(normalized_channel: &str, files: &NormalizedFiles, threshold: u8) -> Option<usize> {
     if normalized_channel.is_empty() {
         return None;
     }
-    let mut best: Option<(f64, &String)> = None;
-    for filename in logo_filenames {
-        let normalized_logo = normalize_logo_filename(filename, country_suffix);
-        if normalized_logo.is_empty() {
+    let joined_text: String = normalized_channel.chars().filter(|c| *c != ' ').collect();
+    if let Some(&position) = files.by_joined.get(&joined_text) {
+        return Some(position);
+    }
+    let spaced: Vec<char> = normalized_channel.chars().collect();
+    let joined: Vec<char> = joined_text.chars().collect();
+    let floor = f64::from(threshold) / 100.0 - CUTOFF_SLACK;
+    let mut best: Option<(f64, usize)> = None;
+    for (position, entry) in files.entries.iter().enumerate() {
+        let Some(entry) = entry else {
             continue;
-        }
-        let score = logo_similarity(normalized_channel, &normalized_logo);
+        };
+        let cutoff = match best {
+            Some((top, _)) => floor.max(top / 100.0 - CUTOFF_SLACK),
+            None => floor,
+        };
+        let spaced_score = calculate_similarity_chars(&spaced, &entry.spaced, cutoff);
+        let score = if spaced_score >= 1.0 {
+            100.0
+        } else {
+            let flat = calculate_similarity_chars(&joined, &entry.joined, cutoff);
+            (spaced_score.max(flat) * 100.0).min(100.0)
+        };
         let better = match &best {
             None => true,
             Some((top, _)) => score > *top,
         };
         if better {
-            best = Some((score, filename));
+            best = Some((score, position));
             if score >= 100.0 {
                 break;
             }
         }
     }
     match best {
-        Some((score, filename)) if score >= f64::from(threshold) => Some(filename.clone()),
+        Some((score, position)) if score >= f64::from(threshold) => Some(position),
         _ => None,
     }
 }
@@ -584,28 +676,30 @@ pub fn match_channel_to_logo(
     country_suffix: &str,
     threshold: u8,
 ) -> Option<String> {
+    let normalized = NormalizedFiles::new(logo_filenames, country_suffix);
+    match_channel_in(channel_name, logo_filenames, &normalized, threshold)
+}
+
+/// [`match_channel_to_logo`] over files already normalised ([`TvLogosIndex::normalized`]).
+fn match_channel_in(
+    channel_name: &str,
+    logo_filenames: &[String],
+    normalized: &NormalizedFiles,
+    threshold: u8,
+) -> Option<String> {
+    let file = |position: usize| logo_filenames.get(position).cloned();
     let (base_name, is_timeshift) = split_timeshift(channel_name);
     if is_timeshift {
         let base = normalize_channel_name(&base_name);
         if base.is_empty() {
             return None;
         }
-        if let Some(found) = best_logo(
-            &format!("{base} plus"),
-            logo_filenames,
-            country_suffix,
-            threshold,
-        ) {
-            return Some(found);
+        if let Some(found) = best_logo(&format!("{base} plus"), normalized, threshold) {
+            return file(found);
         }
-        return best_logo(&base, logo_filenames, country_suffix, threshold);
+        return best_logo(&base, normalized, threshold).and_then(file);
     }
-    best_logo(
-        &normalize_channel_name(channel_name),
-        logo_filenames,
-        country_suffix,
-        threshold,
-    )
+    best_logo(&normalize_channel_name(channel_name), normalized, threshold).and_then(file)
 }
 
 /// One tv-logos hit: the URL to assign and how it was found.
@@ -700,7 +794,9 @@ fn search_tv(
                 });
             }
         }
-        if let Some((file, matched)) = match_zone_feed(name, files, &suffix, threshold) {
+        let normalized = index.normalized(dir, &suffix);
+        if let Some((file, matched)) = match_zone_feed(name, files, &normalized, &suffix, threshold)
+        {
             // The plain name's similarity to the file (a timeshift matched as
             // `<name> plus` reports the plain reading, like the scored list).
             let score = Some(logo_similarity(
@@ -730,10 +826,11 @@ fn search_tv(
 fn match_zone_feed(
     name: &str,
     files: &[String],
+    normalized: &NormalizedFiles,
     suffix: &str,
     threshold: u8,
 ) -> Option<(String, String)> {
-    let full = match_channel_to_logo(name, files, suffix, threshold);
+    let full = match_channel_in(name, files, normalized, threshold);
     let Some(zone_free) = crosstalk_matching::country::strip_zone_marker(name) else {
         return full.map(|file| (file, name.to_string()));
     };
@@ -752,7 +849,7 @@ fn match_zone_feed(
     if zone_free.is_empty() {
         return None;
     }
-    match_channel_to_logo(&zone_free, files, suffix, threshold).map(|file| (file, zone_free))
+    match_channel_in(&zone_free, files, normalized, threshold).map(|file| (file, zone_free))
 }
 
 /// The tv-logos file for a network name (`cbs`), or `None` (CM's `network_logo`):
@@ -889,6 +986,93 @@ pub fn resolve_logo(query: &LogoQuery<'_>, sources: &LogoSources<'_>) -> Option<
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The pruned, memoised fuzzy tier (E-B4) picks exactly what the full scan picks: the
+    /// first file with the highest `logo_similarity`, accepted at the threshold.
+    #[test]
+    fn the_pruned_fuzzy_tier_matches_the_full_scan() {
+        fn full_scan(
+            channel: &str,
+            files: &[String],
+            suffix: &str,
+            threshold: u8,
+        ) -> Option<String> {
+            let norm = normalize_channel_name(channel);
+            if norm.is_empty() {
+                return None;
+            }
+            let mut best: Option<(f64, &String)> = None;
+            for file in files {
+                let logo = normalize_logo_filename(file, suffix);
+                if logo.is_empty() {
+                    continue;
+                }
+                let score = logo_similarity(&norm, &logo);
+                let better = match best {
+                    None => true,
+                    Some((top, _)) => score > top,
+                };
+                if better {
+                    best = Some((score, file));
+                    if score >= 100.0 {
+                        break;
+                    }
+                }
+            }
+            match best {
+                Some((score, file)) if score >= f64::from(threshold) => Some(file.clone()),
+                _ => None,
+            }
+        }
+        let files: Vec<String> = [
+            "cnn-us.png",
+            "cnn-international-us.png",
+            "espn-us.png",
+            "espn-2-us.png",
+            "e-4-us.png",
+            "food-network-us.png",
+            "fox-news-us.png",
+            "fox-sports-1-us.png",
+            "fox-sports-2-us.png",
+            "hbo-us.png",
+            "hbo-2-us.png",
+            "showtime-us.png",
+            "bbc-one-us.png",
+            "itv-2-plus-us.png",
+            "us.png",
+        ]
+        .iter()
+        .map(|file| file.to_string())
+        .collect();
+        let normalized = NormalizedFiles::new(&files, "us");
+        for channel in [
+            "CNN",
+            "CNN HD",
+            "ESPN2",
+            "ESPN 2",
+            "E4",
+            "Food Network",
+            "Fox News Channel",
+            "FOX Sports 1",
+            "Fox Sport 2",
+            "HBO 2",
+            "HB0",
+            "Showtime",
+            "BBC One",
+            "ITV2 plus",
+            "Unknown Thing",
+        ] {
+            for threshold in [0u8, 50, 85, 95, 100] {
+                let pruned = best_logo(&normalize_channel_name(channel), &normalized, threshold)
+                    .map(|position| files[position].clone());
+                assert_eq!(
+                    pruned,
+                    full_scan(channel, &files, "us", threshold),
+                    "{channel} at {threshold}"
+                );
+            }
+        }
+    }
 
     /// The recorded tree fixture shape: a handful of blobs across two dirs.
     fn fixture_tree() -> serde_json::Value {

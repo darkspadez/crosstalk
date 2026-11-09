@@ -449,23 +449,52 @@ pub fn render_format(
 /// `{epg}` reads the EPG listing, which a run loads only when a format names it
 /// ([`formats_name_epg`]); a channel with no EPG reads `No EPG`, as channel ops does.
 fn channel_values(
-    world: &World,
+    names: &NameLookup<'_>,
     channel: &Channel,
     name: &str,
 ) -> crosstalk_core::naming::ChannelValues {
     crosstalk_core::naming::ChannelValues {
         name: name.to_string(),
-        group: world.group_name(channel.channel_group_id),
+        group: channel
+            .channel_group_id
+            .and_then(|id| names.groups.get(&id))
+            .map_or_else(|| "No Group".to_string(), |name| (*name).to_string()),
         number: channel
             .display_number()
             .map(|number| format!("{number}"))
             .unwrap_or_default(),
         epg: channel
             .current_epg_id()
-            .and_then(|id| world.entries.iter().find(|entry| entry.id == id))
-            .map(|entry| entry.name.clone())
-            .unwrap_or_else(|| "No EPG".to_string()),
+            .and_then(|id| names.epg.get(&id))
+            .map_or_else(|| "No EPG".to_string(), |name| (*name).to_string()),
         id: channel.id.to_string(),
+    }
+}
+
+/// The world's group and EPG entry names by id, built once per plan (E-S7): a rename
+/// format naming `{epg}` would otherwise walk the whole EPG listing per renamed channel.
+/// Reversed so a duplicated id keeps its first entry, as a `find` would.
+struct NameLookup<'a> {
+    groups: HashMap<i64, &'a str>,
+    epg: HashMap<i64, &'a str>,
+}
+
+impl<'a> NameLookup<'a> {
+    fn of(world: &'a World) -> Self {
+        Self {
+            groups: world
+                .groups
+                .iter()
+                .rev()
+                .map(|group| (group.id, group.name.as_str()))
+                .collect(),
+            epg: world
+                .entries
+                .iter()
+                .rev()
+                .map(|entry| (entry.id, entry.name.as_str()))
+                .collect(),
+        }
     }
 }
 
@@ -573,6 +602,7 @@ pub fn plan(
         .map(|channel| (channel.id, channel))
         .collect();
 
+    let names = NameLookup::of(world);
     let mut outcome = TriageOutcome {
         judged: verdicts.len(),
         switches,
@@ -585,7 +615,7 @@ pub fn plan(
             .or_insert(0) += 1;
         plan_channel(
             &mut outcome,
-            world,
+            &names,
             settings,
             &suffixes,
             channels.get(&verdict.channel_id).copied(),
@@ -605,7 +635,7 @@ pub fn plan(
 /// Plan one channel's rename, suffix and move.
 fn plan_channel(
     outcome: &mut TriageOutcome,
-    world: &World,
+    names: &NameLookup<'_>,
     settings: &StreamsSettings,
     suffixes: &[String],
     channel: Option<&Channel>,
@@ -643,7 +673,7 @@ fn plan_channel(
                          (IPTV Checker would append a second one)"
                     ),
                 });
-            } else if let Some(to) = render_format(format, &channel_values(world, channel, &base)) {
+            } else if let Some(to) = render_format(format, &channel_values(names, channel, &base)) {
                 if to == base {
                     outcome.skipped.push(Skip {
                         channel_id: verdict.channel_id,
@@ -1420,7 +1450,7 @@ mod tests {
             channel_number: Some(serde_json::json!(12)),
             ..Channel::default()
         };
-        let values = channel_values(&world, &channel, "ESPN");
+        let values = channel_values(&NameLookup::of(&world), &channel, "ESPN");
         assert_eq!(
             render_format("{name} [DEAD] {group} #{number} {id} {epg}", &values).as_deref(),
             Some("ESPN [DEAD] US: Sports #12 42 No EPG")

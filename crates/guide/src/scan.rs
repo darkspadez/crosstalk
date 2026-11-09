@@ -225,6 +225,15 @@ pub async fn run(
         "checking programme data",
     ));
 
+    // Settle what one request per source and per 50 entries can (E-B1); the loop below
+    // then answers those from the memo and searches only the rest.
+    let asked: Vec<&EpgEntry> = scoped_channels
+        .channels
+        .iter()
+        .filter_map(|channel| entry_by_id.get(&channel.current_epg_id()?).copied())
+        .collect();
+    crate::programs::seed(context, client, world, asked, &window, PROGRESS_ACTION).await;
+
     let concurrency = context.config().dispatcharr.concurrency.max(1);
     let mut answered: Vec<Option<HasPrograms>> = checks.iter().map(|_| None).collect();
     let mut failed: Vec<bool> = checks.iter().map(|_| false).collect();

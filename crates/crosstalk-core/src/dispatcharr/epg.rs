@@ -193,6 +193,176 @@ impl DispatcharrClient {
         Ok(answer)
     }
 
+    /// Answer [`Self::has_programs`] for many entries at once, before anyone asks.
+    ///
+    /// `entries` are `(entry id, tvg_id, source)`. Two cheap questions settle most of them,
+    /// and only what neither settles is left for the per-entry search:
+    ///
+    ///   1. one [`Self::epg_ends_at_or_after`] per source at the window's start: a source with
+    ///      nothing ending at or after it has no programme in the window for ANY of its
+    ///      entries, so each of them memoises "no" — the exact answer the search would give.
+    ///   2. [`Self::current_programs`] for the rest, 50 ids per request: a programme airing on
+    ///      an entry whose span overlaps the window is a row the search would find, so the
+    ///      entry memoises "yes". The programme must carry the entry's own `tvg_id` (the key
+    ///      the search filters on); a `parsing` marker, a programme without a time span, or
+    ///      an entry with nothing airing settles nothing and falls back to the search.
+    ///
+    /// Never fails: a request that errors only leaves its entries unsettled, so the per-entry
+    /// search (and its own error handling) still decides them. The caller keeps dummy sources
+    /// out, because their programmes are generated rather than stored. `cancelled` is checked
+    /// before each request is sent; `progress` gets `(done, total)` requests.
+    pub async fn seed_programs(
+        &self,
+        entries: &[(i64, String, i64)],
+        window: &ProgramWindow,
+        concurrency: usize,
+        cancelled: impl Fn() -> bool,
+        progress: impl Fn(usize, usize),
+    ) -> ProgramSeed {
+        use std::collections::{HashMap, HashSet};
+
+        let mut seed = ProgramSeed::default();
+        let (Ok(start), Ok(end)) = (
+            DateTime::parse_from_rfc3339(&window.start),
+            DateTime::parse_from_rfc3339(&window.end),
+        ) else {
+            return seed;
+        };
+        let (start, end) = (start.with_timezone(&Utc), end.with_timezone(&Utc));
+        let key = |tvg_id: &str, source: i64| {
+            (
+                tvg_id.to_string(),
+                source,
+                window.start.clone(),
+                window.end.clone(),
+            )
+        };
+
+        // Distinct entries with something to ask that no earlier check has answered.
+        let mut seen: HashSet<i64> = HashSet::with_capacity(entries.len());
+        let wanted: Vec<&(i64, String, i64)> = entries
+            .iter()
+            .filter(|(id, tvg_id, source)| {
+                !tvg_id.is_empty()
+                    && seen.insert(*id)
+                    && !self.program_cache.contains_key(&key(tvg_id, *source))
+            })
+            .collect();
+        seed.entries = wanted.len();
+        if wanted.is_empty() {
+            return seed;
+        }
+        let concurrency = concurrency.max(1);
+        let mut sources: Vec<i64> = wanted.iter().map(|(_, _, source)| *source).collect();
+        sources.sort_unstable();
+        sources.dedup();
+        let total = sources.len() + wanted.len().div_ceil(CURRENT_PROGRAMS_CHUNK_SIZE);
+        let mut done = 0;
+
+        // 1. The per-source prefilter.
+        let mut empty: HashSet<i64> = HashSet::new();
+        {
+            let mut pending = sources.iter().copied();
+            let mut set = tokio::task::JoinSet::new();
+            loop {
+                while set.len() < concurrency && !cancelled() {
+                    let Some(source) = pending.next() else {
+                        break;
+                    };
+                    let client = self.clone();
+                    seed.source_requests += 1;
+                    set.spawn(async move {
+                        let _permit = client.permits.acquire().await.ok();
+                        (source, client.epg_ends_at_or_after(source, start).await)
+                    });
+                }
+                let Some(joined) = set.join_next().await else {
+                    break;
+                };
+                done += 1;
+                progress(done, total);
+                if let Ok((source, Ok(false))) = joined {
+                    empty.insert(source);
+                }
+            }
+        }
+        seed.empty_sources = empty.len();
+        for (_, tvg_id, source) in wanted.iter().filter(|(_, _, s)| empty.contains(s)) {
+            self.program_cache
+                .entry(key(tvg_id, *source))
+                .or_insert(HasPrograms::No);
+            seed.seeded_no += 1;
+        }
+        if cancelled() {
+            seed.cancelled = true;
+            return seed;
+        }
+
+        // 2. What is airing now, 50 entries per request.
+        let live: Vec<&(i64, String, i64)> = wanted
+            .into_iter()
+            .filter(|(_, _, source)| !empty.contains(source))
+            .collect();
+        let by_id: HashMap<i64, (&str, i64)> = live
+            .iter()
+            .map(|(id, tvg_id, source)| (*id, (tvg_id.as_str(), *source)))
+            .collect();
+        let mut chunks = live
+            .chunks(CURRENT_PROGRAMS_CHUNK_SIZE)
+            .map(|chunk| chunk.iter().map(|(id, _, _)| *id).collect::<Vec<i64>>());
+        let mut set = tokio::task::JoinSet::new();
+        loop {
+            while set.len() < concurrency && !cancelled() {
+                let Some(ids) = chunks.next() else {
+                    break;
+                };
+                let client = self.clone();
+                seed.batch_requests += 1;
+                set.spawn(async move {
+                    let _permit = client.permits.acquire().await.ok();
+                    client.current_programs_chunk(&ids).await
+                });
+            }
+            let Some(joined) = set.join_next().await else {
+                break;
+            };
+            done += 1;
+            progress(done, total);
+            let Ok(Ok(programs)) = joined else {
+                continue;
+            };
+            for program in programs {
+                if program.is_parsing() {
+                    continue;
+                }
+                let Some(&(tvg_id, source)) = by_id.get(&program.epg_data_id) else {
+                    continue;
+                };
+                if program.tvg_id != tvg_id {
+                    continue;
+                }
+                let (Some(starts), Some(ends)) = (program.start_time, program.end_time) else {
+                    continue;
+                };
+                // The search's own bounds: `end_time >= start` and `start_time <= end`.
+                if ends >= start && starts <= end {
+                    let mut inserted = false;
+                    self.program_cache
+                        .entry(key(tvg_id, source))
+                        .or_insert_with(|| {
+                            inserted = true;
+                            HasPrograms::Yes
+                        });
+                    if inserted {
+                        seed.seeded_yes += 1;
+                    }
+                }
+            }
+        }
+        seed.cancelled = cancelled();
+        seed
+    }
+
     /// Whether any programme on an EPG source ends at or after `cutoff`.
     ///
     /// One request: `GET /epg/programs/search/?epg_source=<id>&end_after=<cutoff>` with
@@ -248,25 +418,28 @@ impl DispatcharrClient {
         }
         let mut programs: Vec<CurrentProgram> = Vec::with_capacity(epg_data_ids.len());
         for chunk in epg_data_ids.chunks(CURRENT_PROGRAMS_CHUNK_SIZE) {
-            let body = serde_json::json!({ "epg_data_ids": chunk });
-            let answered: Vec<CurrentProgram> = self
-                .write_json(
-                    &reqwest::Method::POST,
-                    "/epg/current-programs/",
-                    Some(&body),
-                    Retry::Idempotent,
-                )
-                .await
-                .with_context(|| {
-                    format!(
-                        "reading what is airing on {} EPG entr{}",
-                        chunk.len(),
-                        if chunk.len() == 1 { "y" } else { "ies" }
-                    )
-                })?;
-            programs.extend(answered);
+            programs.extend(self.current_programs_chunk(chunk).await?);
         }
         Ok(programs)
+    }
+
+    /// One `POST /epg/current-programs/` of at most [`CURRENT_PROGRAMS_CHUNK_SIZE`] ids.
+    async fn current_programs_chunk(&self, chunk: &[i64]) -> Result<Vec<CurrentProgram>> {
+        let body = serde_json::json!({ "epg_data_ids": chunk });
+        self.write_json(
+            &reqwest::Method::POST,
+            "/epg/current-programs/",
+            Some(&body),
+            Retry::Idempotent,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "reading what is airing on {} EPG entr{}",
+                chunk.len(),
+                if chunk.len() == 1 { "y" } else { "ies" }
+            )
+        })
     }
 
     /// The latest programme end time on an EPG source, over the default bracket: the last

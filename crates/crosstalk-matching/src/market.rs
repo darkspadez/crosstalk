@@ -17,7 +17,7 @@
 
 use crate::data::merged::{merged_stations, MergedStation};
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 /// A market reference parsed from a channel name: the provider's market city, an
 /// optional trailing state, and the channel number after the stated network.
@@ -100,6 +100,34 @@ fn place_characters_ok(city: &str) -> bool {
     re.is_match(city)
 }
 
+/// The two per-network patterns [`parse_market_reference`] reads (the channel number after
+/// the network, and the network-plus-number prefix to strip), compiled once per network
+/// rather than per call (E-S6). Networks are a small vocabulary; the memo is still bounded.
+fn network_regexes(network: &str) -> Option<(regex::Regex, regex::Regex)> {
+    type Patterns = Option<(regex::Regex, regex::Regex)>;
+    static MEMO: OnceLock<Mutex<HashMap<String, Patterns>>> = OnceLock::new();
+    let memo = MEMO.get_or_init(Default::default);
+    if let Some(hit) = memo.lock().expect("market regex memo").get(network) {
+        return hit.clone();
+    }
+    let escaped = regex::escape(network);
+    let built: Patterns =
+        regex::Regex::new(&format!(r"(?i)^{escaped}\s+(\d{{1,3}})(?:/\d{{1,3}})?\b"))
+            .ok()
+            .zip(
+                regex::Regex::new(&format!(
+                    r"(?i)^{escaped}\s*(?:\d{{1,3}}(?:/\d{{1,3}})?)?\s*"
+                ))
+                .ok(),
+            );
+    let mut memo = memo.lock().expect("market regex memo");
+    if memo.len() >= 4096 {
+        memo.clear();
+    }
+    memo.insert(network.to_string(), built.clone());
+    built
+}
+
 /// Parse the market reference a name states (`market_index.parse_market_reference`).
 ///
 /// `network` is the network the name itself claims (CM's `_extract_stream_network`).
@@ -129,9 +157,7 @@ pub fn parse_market_reference(stream_name: &str, network: &str) -> Option<Market
 
     // Channel number: the token after the network.
     let mut number: Option<String> = None;
-    let escaped = regex::escape(network);
-    let num_re =
-        regex::Regex::new(&format!(r"(?i)^{escaped}\s+(\d{{1,3}})(?:/\d{{1,3}})?\b")).ok()?;
+    let (num_re, strip_re) = network_regexes(network)?;
     if let Some(caps) = num_re.captures(&text) {
         number = caps.get(1).map(|m| m.as_str().to_string());
     }
@@ -154,10 +180,6 @@ pub fn parse_market_reference(stream_name: &str, network: &str) -> Option<Market
     } else {
         city = text.clone();
     }
-    let strip_re = regex::Regex::new(&format!(
-        r"(?i)^{escaped}\s*(?:\d{{1,3}}(?:/\d{{1,3}})?)?\s*"
-    ))
-    .ok()?;
     city = strip_re.replace(&city, "").to_string();
     city = strip_noise(&city).to_uppercase();
     city = city

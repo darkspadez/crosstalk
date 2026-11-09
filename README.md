@@ -233,7 +233,8 @@ carry `THIRD_PARTY_LICENSES`, the licence text of every Rust crate compiled in.
 | `crosstalk exports clear [--app <id>] [--yes]` | Delete the CSV reports the sub-apps wrote (the UI's **Clear exports** button does the same) |
 | `crosstalk bench streams --synthetic [--config <dir>] [--channels N --streams N --accounts N]` | Time the streams plans on a world built in memory: no network, no Dispatcharr. See [Scale](#scale) |
 | `crosstalk bench streams --live [--config <dir>] [--write-timing --channel-ids <ids> --yes]` | Time the same plans against the configured Dispatcharr, read-only unless `--write-timing` is asked for twice |
-| `crosstalk bench lineup --synthetic [--config <dir>] [--channels N --lineup-channels N]` | Time the lineup plans (clean, names, categorize, logos, sync) on a world built in memory. See [Scale](#scale) |
+| `crosstalk bench lineup --synthetic [--config <dir>] [--channels N --lineup-channels N --streams N --tv-logos-per-country N] [--json]` | Time the lineup plans (clean, names, categorize, logos, sync, create, tidy, undo) on a world built in memory, with a file-backed identity cache. See [Scale](#scale) |
+| `crosstalk bench guide --synthetic [--config <dir>] [--channels N --entries N --sources N --delay-ms N] [--json]` | Time the guide plans (match, scan, heal) against an in-process fake Dispatcharr and count every request. See [Scale](#scale) |
 | `crosstalk simulate-streams --channels <csv> --streams <m3u> [--threshold 95]` | Offline stream-to-channel simulation on the unified engine (what guide and streams would take: a stream passes as a member of the channel's best identity family at the cut), for tuning the `[matching]` cut without touching a live install. `families.csv` lists every channel whose family takes each stream (two spellings of one identity both do); `best_channel` is the first in channel order |
 
 `crosstalk run` refuses an action that changes data unless `--yes` is passed, because a
@@ -611,6 +612,40 @@ synthetic lineup world: 20,000 channel(s), 500 lineup entr(y/ies)
 | `categorize_preview` / `categorize_apply` plan | **≈ 2.5 s** | The same resolve and rank; the category map is one lookup per family leader |
 | `logos_preview` / `logos_apply` plan | **≈ 0.02 s** | Without a tv-logos index (a synthetic bench never fetches) the EPG, Logo Manager and default tiers are lookups; the tv-logos fuzzy tier adds one similarity pass per candidate file per channel |
 | `sync_preview` / `sync_apply` plan, 351 entries | **≈ 1 ms** | Decide + create plan with the global number check; the rerun over the synced world plans nothing. Creates are one POST each (361 requests for 16 groups and 345 channels), which `bench streams --live --write-timing` prices on your box |
+| `create_preview` / `create_apply` plan, 50k streams | **<measured>** | Streams mode over the streams bench's world: 20k live channel identities (one batch warm, then rayon), one decision per stream on rayon, the foreign-family check through a family-key index, the create plan with the collision and number checks. One POST per created object |
+| `tidy_preview` / `tidy_apply` plan | **<measured>** | 10k owned channels judged, the tidy history read from the store (visibility rows only, indexed) |
+| host `undo` plan of a names apply | **<measured>** | The names plan recorded as a finished apply in the file store, planned back against the world it leaves |
+
+The audit's performance pass (docs/audit/E-perf.md) re-took these numbers with the identity cache
+on a FILE store (the batch warm pays real commits), a synthetic tv-logos tree of 1,500 files per
+country (so the `logos` row now includes the fuzzy tier) and an SLA line: every plan, setup
+included, under 10 s at 20k channels. `--json` prints the same report as one JSON document.
+
+| What (audit re-take) | Cost | Note |
+|---|---|---|
+| engine + merged index | **<measured>** | Index views now built on rayon |
+| `names_preview` / `names_apply` plan | **<measured>** | Batch warm (one read pass, one write transaction) before the rayon stage |
+| `categorize_preview` / `categorize_apply` plan | **<measured>** | Same warm, off the async runtime in the action |
+| `logos_preview` / `logos_apply` plan, tv-logos tier | **<measured>** | Filenames normalised once per directory, exact hits by hash, early-exit similarity at the 85 cut |
+| SLA line (`bench lineup`) | **<measured>** | PASS/FAIL against 10 s |
+
+The guide plans have their own bench (`crosstalk bench guide --synthetic`, audit E-S9): 20,000
+channels and 55,000 EPG entries in 20 sources, served by an in-process fake Dispatcharr that
+answers the programme search, the per-source horizon probe and `POST /epg/current-programs/`
+after `--delay-ms` per request and counts every request by kind. One source in ten has nothing in
+the window, one entry in seven carries no programmes, and most of the rest are airing now.
+
+```bash
+crosstalk bench guide --synthetic
+crosstalk bench guide --synthetic --delay-ms 20 --json
+```
+
+| What | Cost | Requests | Note |
+|---|---|---|---|
+| `match_preview` / `match_apply` plan | **<measured>** | **<measured>** | Every family member a walk could ask about is settled first: one horizon probe per source (an empty source answers "no" for all its entries) and one airing-now batch per 50 entries; only the rest are searched one by one |
+| `scan` plan | **<measured>** | **<measured>** | Same pre-seed over the assigned entries |
+| `heal_preview` / `heal_apply` plan | **<measured>** | **<measured>** | Pre-seed for the detection and again for the replacement walks; detection runs in batches with progress and cancel points |
+| SLA line (`bench guide`) | **<measured>** | | PASS/FAIL against 10 s |
 
 A debug build is 10–50× slower on exactly this code and says so in its own output; quote the
 release numbers. The point of the two-request-pattern bench is the bridge question: whether REST
