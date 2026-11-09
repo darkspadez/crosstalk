@@ -311,14 +311,16 @@ pub fn is_time_shift(name: &str) -> bool {
     plus_shift_re().is_match(name).unwrap_or(false)
 }
 
-/// Collapse the separators ignored for the no-space comparison: whitespace, `&`, `-`.
-fn letters_only_re() -> &'static fancy_regex::Regex {
-    static RE: OnceLock<fancy_regex::Regex> = OnceLock::new();
-    RE.get_or_init(|| fancy_regex::Regex::new(&pythonize(r"[\s&\-]+")).expect("static"))
-}
-
+/// Drop the separators ignored for the no-space comparison: Python's whitespace
+/// (Unicode `White_Space` plus `\x1c`-`\x1f`), `&` and `-`.
+///
+/// Byte-identical to the Python `re.sub(r"[\s&\-]+", "", text)` it ports (the
+/// pythonized fancy_regex this replaced is pinned against it in the tests), without
+/// a regex: it ran once per scored pair and was the top frame of the guide bench.
 fn nospace(text: &str) -> String {
-    letters_only_re().replace_all(text, "").into_owned()
+    text.chars()
+        .filter(|&c| !(crate::pyre::py_is_space(c) || c == '&' || c == '-'))
+        .collect()
 }
 
 /// JAN disagreement shape over SM designator tokens (decided T07).
@@ -676,14 +678,15 @@ impl UnifiedEngine {
     /// normalized callsign when the query's identity has a high-confidence
     /// callsign that exists in the merged station table, else `None` (the whole
     /// rule is off for that query — including callsign-led names whose callsign
-    /// no station row knows, and every name without a callsign).
-    fn callsign_first_query(&self, prep: &QueryPrep) -> Option<String> {
-        if !prep.high {
+    /// no station row knows, and every name without a callsign). Computed once per
+    /// query into [`QueryPrep::first_base`].
+    fn callsign_first_query(&self, high: bool, base: Option<&str>) -> Option<String> {
+        if !high {
             return None;
         }
-        let base = prep.base.clone()?;
-        if self.known.contains(&base) {
-            Some(base)
+        let base = base?;
+        if self.known.contains(base) {
+            Some(base.to_string())
         } else {
             None
         }
@@ -810,8 +813,8 @@ impl UnifiedEngine {
     fn score_core(&self, prep: &QueryPrep, view: &CandidateView) -> Option<(u8, EngineMethod)> {
         // Anchor picture (C06/D04 `lu-anchor`): agreement needs high confidence
         // on BOTH sides; disagreement hard-rejects (even an alias hit).
-        let anchor_agrees = match (prep.base.as_deref(), view.base.as_deref()) {
-            (Some(q), Some(c)) if prep.high && view.high => Some(q == normalize_callsign(c)),
+        let anchor_agrees = match (prep.base.as_deref(), view.anchor_base.as_deref()) {
+            (Some(q), Some(c)) if prep.high && view.high => Some(q == c),
             _ => None,
         };
 
@@ -826,7 +829,7 @@ impl UnifiedEngine {
         // here: it still matches at pair level, so a pool holding no station
         // keeps today's national family (the ranker prefers a same-callsign
         // candidate whenever one survives the cut — see `ranked_survivors`).
-        if let Some(query_base) = self.callsign_first_query(prep) {
+        if let Some(query_base) = prep.first_base.as_deref() {
             if let Some(candidate_base) = view.base.as_deref() {
                 if candidate_base != query_base && self.known.contains(candidate_base) {
                     return None;
@@ -875,31 +878,28 @@ impl UnifiedEngine {
                     consider(100, EngineMethod::Alias, Stage::Alias);
                 } else {
                     let threshold_ratio = f64::from(self.threshold) / 100.0;
-                    let candidate_chars: Vec<char> = view.norm_lower.chars().collect();
+                    let candidate_chars = view.norm_chars.as_slice();
                     let mut best_ratio = 0.0;
                     let mut best_len = 0;
-                    let mut best_processed = String::new();
-                    for (alias, processed) in prep
-                        .variant_spaced
-                        .iter()
-                        .zip(prep.variant_processed.iter())
+                    let mut best_processed = "";
+                    for (alias_chars, processed) in
+                        prep.variant_chars.iter().zip(prep.variant_processed.iter())
                     {
-                        let alias_chars: Vec<char> = alias.chars().collect();
                         let ratio = calculate_similarity_chars(
-                            &alias_chars,
-                            &candidate_chars,
+                            alias_chars,
+                            candidate_chars,
                             threshold_ratio,
                         );
                         if ratio > best_ratio {
                             best_ratio = ratio;
                             best_len = alias_chars.len().min(candidate_chars.len());
-                            best_processed = processed.clone();
+                            best_processed = processed.as_str();
                         }
                     }
                     let score = (best_ratio * 100.0) as u8;
                     if score >= length_scaled_threshold(self.threshold, best_len) {
                         let guarded = score < 100
-                            && !has_token_overlap_core(&best_processed, &view.processed, 4, true);
+                            && !has_token_overlap_core(best_processed, &view.processed, 4, true);
                         if !guarded {
                             consider(score, EngineMethod::Alias, Stage::Alias);
                         }
@@ -935,15 +935,7 @@ impl UnifiedEngine {
 
         // Stages 1-3 over the normalized pair (T03 `cm`, T09 `lu`).
         if view.scored {
-            let query_nospace = nospace(&prep.lower);
-            if let Some(hit) = self.fuzzy_stages(
-                &prep.lower,
-                &view.norm_lower,
-                &query_nospace,
-                &view.nospace,
-                &prep.processed,
-                &view.processed,
-            ) {
+            if let Some(hit) = self.fuzzy_stages(prep, view) {
                 consider(hit.0, hit.1, Stage::Fuzzy);
             }
         }
@@ -991,27 +983,24 @@ impl UnifiedEngine {
     /// applied here — the caller post-filters the winner once, as Engine.same
     /// post-filters ranked[0].
     ///
-    /// `processed_q` / `processed_c` are the token-sorted forms of the two lowered
-    /// keys, computed once per query and once per candidate (the phase 3 review bench
-    /// found the per-pair recomputation was most of a 20k-channel plan).
-    fn fuzzy_stages(
-        &self,
-        query_lower: &str,
-        candidate_lower: &str,
-        query_nospace: &str,
-        candidate_nospace: &str,
-        processed_q: &str,
-        processed_c: &str,
-    ) -> Option<(u8, EngineMethod)> {
-        let query_chars: Vec<char> = query_lower.chars().collect();
-        let candidate_chars: Vec<char> = candidate_lower.chars().collect();
+    /// Every derived form (lowered key, no-space form, token-sorted form and their
+    /// scalar values) is precomputed once per query ([`QueryPrep`]) and once per
+    /// candidate ([`CandidateView`]): the phase 3 review bench found the per-pair
+    /// recomputation was most of a 20k-channel plan, and the guide bench (audit E-B1
+    /// follow-up) found the per-pair no-space regex and `Vec<char>` collection were
+    /// most of what remained. Nothing here allocates on a miss.
+    fn fuzzy_stages(&self, prep: &QueryPrep, view: &CandidateView) -> Option<(u8, EngineMethod)> {
+        let query_lower = prep.lower.as_str();
+        let candidate_lower = view.norm_lower.as_str();
+        let query_chars = prep.lower_chars.as_slice();
+        let candidate_chars = view.norm_chars.as_slice();
         let threshold_ratio = f64::from(self.threshold) / 100.0;
 
         // Stage 1: exact after normalisation, then the guarded 0.97 tier (T04).
-        if query_nospace == candidate_nospace {
+        if prep.nospace == view.nospace {
             return Some((100, EngineMethod::Exact));
         }
-        let exact_ratio = calculate_similarity_chars(&query_chars, &candidate_chars, 0.97);
+        let exact_ratio = calculate_similarity_chars(query_chars, candidate_chars, 0.97);
         if exact_ratio >= 0.97 {
             let score = (exact_ratio * 100.0) as u8;
             let shorter = query_chars.len().min(candidate_chars.len());
@@ -1029,7 +1018,7 @@ impl UnifiedEngine {
             let longer = query_chars.len().max(candidate_chars.len());
             if longer > 0 && shorter as f64 / longer as f64 >= 0.75 {
                 let ratio =
-                    calculate_similarity_chars(&query_chars, &candidate_chars, threshold_ratio);
+                    calculate_similarity_chars(query_chars, candidate_chars, threshold_ratio);
                 let score = (ratio * 100.0) as u8;
                 if score >= length_scaled_threshold(self.threshold, shorter)
                     && has_token_overlap_core(query_lower, candidate_lower, 4, true)
@@ -1042,13 +1031,13 @@ impl UnifiedEngine {
         // Stage 3: token-sort fuzzy with the same scaled + majority guards.
         // `process_string_for_matching` lowercases internally, so the lowered
         // pair scores exactly as the cased one.
-        let pq: Vec<char> = processed_q.chars().collect();
-        let pc: Vec<char> = processed_c.chars().collect();
-        let ratio = calculate_similarity_chars(&pq, &pc, threshold_ratio);
+        let pq = prep.processed_chars.as_slice();
+        let pc = view.processed_chars.as_slice();
+        let ratio = calculate_similarity_chars(pq, pc, threshold_ratio);
         let score = (ratio * 100.0) as u8;
         let shorter = pq.len().min(pc.len());
         if score >= length_scaled_threshold(self.threshold, shorter)
-            && has_token_overlap_core(processed_q, processed_c, 4, true)
+            && has_token_overlap_core(&prep.processed, &view.processed, 4, true)
         {
             return Some((score, EngineMethod::Fuzzy(score)));
         }
@@ -1194,8 +1183,7 @@ impl UnifiedEngine {
         // different KNOWN callsign never reach the sort (`score_core` rejects
         // them); callsign-less candidates stay, ordered after every surviving
         // same-callsign candidate — the fallback when the pool holds no station.
-        let first_base = self.callsign_first_query(&prep);
-        let query_nospace = nospace(&prep.lower);
+        let first_base = prep.first_base.as_deref();
         let query_country = country_hint.or_else(|| self.country_of(query));
         let mut count = CountryFilterCount::default();
         let query_tokens = ascii_tokens(&query.to_lowercase());
@@ -1207,7 +1195,7 @@ impl UnifiedEngine {
         if let Some(indexes) = index.spaced_map.get(&prep.lower) {
             probe.extend_from_slice(indexes);
         }
-        if let Some(indexes) = index.nospace_map.get(&query_nospace) {
+        if let Some(indexes) = index.nospace_map.get(&prep.nospace) {
             probe.extend_from_slice(indexes);
         }
         // Verbatim-alias exact: the query's own variant norms hit the maps.
@@ -1268,9 +1256,7 @@ impl UnifiedEngine {
                     continue;
                 }
                 let overlap = token_overlap_count(&query_tokens, &index.names[i]);
-                let first = first_base
-                    .as_deref()
-                    .is_some_and(|qb| index.views[i].base.as_deref() == Some(qb));
+                let first = first_base.is_some_and(|qb| index.views[i].base.as_deref() == Some(qb));
                 scored.push((
                     EngineRanked {
                         index: i,
@@ -1408,18 +1394,23 @@ fn family_compatible(country: Option<&str>, i: usize, index: &EngineIndex) -> bo
 struct CandidateView {
     /// Full normalized key (empty when the name normalizes away).
     norm_key: String,
-    /// Lowercased normalized key.
+    /// Lowercased normalized key, and its scalar values (the similarity's input).
     norm_lower: String,
+    norm_chars: Vec<char>,
     /// Whether the fuzzy/alias-verbatim stages may score it (2+ chars).
     scored: bool,
     /// No-space comparison form.
     nospace: String,
-    /// Token-sorted comparison form.
+    /// Token-sorted comparison form, and its scalar values.
     processed: String,
+    processed_chars: Vec<char>,
     /// Extracted callsign (full) + positional confidence + normalized base.
     callsign: Option<String>,
     high: bool,
     base: Option<String>,
+    /// `normalize_callsign` of `base` again: what the anchor compares the query's
+    /// base against (the suffix strip is not idempotent, so this is not `base`).
+    anchor_base: Option<String>,
     /// Reverse-index canonical (identity half; no length floor, only empty).
     alias_canonical: Option<String>,
     /// `+N` time-shift marker on the ORIGINAL name.
@@ -1442,9 +1433,13 @@ impl CandidateView {
         let (callsign, high) = engine.callsign_confident(name);
         let base = callsign.as_deref().map(normalize_callsign);
         let zone = extract_zone_noguard(name);
+        let processed = process_string_for_matching(&norm_lower);
         Self {
             nospace: nospace(&norm_lower),
-            processed: process_string_for_matching(&norm_lower),
+            norm_chars: norm_lower.chars().collect(),
+            processed_chars: processed.chars().collect(),
+            processed,
+            anchor_base: base.as_deref().map(normalize_callsign),
             alias_canonical: engine.alias_canonical_of(&norm_key),
             designators: norm_lower
                 .split_whitespace()
@@ -1471,18 +1466,29 @@ impl CandidateView {
 /// variants, re-extract its callsign or re-run its zone regexes per candidate:
 /// everything query-side lives here.
 struct QueryPrep {
+    /// Lowercased normalized key, its scalar values and its no-space form.
     lower: String,
-    /// Token-sorted form of `lower` (stage 3), computed once per query.
+    lower_chars: Vec<char>,
+    nospace: String,
+    /// Token-sorted form of `lower` (stage 3), computed once per query, and its
+    /// scalar values.
     processed: String,
+    processed_chars: Vec<char>,
     trailing: Option<u32>,
     designators: HashSet<String>,
     shift: bool,
     west: bool,
     base: Option<String>,
     high: bool,
+    /// The callsign-first base (decided C07), see
+    /// [`UnifiedEngine::callsign_first_query`].
+    first_base: Option<String>,
     canonical: Option<String>,
     variant_lookup: HashSet<String>,
+    /// The verbatim-alias variants' lowered norms, their scalar values (parallel)
+    /// and their token-sorted forms (parallel).
     variant_spaced: Vec<String>,
+    variant_chars: Vec<Vec<char>>,
     variant_processed: Vec<String>,
 }
 
@@ -1496,6 +1502,7 @@ impl QueryPrep {
         let (callsign, high) = engine.callsign_confident(query);
         let mut variant_lookup = HashSet::new();
         let mut variant_spaced = Vec::new();
+        let mut variant_chars: Vec<Vec<char>> = Vec::new();
         let mut variant_processed = Vec::new();
         for variant in engine.aliases.aliases_for_exact(query) {
             let normalized = engine.normalize_key(variant);
@@ -1505,13 +1512,17 @@ impl QueryPrep {
             let lowered = normalized.to_lowercase();
             variant_lookup.insert(lowered.clone());
             variant_processed.push(process_string_for_matching(&lowered));
+            variant_chars.push(lowered.chars().collect());
             variant_spaced.push(lowered.clone());
             let stripped = nospace(&lowered);
             if stripped != lowered {
                 variant_lookup.insert(stripped);
             }
         }
+        let base = callsign.as_deref().map(normalize_callsign);
+        let processed = process_string_for_matching(&lower);
         Some(Self {
+            first_base: engine.callsign_first_query(high, base.as_deref()),
             designators: lower
                 .split_whitespace()
                 .filter(|t| crate::tokens::is_designator_token(t))
@@ -1520,13 +1531,17 @@ impl QueryPrep {
             trailing: trailing_number(&lower),
             shift: is_time_shift(query),
             west: extract_zone_noguard(query) == FeedZone::West,
-            base: callsign.as_deref().map(normalize_callsign),
+            base,
             high,
             canonical: engine.alias_canonical_of(&norm),
             variant_lookup,
             variant_spaced,
+            variant_chars,
             variant_processed,
-            processed: process_string_for_matching(&lower),
+            processed_chars: processed.chars().collect(),
+            processed,
+            lower_chars: lower.chars().collect(),
+            nospace: nospace(&lower),
             lower,
         })
     }
@@ -1551,12 +1566,15 @@ impl PreparedCandidate {
             CandidateView {
                 norm_key: String::new(),
                 norm_lower: String::new(),
+                norm_chars: Vec::new(),
                 scored: false,
                 nospace: String::new(),
                 processed: String::new(),
+                processed_chars: Vec::new(),
                 callsign: None,
                 high: false,
                 base: None,
+                anchor_base: None,
                 alias_canonical: None,
                 shift: false,
                 designators: HashSet::new(),
@@ -1899,6 +1917,57 @@ mod tests {
 
     fn engine() -> UnifiedEngine {
         UnifiedEngine::decided()
+    }
+
+    /// `nospace` is byte-identical to the pythonized `[\s&\-]+` removal it replaced
+    /// (audit E-B1 follow-up): for every scalar value, alone and in a run, and on
+    /// random strings over an alphabet weighted towards separators.
+    #[test]
+    fn nospace_matches_the_pythonized_regex() {
+        let re = fancy_regex::Regex::new(&pythonize(r"[\s&\-]+")).expect("static");
+        let old = |text: &str| re.replace_all(text, "").into_owned();
+
+        // Every scalar value, in chunks: `a{c}` and `a{c}{c}` (a run) per value.
+        let all: Vec<char> = (0u32..=0x10FFFF).filter_map(char::from_u32).collect();
+        for chunk in all.chunks(1024) {
+            let mut single = String::new();
+            let mut run = String::new();
+            for &c in chunk {
+                single.push('a');
+                single.push(c);
+                run.push('a');
+                run.push(c);
+                run.push(c);
+            }
+            single.push('a');
+            run.push('a');
+            let from = u32::from(chunk[0]);
+            assert_eq!(nospace(&single), old(&single), "from U+{from:04X}");
+            assert_eq!(nospace(&run), old(&run), "from U+{from:04X}");
+        }
+
+        let alphabet: Vec<char> = concat!(
+            " \t\n\r\u{b}\u{c}\u{1c}\u{1d}\u{1e}\u{1f}\u{85}\u{a0}\u{1680}\u{180e}",
+            "\u{2000}\u{200a}\u{200b}\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}\u{feff}",
+            "&-\u{2013}\u{2014}_.+|abcXYZ09\u{e9}\u{df}\u{65e5}\u{672c}",
+        )
+        .chars()
+        .collect();
+        // xorshift64: deterministic, no test dependency.
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..20_000 {
+            let len = (next() % 24) as usize;
+            let text: String = (0..len)
+                .map(|_| alphabet[(next() % alphabet.len() as u64) as usize])
+                .collect();
+            assert_eq!(nospace(&text), old(&text), "{text:?}");
+        }
     }
 
     #[test]
