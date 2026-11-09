@@ -41,9 +41,13 @@
 //!
 //! Measured 2026-11-05: the tree is 10,966 entries / 3.4 MiB, `truncated:
 //! false` (GitHub truncates past 100,000 entries or 7 MB). A truncated tree is
-//! still parsed, flagged on [`TvLogosIndex::truncated`] and warned about: the
-//! files it does list are real, and per-directory fetches would cost one
-//! request per country against the 60/h anonymous limit.
+//! still parsed and flagged on [`TvLogosIndex::truncated`]: the files it does
+//! list are real, and per-directory fetches would cost one request per country
+//! against the 60/h anonymous limit. The caller decides what a truncated tree
+//! may still be trusted for (lineup's `logos` keeps it away from replacing a
+//! logo a channel already has). A payload with no `tree` array, or one that
+//! yields no image at all, is not an index: [`TvLogosIndex::try_from_tree`]
+//! refuses it, and the fetch cache never stores it.
 //!
 //! # Fuzzy matching
 //!
@@ -250,13 +254,39 @@ fn is_image(name: &str) -> bool {
 }
 
 impl TvLogosIndex {
-    /// Parse the GitHub recursive-tree payload.
+    /// Parse a GitHub recursive-tree payload that must be an index.
+    ///
+    /// [`Self::from_tree`], refused when the payload has no `tree` array (an
+    /// error document, `{}`, an HTML page that happened to parse) or yields no
+    /// image file at all: an empty index would make every tv-logos lookup miss
+    /// silently, and the cache would keep serving it for a day.
+    pub fn try_from_tree(payload: &serde_json::Value) -> anyhow::Result<Self> {
+        if !payload.get("tree").is_some_and(serde_json::Value::is_array) {
+            anyhow::bail!("the tv-logos tree payload has no `tree` array");
+        }
+        let index = Self::from_tree(payload);
+        if index.files.is_empty() {
+            anyhow::bail!("the tv-logos tree lists no image under countries/");
+        }
+        Ok(index)
+    }
+
+    /// [`Self::try_from_tree`] over the raw response body.
+    pub fn try_from_body(body: &[u8]) -> anyhow::Result<Self> {
+        let payload: serde_json::Value = serde_json::from_slice(body)
+            .map_err(|error| anyhow::anyhow!("the tv-logos tree is not JSON: {error}"))?;
+        Self::try_from_tree(&payload)
+    }
+
+    /// Parse the GitHub recursive-tree payload, leniently.
     ///
     /// Keeps `blob` entries under `countries/<dir…>/<file>` with image
     /// extensions, keyed by the directory path. A path with an empty, `.` or
     /// `..` segment, or a backslash, is skipped: tree paths are data, and a
-    /// URL is built from them. Unknown shapes are skipped, never an error: a
-    /// tree with an extra key is still an index.
+    /// URL is built from them. Unknown entry shapes are skipped, never an
+    /// error: a tree with an extra key is still an index. A payload that is
+    /// not a tree at all yields an empty index here; use
+    /// [`Self::try_from_tree`] where that must be an error.
     pub fn from_tree(payload: &serde_json::Value) -> Self {
         let mut index = TvLogosIndex {
             truncated: payload
@@ -265,11 +295,6 @@ impl TvLogosIndex {
                 .unwrap_or(false),
             ..TvLogosIndex::default()
         };
-        if index.truncated {
-            tracing::warn!(
-                "the tv-logos tree came back truncated; logos past the cut are not matched"
-            );
-        }
         let Some(tree) = payload.get("tree").and_then(|t| t.as_array()) else {
             return index;
         };
@@ -1233,6 +1258,29 @@ mod tests {
     }
 
     #[test]
+    fn a_payload_that_is_not_a_tree_is_not_an_index() {
+        for payload in [
+            json!({}),
+            json!({"tree": null}),
+            json!({"tree": {}}),
+            json!({"tree": "x"}),
+            json!({"message": "API rate limit exceeded"}),
+            json!({"tree": []}),
+            json!({"tree": [{"path": "README.md", "type": "blob"}]}),
+        ] {
+            assert!(TvLogosIndex::try_from_tree(&payload).is_err(), "{payload}");
+        }
+        assert!(TvLogosIndex::try_from_body(b"<html>busy</html>").is_err());
+        let index = TvLogosIndex::try_from_tree(&fixture_tree()).expect("a real tree");
+        assert_eq!(index.files, TvLogosIndex::from_tree(&fixture_tree()).files);
+        let truncated = TvLogosIndex::try_from_body(
+            br#"{"truncated": true, "tree": [{"path": "countries/x/a.png", "type": "blob"}]}"#,
+        )
+        .expect("a truncated tree is still an index");
+        assert!(truncated.truncated);
+    }
+
+    #[test]
     fn gb_uses_the_repos_uk_suffix() {
         assert_eq!(country_suffix_for("GB"), "uk");
         assert_eq!(country_suffix_for("us"), "us");
@@ -1270,5 +1318,249 @@ mod tests {
             match_station_logo(&station, &files).as_deref(),
             Some("cbs-4-kxyz-dtv-us.png")
         );
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    //! Target 3 of docs/audit/D-inputs.md: the tv-logos tree parse and the URLs built from it.
+    use super::*;
+    use proptest::prelude::*;
+    use serde_json::{json, Value};
+    use std::collections::HashSet;
+
+    fn config() -> ProptestConfig {
+        // `PROPTEST_CASES` overrides this (10_000 for a local soak).
+        ProptestConfig {
+            cases: std::env::var("PROPTEST_CASES")
+                .ok()
+                .and_then(|cases| cases.parse().ok())
+                .unwrap_or(256),
+            ..ProptestConfig::default()
+        }
+    }
+
+    const SEGMENTS: &[&str] = &[
+        "",
+        ".",
+        "..",
+        "\\",
+        "countries",
+        "%",
+        "#",
+        "?",
+        " ",
+        "%2e%2e",
+        "ü",
+        "дом",
+        "a",
+        "b-c",
+        "us-local",
+        "united-states",
+    ];
+    const FILES: &[&str] = &[
+        "x.png",
+        "Y.PNG",
+        "z.svg",
+        "w.JpEg",
+        "v.webp",
+        "u.gif",
+        "n.txt",
+        "noext",
+        "a b.gif",
+        "%.webp",
+        "#.png",
+        "?.png",
+        "100%-news.png",
+        "genç.png",
+        ".png",
+        "..",
+        "",
+    ];
+
+    fn path() -> impl Strategy<Value = String> {
+        (
+            any::<bool>(),
+            proptest::collection::vec(proptest::sample::select(SEGMENTS), 0..4),
+            proptest::option::of(proptest::sample::select(FILES)),
+        )
+            .prop_map(|(countries, dirs, file)| {
+                let mut parts: Vec<&str> = Vec::new();
+                if countries {
+                    parts.push("countries");
+                }
+                parts.extend(dirs);
+                parts.extend(file);
+                parts.join("/")
+            })
+    }
+
+    fn entry() -> impl Strategy<Value = Value> {
+        let kind = prop_oneof![
+            4 => Just(Some("blob")),
+            1 => Just(Some("tree")),
+            1 => Just(Some("commit")),
+            1 => Just(Some("junk")),
+            1 => Just(None),
+        ];
+        prop_oneof![
+            8 => (path(), kind).prop_map(|(path, kind)| match kind {
+                Some(kind) => json!({"path": path, "type": kind}),
+                None => json!({"path": path}),
+            }),
+            1 => Just(json!({"type": "blob"})),
+            1 => Just(json!({"path": 7, "type": "blob"})),
+            1 => Just(json!(42)),
+            1 => Just(json!("countries/x/y.png")),
+            1 => Just(Value::Null),
+        ]
+    }
+
+    fn payload() -> impl Strategy<Value = Value> {
+        let truncated = prop_oneof![
+            Just(None),
+            Just(Some(json!(true))),
+            Just(Some(json!(false))),
+            Just(Some(json!("yes"))),
+            Just(Some(json!(1))),
+        ];
+        let tree = prop_oneof![
+            8 => proptest::collection::vec(entry(), 0..40).prop_map(|entries| Some(Value::Array(entries))),
+            1 => Just(None),
+            1 => Just(Some(Value::Null)),
+            1 => Just(Some(json!({}))),
+            1 => Just(Some(json!("tree"))),
+        ];
+        (truncated, tree).prop_map(|(truncated, tree)| {
+            let mut object = serde_json::Map::new();
+            if let Some(truncated) = truncated {
+                object.insert("truncated".to_string(), truncated);
+            }
+            if let Some(tree) = tree {
+                object.insert("tree".to_string(), tree);
+            }
+            object.insert("sha".to_string(), json!("junk"));
+            Value::Object(object)
+        })
+    }
+
+    fn bad_segment(segment: &str) -> bool {
+        segment.is_empty() || segment == "." || segment == ".." || segment.contains('\\')
+    }
+
+    fn percent_decode(segment: &str) -> Option<String> {
+        let bytes = segment.as_bytes();
+        let mut out = Vec::new();
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'%' {
+                let hex = std::str::from_utf8(bytes.get(index + 1..index + 3)?).ok()?;
+                out.push(u8::from_str_radix(hex, 16).ok()?);
+                index += 3;
+            } else {
+                out.push(bytes[index]);
+                index += 1;
+            }
+        }
+        String::from_utf8(out).ok()
+    }
+
+    /// The index rendered back into the tree shape it came from.
+    fn render(index: &TvLogosIndex) -> Value {
+        let mut entries = Vec::new();
+        for (dir, files) in &index.files {
+            for file in files {
+                entries.push(json!({"path": format!("countries/{dir}/{file}"), "type": "blob"}));
+            }
+        }
+        json!({"truncated": index.truncated, "tree": entries})
+    }
+
+    proptest! {
+        #![proptest_config(config())]
+
+        #[test]
+        fn every_indexed_file_is_a_safe_image_blob_under_countries(payload in payload()) {
+            let index = TvLogosIndex::from_tree(&payload);
+            prop_assert_eq!(
+                index.truncated,
+                payload.get("truncated").and_then(Value::as_bool).unwrap_or(false)
+            );
+            let blobs: HashSet<&str> = payload
+                .get("tree")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|entry| entry.get("type").and_then(Value::as_str) == Some("blob"))
+                .filter_map(|entry| entry.get("path").and_then(Value::as_str))
+                .collect();
+            for (dir, files) in &index.files {
+                prop_assert!(!dir.split('/').any(bad_segment), "dir {:?}", dir);
+                prop_assert!(!files.is_empty());
+                prop_assert!(files.windows(2).all(|pair| pair[0] <= pair[1]), "unsorted {:?}", files);
+                for file in files {
+                    prop_assert!(!bad_segment(file) && !file.contains('/'), "file {:?}", file);
+                    prop_assert!(is_image(file), "not an image: {:?}", file);
+                    let source = format!("countries/{dir}/{file}");
+                    prop_assert!(blobs.contains(source.as_str()), "no blob for {:?}", source);
+
+                    let url = build_logo_url(TV_LOGOS_REPO, TV_LOGOS_BRANCH, dir, file);
+                    let rest = url
+                        .strip_prefix("https://raw.githubusercontent.com/")
+                        .expect("host is raw.githubusercontent.com");
+                    prop_assert!(!rest.contains('?') && !rest.contains('#'), "{}", url);
+                    let decoded: Option<Vec<String>> = rest.split('/').map(percent_decode).collect();
+                    let mut expected: Vec<String> = ["tv-logo", "tv-logos", "main", "countries"]
+                        .iter()
+                        .map(|part| part.to_string())
+                        .collect();
+                    expected.extend(dir.split('/').map(str::to_string));
+                    expected.push(file.clone());
+                    prop_assert_eq!(decoded, Some(expected), "{}", url);
+                }
+            }
+            // Rendering the index back and re-parsing it is the identity.
+            let again = TvLogosIndex::from_tree(&render(&index));
+            prop_assert_eq!(&again.files, &index.files);
+            prop_assert_eq!(again.truncated, index.truncated);
+        }
+
+        #[test]
+        fn a_strict_parse_refuses_exactly_what_is_not_an_index(payload in payload()) {
+            let lenient = TvLogosIndex::from_tree(&payload);
+            let has_tree = payload.get("tree").is_some_and(Value::is_array);
+            match TvLogosIndex::try_from_tree(&payload) {
+                Ok(index) => {
+                    prop_assert!(has_tree && !lenient.files.is_empty());
+                    prop_assert_eq!(index.files, lenient.files);
+                    prop_assert_eq!(index.truncated, lenient.truncated);
+                }
+                Err(_) => prop_assert!(!has_tree || lenient.files.is_empty()),
+            }
+        }
+    }
+
+    #[test]
+    fn a_hundred_thousand_entries_parse_quickly() {
+        let entries: Vec<Value> = (0..100_000)
+            .map(|n| {
+                json!({
+                    "path": format!("countries/dir-{}/file-{n}.png", n % 120),
+                    "type": if n % 7 == 0 { "tree" } else { "blob" },
+                })
+            })
+            .collect();
+        let payload = json!({"truncated": false, "tree": entries});
+        let started = std::time::Instant::now();
+        let index = TvLogosIndex::try_from_tree(&payload).expect("an index");
+        let elapsed = started.elapsed();
+        assert_eq!(index.files.len(), 120);
+        // 500 ms is the release budget; an unoptimised test build gets ten times that.
+        let budget = if cfg!(debug_assertions) {
+            std::time::Duration::from_secs(5)
+        } else {
+            std::time::Duration::from_millis(500)
+        };
+        assert!(elapsed < budget, "{elapsed:?}");
     }
 }

@@ -650,6 +650,54 @@ async fn a_streamlink_host_is_skipped_without_running_anything() {
 }
 
 #[tokio::test]
+async fn a_url_outside_the_scheme_allow_list_is_skipped_without_running_anything() {
+    let config = content_config();
+    for url in ["-report", "file:/etc/passwd", "/etc/passwd", "concat:a|b"] {
+        let tools = runner();
+        let verdict = probe(&tools, &config, url, 11).await;
+        assert_eq!(verdict.class, Class::Skipped, "{url}");
+        assert_eq!(verdict.error_type, classify::UNSUPPORTED_URL, "{url}");
+        assert_eq!(verdict.health_class, "skipped", "{url}");
+        assert!(verdict.error.contains("unsupported URL"), "{url}");
+        assert!(
+            !verdict.error.contains(url),
+            "the URL stays out of the error"
+        );
+        assert!(!verdict.writes_stats(), "{url}");
+        assert!(tools.calls().is_empty(), "{url}: nothing was run");
+    }
+}
+
+#[tokio::test]
+async fn both_tools_get_the_url_as_i_and_the_protocol_whitelist() {
+    let url = "http://provider.test/a.ts";
+    let tools = runner()
+        .answering("ffprobe", url, alive(1920, 1080, "50/1"))
+        .answering("ffmpeg", url, ToolOutput::new(0, "", ""));
+    let verdict = probe(&tools, &content_config(), url, 12).await;
+    assert_eq!(verdict.class, Class::Alive, "{}", verdict.error);
+    let calls = tools.calls();
+    assert_eq!(calls.len(), 2, "ffprobe, then the content pass");
+    for spec in &calls {
+        let name = spec.program_name();
+        let at = spec.args.iter().position(|arg| arg == "-i").expect("-i");
+        assert_eq!(spec.args[at + 1], url, "{name}");
+        assert_eq!(
+            spec.args.iter().filter(|arg| arg.as_str() == url).count(),
+            1,
+            "{name}: the URL appears once, as the value of -i"
+        );
+        let wl = spec
+            .args
+            .iter()
+            .position(|arg| arg == "-protocol_whitelist")
+            .expect("-protocol_whitelist");
+        assert!(wl < at, "{name}: an input option must precede -i");
+        assert_eq!(spec.args[wl + 1], ffprobe::PROTOCOL_WHITELIST, "{name}");
+    }
+}
+
+#[tokio::test]
 async fn a_black_screen_is_dead_blank_and_wins_over_frozen() {
     let url = "http://provider.test/a.ts";
     let tools = runner()

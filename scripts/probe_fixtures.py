@@ -53,6 +53,8 @@ DEFAULT_OUT = REPO / "crates" / "streams" / "tests" / "fixtures" / "probe"
 # builds, without importing the plugin (it generates fixtures; `probe_parity.py` is what compares).
 USER_AGENT = "VLC/3.0.21 LibVLC/3.0.21"
 PROBESIZE = 10_000_000
+# crosstalk's hardening (README, Differences): network protocols only, the URL always `-i`.
+PROTOCOL_WHITELIST = "http,https,tls,tcp,udp,rtp,rtmp,rtmps,rtsp,srt,crypto,hls,httpproxy"
 ANALYZE_SECONDS = 8
 TIMEOUT_BUFFER_SECONDS = 5
 
@@ -247,7 +249,8 @@ def ffprobe_command(ffprobe: str, url: str, timeout: int, probe_timeout: int,
         "-show_packets",
         "-show_format",
         "-read_intervals", f"%+{analyze}",
-        url,
+        "-protocol_whitelist", PROTOCOL_WHITELIST,
+        "-i", url,
     ]
 
 
@@ -267,6 +270,7 @@ def ffmpeg_command(ffmpeg: str, url: str, timeout: int, settings: dict) -> list[
         "-hide_banner", "-nostats", "-loglevel", "info",
         "-user_agent", USER_AGENT,
         "-rw_timeout", str(timeout * 1_000_000),
+        "-protocol_whitelist", PROTOCOL_WHITELIST,
         "-i", url,
         "-t", str(sample),
     ]

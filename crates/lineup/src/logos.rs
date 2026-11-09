@@ -513,6 +513,16 @@ pub async fn load_tv_index(
     injected: Option<TvLogosIndex>,
     needed: bool,
 ) -> Result<Option<TvLogosIndex>> {
+    load_tv_index_from(data_dir, injected, needed, TV_LOGOS_TREE_URL).await
+}
+
+/// [`load_tv_index`] against a given tree URL (tests point it at a mock).
+async fn load_tv_index_from(
+    data_dir: &std::path::Path,
+    injected: Option<TvLogosIndex>,
+    needed: bool,
+    tree_url: &str,
+) -> Result<Option<TvLogosIndex>> {
     if !needed {
         return Ok(None);
     }
@@ -520,10 +530,41 @@ pub async fn load_tv_index(
         return Ok(Some(index));
     }
     let cache = FetchCache::tv_logos(data_dir)?;
-    let fetched = cache.fetch(TV_LOGOS_TREE_URL).await?;
-    let payload: serde_json::Value = serde_json::from_slice(&fetched.body)
-        .map_err(|error| anyhow::anyhow!("the tv-logos tree is not JSON: {error:#}"))?;
-    Ok(Some(TvLogosIndex::from_tree(&payload)))
+    Ok(Some(fetch_tv_index(&cache, tree_url).await?))
+}
+
+/// Fetch and parse the tree through the cache. Only a body that parses as an
+/// index is stored or served ([`TvLogosIndex::try_from_body`]): an error page
+/// answered with a 200, or `{}`, is a failed fetch (the stale copy serves when
+/// there is one), never a cached empty index that silently matches nothing.
+pub async fn fetch_tv_index(cache: &FetchCache, tree_url: &str) -> Result<TvLogosIndex> {
+    let fetched = cache
+        .fetch_validated(tree_url, |body| {
+            TvLogosIndex::try_from_body(body).map(|_| ())
+        })
+        .await?;
+    let index = TvLogosIndex::try_from_body(&fetched.body)?;
+    if index.truncated {
+        tracing::warn!(
+            "the tv-logos tree came back truncated; logos past the cut are not matched, and \
+             a replace run keeps the logos channels already carry"
+        );
+    }
+    Ok(index)
+}
+
+/// The report line for a truncated tree, when the run met one.
+fn truncated_note(index: Option<&TvLogosIndex>, replace_existing: bool) -> Option<String> {
+    if !index.is_some_and(|index| index.truncated) {
+        return None;
+    }
+    Some(if replace_existing {
+        "GitHub truncated the tree: logos past the cut are not matched, and a channel that \
+         already has a logo keeps it (a partial tree could replace it with a worse match)"
+            .to_string()
+    } else {
+        "GitHub truncated the tree: logos past the cut are not matched".to_string()
+    })
 }
 
 /// Run `logos_preview` / `logos_apply`.
@@ -541,7 +582,6 @@ pub async fn run(
 }
 
 /// [`run`] with an injected tv-logos index (tests, no network) and creator.
-#[allow(clippy::too_many_lines)]
 pub async fn run_with(
     app: &dyn SubApp,
     context: &JobContext,
@@ -549,6 +589,29 @@ pub async fn run_with(
     dry_run: bool,
     tv_injected: Option<TvLogosIndex>,
     creator: Option<Arc<dyn ChannelCreator>>,
+) -> Result<JobOutcome> {
+    run_with_tree_url(
+        app,
+        context,
+        settings,
+        dry_run,
+        tv_injected,
+        creator,
+        TV_LOGOS_TREE_URL,
+    )
+    .await
+}
+
+/// [`run_with`] against a given tree URL: the network path, testable.
+#[allow(clippy::too_many_lines)]
+async fn run_with_tree_url(
+    app: &dyn SubApp,
+    context: &JobContext,
+    settings: &crate::settings::LineupSettings,
+    dry_run: bool,
+    tv_injected: Option<TvLogosIndex>,
+    creator: Option<Arc<dyn ChannelCreator>>,
+    tree_url: &str,
 ) -> Result<JobOutcome> {
     let action_id = if dry_run {
         crate::ACTION_LOGOS_PREVIEW
@@ -594,9 +657,14 @@ pub async fn run_with(
         && channels
             .iter()
             .any(|channel| !has_logo_id(channel.logo_id) || settings.replace_existing);
-    let tv_index = load_tv_index(&context.data_dir(), tv_injected, needs_tv).await?;
+    let tv_index = load_tv_index_from(&context.data_dir(), tv_injected, needs_tv, tree_url).await?;
     let enabled: Vec<String> = config.matching.databases();
     let sources = lookups.sources(order.clone(), tv_index.as_ref(), settings);
+    // A truncated tree is missing files, so its best fuzzy match may be a worse
+    // file than the one a channel already carries: it never REPLACES a logo. A
+    // channel with no logo still takes what the partial tree offers.
+    let truncated = tv_index.as_ref().is_some_and(|index| index.truncated);
+    let without_tv = lookups.sources(order.clone(), None, settings);
 
     // One resolve per channel, on every core (the tv-logos fuzzy tier is the costly
     // part: one similarity pass per candidate file per channel).
@@ -605,7 +673,12 @@ pub async fn run_with(
         .map(|channel| {
             let identity = run_engine.resolve(&channel.name, &ctx);
             let codes = tv_countries(settings, &identity, &enabled);
-            decide_logo(channel, &identity, &lookups, &sources, &codes, settings)
+            let sources = if truncated && has_logo_id(channel.logo_id) {
+                &without_tv
+            } else {
+                &sources
+            };
+            decide_logo(channel, &identity, &lookups, sources, &codes, settings)
         })
         .collect();
 
@@ -820,6 +893,9 @@ pub async fn run_with(
         )
         .result("Skipped", plan.skipped.len() + skipped)
         .setting(cut.0, cut.1);
+    if let Some(note) = truncated_note(tv_index.as_ref(), settings.replace_existing) {
+        report = report.result("tv-logos tree", note);
+    }
     let mut sources: Vec<(String, usize)> = by_source
         .into_iter()
         .map(|(source, count)| {
@@ -1514,6 +1590,95 @@ mod tests {
             undo.left.iter().any(|left| left.kind == "logo"),
             "created logos are left and listed: {undo:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_tree_that_is_not_an_index_fails_the_run_before_any_write() {
+        let world = logos_world();
+        let (server, config, _dir) = serve(&world).await;
+        for body in ["{}", "<html>rate limited</html>"] {
+            Mock::given(method("GET"))
+                .and(path("/tree"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            let store = Store::in_memory().expect("store");
+            let app = crate::LineupApp::new();
+            let (context, _) = context_for(&config, &store, "lineup", "logos_apply", false);
+            let error = run_with_tree_url(
+                &app,
+                &context,
+                &test_settings(),
+                false,
+                None,
+                None,
+                &format!("{}/tree", server.uri()),
+            )
+            .await
+            .expect_err("not an index");
+            assert!(format!("{error:#}").contains("tv-logos"), "{error:#}");
+        }
+        let writes: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|request| request.method.as_str() != "GET")
+            .collect();
+        assert!(writes.is_empty(), "nothing was written: {writes:?}");
+        // And nothing was cached: the next run asks again instead of serving `{}`.
+        let cache = FetchCache::tv_logos(&_dir.path().join("cache-check")).expect("cache");
+        Mock::given(method("GET"))
+            .and(path("/tree2"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let url = format!("{}/tree2", server.uri());
+        fetch_tv_index(&cache, &url).await.expect_err("first");
+        fetch_tv_index(&cache, &url)
+            .await
+            .expect_err("not served from cache");
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn a_truncated_tree_never_replaces_a_logo_a_channel_has() {
+        let world = logos_world();
+        let (_server, config, _dir) = serve(&world).await;
+        let mut tree = fixture_tree();
+        tree["truncated"] = json!(true);
+        tree["tree"]
+            .as_array_mut()
+            .expect("tree")
+            .push(json!({"path": "countries/united-states/hbo-us.png", "type": "blob"}));
+        let index = TvLogosIndex::try_from_tree(&tree).expect("index");
+        assert!(index.truncated);
+        let mut settings = test_settings();
+        settings.replace_existing = true;
+        settings.logo_sources = "tv-logos, logo_manager".to_string();
+        let store = Store::in_memory().expect("store");
+        let app = crate::LineupApp::new();
+        let (context, _) = context_for(&config, &store, "lineup", "logos_preview", true);
+        let outcome = run_with(&app, &context, &settings, true, Some(index), None)
+            .await
+            .expect("previews");
+        let text = std::fs::read_to_string(outcome.report_path.expect("report")).expect("read");
+        assert!(
+            text.contains("# ") && text.contains("GitHub truncated the tree"),
+            "{text}"
+        );
+        let row = |id: &str| {
+            text.lines()
+                .find(|line| line.starts_with(&format!("{id},")))
+                .unwrap_or_default()
+                .to_string()
+        };
+        // HBO already has a logo: the partial tree's hbo-us.png does not replace it.
+        assert!(!row("6").contains("hbo-us.png"), "{}", row("6"));
+        // A channel with no logo still takes what the partial tree offers.
+        assert!(row("3").contains("food-network-us.png"), "{}", row("3"));
     }
 
     #[tokio::test]

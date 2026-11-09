@@ -100,15 +100,17 @@ impl ToolSpec {
         }
         line
     }
-    /// The URL being probed: the one argument of either command that carries a scheme.
+    /// The URL being probed: the value of `-i`, or else the one argument carrying a scheme.
     ///
-    /// Not the last argument: ffprobe takes the URL last, and ffmpeg takes it in the middle
-    /// (`-i <url> -t 6 … -f null -`), so a fake keyed on "last" would key every ffmpeg call on
-    /// `-`.
+    /// Not the last argument: both commands take the URL as `-i <url>` followed by more
+    /// flags (`-t 6 … -f null -` for ffmpeg), so a fake keyed on "last" would key every ffmpeg
+    /// call on `-`.
     pub fn url(&self) -> Option<&str> {
         self.args
             .iter()
-            .find(|arg| arg.contains("://"))
+            .position(|arg| arg == "-i")
+            .and_then(|at| self.args.get(at + 1))
+            .or_else(|| self.args.iter().find(|arg| arg.contains("://")))
             .map(String::as_str)
     }
 
@@ -244,6 +246,8 @@ impl ProcessRunner {
         let mut child = command
             .spawn()
             .with_context(|| format!("running {}", spec.masked_command_line()))?;
+        // Taken now: once the child is reaped `id()` is gone, and the group may outlive it.
+        let group = child.id();
 
         // Read both pipes while the child runs: ffprobe's stdout for 8 s of packets is far
         // larger than a pipe buffer, so reading after the wait would deadlock the child. Each
@@ -274,7 +278,10 @@ impl ProcessRunner {
 
         match stop {
             Stop::Exited(status) => {
-                output.status = status.context("waiting for the tool to finish")?.code()
+                output.status = status.context("waiting for the tool to finish")?.code();
+                // A grandchild the tool left behind still holds the pipes open: end the group
+                // so the reads below reach EOF instead of waiting on it.
+                kill_group_id(group);
             }
             Stop::TimedOut => {
                 output.timed_out = true;
@@ -286,39 +293,44 @@ impl ProcessRunner {
             }
         }
 
-        // After a kill the pipes close once the group is gone; the bound is the backstop
-        // for a process that escaped the group, so a probe never outlives its cap by more.
-        let killed = output.timed_out || output.cancelled;
-        let stdout = collect(stdout_task, killed).await;
-        let stderr = collect(stderr_task, killed).await;
+        // The pipes close once the group is gone; the bound is the backstop for a process
+        // that escaped the group, so a probe never outlives its cap (or its exit) by more.
+        let stdout = collect(stdout_task).await;
+        let stderr = collect(stderr_task).await;
         output.stdout = String::from_utf8_lossy(&stdout).into_owned();
         output.stderr = String::from_utf8_lossy(&stderr).into_owned();
         Ok(output)
     }
 }
 
-/// How long the pipe readers may run on after a kill before what they hold is given up.
+/// How long the pipe readers may run on after the child stopped before what they hold is
+/// given up.
 const AFTER_KILL_READ: Duration = Duration::from_secs(2);
 
-/// Kill the child and every process in its group, then reap it.
-async fn kill_group(child: &mut tokio::process::Child) {
+/// Signal every process in the group the child leads.
+fn kill_group_id(group: Option<u32>) {
     #[cfg(unix)]
-    if let Some(pid) = child.id() {
+    if let Some(pid) = group {
         // SAFETY: `killpg` only sends a signal; the group id is the child's pid because it
-        // was spawned with `process_group(0)`, and a stale id fails harmlessly with ESRCH.
+        // was spawned with `process_group(0)`, and a group with no members left fails
+        // harmlessly with ESRCH (a pid is not reused while its group still has members).
         unsafe {
             libc::killpg(pid as libc::pid_t, libc::SIGKILL);
         }
     }
+    #[cfg(not(unix))]
+    let _ = group;
+}
+
+/// Kill the child and every process in its group, then reap it.
+async fn kill_group(child: &mut tokio::process::Child) {
+    kill_group_id(child.id());
     let _ = child.kill().await;
     let _ = child.wait().await;
 }
 
-/// A pipe reader's bytes; after a kill, bounded by [`AFTER_KILL_READ`].
-async fn collect(task: tokio::task::JoinHandle<Vec<u8>>, killed: bool) -> Vec<u8> {
-    if !killed {
-        return task.await.unwrap_or_default();
-    }
+/// A pipe reader's bytes, bounded by [`AFTER_KILL_READ`] once the child has stopped.
+async fn collect(task: tokio::task::JoinHandle<Vec<u8>>) -> Vec<u8> {
     let abort = task.abort_handle();
     match tokio::time::timeout(AFTER_KILL_READ, task).await {
         Ok(bytes) => bytes.unwrap_or_default(),
@@ -347,9 +359,53 @@ impl ToolRunner for ProcessRunner {
                      streams.toml if it lives elsewhere."
                 );
             }
+            check_tool_file(role, path)?;
         }
         Ok(())
     }
+}
+
+/// The checks on a configured tool path that need no filesystem: absolute, and named for the
+/// tool (`ffprobe`, `ffprobe.exe`). `settings::validate` runs these on every load and save.
+///
+/// The path is executed for every probe, so a path that names anything else (`/bin/sh`, a
+/// script in a writable directory) is refused rather than run.
+pub fn check_tool_path(role: &str, path: &str) -> Result<()> {
+    let candidate = Path::new(path);
+    if !candidate.is_absolute() {
+        anyhow::bail!("{role}_path must be an absolute path, got {path:?}");
+    }
+    let name = candidate
+        .file_name()
+        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if name != role && name != format!("{role}.exe") {
+        anyhow::bail!(
+            "{role}_path must name the {role} executable ({role} or {role}.exe), got {path:?}"
+        );
+    }
+    Ok(())
+}
+
+/// [`check_tool_path`], plus what only the filesystem can answer: the file is executable and
+/// not world-writable (anyone who can rewrite it runs code as the daemon).
+pub fn check_tool_file(role: &str, path: &str) -> Result<()> {
+    check_tool_path(role, path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)
+            .with_context(|| format!("reading {role}_path {path}"))?
+            .permissions()
+            .mode();
+        if mode & 0o111 == 0 {
+            anyhow::bail!("{role}_path {path} is not executable");
+        }
+        if mode & 0o002 != 0 {
+            anyhow::bail!("{role}_path {path} is world-writable; refusing to run it");
+        }
+    }
+    Ok(())
 }
 
 /// A runner that answers from a table, for tests and the parity harness.
@@ -588,9 +644,75 @@ mod tests {
         assert!(format!("{error}").contains("ffprobe not found"), "{error}");
         // ffmpeg is only required when a content detector is on, which the caller expresses by
         // passing `None`.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let ffprobe = fake_tool(directory.path(), "ffprobe", 0o755);
         assert!(ProcessRunner::new(Arc::new(AtomicBool::new(false)))
-            .preflight("/bin/sh", None)
+            .preflight(&ffprobe, None)
             .is_ok());
+    }
+
+    /// An executable file named `name` with `mode`, for the path checks.
+    fn fake_tool(directory: &Path, name: &str, mode: u32) -> String {
+        let path = directory.join(name);
+        std::fs::write(&path, "#!/bin/sh\n").expect("write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        path.display().to_string()
+    }
+
+    #[test]
+    fn a_tool_path_must_be_absolute_and_named_for_the_tool() {
+        for path in [
+            "/usr/bin/ffprobe",
+            "/opt/homebrew/bin/ffprobe",
+            "/x/FFPROBE.exe",
+        ] {
+            check_tool_path("ffprobe", path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        }
+        check_tool_path("ffmpeg", "/usr/bin/ffmpeg").expect("ffmpeg");
+        for path in [
+            "/bin/sh",
+            "ffprobe",
+            "bin/ffprobe",
+            "/usr/bin/ffmpeg",
+            "/usr/bin/ffprobe.sh",
+            "/usr/bin/",
+            "",
+        ] {
+            assert!(check_tool_path("ffprobe", path).is_err(), "{path:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tool_file_must_be_executable_and_not_world_writable() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let runner = ProcessRunner::new(Arc::new(AtomicBool::new(false)));
+        let good = fake_tool(directory.path(), "ffprobe", 0o755);
+        runner
+            .preflight(&good, None)
+            .expect("a normal install passes");
+
+        let plain = tempfile::tempdir().expect("tempdir");
+        let not_executable = fake_tool(plain.path(), "ffprobe", 0o644);
+        let error = runner
+            .preflight(&not_executable, None)
+            .expect_err("refused");
+        assert!(format!("{error}").contains("not executable"), "{error}");
+
+        let open = tempfile::tempdir().expect("tempdir");
+        let writable = fake_tool(open.path(), "ffprobe", 0o777);
+        let error = runner.preflight(&writable, None).expect_err("refused");
+        assert!(format!("{error}").contains("world-writable"), "{error}");
+
+        // A real binary under another name is refused before anything runs it.
+        let error = runner.preflight("/bin/sh", None).expect_err("refused");
+        assert!(format!("{error}").contains("ffprobe_path"), "{error}");
     }
 
     /// An opt-in check that the real runner actually runs a real process, times it out and
@@ -624,6 +746,27 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "the cap is enforced, not waited out"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_grandchild_left_holding_the_pipes_does_not_outlive_a_normal_exit() {
+        let runner = ProcessRunner::new(Arc::new(AtomicBool::new(false)));
+        // The shell exits at once; the backgrounded sleep inherits stdout and would keep the
+        // read open for 30 s if the group were not ended after the exit.
+        let spec = ToolSpec::new(
+            "/bin/sh",
+            vec!["-c".to_string(), "sleep 30 & printf done".to_string()],
+            Duration::from_secs(60),
+        );
+        let started = std::time::Instant::now();
+        let output = runner.run(&spec).await.expect("ran");
+        assert_eq!(output.status, Some(0));
+        assert_eq!(output.stdout, "done");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the reads ended with the group, not with the sleep"
         );
     }
 

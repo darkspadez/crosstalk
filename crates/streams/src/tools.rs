@@ -440,19 +440,7 @@ pub async fn run_scan_placeholders(
         &PLACEHOLDER_COLUMNS,
         |writer| {
             for (index, family) in scan.families.iter().enumerate() {
-                writer.write_record([
-                    placeholder_scan::ascii_safe(&family.template),
-                    family.count.to_string(),
-                    family.distinct_numbers.to_string(),
-                    placeholder_scan::ascii_safe(&family.example),
-                    family.with_epg_id.to_string(),
-                    family.covered.to_string(),
-                    family.uncovered.to_string(),
-                    family.suggested.clone(),
-                    family.suggestion_too_long().to_string(),
-                    family.mostly_carries_epg().to_string(),
-                    (index < placeholder_scan::DETAIL_LIMIT).to_string(),
-                ])?;
+                writer.write_record(placeholder_row(index, family))?;
             }
             Ok(())
         },
@@ -469,6 +457,24 @@ pub async fn run_scan_placeholders(
         .count("patterns", scan.patterns as i64)
         .report(Some(path))
         .build())
+}
+
+/// One family's CSV row. The three text cells are provider stream names (or built from
+/// them), so they are ASCII-escaped like the readout and formula-defused like every other cell.
+fn placeholder_row(index: usize, family: &placeholder_scan::Family) -> [String; 11] {
+    [
+        csv_report::safe_cell(&placeholder_scan::ascii_safe(&family.template)),
+        family.count.to_string(),
+        family.distinct_numbers.to_string(),
+        csv_report::safe_cell(&placeholder_scan::ascii_safe(&family.example)),
+        family.with_epg_id.to_string(),
+        family.covered.to_string(),
+        family.uncovered.to_string(),
+        csv_report::safe_cell(&placeholder_scan::ascii_safe(&family.suggested)),
+        family.suggestion_too_long().to_string(),
+        family.mostly_carries_epg().to_string(),
+        (index < placeholder_scan::DETAIL_LIMIT).to_string(),
+    ]
 }
 
 // =======================================================================================
@@ -1146,6 +1152,35 @@ mod tests {
             .bodies("PATCH", "/api/channels/channels/edit/bulk/")
             .await
             .is_empty());
+    }
+
+    #[test]
+    fn a_placeholder_row_defuses_formulas_in_its_text_cells() {
+        let family = placeholder_scan::Family {
+            template: "=HYPERLINK(\"http://x\") #".to_string(),
+            count: 2,
+            distinct_numbers: 2,
+            example: "+cmd|' /C calc'!A0 1".to_string(),
+            with_epg_id: 0,
+            covered: 0,
+            uncovered: 2,
+            suggested: "@SUM(1) \\d+ é".to_string(),
+        };
+        let row = placeholder_row(0, &family);
+        assert!(row[0].starts_with("'="), "{}", row[0]);
+        assert!(row[3].starts_with("'+"), "{}", row[3]);
+        assert!(row[7].starts_with("'@"), "{}", row[7]);
+        assert!(row[7].ends_with("\\u00e9"), "ASCII-escaped too: {}", row[7]);
+        // A pattern that does not look like a formula is pasteable as written.
+        let plain = placeholder_scan::Family {
+            template: "PPV EVENT #".to_string(),
+            example: "PPV EVENT 1".to_string(),
+            suggested: "^PPV EVENT \\d+$".to_string(),
+            ..family
+        };
+        let row = placeholder_row(0, &plain);
+        assert_eq!(row[0], "PPV EVENT #");
+        assert_eq!(row[7], "^PPV EVENT \\d+$");
     }
 
     #[tokio::test]

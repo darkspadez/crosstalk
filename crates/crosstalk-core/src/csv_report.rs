@@ -70,7 +70,25 @@ pub fn preamble(
         lines.push(format!("#   {label}: {value}"));
     }
     lines.push("#".to_string());
-    lines
+    lines.into_iter().map(|line| comment_line(&line)).collect()
+}
+
+/// One preamble line made safe to write: every control character (a CR or LF inside a
+/// channel name, a tab, an escape) becomes a space, and a line that does not open with `#`
+/// gets one.
+///
+/// The labels and values come from Dispatcharr names and the operator's settings; a newline
+/// in one would end the comment line and start a data row the spreadsheet reads as a cell.
+pub fn comment_line(text: &str) -> String {
+    let line: String = text
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    if line.starts_with('#') {
+        line
+    } else {
+        format!("# {line}")
+    }
 }
 
 /// The settings, rendered under the labels the form shows.
@@ -151,7 +169,9 @@ fn render_databases(host: &CrosstalkConfig) -> String {
 /// Write a report: preamble, header row, then the rows.
 ///
 /// Rows are written through a callback so a caller can stream them rather than build the whole
-/// table first.
+/// table first. Every preamble line passes through [`comment_line`] here, whoever built it, so
+/// a caller's line can never break out of the comment block. The file is UTF-8 with no BOM: a
+/// BOM would sit in front of the first `#` and make the first line a data row.
 pub fn write_report<F>(
     path: &Path,
     preamble_lines: &[String],
@@ -174,7 +194,7 @@ where
             .with_context(|| format!("creating the report {}", path.display()))?;
         let mut buffer = String::new();
         for line in preamble_lines {
-            buffer.push_str(line);
+            buffer.push_str(&comment_line(line));
             buffer.push_str("\r\n");
         }
         file.write_all(buffer.as_bytes())
@@ -283,7 +303,10 @@ impl<'a> Report<'a> {
         // The preamble closes with a lone `#`; extra settings go just above it.
         let closing = preamble.len().saturating_sub(1);
         for (offset, (label, value)) in self.settings.iter().enumerate() {
-            preamble.insert(closing + offset, format!("#   {label}: {value}"));
+            preamble.insert(
+                closing + offset,
+                comment_line(&format!("#   {label}: {value}")),
+            );
         }
         write_report(&path, &preamble, header, rows)?;
         Ok(path)
@@ -309,18 +332,24 @@ impl<'a> Report<'a> {
 /// Defuse a spreadsheet formula before it reaches the CSV.
 ///
 /// Channel and guide names come from Dispatcharr, which an operator does not control:
-/// a name starting with `=`, `+`, `-` or `@` (or a tab/CR, which some spreadsheets
-/// also honour) would execute as a formula when the export is opened. Prefixing such
-/// a cell with a single quote keeps the text visible but inert. Note the quote BECOMES
-/// part of the parsed CSV value: a spreadsheet hides it as a display instruction, but
-/// any other CSV reader sees the quote as the cell's first character. Ordinary cells
-/// pass through unchanged.
+/// a name whose first non-whitespace character is `=`, `+`, `-` or `@` (or their full-width
+/// forms `＝ ＋ － ＠`, which some spreadsheets fold to ASCII), or one that starts with a
+/// tab or a line break, would execute as a formula when the export is opened — spreadsheets
+/// skip leading whitespace before deciding. Prefixing such a cell with a single quote keeps
+/// the text visible but inert. Note the quote BECOMES part of the parsed CSV value: a
+/// spreadsheet hides it as a display instruction, but any other CSV reader sees the quote as
+/// the cell's first character. Ordinary cells pass through unchanged.
 pub fn safe_cell(text: &str) -> String {
-    match text.chars().next() {
-        Some('=') | Some('+') | Some('-') | Some('@') | Some('\t') | Some('\r') => {
-            format!("'{text}")
-        }
-        _ => text.to_string(),
+    let leads_with_break = matches!(text.chars().next(), Some('\t' | '\r' | '\n'));
+    let first = text.chars().find(|ch| !ch.is_whitespace());
+    let formula = matches!(
+        first,
+        Some('=' | '+' | '-' | '@' | '\u{FF1D}' | '\u{FF0B}' | '\u{FF0D}' | '\u{FF20}')
+    );
+    if leads_with_break || formula {
+        format!("'{text}")
+    } else {
+        text.to_string()
     }
 }
 
@@ -634,10 +663,36 @@ mod tests {
 
     #[test]
     fn formula_cells_are_quoted_and_plain_ones_pass_through() {
-        for hostile in ["=cmd", "+1", "-2", "@mention", "\tindented", "\rreturn"] {
+        for hostile in [
+            "=cmd",
+            "+1",
+            "-2",
+            "@mention",
+            "\tindented",
+            "\rreturn",
+            "\nnewline",
+            " =cmd",
+            "  \u{3000}+1",
+            "\u{FF1D}cmd",
+            "\u{FF0B}1",
+            "\u{FF0D}2",
+            "\u{FF20}x",
+            " \u{FF1D}cmd",
+        ] {
             assert_eq!(safe_cell(hostile), format!("'{hostile}"), "{hostile:?}");
         }
-        for plain in ["ESPN HD", "007", "", "(not set)", "Yes", "N/A", "'already"] {
+        for plain in [
+            "ESPN HD",
+            "007",
+            "",
+            "   ",
+            "(not set)",
+            "Yes",
+            "N/A",
+            "'already",
+            " ESPN",
+            "a=b",
+        ] {
             assert_eq!(safe_cell(plain), plain, "{plain:?}");
         }
     }
@@ -890,6 +945,49 @@ mod tests {
         for line in &lines {
             assert!(line.starts_with('#'), "not a comment: {line:?}");
         }
+    }
+
+    #[test]
+    fn a_line_break_in_a_result_or_setting_stays_inside_the_comment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = StubApp::new();
+        let report = Report::new(dir.path(), &app, "names", "Names Preview")
+            .result("Renamed\r\n=HYPERLINK(1)", "ESPN\nFOX\u{1b}[31m")
+            .setting("Template\n", "{name}\r=cmd");
+        let path = report
+            .write(
+                &CrosstalkConfig::default(),
+                &SettingsSchema::new(vec![]),
+                &SettingsValues::new(),
+                &["channel_name"],
+                |writer| {
+                    writer.write_record(["ESPN"])?;
+                    Ok(())
+                },
+            )
+            .expect("write");
+        let text = std::fs::read_to_string(&path).expect("read");
+        let lines: Vec<&str> = text.split("\r\n").collect();
+        let header = lines
+            .iter()
+            .position(|line| *line == "channel_name")
+            .expect("header");
+        for line in &lines[..header] {
+            assert!(line.starts_with('#'), "{line:?}");
+            assert!(!line.contains('\n') && !line.contains('\r'), "{line:?}");
+        }
+        assert!(
+            text.contains("#   Renamed  =HYPERLINK(1): ESPN FOX [31m"),
+            "{text}"
+        );
+        assert!(text.contains("#   Template : {name} =cmd"), "{text}");
+        // A caller's own preamble line is held to the same rule by the writer.
+        let raw = dir.path().join("raw.csv");
+        write_report(&raw, &["no marker\nx".to_string()], &["h"], |_| Ok(())).expect("write");
+        assert_eq!(
+            std::fs::read_to_string(&raw).expect("read"),
+            "# no marker x\r\nh\r\n"
+        );
     }
 
     #[test]
@@ -1201,5 +1299,91 @@ mod tests {
             .open(path)
             .expect("open for time");
         file.set_modified(when).expect("set mtime");
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use crate::test_app::StubApp;
+    use proptest::prelude::*;
+
+    fn config() -> ProptestConfig {
+        // `PROPTEST_CASES` overrides this (10_000 for a local soak).
+        ProptestConfig {
+            cases: std::env::var("PROPTEST_CASES")
+                .ok()
+                .and_then(|cases| cases.parse().ok())
+                .unwrap_or(256),
+            ..ProptestConfig::default()
+        }
+    }
+
+    /// Text biased toward what breaks a comment line: CR, LF, other controls, `#`, `=`.
+    fn hostile_text() -> impl Strategy<Value = String> {
+        proptest::collection::vec(
+            prop_oneof![
+                Just('\r'),
+                Just('\n'),
+                Just('\u{0}'),
+                Just('\u{1b}'),
+                Just('\u{85}'),
+                Just('\u{2028}'),
+                Just('#'),
+                Just('='),
+                any::<char>(),
+            ],
+            0..40,
+        )
+        .prop_map(|chars| chars.into_iter().collect())
+    }
+
+    proptest! {
+        #![proptest_config(config())]
+
+        #[test]
+        fn every_preamble_line_is_one_comment_line(
+            title in hostile_text(),
+            results in proptest::collection::vec((hostile_text(), hostile_text()), 0..6),
+        ) {
+            let results: Vec<(&str, String)> = results
+                .iter()
+                .map(|(label, value)| (label.as_str(), value.clone()))
+                .collect();
+            let lines = preamble(
+                &CrosstalkConfig::default(),
+                &StubApp::new().report_title(&title),
+                &SettingsSchema::new(vec![]),
+                &SettingsValues::new(),
+                0,
+                &results,
+            );
+            for line in &lines {
+                prop_assert!(line.starts_with('#'), "{:?}", line);
+                prop_assert!(!line.contains('\r') && !line.contains('\n'), "{:?}", line);
+                prop_assert!(!line.chars().any(char::is_control), "{:?}", line);
+            }
+        }
+
+        #[test]
+        fn a_comment_line_is_idempotent_and_never_breaks(text in hostile_text()) {
+            let line = comment_line(&text);
+            prop_assert!(line.starts_with('#'));
+            prop_assert!(!line.chars().any(char::is_control));
+            prop_assert_eq!(comment_line(&line), line.clone());
+        }
+
+        #[test]
+        fn a_safe_cell_never_leads_with_a_formula(text in hostile_text()) {
+            let cell = safe_cell(&text);
+            let first = cell.chars().find(|ch| !ch.is_whitespace());
+            prop_assert!(
+                !matches!(first, Some('=' | '+' | '-' | '@' | '\u{FF1D}' | '\u{FF0B}' | '\u{FF0D}' | '\u{FF20}')),
+                "{:?}",
+                cell
+            );
+            let quoted = format!("'{text}");
+            prop_assert!(cell == text || cell == quoted);
+        }
     }
 }

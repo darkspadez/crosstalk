@@ -61,6 +61,13 @@ const RETIRED_MATCH_CUT: [(&str, &str); 1] = [(
 )];
 
 /// The two group-filter modes, as Stream-Mapparr spells them (`GROUP_FILTER_MODES`).
+/// Keys `streams.toml` holds that the web form never shows or saves.
+///
+/// The tool paths are executed by every probe: a form that could set them would turn the
+/// settings page into "run this binary". They are edited in the file only, and
+/// [`validate`] holds them to an absolute path named for the tool.
+pub const FILE_ONLY_KEYS: [&str; 2] = ["ffprobe_path", "ffmpeg_path"];
+
 pub const FILTER_MODES: [&str; 2] = ["include", "exclude"];
 pub const DEFAULT_FILTER_MODE: &str = "include";
 
@@ -296,9 +303,9 @@ pub struct StreamsSettings {
     pub silent_audio_max_db: i32,
     /// Hosts ffprobe cannot validate (Streamlink). IPTV Checker's `streamlink_hosts`.
     pub streamlink_hosts: String,
-    /// IPTV Checker's `ffprobe_path`.
+    /// IPTV Checker's `ffprobe_path`. File-only ([`FILE_ONLY_KEYS`]): never in the web form.
     pub ffprobe_path: String,
-    /// IPTV Checker's `ffmpeg_path`.
+    /// IPTV Checker's `ffmpeg_path`. File-only ([`FILE_ONLY_KEYS`]): never in the web form.
     pub ffmpeg_path: String,
 
     // --- Triage -------------------------------------------------------------------------
@@ -1382,34 +1389,6 @@ pub fn schema() -> SettingsSchema {
              these is recorded as SKIPPED rather than dead, so triage leaves it alone. Use \
              full domains, not bare words.",
         ),
-        FieldSpec::new(
-            "ffprobe_path",
-            SECTION_PROBE,
-            "FFprobe Path",
-            FieldKind::Text,
-            FieldValue::Text("/usr/bin/ffprobe".to_string()),
-        )
-        .with_placeholder("/usr/bin/ffprobe")
-        .with_help(
-            "Full path to the ffprobe executable. The default is where the image installs it \
-             (Alpine's ffmpeg package); a bare-metal install usually has it in /usr/bin or, on \
-             Homebrew, /opt/homebrew/bin. The analysis flags are fixed by the probe \
-             (show_streams, show_packets, an error-level log) rather than configurable, \
-             because a flag set that breaks the parser would fail every stream at once.",
-        ),
-        FieldSpec::new(
-            "ffmpeg_path",
-            SECTION_PROBE,
-            "FFmpeg Path",
-            FieldKind::Text,
-            FieldValue::Text("/usr/bin/ffmpeg".to_string()),
-        )
-        .with_placeholder("/usr/bin/ffmpeg")
-        .with_help(
-            "Full path to the ffmpeg executable, used for the one content-detection decode \
-             pass and by nothing else. Unused when every content check is off. The default is \
-             where the image installs it.",
-        ),
         FieldSpec::section(
             SECTION_TRIAGE,
             "Triage",
@@ -1597,8 +1576,6 @@ pub fn to_values(settings: &StreamsSettings) -> SettingsValues {
         ("audio_channels_priority", &settings.audio_channels_priority),
         ("audio_codec_priority", &settings.audio_codec_priority),
         ("streamlink_hosts", &settings.streamlink_hosts),
-        ("ffprobe_path", &settings.ffprobe_path),
-        ("ffmpeg_path", &settings.ffmpeg_path),
         ("dead_rename_format", &settings.dead_rename_format),
         ("move_to_group_name", &settings.move_to_group_name),
         (
@@ -1816,12 +1793,6 @@ pub fn apply_values(settings: &mut StreamsSettings, values: &SettingsValues) -> 
     }
     if let Some(text) = values.text("streamlink_hosts") {
         settings.streamlink_hosts = text.to_string();
-    }
-    if let Some(text) = values.text("ffprobe_path") {
-        settings.ffprobe_path = text.to_string();
-    }
-    if let Some(text) = values.text("ffmpeg_path") {
-        settings.ffmpeg_path = text.to_string();
     }
     if let Some(text) = values.text("dead_rename_format") {
         settings.dead_rename_format = text.to_string();
@@ -2091,6 +2062,17 @@ pub fn validate(settings: &StreamsSettings) -> Vec<String> {
                 .to_string(),
         );
     }
+    // The tool paths are executed by every probe. The filesystem half of the check (executable,
+    // not world-writable) is the probe's preflight, so a settings file still loads on a host
+    // without the tools installed.
+    for (role, path) in [
+        ("ffprobe", &settings.ffprobe_path),
+        ("ffmpeg", &settings.ffmpeg_path),
+    ] {
+        if let Err(error) = crate::probe::tool::check_tool_path(role, path) {
+            errors.push(error.to_string());
+        }
+    }
 
     errors
 }
@@ -2221,7 +2203,44 @@ mod tests {
         let rendered = toml::to_string_pretty(&StreamsSettings::default()).expect("serialise");
         let parsed: toml::Value = toml::from_str(&rendered).expect("parse");
         let keys = parsed.as_table().expect("a table").len();
-        assert_eq!(keys, schema().editable().count());
+        assert_eq!(keys, schema().editable().count() + FILE_ONLY_KEYS.len());
+    }
+
+    #[test]
+    fn the_tool_paths_are_file_only_and_validated() {
+        // Executed by every probe, so the web form can neither show an editable control for
+        // them nor carry them in a save.
+        let schema = schema();
+        let values = to_values(&StreamsSettings::default());
+        for id in FILE_ONLY_KEYS {
+            assert!(schema.field(id).is_none(), "{id} is in the web schema");
+            assert!(values.get(id).is_none(), "{id} is in the form values");
+            let mut submitted = SettingsValues::new();
+            submitted.insert(id, FieldValue::Text("/bin/sh".to_string()));
+            assert!(!schema.validate(&submitted).is_empty(), "{id} accepted");
+            // Even past the schema, `apply_values` never writes it.
+            let mut settings = StreamsSettings::default();
+            apply_values(&mut settings, &submitted).expect("apply");
+            assert_eq!(settings, StreamsSettings::default());
+        }
+
+        assert!(validate(&StreamsSettings::default()).is_empty());
+        for (ffprobe, ffmpeg, wanted) in [
+            ("/bin/sh", "/usr/bin/ffmpeg", "ffprobe_path"),
+            ("ffprobe", "/usr/bin/ffmpeg", "absolute"),
+            ("/usr/bin/ffprobe", "/tmp/ffmpeg.sh", "ffmpeg_path"),
+        ] {
+            let settings = StreamsSettings {
+                ffprobe_path: ffprobe.to_string(),
+                ffmpeg_path: ffmpeg.to_string(),
+                ..StreamsSettings::default()
+            };
+            let errors = validate(&settings);
+            assert!(
+                errors.iter().any(|error| error.contains(wanted)),
+                "{ffprobe} {ffmpeg}: {errors:?}"
+            );
+        }
     }
 
     #[test]

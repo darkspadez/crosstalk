@@ -935,17 +935,34 @@ fn rejoin_designators(normalized: &str, original: &str) -> String {
     out
 }
 
+/// How many distinct tags [`tag_regex`] keeps compiled. Tags come from settings (a handful
+/// per run), so this is never reached in practice; it bounds the cache if a caller ever feeds
+/// it names instead of tags. Past it the cache starts over.
+const TAG_REGEX_CACHE_MAX: usize = 4096;
+
+type TagMap = HashMap<String, Option<std::sync::Arc<FancyRegex>>>;
+
+fn tag_cache() -> &'static Mutex<TagMap> {
+    static CACHE: OnceLock<Mutex<TagMap>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The cache, even after a panic elsewhere poisoned it: it only ever holds complete
+/// entries, so a poisoned guard is still a consistent map.
+fn lock_tag_cache() -> std::sync::MutexGuard<'static, TagMap> {
+    tag_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Compile (and cache) the pattern for one user-configured tag.
 ///
 /// The cache is not an optimisation detail: `fancy_regex` compilation costs tens of
 /// milliseconds, and a run normalises tens of thousands of names against the same
-/// handful of tags, so compiling per call would dominate the run.
+/// handful of tags, so compiling per call would dominate the run. It holds at most
+/// [`TAG_REGEX_CACHE_MAX`] tags.
 fn tag_regex(tag: &str) -> Option<std::sync::Arc<FancyRegex>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, Option<std::sync::Arc<FancyRegex>>>>> =
-        OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-
-    if let Some(cached) = cache.lock().expect("tag cache").get(tag) {
+    if let Some(cached) = lock_tag_cache().get(tag) {
         return cached.clone();
     }
 
@@ -964,11 +981,21 @@ fn tag_regex(tag: &str) -> Option<std::sync::Arc<FancyRegex>> {
     };
     let compiled = FancyRegex::new(&pattern).ok().map(std::sync::Arc::new);
 
-    cache
-        .lock()
-        .expect("tag cache")
-        .insert(tag.to_string(), compiled.clone());
+    remember(
+        &mut lock_tag_cache(),
+        tag,
+        compiled.clone(),
+        TAG_REGEX_CACHE_MAX,
+    );
     compiled
+}
+
+/// Insert into a cache holding at most `max` entries, starting over when it is full.
+fn remember<V>(cache: &mut HashMap<String, V>, key: &str, value: V, max: usize) {
+    if cache.len() >= max && !cache.contains_key(key) {
+        cache.clear();
+    }
+    cache.insert(key.to_string(), value);
 }
 
 /// Escape a literal for a case-insensitive pattern, keeping Python's `(?i)` meaning for
@@ -1200,6 +1227,35 @@ mod tests {
     #[test]
     fn ampersand_becomes_and() {
         assert_eq!(all_on("U&Yesterday"), "U and Yesterday");
+    }
+
+    #[test]
+    fn the_tag_cache_is_bounded_and_survives_a_poisoned_lock() {
+        // Past the cap the cache starts over instead of growing.
+        let mut cache: HashMap<String, u32> = HashMap::new();
+        for n in 0..10 {
+            remember(&mut cache, &format!("tag{n}"), n, 3);
+            assert!(cache.len() <= 3, "{cache:?}");
+        }
+        assert_eq!(cache.get("tag9"), Some(&9));
+        remember(&mut cache, "tag9", 90, 3);
+        assert_eq!(
+            cache.get("tag9"),
+            Some(&90),
+            "a known key is replaced, not evicted"
+        );
+
+        // A panic while the lock is held poisons it; the next lookup still answers.
+        let _ = std::thread::spawn(|| {
+            let _guard = tag_cache().lock();
+            panic!("poison the tag cache");
+        })
+        .join();
+        assert!(tag_regex("HD").is_some());
+        assert!(
+            tag_regex("HD").is_some(),
+            "and again, from the poisoned cache"
+        );
     }
 }
 

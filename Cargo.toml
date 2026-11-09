@@ -76,6 +76,9 @@ csv = "1"
 # Dev
 tempfile = "3"
 wiremock = "0.6"
+# Property tests for the input parsers (docs/audit/D-inputs.md). `PROPTEST_CASES` sets the
+# case count; each test file defaults to 256.
+proptest = "1"
 
 [profile.release]
 # Release binaries (and the Docker image) ship without symbol tables. Panics still

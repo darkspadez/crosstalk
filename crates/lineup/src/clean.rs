@@ -92,6 +92,7 @@ use crosstalk_core::dispatcharr::World;
 use crosstalk_core::jobs::JobContext;
 use crosstalk_core::subapp::{JobOutcome, OutcomeBuilder, SubApp};
 use crosstalk_matching::tags;
+use crosstalk_streams::selection::{REGEX_PATTERN_MAX_LEN, REGEX_SIZE_LIMIT};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::OnceLock;
 
@@ -123,7 +124,14 @@ pub fn parse_custom_rules(raw: &str) -> Vec<CustomRule> {
         let (pat, rep) = line.split_once("=>").expect("contains =>");
         let pat = pat.trim();
         let rep = rep.trim();
-        let compiled = channel_ops::compile_pattern(pat).and_then(|pattern| {
+        if rep.chars().count() > REGEX_PATTERN_MAX_LEN {
+            tracing::warn!(
+                "lineup clean: ignoring custom rule {line:?}: the replacement is over \
+                 {REGEX_PATTERN_MAX_LEN} characters"
+            );
+            continue;
+        }
+        let compiled = compile_user_pattern(pat).and_then(|pattern| {
             let replacement = python_replacement(rep, &pattern)?;
             Ok((pattern, replacement))
         });
@@ -142,86 +150,31 @@ pub fn parse_custom_rules(raw: &str) -> Vec<CustomRule> {
 }
 
 /// Translate a Python `re.sub` replacement (NC's custom rules) into the Rust `regex`
-/// replacement that produces the same text.
-///
-/// Python reads `\1` / `\g<1>` / `\g<name>` as group references, `\\` as a
-/// backslash, `\n`-style letters as their control characters, and keeps any other
-/// non-letter escape (`\.`) verbatim; `$` is plain text. Rust reads `$1` / `${name}` and
-/// nothing else, so a straight copy would turn NC's `\1` into a literal and a `$` in the
-/// replacement into a group. What Python refuses (`\q`, a group the pattern lacks, a
-/// trailing `\`) is refused here too — NC skipped such a rule on `re.error`, or crashed
-/// on an unknown group name. Octal escapes (`\0`, `\123`) are refused as unsupported.
+/// replacement that produces the same text: the shared translator streams' regex rules use
+/// ([`crosstalk_streams::selection::translate_replacement`], a port of CPython's
+/// `_parse_template`), so one replacement means one thing in every app. What Python refuses
+/// (`\q`, a group the pattern lacks, a trailing `\`) is refused, and NC skipped such a rule.
 fn python_replacement(rep: &str, pattern: &regex::Regex) -> Result<String> {
-    let groups = pattern.captures_len() - 1;
-    let names: BTreeSet<&str> = pattern.capture_names().flatten().collect();
-    let group = |reference: &str| -> Result<String> {
-        match reference.parse::<usize>() {
-            Ok(index) if index <= groups => Ok(format!("${{{index}}}")),
-            Ok(index) => bail!("the replacement refers to group {index}, the pattern has {groups}"),
-            Err(_) if names.contains(reference) => Ok(format!("${{{reference}}}")),
-            Err(_) => bail!("the replacement refers to unknown group name {reference:?}"),
-        }
-    };
-    let mut out = String::with_capacity(rep.len());
-    let mut chars = rep.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '$' => out.push_str("$$"),
-            '\\' => match chars.next() {
-                None => bail!("the replacement ends in a lone backslash"),
-                Some('\\') => out.push('\\'),
-                Some('g') => {
-                    if chars.next() != Some('<') {
-                        bail!("the replacement has a malformed \\g<...> group reference");
-                    }
-                    let mut reference = String::new();
-                    loop {
-                        match chars.next() {
-                            Some('>') => break,
-                            Some(c) => reference.push(c),
-                            None => bail!("the replacement has an unclosed \\g<...>"),
-                        }
-                    }
-                    out.push_str(&group(&reference)?);
-                }
-                Some(digit @ '1'..='9') => {
-                    let mut reference = digit.to_string();
-                    if let Some(next) = chars.peek().copied().filter(char::is_ascii_digit) {
-                        chars.next();
-                        reference.push(next);
-                        if chars.peek().is_some_and(char::is_ascii_digit) {
-                            bail!("octal escapes in the replacement are not supported");
-                        }
-                    }
-                    out.push_str(&group(&reference)?);
-                }
-                Some('0') => bail!("octal escapes in the replacement are not supported"),
-                Some(letter) if letter.is_ascii_alphabetic() => {
-                    let control = match letter {
-                        'n' => '\n',
-                        't' => '\t',
-                        'r' => '\r',
-                        'f' => '\u{0c}',
-                        'v' => '\u{0b}',
-                        'a' => '\u{07}',
-                        'b' => '\u{08}',
-                        other => bail!("the replacement has a bad escape \\{other}"),
-                    };
-                    out.push(control);
-                }
-                Some(other) => {
-                    out.push('\\');
-                    if other == '$' {
-                        out.push_str("$$");
-                    } else {
-                        out.push(other);
-                    }
-                }
-            },
-            other => out.push(other),
-        }
+    crosstalk_streams::selection::translate_replacement(rep, pattern)
+}
+
+/// Compile an operator's pattern (a custom rule or `protect_regex`): at most
+/// [`REGEX_PATTERN_MAX_LEN`] characters and [`REGEX_SIZE_LIMIT`] bytes compiled, else the
+/// shared compiler's explanation of what Rust's `regex` does not support.
+fn compile_user_pattern(pattern: &str) -> Result<regex::Regex> {
+    if pattern.chars().count() > REGEX_PATTERN_MAX_LEN {
+        bail!("the pattern is over {REGEX_PATTERN_MAX_LEN} characters");
     }
-    Ok(out)
+    match regex::RegexBuilder::new(pattern)
+        .size_limit(REGEX_SIZE_LIMIT)
+        .build()
+    {
+        Ok(regex) => Ok(regex),
+        Err(regex::Error::CompiledTooBig(limit)) => {
+            bail!("the pattern compiles past the {limit}-byte limit; simplify it")
+        }
+        Err(_) => channel_ops::compile_pattern(pattern),
+    }
 }
 
 /// The cleaning switches, from [`crate::settings::LineupSettings`].
@@ -534,7 +487,7 @@ pub fn compile_protect_regex(raw: &str) -> Option<regex::Regex> {
     if trimmed.is_empty() {
         return None;
     }
-    match channel_ops::compile_pattern(trimmed) {
+    match compile_user_pattern(trimmed) {
         Ok(re) => Some(re),
         Err(error) => {
             tracing::warn!("lineup clean: invalid protect_regex ignored: {error:#}");
@@ -1191,10 +1144,29 @@ mod tests {
             "a => \\1",
             "(a) => \\g<x>",
             "a => b\\",
-            "(a) => \\0",
+            "(a) => \\g<>",
+            "a => \\400",
         ] {
             assert!(parse_custom_rules(bad).is_empty(), "{bad:?}");
         }
+        // Python's octal escapes are Python's: `\0` is NUL, `\101` is `A`.
+        let (next, _, _) = clean_name("xa", &rules, &parse_custom_rules("a => \\101"));
+        assert_eq!(next, "xA");
+    }
+
+    #[test]
+    fn an_oversized_pattern_or_replacement_is_skipped() {
+        let long = "a".repeat(REGEX_PATTERN_MAX_LEN + 1);
+        assert!(parse_custom_rules(&format!("{long} => b")).is_empty());
+        assert!(parse_custom_rules(&format!("a => {long}")).is_empty());
+        assert!(compile_protect_regex(&long).is_none());
+        // Short, but a large compiled program: refused by the size limit, not run.
+        let heavy = "(?:\\w{100}){100}";
+        assert!(heavy.len() <= REGEX_PATTERN_MAX_LEN);
+        let error = compile_user_pattern(heavy).expect_err("too big");
+        assert!(format!("{error:#}").contains("limit"), "{error:#}");
+        assert!(compile_protect_regex(heavy).is_none());
+        assert_eq!(parse_custom_rules("sky => SKY").len(), 1);
     }
 
     #[test]
