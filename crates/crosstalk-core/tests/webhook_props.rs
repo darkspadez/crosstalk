@@ -192,9 +192,7 @@ proptest! {
 proptest! {
     #![proptest_config(config())]
 
-    /// Needs fix 2 (N2: `valid_name` refuses control characters); un-ignore once it lands.
     #[test]
-    #[ignore = "needs N2 (fix 2): valid_name must refuse control characters"]
     fn an_event_name_carries_no_control_character(query in ".{0,40}", event in ".{0,40}") {
         let fields: BTreeMap<String, String> =
             [("event".to_string(), event)].into_iter().collect();
