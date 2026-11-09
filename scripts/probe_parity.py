@@ -339,7 +339,7 @@ def run_rust(lines: list[dict], binary: str) -> list[dict]:
 # The one documented command-line exception (README, Differences: "`streams.probe` opens only
 # network URLs"): both tools get a network-only protocol whitelist, and the URL is always the
 # value of `-i`. Everything else in the argv must match the plugin verbatim.
-PROTOCOL_WHITELIST = "http,https,tls,tcp,udp,rtp,rtmp,rtmps,rtsp,srt,crypto,hls,httpproxy"
+PROTOCOL_WHITELIST = "http,https,tls,tcp,udp,rtp,rtmp,rtmps,rtsp,srt,crypto,hls,httpproxy,data"
 
 
 def hardened_argv(argv):

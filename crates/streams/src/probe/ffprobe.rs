@@ -82,9 +82,13 @@ pub const MIN_PACKETS_FOR_BITRATE_CALC: usize = 30;
 /// `-protocol_whitelist`, for both tools: the network protocols the allow-listed URL schemes
 /// need, plus what they open underneath (`tls`/`tcp`/`udp`, `crypto` for AES-128 HLS, `hls`
 /// for `hls+http`, `httpproxy` when `http_proxy` is set — without it a proxied install would
-/// read every stream as dead). No `file`, `pipe`, `concat`, `subfile` or `data`.
+/// read every stream as dead, and `data` for an HLS key or playlist given inline as a
+/// `data:` URI, which some providers do). This is ffmpeg's own default nested whitelist for
+/// an `http` input (`http,https,tls,rtp,tcp,udp,crypto,httpproxy,data`) plus the other
+/// allow-listed schemes, so a stream ffprobe reads unrestricted still reads here. No `file`,
+/// `pipe`, `concat` or `subfile`: nothing that reaches the local file system.
 pub const PROTOCOL_WHITELIST: &str =
-    "http,https,tls,tcp,udp,rtp,rtmp,rtmps,rtsp,srt,crypto,hls,httpproxy";
+    "http,https,tls,tcp,udp,rtp,rtmp,rtmps,rtsp,srt,crypto,hls,httpproxy,data";
 
 /// How long the ffprobe process may run for a connection timeout and probe timeout.
 pub fn total_timeout(probe_timeout_seconds: u32) -> Duration {
@@ -678,7 +682,25 @@ mod tests {
         // The URL is always the value of `-i`, never a positional that could parse as a flag.
         let at = spec.args.iter().position(|arg| arg == "-i").expect("-i");
         assert_eq!(spec.args[at + 1], "http://host/live.ts");
-        assert!(!PROTOCOL_WHITELIST.split(',').any(|p| p == "file"));
+        // Nothing local: ffmpeg's default nested whitelist for an http input is a subset,
+        // so an unrestricted ffprobe's HLS (inline `data:` keys included) still reads here.
+        let allowed: Vec<&str> = PROTOCOL_WHITELIST.split(',').collect();
+        for local in ["file", "pipe", "concat", "subfile", "cache", "fd"] {
+            assert!(!allowed.contains(&local), "{local}");
+        }
+        for needed in [
+            "http",
+            "https",
+            "tls",
+            "rtp",
+            "tcp",
+            "udp",
+            "crypto",
+            "httpproxy",
+            "data",
+        ] {
+            assert!(allowed.contains(&needed), "{needed}");
+        }
         // `probe_timeout + analysis + 5`.
         assert_eq!(spec.timeout, Duration::from_secs(20 + 8 + 5));
     }
