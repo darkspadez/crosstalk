@@ -562,6 +562,8 @@ pub fn fields(schema: &SettingsSchema, values: &SettingsValues) -> Vec<UiField> 
                     serde_json::to_string_pretty(map).unwrap_or_else(|_| "{}".to_string()),
                     false,
                 ),
+                // The value of a secret field is its status line, never the secret.
+                (FieldKind::Secret, value) => ("secret".to_string(), value.render(), false),
                 (_, value) => ("text".to_string(), value.render(), false),
             };
 
@@ -739,6 +741,8 @@ pub fn values_from_form(
             FieldKind::Text | FieldKind::Info => {
                 values.insert(field.id, FieldValue::Text(raw.cloned().unwrap_or_default()));
             }
+            // A form never sets a secret, whatever it submits.
+            FieldKind::Secret => {}
         }
     }
 

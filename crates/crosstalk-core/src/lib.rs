@@ -9,6 +9,7 @@
 
 pub mod ai;
 pub mod ai_gate;
+pub mod bridge;
 pub mod channel_ops;
 pub mod config;
 pub mod csv_report;
@@ -29,6 +30,7 @@ pub mod redact;
 pub mod runner;
 pub mod scheduler;
 pub mod scope;
+pub mod sha256;
 pub mod status;
 pub mod store;
 pub mod subapp;
@@ -43,10 +45,10 @@ mod test_app;
 
 pub use ai::{AiService, Answer, Decider, DecisionRequest, DecisionResponse, Question, Verdict};
 pub use channel_ops::{
-    apply, apply_with_writer, parse_stream_ids, plan, plan_with_options, rows_for_field, run_rows,
-    write_ops_report, ApplyReport, Change, Field, ListedStream, Op, OpKind, Plan, PlanOptions,
-    RenameKind, ReportSpec, RestStreamListWriter, RowStatus, SelectedChannel, Selection, SetValue,
-    Skip, StreamListWriter, Value,
+    apply, apply_with_writer, apply_with_writers, parse_stream_ids, plan, plan_with_options,
+    rows_for_field, run_rows, write_ops_report, ApplyReport, Change, Field, GroupClearer,
+    ListedStream, Op, OpKind, Plan, PlanOptions, RenameKind, ReportSpec, RestStreamListWriter,
+    RowStatus, SelectedChannel, Selection, SetValue, Skip, StreamListWriter, Value,
 };
 pub use config::{
     ConfigReport, CrosstalkConfig, HooksConfig, ScheduleEntry, ScheduleTable, SharedConfig,

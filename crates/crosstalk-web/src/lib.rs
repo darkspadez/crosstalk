@@ -19,8 +19,10 @@ pub mod limits;
 pub mod routes;
 pub mod security;
 pub mod session;
-pub mod sha256;
 pub mod state;
+
+/// SHA-256 lives in the host crate, which the bridge client signs with too.
+pub use crosstalk_core::sha256;
 
 pub use routes::router;
 pub use state::{AppState, UiApp, UiField};

@@ -60,6 +60,20 @@ timeout_secs = 30
 # group and logo writes are paced by this cap too (it replaces Lineuparr's rate_limiting).
 concurrency = 8
 
+# The crosstalk-bridge Dispatcharr plugin (docs/bridge.md): the four writes REST cannot do
+# (bulk stream lists, bulk stream stats, moving a channel to No Group, generated guide entries).
+# Off by default. `crosstalk bridge secret` fills in `secret` and prints it once to paste into
+# the plugin; `crosstalk bridge ping` checks the install. When enabled, `serve` pings the plugin
+# at start-up and uses it only if it answers a signed ping at min_version or later.
+[bridge]
+enabled = false
+secret = ""
+# When this variable is set and not blank it wins over `secret`.
+secret_env = "CROSSTALK_BRIDGE_SECRET"
+# The zip import installs the plugin as crosstalk_bridge; the other spelling is tried too.
+plugin_key = "crosstalk_bridge"
+min_version = "0.1.0"
+
 # AI providers. The endpoint, the key and the concurrency cap live here, so several
 # sub-apps share one provider entry rather than each holding a copy. Which provider and
 # model are used, and when a borderline match is worth asking about, is the [ai.verify]

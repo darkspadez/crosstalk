@@ -88,7 +88,9 @@
 //!     streams means re-walking the whole queue;
 //!   * **duplicate probes are gone**: the plugin's loaded-channels file repeated a stream once
 //!     per channel carrying it, so a stream on four channels cost four probes and four rows;
-//!   * **an unchanged `stream_stats` is not rewritten** (the same end state, fewer requests);
+//!   * **an unchanged `stream_stats` is not rewritten** (the same end state, fewer requests),
+//!     and with the `crosstalk-bridge` plugin verified at start-up the changed ones go in a few
+//!     signed bulk requests instead of one PATCH each (`docs/bridge.md`);
 //!   * **the ffprobe analysis window is a constant** ([`ffprobe::ANALYZE_SECONDS`]), because the
 //!     settings form retired `ffprobe_analysis_duration`;
 //!   * **throughput runs when `enable_throughput_sorting` is on**, not as a separate action, and
@@ -1840,8 +1842,12 @@ pub async fn run_with(
                     .into_iter()
                     .map(|stream| (stream.id, stream.stream_stats))
                     .collect();
+                // Through the bridge when the start-up check verified it: one signed request
+                // per few thousand streams instead of one PATCH per stream.
+                let bridge = crosstalk_core::bridge::for_config(context.config(), client);
                 write_stats(
                     client,
+                    bridge.as_ref(),
                     &verdicts,
                     &current,
                     settings.write_concurrency.max(1) as usize,
@@ -2302,7 +2308,7 @@ enum StatsOutcome {
     Failed(String),
 }
 
-/// Write the stream stats that change, with bounded concurrency.
+/// Write the stream stats that change, with bounded concurrency, or through the bridge.
 ///
 /// Streams whose stats would not change are not rewritten: the end state is the same and a
 /// nightly run over 50k streams should not be 50k PATCHes. Returns each judged stream's
@@ -2310,6 +2316,7 @@ enum StatsOutcome {
 /// recorded and reported, never fatal — the probe's own record is already in the store.
 async fn write_stats(
     client: &DispatcharrClient,
+    bridge: Option<&crosstalk_core::bridge::BridgeClient>,
     verdicts: &[StreamVerdict],
     current: &HashMap<i64, Value>,
     concurrency: usize,
@@ -2327,6 +2334,20 @@ async fn write_stats(
             continue;
         }
         writes.push((verdict.stream_id, merged));
+    }
+
+    if let Some(bridge) = bridge {
+        for (stream_id, result) in bridge.set_stream_stats(&writes).await {
+            let outcome = match result {
+                Ok(()) => StatsOutcome::Written,
+                Err(error) => {
+                    tracing::warn!("could not write stream stats through the bridge: {error:#}");
+                    StatsOutcome::Failed(format!("{error:#}"))
+                }
+            };
+            outcomes.insert(stream_id, outcome);
+        }
+        return outcomes;
     }
 
     for chunk in writes.chunks(concurrency.max(1)) {

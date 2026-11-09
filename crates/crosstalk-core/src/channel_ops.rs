@@ -43,7 +43,8 @@
 //!     400 for the whole `edit/bulk` chunk. [`apply`] refuses those rows with that reason
 //!     instead of sending a payload that fails. The column is nullable and the model allows
 //!     it (deleting a group leaves its channels with none), so this is an API gap rather than
-//!     a crosstalk limitation, and a bridge-backed writer can close it later.
+//!     a crosstalk limitation: with the `crosstalk-bridge` plugin verified at start-up the
+//!     moves go through its [`GroupClearer`] instead (`docs/bridge.md`).
 //!
 //! Without [`PlanOptions::suffix_present_skips_rest`] the operations are independent: a
 //! rename that is a no-op is reported as a skip and the rest still run, which is what
@@ -1323,6 +1324,15 @@ impl StreamListWriter for RestStreamListWriter {
     }
 }
 
+/// Moves channels to "No Group" (`channel_group` NULL): the one channel edit REST cannot
+/// express (see the module docs), so the only implementation is the bridge
+/// ([`crate::bridge::BridgeClient`]). Same contract as [`StreamListWriter`]: one answer per
+/// channel, in input order, `Ok` only when the write is confirmed.
+#[async_trait::async_trait]
+pub trait GroupClearer: Send + Sync {
+    async fn clear_many(&self, channel_ids: &[i64]) -> Vec<(i64, Result<()>)>;
+}
+
 /// Apply a plan, one request per endpoint, recording every row's outcome.
 ///
 /// The writes are batched the way the API wants them: a rename, a group move and a hide are
@@ -1336,20 +1346,31 @@ impl StreamListWriter for RestStreamListWriter {
 /// how many rows before it were confirmed — the same partial-progress wording
 /// `batch_set_epg` and `edit_channels` already use. It does not stop the other endpoints: a
 /// failed profile update must not abandon the EPG clear the operator asked for too.
+///
+/// With the bridge verified at start-up ([`crate::bridge::for_config`]) the stream lists and
+/// the "No Group" moves go through it; without it the lists go over REST and the moves are
+/// refused per row, saying they need the bridge.
 pub async fn apply(
     client: &DispatcharrClient,
     plan: &Plan,
     context: &JobContext,
     action: &str,
 ) -> ApplyReport {
-    let writer = RestStreamListWriter::new(client.clone());
-    apply_with_writer(client, plan, context, action, &writer).await
+    let bridge = crate::bridge::for_config(context.config(), client);
+    let rest = RestStreamListWriter::new(client.clone());
+    let writer: &dyn StreamListWriter = match &bridge {
+        Some(bridge) => bridge,
+        None => &rest,
+    };
+    let clearer = bridge.as_ref().map(|bridge| bridge as &dyn GroupClearer);
+    apply_inner(client, plan, context, action, writer, clearer, false).await
 }
 
 /// [`apply`] with a caller-supplied [`StreamListWriter`].
 ///
 /// The hook a bridge-backed writer needs; everything except the stream-list stage is the same
-/// code [`apply`] runs.
+/// code [`apply`] runs, including the "No Group" moves going through the verified bridge when
+/// there is one.
 pub async fn apply_with_writer(
     client: &DispatcharrClient,
     plan: &Plan,
@@ -1357,7 +1378,22 @@ pub async fn apply_with_writer(
     action: &str,
     writer: &dyn StreamListWriter,
 ) -> ApplyReport {
-    apply_inner(client, plan, context, action, writer, false).await
+    let bridge = crate::bridge::for_config(context.config(), client);
+    let clearer = bridge.as_ref().map(|bridge| bridge as &dyn GroupClearer);
+    apply_inner(client, plan, context, action, writer, clearer, false).await
+}
+
+/// [`apply`] with both writers chosen by the caller: `clearer` `None` refuses the "No Group"
+/// moves the way a run without the bridge does.
+pub async fn apply_with_writers(
+    client: &DispatcharrClient,
+    plan: &Plan,
+    context: &JobContext,
+    action: &str,
+    writer: &dyn StreamListWriter,
+    clearer: Option<&dyn GroupClearer>,
+) -> ApplyReport {
+    apply_inner(client, plan, context, action, writer, clearer, false).await
 }
 
 /// [`apply`] for a run whose rows are exactly [`run_rows`] of `plan`, keeping those rows in
@@ -1374,8 +1410,14 @@ pub async fn apply_recorded(
     action: &str,
 ) -> Result<ApplyReport> {
     context.record_rows(&run_rows(plan, None))?;
-    let writer = RestStreamListWriter::new(client.clone());
-    let report = apply_inner(client, plan, context, action, &writer, true).await;
+    let bridge = crate::bridge::for_config(context.config(), client);
+    let rest = RestStreamListWriter::new(client.clone());
+    let writer: &dyn StreamListWriter = match &bridge {
+        Some(bridge) => bridge,
+        None => &rest,
+    };
+    let clearer = bridge.as_ref().map(|bridge| bridge as &dyn GroupClearer);
+    let report = apply_inner(client, plan, context, action, writer, clearer, true).await;
     context.record_rows(&run_rows(plan, Some(&report)))?;
     Ok(report)
 }
@@ -1386,6 +1428,7 @@ async fn apply_inner(
     context: &JobContext,
     action: &str,
     writer: &dyn StreamListWriter,
+    clearer: Option<&dyn GroupClearer>,
     record: bool,
 ) -> ApplyReport {
     let mut changes = plan.changes.clone();
@@ -1430,7 +1473,16 @@ async fn apply_inner(
         origin,
         record,
     };
-    let report = apply_stages(client, &fresh, context, action, writer, &checkpoint).await;
+    let report = apply_stages(
+        client,
+        &fresh,
+        context,
+        action,
+        writer,
+        clearer,
+        &checkpoint,
+    )
+    .await;
     let changes = checkpoint.merged(&report.changes);
     let ok = changes
         .iter()
@@ -1587,6 +1639,7 @@ async fn apply_stages(
     context: &JobContext,
     action: &str,
     writer: &dyn StreamListWriter,
+    clearer: Option<&dyn GroupClearer>,
     checkpoint: &Checkpoint<'_>,
 ) -> ApplyReport {
     let mut changes = plan.changes.clone();
@@ -1607,8 +1660,9 @@ async fn apply_stages(
         }
         if change.field == Field::Group && matches!(&change.after, Value::Group(None)) {
             // The one channel edit the API cannot express, and one invalid row rejects its
-            // whole chunk — so it is reported here rather than sent. A channel that also has a
-            // rename in this plan keeps it: each field is its own row.
+            // whole chunk — so it never goes into `edit/bulk`: the bridge writes it, or it is
+            // reported. A channel that also has a rename in this plan keeps it: each field is
+            // its own row.
             no_group_rows.push(index);
             continue;
         }
@@ -1655,14 +1709,36 @@ async fn apply_stages(
         checkpoint.stage(context, &changes);
     }
     if !no_group_rows.is_empty() {
-        // A cancelled run says so, like every other batch it never reached; otherwise the
-        // reason is the API's own gap.
-        let reason = if context.is_cancelled() {
-            CANCELLED
-        } else {
-            NO_GROUP_UNSUPPORTED
-        };
-        mark(&mut changes, &no_group_rows, RowStatus::Failed, reason);
+        match clearer {
+            Some(clearer) if !context.is_cancelled() => {
+                let ids: Vec<i64> = no_group_rows
+                    .iter()
+                    .map(|index| plan.changes[*index].channel_id)
+                    .collect();
+                progress.set(
+                    done,
+                    &format!("moving {} channel(s) to No Group", ids.len()),
+                );
+                let by_channel: HashMap<i64, Option<Result<()>>> = clearer
+                    .clear_many(&ids)
+                    .await
+                    .into_iter()
+                    .map(|(channel_id, result)| (channel_id, Some(result)))
+                    .collect();
+                mark_by_channel(&mut changes, &no_group_rows, &by_channel);
+                checkpoint.stage(context, &changes);
+            }
+            _ => {
+                // A cancelled run says so, like every other batch it never reached; otherwise
+                // the reason is the API's own gap.
+                let reason = if context.is_cancelled() {
+                    CANCELLED
+                } else {
+                    NO_GROUP_UNSUPPORTED
+                };
+                mark(&mut changes, &no_group_rows, RowStatus::Failed, reason);
+            }
+        }
         done += no_group_rows.len() as u64;
     }
 
@@ -1844,7 +1920,8 @@ const CANCELLED: &str = "not applied: the run was cancelled";
 /// would fail the whole chunk it shares — and take the renames in that chunk down with it.
 const NO_GROUP_UNSUPPORTED: &str =
     "not applied: Dispatcharr's channel edit cannot clear a channel group (its serializer \
-     rejects a null channel_group_id), so this move has to be made in the Dispatcharr UI";
+     rejects a null channel_group_id); this move needs the crosstalk-bridge plugin ([bridge] \
+     in crosstalk.toml, see docs/bridge.md) or the Dispatcharr UI";
 
 /// What a channel-ops report needs from its caller: the app it belongs to and the settings
 /// the preamble names.
@@ -7403,6 +7480,92 @@ mod tests {
                 .status,
             RowStatus::Ok
         );
+        // And the reason names the way out.
+        assert!(
+            moved.reason.contains("crosstalk-bridge"),
+            "{}",
+            moved.reason
+        );
+    }
+
+    /// A [`GroupClearer`] that records what it was asked and fails the ids it is told to.
+    struct RecordingClearer {
+        asked: std::sync::Mutex<Vec<i64>>,
+        failing: Vec<i64>,
+    }
+
+    #[async_trait::async_trait]
+    impl GroupClearer for RecordingClearer {
+        async fn clear_many(&self, channel_ids: &[i64]) -> Vec<(i64, Result<()>)> {
+            self.asked
+                .lock()
+                .expect("lock")
+                .extend_from_slice(channel_ids);
+            channel_ids
+                .iter()
+                .map(|id| {
+                    let result = if self.failing.contains(id) {
+                        Err(anyhow::anyhow!("not_found: no such channel"))
+                    } else {
+                        Ok(())
+                    };
+                    (*id, result)
+                })
+                .collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_move_to_no_group_goes_through_the_group_clearer_when_there_is_one() {
+        let server = MockServer::start().await;
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        let context = JobContext::for_tests(crate::config::CrosstalkConfig::default());
+        let plan = plan_ops(
+            &world(),
+            &Selection {
+                channel_ids: Some(vec![1, 2]),
+                ..Selection::default()
+            },
+            &[Op::MoveGroup { group_id: None }],
+        )
+        .expect("plans");
+        let grouped: Vec<i64> = plan
+            .changes
+            .iter()
+            .filter(|change| change.field == Field::Group)
+            .map(|change| change.channel_id)
+            .collect();
+        assert!(!grouped.is_empty());
+
+        let clearer = RecordingClearer {
+            asked: std::sync::Mutex::new(Vec::new()),
+            failing: vec![grouped[0]],
+        };
+        let writer = RecordingWriter::new();
+        serve_channels(&server, &world()).await;
+        let report = apply_with_writers(
+            &client,
+            &plan,
+            &context,
+            "guide.restore_apply",
+            &writer,
+            Some(&clearer),
+        )
+        .await;
+        assert_eq!(*clearer.asked.lock().expect("lock"), grouped);
+        for change in &report.changes {
+            if change.channel_id == grouped[0] {
+                assert_eq!(change.status, RowStatus::Failed);
+                assert!(change.reason.contains("not_found"), "{}", change.reason);
+            } else {
+                assert_eq!(change.status, RowStatus::Ok, "{}", change.reason);
+            }
+        }
+        // Nothing went to `edit/bulk`: a null group there fails the whole chunk.
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert!(requests
+            .iter()
+            .all(|request| request.url.path() != "/api/channels/channels/edit/bulk/"));
     }
 
     // ---- rows --------------------------------------------------------------

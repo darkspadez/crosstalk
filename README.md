@@ -231,6 +231,9 @@ carry `THIRD_PARTY_LICENSES`, the licence text of every Rust crate compiled in.
 | `crosstalk run workflow <name> [--dry-run] [--yes] [--fresh]` | Run one workflow once and exit (`run workflow.<name>` works too); `--dry-run` runs every writing step as its preview |
 | `crosstalk undo <run-id> [--dry-run] [--yes] [--config <dir>]` | Reverse a finished apply run's rows that are still in effect (`--dry-run` previews; the apply needs `--yes`; the undo is itself a recorded, undoable run). Refuses previews, reads, running/paused runs, workflow runs (it lists their step runs to undo one at a time, newest first) and runs that recorded nothing undoable. Created channels end hidden; created groups/logos are left and listed |
 | `crosstalk exports clear [--app <id>] [--yes]` | Delete the CSV reports the sub-apps wrote (the UI's **Clear exports** button does the same) |
+| `crosstalk bridge secret [--force] [--config <dir>]` | Generate the [bridge plugin](#bridge-plugin)'s shared secret, write it to `crosstalk.toml` `[bridge] secret` (0600) and print it once. Refuses when one is set (`--force` overwrites) or when `[bridge] secret_env` supplies it |
+| `crosstalk bridge rotate [--config <dir>]` | Replace the bridge secret and print the order to roll it into the plugin without breaking it |
+| `crosstalk bridge ping [--config <dir>]` | Send the bridge plugin a signed ping (even while `[bridge] enabled = false`) and say whether this crosstalk can use it |
 | `crosstalk bench streams --synthetic [--config <dir>] [--channels N --streams N --accounts N]` | Time the streams plans on a world built in memory: no network, no Dispatcharr. See [Scale](#scale) |
 | `crosstalk bench streams --live [--config <dir>] [--write-timing --channel-ids <ids> --yes]` | Time the same plans against the configured Dispatcharr, read-only unless `--write-timing` is asked for twice |
 | `crosstalk bench lineup --synthetic [--config <dir>] [--channels N --lineup-channels N --streams N --tv-logos-per-country N] [--json]` | Time the lineup plans (clean, names, categorize, logos, sync, create, tidy, undo) on a world built in memory, with a file-backed identity cache. See [Scale](#scale) |
@@ -322,9 +325,11 @@ accident.
   through its `*_env` variable (`token_env = "CROSSTALK_TOKEN"`, the default). When both are
   set the **environment wins**, so a token rotates without editing the file; `validate` warns
   that the file's value is shadowed. A blank variable falls back to the file. The
-  `CROSSTALK_<SECTION>__<KEY>` overrides of `token`, `api_key`, `password`, `username`,
-  `base_url` and `public_url` are taken verbatim: `CROSSTALK_SERVER__TOKEN=0123456` stays
-  `0123456`.
+  `CROSSTALK_<SECTION>__<KEY>` overrides of `token`, `api_key`, `password`, `secret`,
+  `username`, `base_url` and `public_url` are taken verbatim: `CROSSTALK_SERVER__TOKEN=0123456`
+  stays `0123456`. The bridge secret works the same way (`[bridge] secret` /
+  `secret_env = "CROSSTALK_BRIDGE_SECRET"`); the settings page shows only whether it is set and
+  where from, and never changes it.
 - **`base_url` credentials.** A `user:pass@` in `dispatcharr.base_url` (for a proxy in front of
   Dispatcharr) is sent as HTTP basic auth and never printed: `validate`, errors and logs show
   the URL without it.
@@ -350,6 +355,55 @@ accident.
 The web UI writes settings back through `toml_edit`, preserving your comments and ordering.
 Host settings saved in the UI hot-reload: the next run uses them and schedules re-arm, with
 no daemon restart (a run already in progress finishes with the settings it started with).
+
+## Bridge plugin
+
+`crosstalk-bridge` is a small Dispatcharr plugin, shipped as `crosstalk-bridge-<version>.zip`
+with every release, for the four writes Dispatcharr's REST API cannot do well or at all:
+
+| Write | Without the bridge | With it |
+|---|---|---|
+| Channels' ordered stream lists (`streams` match, sort and mirror applies, and their undo) | `edit/bulk`, one PATCH per channel for a rejected chunk | `ChannelStream` rows rewritten in one transaction, 2,000 channels per request |
+| `stream_stats` after a probe | one PATCH per changed stream | 5,000 streams per request |
+| Moving a channel to "No Group" (triage restore, undo of a group move) | impossible: the channel serializer refuses a null group, so the row is refused with a reason | one `UPDATE` |
+| Guide entries and programmes for generated guides (phase 4) | no endpoint | upsert by `(tvg_id, source)`, programmes replaced inside one window |
+
+It is **off by default** and nothing changes until it is on: everything works over REST, and
+the "No Group" rows say they need the bridge.
+
+**Install.** Download the zip and `SHA256SUMS` from the release (and
+`gh attestation verify crosstalk-bridge-<version>.zip --repo darkspadez/crosstalk` if you like),
+import it in Dispatcharr (**Plugins → Import**; it installs as `crosstalk_bridge`), run
+`crosstalk bridge secret`, give the printed secret to the plugin, enable the plugin, set
+`[bridge] enabled = true`, and check with `crosstalk bridge ping`. The plugin's own
+[README](bridge/README.md) walks through it.
+
+**The secret.** Every request goes through Dispatcharr's plugin-run API with the Dispatcharr key
+crosstalk already uses, and its body is signed: HMAC-SHA256 over a canonical JSON envelope
+(operation, payload, timestamp, nonce) with a secret only crosstalk and the plugin hold. The
+plugin refuses anything unsigned, older than 5 minutes, replayed, or not one of its five
+operations (`ping` and the four writes). The secret is generated by crosstalk from the OS
+CSPRNG, stored in `crosstalk.toml` (0600) or its environment variable, never shown in the UI and
+never logged. On the Dispatcharr side, prefer `CROSSTALK_BRIDGE_SECRET` in Dispatcharr's
+environment to the plugin's Secret field: a setting is stored in Dispatcharr's database and
+returned by `GET /api/plugins/plugins/` to anyone with plugin access, the environment is not.
+
+**Rotation.** `crosstalk bridge rotate` writes a new secret and prints the order: the old secret
+goes into the plugin's Previous secret with a grace time, the new one into Secret, crosstalk
+restarts, then the previous one is cleared. Both are accepted only until the grace time.
+
+**At start-up** `serve` (and `run`, `undo`) pings the plugin once. Only a plugin that verifies
+the signature, speaks protocol 1, is at least `[bridge] min_version` and offers all four writes
+is used; otherwise the log says why and the run falls back to REST where REST can do the write.
+`validate` pings too and prints the verdict.
+
+**What it can never do.** Read data, delete a channel, stream, group, EPG source or guide entry,
+change names, numbers, logos, EPG assignments, users or settings, or run anything else: the five
+operations are an allow-list in the plugin's code, every write is idempotent, and guide writes
+only reach the EPG sources the operator lists in the plugin. A leaked bridge secret is limited to
+those writes; a leaked Dispatcharr admin key was already the bigger problem (it can read a
+secret stored in plugin settings, and install plugins of its own). The full contract, canonical
+JSON, limits and threat model: [docs/bridge.md](docs/bridge.md).
 
 ## Actions
 
@@ -661,8 +715,9 @@ just read** — an idempotent no-op, so nothing changes — once per channel and
 `edit/bulk` chunk, then extrapolates
 both to 20,000 channels. The rule the plan states: **the bridge is unnecessary if a 20k-channel
 apply fits in 120 seconds**, which is what the bench's recommendation line tells you once it has
-measured. Until that has been run on the target host, crosstalk writes over REST and the
-`StreamListWriter` seam is where a bridge would plug in.
+measured. Without the [bridge plugin](#bridge-plugin) crosstalk writes over REST; with it
+enabled and verified at start-up, the `StreamListWriter` seam writes through the bridge
+instead.
 
 ## AI verification
 
@@ -1158,7 +1213,7 @@ in `docs/oracle-reports/`.
 | streams | `streams.mirror_apply` records the previous order in the run store, not a snapshot file | The plugin refuses to write unless it first saved every changed channel's order to a snapshot file, and skips a channel that moved mid-run. crosstalk plans and writes one world snapshot: what the run reports as `before` is what Dispatcharr held when the run started, and a concurrent edit after that is overwritten rather than detected. Same trade as every other channel-write action (writes same; a concurrent edit is overwritten, not detected) |
 | streams | `streams.visibility_apply` writes only the memberships that move | The plugin disables every channel in scope and re-enables the winners — two bulk updates touching rows that end up unchanged. crosstalk writes the end state as per-channel values, so a channel already holding its value is a skipped row, not a write. Same end state (writes less, same end state) |
 | streams | `streams.visibility_apply` writes the first named profile that exists | Stream-Mapparr's `profile_name` list resolves to `profile_ids[0]` for the write while every named profile widens the channel set; crosstalk does exactly that. With a single profile the action only ever disables (writes same) |
-| streams | `streams.visibility_apply` never enables a channel that is not already enabled in the profile | The plugin enables each winner with `update(enabled=True)`, which reaches a disabled row but not a channel with no row in the profile (a `start_empty` profile, or a channel created for chosen profiles only). Over REST a profile lists only its enabled channels, so the two cases look the same, and the only write, `PATCH .../bulk-update/`, *creates* a missing row. So crosstalk withholds every such enable (the report lists them, `enable_withheld` counts them) and only ever disables: its writes are a subset of the plugin's. This only matters with several profiles in `[scope] profiles` (a winner enabled in the second but not the first); with one profile the plugin's enable step is a no-op too. The bridge would restore the exact behaviour (writes less) |
+| streams | `streams.visibility_apply` never enables a channel that is not already enabled in the profile | The plugin enables each winner with `update(enabled=True)`, which reaches a disabled row but not a channel with no row in the profile (a `start_empty` profile, or a channel created for chosen profiles only). Over REST a profile lists only its enabled channels, so the two cases look the same, and the only write, `PATCH .../bulk-update/`, *creates* a missing row. So crosstalk withholds every such enable (the report lists them, `enable_withheld` counts them) and only ever disables: its writes are a subset of the plugin's. This only matters with several profiles in `[scope] profiles` (a winner enabled in the second but not the first); with one profile the plugin's enable step is a no-op too. Profile membership is not one of the [bridge plugin](#bridge-plugin)'s writes, so this stays (writes less) |
 | streams | `streams.visibility_*` reads Dispatcharr live, not the last load snapshot | The plugin reads its `processed_data` file and refuses to run without it. A channel created since the last load takes part here — the plan's improvement that every apply plans from live state, never from a saved snapshot (writes more: channels created since the last load) |
 | streams | `streams.probe` is one action with `--dry-run`, not a pair | It writes stream stats and crosstalk's health table, never a channel's data, so "what would change" is a number the run only learns by measuring. `--dry-run` runs the whole probe, records health, the CSV and the per-channel verdicts, and writes no stream stats (writes same) |
 | streams | `streams.probe` caps connections per M3U account, not workers | IPTV Checker's global `parallel_workers` (2) is gone: `probe_per_account_limit` (default 1) connections per account, never above that account's `max_streams`, with `stream_check_delay` between starts on it. Total parallelism grows with the number of accounts, which is the limit a provider actually enforces (writes same) |
@@ -1186,7 +1241,7 @@ in `docs/oracle-reports/`.
 | streams | `streams.restore_*` leaves the format suffix alone | The plugin's settings text says restore does not strip the video format suffix, and its regex can. crosstalk never reverts a recorded suffix row, but a suffix stacked on top of a recorded mark does not block the mark's restore either: the trailing format run is stripped to follow the chain (as the plugin's own strip does) and dropped with the mark. Undoing the suffix nightly would flap against the next triage run (writes less) |
 | streams | `streams.restore_*` reads the newest 50 `triage_apply` runs | The plugin's `channel_state.json` kept one entry per channel until it was cleared by a restore, however old. crosstalk reads the channel rows of the newest 50 finished `triage_apply` runs (and `[jobs] run_history_days` prunes the table underneath): a change older than either falls back to what the name itself says, so a very old mark still loses its tag but a very old move may keep its group (writes less) |
 | streams | A recorded group that no longer exists is a skipped row | The plugin warns that the destination is gone (`missing_group_ids`). crosstalk restores the channel's NAME, leaves the group untouched, and says why in the row (writes less) |
-| streams | A restore back to "No Group" is planned and refused | Dispatcharr's channel serializer rejects a null `channel_group_id`, so a channel triage moved OUT of "No Group" cannot be moved back over REST. The row is planned, reported, and fails with that reason. The plugin never recorded such a channel at all (`_compute_capture_state` skips a channel with no group). The bridge closes this later (writes same: REST refuses the write) |
+| streams | A restore back to "No Group" is planned and refused | Dispatcharr's channel serializer rejects a null `channel_group_id`, so a channel triage moved OUT of "No Group" cannot be moved back over REST. The row is planned, reported, and fails with that reason. The plugin never recorded such a channel at all (`_compute_capture_state` skips a channel with no group). With the [bridge plugin](#bridge-plugin) enabled the move is written (writes same: REST refuses the write) |
 | streams | A finite container duration is the only placeholder fingerprint | The plugin's `placeholder_file_detection` needs ffprobe to report a container duration, and a live MPEG-TS never does — so the fingerprint only fires on a container that carries one (HLS, MP4), which is what its measured placeholder was. The evidence is recorded for every stream either way (writes same) |
 | streams | `streams.match_preview` drops the plugin's threshold-analysis advice rows | Preview also re-ran the pipeline at 5-point thresholds and collected by exact match against the winning stream name; the plugin itself notes that path disagrees with the real matcher. Those rows were advice, never a write (writes same) |
 | streams | `streams.match` runs the unified matching engine, not Stream-Mapparr's collector | One ranker (the engine's best identity family per channel group), one selection rule (streams attaches the whole family, all members ranked, above the one `[matching]` cut) and one cache shared with guide. Retired: SM's normalized-name groups (identity family keys), the OTA callsign regex path (the engine's callsign anchor), alias force-includes (the merged reverse index), the fuzzy gate with the token/substring family, and the per-app `match_sensitivity` (a file still naming it fails at load, pointing at `[matching] sensitivity`). Every difference from the oracle is attributed in `docs/oracle-reports/streams.md` (writes different: see the oracle report) |
