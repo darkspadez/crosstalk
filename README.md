@@ -250,7 +250,9 @@ Two files, split by who owns the option:
   `preserve_existing_streams`, `rate_limiting`, schedules, `test_name`, CSV retention, usage
   counters) fails at load naming its new home.
 
-The rest of `crosstalk.toml` is `[server]` (`bind`, `port`, `token`/`token_env`), `[dispatcharr]`
+The rest of `crosstalk.toml` is `[server]` (`bind`, `port`, `token`/`token_env`,
+`trusted_proxies`, `public_url`, `secure_cookies`, `hsts`; see
+[Running behind a reverse proxy](#running-behind-a-reverse-proxy)), `[dispatcharr]`
 (`base_url`, an API key or a JWT fallback, `timeout_secs`, `concurrency`), `[ai.providers.<name>]`
 (the endpoints, keys and concurrency caps), `[jobs]` (worker threads, the exports and data
 directories, `run_history_days`) and `[schedules]` (see [Scheduling](#scheduling)).
@@ -799,8 +801,10 @@ Setting it up, in Dispatcharr's own UI:
 How a delivery is handled:
 
 - **Auth**: `Authorization: Bearer <server.token>`, never a cookie; the route is exempt from
-  CSRF only for that reason. Deliveries are rate limited per address
-  (`hooks.rate_per_minute` over a minute, `429` with `Retry-After`).
+  CSRF only for that reason. A wrong token counts toward the same per-client lockout as a
+  wrong sign-in (ten in five minutes, then `429`). Deliveries are rate limited per client
+  (`hooks.rate_per_minute` over a minute, `429` with `Retry-After`); bodies over 64 KiB are
+  refused with `413`.
 - **Which event**: an `?event=` query parameter, then an `event` or `type` field in the body,
   then — because Dispatcharr's default payload names none — the payload's own counters
   (`total_processed`/`streams_created`/`streams_updated`/`elapsed_time` is `m3u_refresh`,
@@ -809,7 +813,9 @@ How a delivery is handled:
   configuration names.
 - **Debounce**: several M3U accounts finishing together is one logical "the playlists changed",
   so every delivery of the same event restarts a `debounce_secs` timer and the run happens once
-  after the burst settles.
+  after the burst settles — or `max_settle_secs` after its first delivery (default five
+  debounce windows, at most 900 s), whichever is sooner, so deliveries that never pause still
+  run their targets.
 - **Busy target**: if the target app (or the workflow slot) is busy, exactly **one** follow-up
   run is queued for when it frees — Stream-Mapparr's dirty-flag behaviour, so a late account is
   not dropped and a busy app is not started twenty times. The follow-up waits at most 30
@@ -844,22 +850,106 @@ curl -X POST http://127.0.0.1:8730/hooks/dispatcharr \
   The host form carries the shared options — scope, CSV retention and the AI policy — plus
   the matching toggles; each app's form carries only what that app owns.
 
-The UI binds to `127.0.0.1` by default. To expose it, set `server.bind` and a `server.token`;
-the daemon refuses to start on a non-loopback address without a token. A browser signs in at
-`/login` and gets an `HttpOnly` cookie; a script sends `Authorization: Bearer <token>`.
+The UI binds to `127.0.0.1` by default. To expose it, set `server.bind` and a `server.token`
+of at least 32 bytes (`openssl rand -hex 32`); the daemon refuses to start on a non-loopback
+address without one, or with a shorter one. A browser signs in at `/login` with the token and
+gets a **session** cookie (`crosstalk_session`, `HttpOnly; SameSite=Strict`, plus `Secure`
+over https): a random id held in memory, never the token itself, which expires after 12 hours
+idle or 7 days at most, ends on **Sign out**, and ends on a token rotation or a daemon restart.
+A script sends `Authorization: Bearer <token>`; that header is the only way the token itself
+travels.
 
 Bots and scripts talk to the same routes the forms do, with two differences from a browser:
 
 - Scripts send `Authorization: Bearer <token>` on every request and are CSRF-exempt: a
   cross-site page cannot forge that header, so a request carrying it is by definition not
   a forged browser form.
-- Browsers send the `crosstalk_token` cookie plus the `csrf_token` hidden field (or the
-  `x-csrf-token` header); without the synchroniser token a POST is rejected with 403.
-- With no token configured, only loopback `Host` values reach the daemon at all: a
-  DNS-rebinding page's hostname may resolve to 127.0.0.1, but its foreign `Host` header
-  is rejected before anything trusts it. With a token configured the Host check is skipped
-  (reverse proxies use foreign Host values by design) and the bearer token is the
-  protection; a POST whose `Origin` disagrees with `Host` is still rejected as a forgery.
+- Browsers send the session cookie plus the session's own `csrf_token` hidden field (or the
+  `x-csrf-token` header) on everything but GET/HEAD/OPTIONS; without it the request is
+  rejected with 403.
+
+What every request meets, in order:
+
+1. **Limits**: 30 s per request (`408`), 256 requests in flight (`503`), and a body bound per
+   route (sign-in 4 KiB, webhook 64 KiB, settings 256 KiB, everything else 64 KiB; `413`).
+2. **Auth**, before anything reads the body or checks CSRF. Ten wrong tokens in five minutes —
+   on the sign-in form or as a Bearer header on any route, the webhook included — lock that
+   client out with `429` and `Retry-After`, even for the right token, until the window passes.
+   A wrong token is always `401` (never a `403` that would say "the token was fine, CSRF was
+   not"), and unauthenticated answers say nothing more than `unauthorized`.
+3. **Host and Origin**: with no token configured, only loopback `Host` values reach the daemon
+   (a DNS-rebinding page's foreign `Host` is rejected), and any request carrying proxy headers
+   (`Forwarded`, `X-Forwarded-*`, `X-Real-IP`) is refused with `401`: a tokenless daemon must
+   not sit behind a proxy. On every write, an `Origin` header must be the daemon's own origin
+   — scheme, host and port: `server.public_url` when set, else what a trusted proxy's
+   `X-Forwarded-Proto`/`X-Forwarded-Host` say, else `http://` plus `Host`.
+4. **CSRF**, as above.
+
+Every response carries a strict Content-Security-Policy, `X-Frame-Options: DENY`,
+`Referrer-Policy: same-origin`, `Cross-Origin-Opener-Policy: same-origin`, a
+`Permissions-Policy` switching off the device APIs, and `Cache-Control: no-store` (the embedded
+`/static/*` assets are cached for a day). `Strict-Transport-Security` is sent when a trusted
+proxy says the request came over https, or always with `server.hsts = true`.
+
+### Running behind a reverse proxy
+
+The recommended internet-facing setup: crosstalk on `127.0.0.1`, a TLS-terminating proxy in
+front, and that proxy listed as trusted.
+
+```toml
+[server]
+bind = "127.0.0.1"           # only the proxy on this host reaches the daemon
+port = 8730
+token_env = "CROSSTALK_TOKEN" # at least 32 bytes: openssl rand -hex 32
+trusted_proxies = ["127.0.0.1", "::1"]
+public_url = "https://crosstalk.example.com"
+# secure_cookies = true / hsts = true force those on even without X-Forwarded-Proto.
+```
+
+- `trusted_proxies` lists the addresses (or CIDR ranges, IPv4 or IPv6) the proxy connects
+  **from**. In Docker that is the proxy container's network, e.g. `["172.16.0.0/12"]`. Only
+  a request whose socket peer is in the list has its `X-Forwarded-For` read (the rightmost
+  address that is not itself a trusted proxy, so a client cannot spoof its way past the
+  limiter), then `X-Real-IP`; anyone else is judged by its socket address. IPv6 clients are
+  counted per `/64`. Setting it requires a token.
+- The proxy must **set** (not append to a client-supplied) `X-Forwarded-Proto`, and should
+  pass `X-Forwarded-For` and `X-Forwarded-Host`. `X-Forwarded-Proto: https` from a trusted
+  proxy marks the session cookie `Secure` and turns on HSTS.
+- `public_url` is only needed when the proxy rewrites `Host` and does not send
+  `X-Forwarded-Host`; it is what a browser's `Origin` is compared against.
+
+Caddy (sets `X-Forwarded-For`, `X-Forwarded-Proto` and `X-Forwarded-Host` itself):
+
+```caddyfile
+crosstalk.example.com {
+    reverse_proxy 127.0.0.1:8730
+}
+```
+
+nginx:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name crosstalk.example.com;
+    # ssl_certificate ... ; ssl_certificate_key ... ;
+
+    client_max_body_size 256k;
+
+    location / {
+        proxy_pass http://127.0.0.1:8730;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+    }
+}
+```
+
+The webhook goes through the same proxy and the same token: point Dispatcharr at
+`https://crosstalk.example.com/hooks/dispatcharr` with the `Authorization: Bearer` header. There
+is no separate webhook token (a deliberate choice: one token, hardened).
 
 ## How matching works
 

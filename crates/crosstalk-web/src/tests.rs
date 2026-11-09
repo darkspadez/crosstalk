@@ -1,6 +1,5 @@
 //! Route-level tests: the pages render, the actions start runs, and auth is enforced.
 
-use crate::auth;
 use crate::routes::router;
 use crate::state::AppState;
 use axum::body::Body;
@@ -135,12 +134,53 @@ async fn get(state: &AppState, uri: &str) -> (StatusCode, String) {
     (status, String::from_utf8_lossy(&body).to_string())
 }
 
-async fn get_with_cookie(state: &AppState, uri: &str, token: &str) -> (StatusCode, String) {
+/// Sign in through the login form, returning the session id and the session's CSRF token.
+async fn sign_in(state: &AppState, token: &str) -> (String, String) {
+    let response = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/login")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(format!("token={token}")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(
+        response.status(),
+        StatusCode::SEE_OTHER,
+        "the sign-in worked"
+    );
+    let prefix = format!("{}=", crate::session::COOKIE);
+    let id = response
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find_map(|cookie| {
+            cookie
+                .strip_prefix(&prefix)
+                .and_then(|rest| rest.split(';').next())
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+        })
+        .expect("a session cookie");
+    let csrf = state
+        .sessions()
+        .touch(&id, token)
+        .expect("a live session")
+        .csrf;
+    (id, csrf)
+}
+
+/// GET with a session cookie.
+async fn get_with_cookie(state: &AppState, uri: &str, session: &str) -> (StatusCode, String) {
     let response = router(state.clone())
         .oneshot(
             Request::builder()
                 .uri(uri)
-                .header("cookie", format!("{}={token}", auth::COOKIE))
+                .header("cookie", format!("{}={session}", crate::session::COOKIE))
                 .body(Body::empty())
                 .expect("request"),
         )
@@ -678,9 +718,23 @@ async fn a_configured_token_is_required() {
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("Access token"), "{body}");
 
-    // With the right cookie, the page renders.
-    let (status, _body) = get_with_cookie(&state, "/", "s3cret").await;
+    // With a session from the login page, the page renders.
+    let (session, _csrf) = sign_in(&state, "s3cret").await;
+    let (status, _body) = get_with_cookie(&state, "/", &session).await;
     assert_eq!(status, StatusCode::OK);
+
+    // The old cookie that held the raw token is no credential any more.
+    let response = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/apps")
+                .header("cookie", "crosstalk_token=s3cret")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
     // With the wrong one it does not.
     let response = router(state.clone())
@@ -1080,7 +1134,8 @@ async fn a_script_bearer_is_csrf_exempt_and_a_wrong_one_is_not() {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 
-    // A wrong Bearer buys nothing: without a CSRF token the POST still fails closed.
+    // A wrong Bearer buys nothing, and is told so by the auth gate before CSRF is consulted:
+    // a 401, never the 403 that would say "the token was fine, only CSRF was missing".
     let (status, _) = post_raw(
         &state,
         "/apps/echo/actions/peek",
@@ -1089,7 +1144,7 @@ async fn a_script_bearer_is_csrf_exempt_and_a_wrong_one_is_not() {
         false,
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -1112,8 +1167,8 @@ async fn bad_logins_without_connect_info_share_the_fallback_bucket() {
         let status = post_form_with_csrf(&state, "/login", "token=wrong", false).await;
         assert_eq!(
             status,
-            StatusCode::OK,
-            "bad attempt {attempt} re-renders login"
+            StatusCode::UNAUTHORIZED,
+            "bad attempt {attempt} re-renders login with a 401"
         );
     }
     let status = post_form_with_csrf(&state, "/login", "token=wrong", false).await;
@@ -1199,7 +1254,7 @@ async fn saving_host_settings_refuses_a_swap_that_would_drop_auth() {
         &state,
         "/settings/host",
         "matching.enabled_databases=US",
-        &[("cookie", "crosstalk_token=s3cret")],
+        &[("authorization", "Bearer s3cret")],
     )
     .await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -1338,7 +1393,7 @@ async fn ten_wrong_tokens_lock_the_address_out_of_login() {
         let status = post_form_with_csrf(&state, "/login", "token=wrong", false).await;
         assert_eq!(
             status,
-            StatusCode::OK,
+            StatusCode::UNAUTHORIZED,
             "attempt {attempt} shows the error page"
         );
     }
@@ -1363,7 +1418,7 @@ async fn a_correct_sign_in_clears_the_failure_count() {
     // Nine failures, then the right token: the sign-in succeeds and the count resets.
     for _ in 0..9 {
         let status = post_form_with_csrf(&state, "/login", "token=wrong", false).await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
     let status = post_form_with_csrf(&state, "/login", "token=s3cret", false).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
@@ -1372,7 +1427,11 @@ async fn a_correct_sign_in_clears_the_failure_count() {
     // would already be the eleventh and locked out.
     for attempt in 1..=10 {
         let status = post_form_with_csrf(&state, "/login", "token=wrong", false).await;
-        assert_eq!(status, StatusCode::OK, "attempt {attempt} after the reset");
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "attempt {attempt} after the reset"
+        );
     }
     let (status, _) = post_raw(&state, "/login", "token=wrong", &[], false).await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
@@ -1612,8 +1671,23 @@ async fn the_webhook_accepts_only_a_bearer_token() {
     let (status, _headers, body) = post_hook(&state, r#"{"event": "m3u_refresh"}"#, None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
 
-    // The session cookie alone is refused, and refused as an auth failure rather than as a
+    // A live session cookie alone is refused, and refused as an auth failure rather than as a
     // missing CSRF token: this route is bearer-only on purpose.
+    let (session, _csrf) = sign_in(&state, "s3cret").await;
+    let (status, headers, body) = post_hook(
+        &state,
+        r#"{"event": "m3u_refresh"}"#,
+        Some(("cookie", format!("{}={session}", crate::session::COOKIE))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(
+        headers
+            .get("www-authenticate")
+            .and_then(|value| value.to_str().ok()),
+        Some("Bearer")
+    );
+    // The old token cookie is refused too.
     let (status, _headers, body) = post_hook(
         &state,
         r#"{"event": "m3u_refresh"}"#,
@@ -1621,7 +1695,6 @@ async fn the_webhook_accepts_only_a_bearer_token() {
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
-    assert!(body.contains("Bearer"), "{body}");
 
     // A wrong token is a 401 like any other.
     let (status, _headers, _body) = post_hook(
@@ -1646,8 +1719,8 @@ async fn the_webhook_accepts_only_a_bearer_token() {
 
 #[tokio::test]
 async fn the_webhook_refuses_a_daemon_with_no_token() {
-    // With no credential to check, a route that starts real work cannot be open: the operator
-    // gets a 401 that says what to configure.
+    // With no credential to check, a route that starts real work cannot be open. The answer is
+    // the generic 401 every unauthenticated request gets; the log says what to configure.
     let (state, store, _dir) = state_with(None, with_hooks);
     let (status, _headers, body) = post_hook(
         &state,
@@ -1656,7 +1729,10 @@ async fn the_webhook_refuses_a_daemon_with_no_token() {
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
-    assert!(body.contains("server.token"), "{body}");
+    assert!(
+        !body.contains("server.token"),
+        "pre-auth answers are generic: {body}"
+    );
     assert_eq!(store.run_count().expect("count"), 0);
 }
 
@@ -2076,4 +2152,748 @@ async fn undoing_needs_a_token_when_one_is_configured() {
         .expect("response");
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(store.run_count().expect("count"), 1, "nothing started");
+}
+
+// --- the auth gate, proxies, sessions and limits (security audit area A) -------------
+
+/// A token long enough for a reachable daemon.
+const LONG: &str = "0123456789abcdef0123456789abcdef";
+
+/// Send one request, optionally from a socket peer (`ConnectInfo`, as the daemon serves it).
+async fn send(
+    state: &AppState,
+    method: &str,
+    uri: &str,
+    peer: Option<&str>,
+    headers: &[(&str, &str)],
+    body: Vec<u8>,
+) -> (StatusCode, axum::http::HeaderMap, String) {
+    let mut builder = Request::builder().method(method).uri(uri);
+    if let Some(peer) = peer {
+        let address: std::net::SocketAddr = peer.parse().expect("peer");
+        builder = builder.extension(axum::extract::ConnectInfo(address));
+    }
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let response = router(state.clone())
+        .oneshot(builder.body(Body::from(body)).expect("request"))
+        .await
+        .expect("response");
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .expect("body");
+    (status, headers, String::from_utf8_lossy(&body).to_string())
+}
+
+fn behind_a_proxy(config: &mut CrosstalkConfig) {
+    config.server.trusted_proxies = vec!["10.0.0.0/8".to_string()];
+}
+
+#[tokio::test]
+async fn ten_wrong_bearers_anywhere_lock_the_client_out_everywhere() {
+    let (state, store, _dir) = state_with(Some(LONG), with_hooks);
+    let form = ("content-type", "application/x-www-form-urlencoded");
+    // Wrong tokens spread over a read, a write without CSRF and the webhook: one counter.
+    for attempt in 0..10 {
+        let (method, uri) = match attempt % 3 {
+            0 => ("GET", "/api/v1/runs"),
+            1 => ("POST", "/exports/clear"),
+            _ => ("POST", HOOK),
+        };
+        let (status, _headers, body) = send(
+            &state,
+            method,
+            uri,
+            None,
+            &[("authorization", "Bearer wrong"), form],
+            b"confirm=true".to_vec(),
+        )
+        .await;
+        // Never the CSRF layer's 403: that would confirm the guess got past auth.
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "attempt {attempt} {uri}: {body}"
+        );
+    }
+
+    // The eleventh is refused before the token is looked at, even the right one, anywhere.
+    let bearer = format!("Bearer {LONG}");
+    for (method, uri) in [
+        ("GET", "/api/v1/runs"),
+        ("POST", "/exports/clear"),
+        ("POST", HOOK),
+    ] {
+        let (status, headers, _body) = send(
+            &state,
+            method,
+            uri,
+            None,
+            &[("authorization", bearer.as_str()), form],
+            b"confirm=true".to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{uri}");
+        assert!(headers.contains_key("retry-after"), "{uri}");
+    }
+    // The sign-in form shares the counter.
+    let (status, _headers, _body) = send(
+        &state,
+        "POST",
+        "/login",
+        None,
+        &[form],
+        format!("token={LONG}").into_bytes(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(store.run_count().expect("count"), 0, "nothing ran");
+}
+
+#[tokio::test]
+async fn wrong_sign_ins_lock_out_bearer_requests_too() {
+    let (state, _store, _dir) = state(Some(LONG));
+    for _ in 0..10 {
+        let status = post_form_with_csrf(&state, "/login", "token=wrong", false).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+    let bearer = format!("Bearer {LONG}");
+    let (status, _headers, _body) = send(
+        &state,
+        "GET",
+        "/api/v1/apps",
+        None,
+        &[("authorization", bearer.as_str())],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn a_correct_bearer_does_not_use_up_the_limit() {
+    let (state, _store, _dir) = state(Some(LONG));
+    let bearer = format!("Bearer {LONG}");
+    for _ in 0..30 {
+        let (status, _headers, _body) = send(
+            &state,
+            "GET",
+            "/api/v1/apps",
+            None,
+            &[("authorization", bearer.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+}
+
+#[tokio::test]
+async fn clients_are_counted_by_socket_address_without_a_trusted_proxy() {
+    let (state, _store, _dir) = state(Some(LONG));
+    // An internet client rotating X-Forwarded-For: ignored, it is one client.
+    for n in 0..10 {
+        let spoofed = format!("198.51.100.{n}");
+        let (status, _h, _b) = send(
+            &state,
+            "GET",
+            "/api/v1/runs",
+            Some("203.0.113.9:40000"),
+            &[
+                ("authorization", "Bearer wrong"),
+                ("x-forwarded-for", spoofed.as_str()),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+    let bearer = format!("Bearer {LONG}");
+    let (status, _h, _b) = send(
+        &state,
+        "GET",
+        "/api/v1/runs",
+        Some("203.0.113.9:40001"),
+        &[
+            ("authorization", bearer.as_str()),
+            ("x-forwarded-for", "198.51.100.200"),
+        ],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the spoof bought nothing"
+    );
+
+    // Someone else is untouched.
+    let (status, _h, _b) = send(
+        &state,
+        "GET",
+        "/api/v1/runs",
+        Some("192.0.2.7:40000"),
+        &[("authorization", bearer.as_str())],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn behind_a_trusted_proxy_each_forwarded_client_has_its_own_count() {
+    let (state, _store, _dir) = state_with(Some(LONG), behind_a_proxy);
+    // An attacker behind the proxy locks themself out...
+    for _ in 0..10 {
+        let (status, _h, _b) = send(
+            &state,
+            "GET",
+            "/api/v1/runs",
+            Some("10.0.0.2:5000"),
+            &[
+                ("authorization", "Bearer wrong"),
+                ("x-forwarded-for", "198.51.100.66"),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+    let bearer = format!("Bearer {LONG}");
+    let (status, _h, _b) = send(
+        &state,
+        "GET",
+        "/api/v1/runs",
+        Some("10.0.0.2:5000"),
+        &[
+            ("authorization", bearer.as_str()),
+            ("x-forwarded-for", "198.51.100.66"),
+        ],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+
+    // ...but not the operator arriving through the same proxy.
+    let (status, _h, _b) = send(
+        &state,
+        "GET",
+        "/api/v1/runs",
+        Some("10.0.0.2:5000"),
+        &[
+            ("authorization", bearer.as_str()),
+            ("x-forwarded-for", "192.0.2.10"),
+        ],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // And a client-supplied hop to the left of the proxy's own changes nothing.
+    let (status, _h, _b) = send(
+        &state,
+        "GET",
+        "/api/v1/runs",
+        Some("10.0.0.2:5000"),
+        &[
+            ("authorization", bearer.as_str()),
+            ("x-forwarded-for", "192.0.2.10, 198.51.100.66"),
+        ],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn a_tokenless_daemon_refuses_proxied_requests() {
+    let (state, _store, _dir) = state(None);
+    let (status, _h, _b) = send(&state, "GET", "/", None, &[], Vec::new()).await;
+    assert_eq!(status, StatusCode::OK, "loopback, no proxy: open");
+    for header in crate::client::FORWARDING_HEADERS {
+        let (status, _h, body) = send(
+            &state,
+            "GET",
+            "/",
+            Some("127.0.0.1:50000"),
+            &[(header, "203.0.113.9")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{header}");
+        assert_eq!(body, "unauthorized\n", "generic: {body}");
+    }
+}
+
+#[tokio::test]
+async fn the_login_page_hands_out_a_session_not_the_token() {
+    let (state, _store, _dir) = state(Some("s3cret"));
+    let (status, headers, _body) = send(
+        &state,
+        "POST",
+        "/login",
+        None,
+        &[("content-type", "application/x-www-form-urlencoded")],
+        b"token=s3cret".to_vec(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let cookies: Vec<String> = headers
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|value| value.to_str().ok().map(str::to_string))
+        .collect();
+    let session = cookies
+        .iter()
+        .find(|cookie| cookie.starts_with("crosstalk_session="))
+        .expect("a session cookie");
+    assert!(!session.contains("s3cret"), "{session}");
+    assert!(session.contains("HttpOnly"), "{session}");
+    assert!(session.contains("SameSite=Strict"), "{session}");
+    assert!(session.contains("Path=/"), "{session}");
+    assert!(!session.contains("Secure"), "plain http: {session}");
+    // The legacy cookie is expired on the way in.
+    assert!(
+        cookies
+            .iter()
+            .any(|cookie| cookie.starts_with("crosstalk_token=;") && cookie.contains("Max-Age=0")),
+        "{cookies:?}"
+    );
+    assert_eq!(state.sessions().len(), 1);
+}
+
+#[tokio::test]
+async fn the_session_cookie_is_secure_over_https() {
+    // Through a trusted proxy that says https.
+    let (state, _store, _dir) = state_with(Some(LONG), behind_a_proxy);
+    let body = format!("token={LONG}").into_bytes();
+    let form = ("content-type", "application/x-www-form-urlencoded");
+    let (status, headers, _b) = send(
+        &state,
+        "POST",
+        "/login",
+        Some("10.0.0.2:5000"),
+        &[form, ("x-forwarded-proto", "https")],
+        body.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let cookie = headers
+        .get("set-cookie")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    assert!(cookie.ends_with("; Secure"), "{cookie}");
+
+    // The same header from anyone else is not believed.
+    let (status, headers, _b) = send(
+        &state,
+        "POST",
+        "/login",
+        Some("203.0.113.9:5000"),
+        &[form, ("x-forwarded-proto", "https")],
+        body.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let cookie = headers
+        .get("set-cookie")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    assert!(!cookie.contains("Secure"), "{cookie}");
+
+    // Or forced on.
+    let (state, _store, _dir) = state_with(Some(LONG), |config| {
+        config.server.secure_cookies = true;
+    });
+    let (_status, headers, _b) = send(&state, "POST", "/login", None, &[form], body).await;
+    let cookie = headers
+        .get("set-cookie")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    assert!(cookie.ends_with("; Secure"), "{cookie}");
+}
+
+#[tokio::test]
+async fn signing_out_ends_the_session_server_side() {
+    let (state, _store, _dir) = state(Some("s3cret"));
+    let (session, csrf) = sign_in(&state, "s3cret").await;
+    let cookie = format!("{}={session}", crate::session::COOKIE);
+    let (status, _h, _b) = send(
+        &state,
+        "POST",
+        "/logout",
+        None,
+        &[
+            ("cookie", cookie.as_str()),
+            (crate::csrf::CSRF_HEADER, csrf.as_str()),
+        ],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert!(state.sessions().is_empty());
+    // A copy of the cookie kept by someone else is worthless now.
+    let (status, _body) = get_with_cookie(&state, "/api/v1/apps", &session).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_sessions_forms_carry_its_own_csrf_token() {
+    let (state, store, _dir) = state(Some("s3cret"));
+    let (session, csrf) = sign_in(&state, "s3cret").await;
+    let cookie = format!("{}={session}", crate::session::COOKIE);
+    let form = ("content-type", "application/x-www-form-urlencoded");
+
+    // The page embeds the session's token, not the daemon-wide one.
+    let (status, body) = get_with_cookie(&state, "/apps/echo", &session).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains(&csrf), "{body}");
+    assert!(!body.contains(state.csrf_token()), "{body}");
+
+    // The daemon-wide token is not this session's.
+    let (status, _h, _b) = send(
+        &state,
+        "POST",
+        "/apps/echo/actions/peek",
+        None,
+        &[
+            ("cookie", cookie.as_str()),
+            (crate::csrf::CSRF_HEADER, state.csrf_token()),
+            form,
+        ],
+        b"dry_run=true".to_vec(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Nor is another session's.
+    let (_other, other_csrf) = sign_in(&state, "s3cret").await;
+    let (status, _h, _b) = send(
+        &state,
+        "POST",
+        "/apps/echo/actions/peek",
+        None,
+        &[
+            ("cookie", cookie.as_str()),
+            (crate::csrf::CSRF_HEADER, other_csrf.as_str()),
+            form,
+        ],
+        b"dry_run=true".to_vec(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(store.run_count().expect("count"), 0);
+
+    // Its own is, as the header or the hidden field.
+    let field = format!("dry_run=true&csrf_token={csrf}");
+    let (status, _h, _b) = send(
+        &state,
+        "POST",
+        "/apps/echo/actions/peek",
+        None,
+        &[("cookie", cookie.as_str()), form],
+        field.into_bytes(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+}
+
+#[tokio::test]
+async fn csrf_covers_every_method_but_get_head_and_options() {
+    let (state, _store, _dir) = state(None);
+    for method in ["PUT", "DELETE", "PATCH"] {
+        let (status, _h, _b) = send(&state, method, "/exports/clear", None, &[], Vec::new()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method}");
+    }
+}
+
+#[tokio::test]
+async fn the_origin_must_be_the_daemons_own_origin() {
+    let form = ("content-type", "application/x-www-form-urlencoded");
+    let bearer = format!("Bearer {LONG}");
+
+    // Behind a Host-rewriting proxy, `public_url` names the origin browsers use.
+    let (state, _store, _dir) = state_with(Some(LONG), |config| {
+        config.server.public_url = "https://crosstalk.example.com".to_string();
+    });
+    let post = |origin: &'static str| {
+        let state = state.clone();
+        let bearer = bearer.clone();
+        async move {
+            send(
+                &state,
+                "POST",
+                "/runs/9999/cancel",
+                None,
+                &[
+                    ("host", "127.0.0.1:8730"),
+                    ("origin", origin),
+                    ("authorization", bearer.as_str()),
+                    form,
+                ],
+                Vec::new(),
+            )
+            .await
+            .0
+        }
+    };
+    assert_eq!(
+        post("https://crosstalk.example.com").await,
+        StatusCode::SEE_OTHER
+    );
+    assert_eq!(
+        post("https://crosstalk.example.com:443").await,
+        StatusCode::SEE_OTHER
+    );
+    // Scheme and port count, not only the host name.
+    assert_eq!(
+        post("http://crosstalk.example.com").await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        post("https://crosstalk.example.com:8443").await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(post("https://evil.example").await, StatusCode::FORBIDDEN);
+    assert_eq!(post("null").await, StatusCode::FORBIDDEN);
+
+    // Without it, a trusted proxy's X-Forwarded-Proto / X-Forwarded-Host decide...
+    let (state, _store, _dir) = state_with(Some(LONG), behind_a_proxy);
+    let forwarded = |peer: &'static str, origin: &'static str| {
+        let state = state.clone();
+        let bearer = bearer.clone();
+        async move {
+            send(
+                &state,
+                "POST",
+                "/runs/9999/cancel",
+                Some(peer),
+                &[
+                    ("host", "127.0.0.1:8730"),
+                    ("x-forwarded-proto", "https"),
+                    ("x-forwarded-host", "ui.example"),
+                    ("origin", origin),
+                    ("authorization", bearer.as_str()),
+                    form,
+                ],
+                Vec::new(),
+            )
+            .await
+            .0
+        }
+    };
+    assert_eq!(
+        forwarded("10.0.0.2:5000", "https://ui.example").await,
+        StatusCode::SEE_OTHER
+    );
+    assert_eq!(
+        forwarded("10.0.0.2:5000", "http://127.0.0.1:8730").await,
+        StatusCode::FORBIDDEN
+    );
+    // ...but only a trusted proxy's: from anyone else the Host header (over http) decides.
+    assert_eq!(
+        forwarded("203.0.113.9:5000", "https://ui.example").await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        forwarded("203.0.113.9:5000", "http://127.0.0.1:8730").await,
+        StatusCode::SEE_OTHER
+    );
+}
+
+#[tokio::test]
+async fn responses_are_not_cached_but_assets_are() {
+    let (state, _store, _dir) = state(None);
+    let (_status, headers, _body) = get_full(&state, "/").await;
+    assert_eq!(
+        headers.get("cache-control").and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+    let (_status, headers, _body) = get_full(&state, "/static/app.css").await;
+    assert_eq!(
+        headers.get("cache-control").and_then(|v| v.to_str().ok()),
+        Some(crate::security::STATIC_CACHE)
+    );
+    assert_eq!(
+        headers
+            .get("cross-origin-opener-policy")
+            .and_then(|v| v.to_str().ok()),
+        Some("same-origin")
+    );
+    assert!(headers.contains_key("permissions-policy"));
+    assert!(
+        !headers.contains_key("strict-transport-security"),
+        "plain http says nothing about https"
+    );
+    // A rejection is not cached either.
+    let (status, headers) = post_raw(&state, "/exports/clear", "", &[], false).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        headers.get("cache-control").and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+}
+
+#[tokio::test]
+async fn hsts_is_sent_over_https_or_when_configured() {
+    let (state, _store, _dir) = state_with(Some(LONG), behind_a_proxy);
+    let (_status, headers, _body) = send(
+        &state,
+        "GET",
+        "/login",
+        Some("10.0.0.2:5000"),
+        &[("x-forwarded-proto", "https")],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(
+        headers
+            .get("strict-transport-security")
+            .and_then(|v| v.to_str().ok()),
+        Some(crate::security::HSTS)
+    );
+    // Not on an untrusted peer's say-so.
+    let (_status, headers, _body) = send(
+        &state,
+        "GET",
+        "/login",
+        Some("203.0.113.9:5000"),
+        &[("x-forwarded-proto", "https")],
+        Vec::new(),
+    )
+    .await;
+    assert!(!headers.contains_key("strict-transport-security"));
+
+    let (state, _store, _dir) = state_with(None, |config| config.server.hsts = true);
+    let (_status, headers, _body) = get_full(&state, "/health").await;
+    assert!(headers.contains_key("strict-transport-security"));
+}
+
+#[tokio::test]
+async fn bodies_are_bounded_per_route() {
+    let form = ("content-type", "application/x-www-form-urlencoded");
+    let (state, _store, _dir) = state(Some(LONG));
+
+    // Sign-in: 4 KiB.
+    let mut login = format!("token={LONG}&pad=").into_bytes();
+    login.resize(crate::limits::LOGIN_BODY + 1, b'a');
+    let (status, _h, _b) = send(&state, "POST", "/login", None, &[form], login).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+
+    // Webhook: 64 KiB.
+    let bearer = format!("Bearer {LONG}");
+    let mut hook = b"event=m3u_refresh&pad=".to_vec();
+    hook.resize(crate::limits::HOOK_BODY + 1, b'a');
+    let (status, _h, _b) = send(
+        &state,
+        "POST",
+        HOOK,
+        None,
+        &[("authorization", bearer.as_str()), form],
+        hook,
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+
+    // An unauthenticated POST is refused before its body is read, however large.
+    let (status, _h, _b) = send(
+        &state,
+        "POST",
+        "/exports/clear",
+        None,
+        &[form],
+        vec![b'a'; 2 << 20],
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn settings_forms_get_a_larger_bound_than_other_forms() {
+    let (state, _store, _dir) = state(None);
+    // 100 KiB: over the default bound, under the settings one.
+    let mut large = b"pad=".to_vec();
+    large.resize(100 * 1024, b'a');
+    let large = String::from_utf8(large).expect("ascii");
+    let (status, _headers) = post_raw(&state, "/settings/echo", &large, &[], true).await;
+    assert_ne!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    let (status, _headers) = post_raw(&state, "/apps/echo/actions/peek", &large, &[], true).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    // The CSRF layer reads the hidden field under the same bound.
+    let (status, _headers) = post_raw(&state, "/apps/echo/actions/peek", &large, &[], false).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+
+    let mut huge = b"pad=".to_vec();
+    huge.resize(crate::limits::SETTINGS_BODY + 1, b'a');
+    let huge = String::from_utf8(huge).expect("ascii");
+    let (status, _headers) = post_raw(&state, "/settings/echo", &huge, &[], true).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn requests_past_the_in_flight_bound_are_refused() {
+    let (state, _store, _dir) = state(None);
+    let held = state
+        .in_flight()
+        .clone()
+        .try_acquire_many_owned(crate::limits::MAX_IN_FLIGHT as u32)
+        .expect("every permit");
+    let (status, headers, _body) = send(&state, "GET", "/health", None, &[], Vec::new()).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(headers.contains_key("retry-after"));
+    drop(held);
+    let (status, _headers, _body) = send(&state, "GET", "/health", None, &[], Vec::new()).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn saving_host_settings_refuses_a_short_token_on_a_reachable_bind() {
+    let (state, _store, dir) = state(Some("s3cret"));
+    std::fs::write(
+        dir.path().join("crosstalk.toml"),
+        "[server]\nbind = \"0.0.0.0\"\ntoken = \"short\"\ntoken_env = \"\"\n",
+    )
+    .expect("seed");
+    let (status, body) = post_page(
+        &state,
+        "/settings/host",
+        "matching.enabled_databases=US",
+        &[("authorization", "Bearer s3cret")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(body.contains("NOT applied"), "{body}");
+    assert!(body.contains("at least 32"), "{body}");
+    assert_eq!(state.snapshot().server.bind, "127.0.0.1", "not swapped in");
+}
+
+#[tokio::test]
+async fn an_overlong_action_input_is_refused() {
+    let (state, store, _dir) = state(None);
+    let long = "x".repeat(crate::routes::MAX_ACTION_INPUT + 1);
+    let status = post_form(
+        &state,
+        "/apps/echo/actions/peek",
+        &format!("dry_run=true&input={long}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(store.run_count().expect("count"), 0);
+}
+
+#[tokio::test]
+async fn the_hook_answer_echoes_only_a_tame_event_name() {
+    let (state, _store, _dir) = state_with(Some("s3cret"), with_hooks);
+    let (status, _headers, body) = post_hook(
+        &state,
+        r#"{"event": "<script>alert(1)</script>"}"#,
+        Some(("authorization", "Bearer s3cret".to_string())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert!(!body.contains('<'), "{body}");
+    assert!(body.contains("?script?alert?1???script?"), "{body}");
 }

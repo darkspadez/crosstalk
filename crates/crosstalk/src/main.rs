@@ -330,6 +330,16 @@ fn serve(args: ServeArgs) -> Result<()> {
                 snapshot.server.bind
             );
         }
+        // The listener rules the configuration report calls errors: a token too short for a
+        // reachable daemon, trusted proxies without a token, a range or public URL that does
+        // not parse. Each would leave the daemon weaker than the operator thinks it is.
+        let security = snapshot.server.security_errors();
+        if !security.is_empty() {
+            anyhow::bail!(
+                "refusing to start with an unsafe [server] configuration:\n  - {}",
+                security.join("\n  - ")
+            );
+        }
 
         let store = Store::open(snapshot.data_dir().join("crosstalk.db"))?;
         let registry = registry::builtin();
@@ -390,13 +400,10 @@ fn serve(args: ServeArgs) -> Result<()> {
             );
         }
 
-        // With `ConnectInfo`: without it the login limiter's `ConnectInfo<SocketAddr>`
-        // extractor is always `None` and every client shares the one fallback bucket, so ten
-        // bad POSTs from anyone would lock out every browser login. Note the limit of this:
-        // behind a reverse proxy every client arrives with the proxy's address, so the
-        // limiter is effectively global there too — there is no trusted-proxy or
-        // X-Forwarded-For support yet, so do not put a login-bearing listener behind one
-        // expecting per-client limiting.
+        // With `ConnectInfo`: without it every client shares the one fallback limiter bucket,
+        // so ten bad tokens from anyone would lock everyone out. Behind a reverse proxy, list
+        // the proxy in `[server] trusted_proxies` so the client address comes from its
+        // `X-Forwarded-For` instead of the proxy's own socket.
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),

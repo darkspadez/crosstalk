@@ -62,6 +62,22 @@ pub struct ServerConfig {
     /// Read the token from this environment variable instead of the file.
     #[serde(deserialize_with = "string_or_scalar")]
     pub token_env: String,
+    /// Reverse proxies allowed to name the client: CIDR ranges (`10.0.0.0/8`, `::1/128`) or bare
+    /// addresses. Only a request whose socket peer is in one of these has its
+    /// `X-Forwarded-For` / `X-Real-IP` / `X-Forwarded-Proto` / `X-Forwarded-Host` honoured;
+    /// everyone else's forwarding headers are ignored. Non-empty requires a token.
+    pub trusted_proxies: Vec<String>,
+    /// The URL browsers use to reach the UI (`https://crosstalk.example.com`), when a proxy
+    /// rewrites `Host`. A POST's `Origin` must match it. Empty means "work it out from the
+    /// trusted proxy's `X-Forwarded-*` headers, else `Host`".
+    #[serde(deserialize_with = "string_or_scalar")]
+    pub public_url: String,
+    /// Always mark the session cookie `Secure`. It is also marked whenever a trusted proxy
+    /// says the request arrived over https.
+    pub secure_cookies: bool,
+    /// Always send `Strict-Transport-Security`. It is also sent whenever a trusted proxy says
+    /// the request arrived over https.
+    pub hsts: bool,
 }
 
 impl Default for ServerConfig {
@@ -71,9 +87,17 @@ impl Default for ServerConfig {
             port: 8730,
             token: String::new(),
             token_env: "CROSSTALK_TOKEN".to_string(),
+            trusted_proxies: Vec::new(),
+            public_url: String::new(),
+            secure_cookies: false,
+            hsts: false,
         }
     }
 }
+
+/// The shortest token a reachable daemon accepts: 32 bytes, the length of
+/// `openssl rand -hex 16` and well past anything guessable at the limiter's rate.
+pub const MIN_TOKEN_BYTES: usize = 32;
 
 impl ServerConfig {
     /// The token to require, resolved from the environment first.
@@ -83,8 +107,74 @@ impl ServerConfig {
 
     /// Whether the bind address is a loopback address.
     pub fn is_loopback(&self) -> bool {
-        let bind = self.bind.trim();
-        bind == "localhost" || bind.starts_with("127.") || bind == "::1" || bind == "[::1]"
+        crate::net::is_loopback_bind(&self.bind)
+    }
+
+    /// The trusted proxy ranges. Entries that do not parse are dropped here; [`Self::security_errors`]
+    /// reports them, and the daemon refuses to start (or to reload) while any remain.
+    pub fn trusted_cidrs(&self) -> Vec<crate::net::Cidr> {
+        self.trusted_proxies
+            .iter()
+            .filter_map(|entry| crate::net::Cidr::parse(entry).ok())
+            .collect()
+    }
+
+    /// `public_url` as a normalised origin (`https://host:443`), when it is set and valid.
+    pub fn public_origin(&self) -> Option<String> {
+        let url = self.public_url.trim();
+        if url.is_empty() {
+            None
+        } else {
+            crate::net::url_origin(url)
+        }
+    }
+
+    /// What makes this listener unsafe to run, as errors: the daemon refuses to start with any,
+    /// and a settings save refuses to swap such a configuration in.
+    ///
+    /// * every `trusted_proxies` entry must parse as an address or CIDR range;
+    /// * trusted proxies mean the daemon is reachable from elsewhere, so a token is required;
+    /// * a token on a reachable daemon (non-loopback bind, or behind a proxy) is at least
+    ///   [`MIN_TOKEN_BYTES`] long, because it is the only thing between the internet and an
+    ///   apply;
+    /// * `public_url`, when set, is an `http(s)://host[:port]` URL.
+    pub fn security_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if let Err(bad) = crate::net::parse_cidrs(&self.trusted_proxies) {
+            for error in bad {
+                errors.push(format!(
+                    "server.trusted_proxies: {error} (use an address like 10.0.0.2 or a range \
+                     like 172.16.0.0/12)"
+                ));
+            }
+        }
+        let token = self.resolved_token();
+        let proxied = !self.trusted_proxies.is_empty();
+        if proxied && token.is_none() {
+            errors.push(
+                "server.trusted_proxies is set but no token is configured: a daemon behind a \
+                 reverse proxy is reachable from outside this host, so set server.token or \
+                 server.token_env"
+                    .to_string(),
+            );
+        }
+        if let Some(token) = &token {
+            if token.len() < MIN_TOKEN_BYTES && (proxied || !self.is_loopback()) {
+                errors.push(format!(
+                    "server.token is {} bytes; a daemon reachable from outside this host (a \
+                     non-loopback bind or trusted_proxies) needs at least {MIN_TOKEN_BYTES}. \
+                     Generate one with `openssl rand -hex 32`.",
+                    token.len()
+                ));
+            }
+        }
+        if !self.public_url.trim().is_empty() && self.public_origin().is_none() {
+            errors.push(format!(
+                "server.public_url {:?} must be an http:// or https:// URL with a host",
+                self.public_url.trim()
+            ));
+        }
+        errors
     }
 }
 
@@ -1036,6 +1126,13 @@ pub struct HooksConfig {
     /// six matches: the timer restarts on every delivery of the same event and the run happens
     /// once, after the burst settles. Zero means "run on the first delivery".
     pub debounce_secs: f64,
+    /// The longest a burst may keep postponing its run, in seconds.
+    ///
+    /// Without a bound, deliveries that keep arriving inside the debounce window (an account
+    /// refreshing every 30 s against a 60 s debounce) would restart the timer forever and the
+    /// targets would never run. Unset means five debounce windows; the value is capped at
+    /// [`HooksConfig::MAX_SETTLE_CAP_SECS`].
+    pub max_settle_secs: Option<f64>,
     /// Deliveries served per client address per minute, for the HTTP route.
     ///
     /// A hook delivery starts real work, so an unauthenticated flood (or a Connect integration
@@ -1051,6 +1148,7 @@ impl Default for HooksConfig {
             // The burst window several M3U accounts need to finish: long enough to collapse a
             // refresh of a dozen accounts, short enough that a nightly match still runs promptly.
             debounce_secs: 60.0,
+            max_settle_secs: None,
             rate_per_minute: 60,
             events: BTreeMap::new(),
         }
@@ -1058,6 +1156,20 @@ impl Default for HooksConfig {
 }
 
 impl HooksConfig {
+    /// The ceiling on `max_settle_secs`: a quarter of an hour.
+    pub const MAX_SETTLE_CAP_SECS: f64 = 900.0;
+
+    /// How long after a burst's FIRST delivery its targets run at the latest: `max_settle_secs`,
+    /// or five debounce windows when unset, capped at fifteen minutes.
+    pub fn max_settle(&self) -> std::time::Duration {
+        let debounce = self.debounce().as_secs_f64();
+        let secs = match self.max_settle_secs {
+            Some(secs) if secs.is_finite() && secs >= 0.0 => secs,
+            _ => debounce * 5.0,
+        };
+        std::time::Duration::from_secs_f64(secs.min(Self::MAX_SETTLE_CAP_SECS))
+    }
+
     /// The debounce window as a duration.
     pub fn debounce(&self) -> std::time::Duration {
         let millis = if self.debounce_secs.is_finite() && self.debounce_secs > 0.0 {
@@ -1095,7 +1207,8 @@ impl<'de> Deserialize<'de> for HooksConfig {
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str(
-                    "a table of debounce_secs, rate_per_minute and event name -> [targets]",
+                    "a table of debounce_secs, max_settle_secs, rate_per_minute and event name \
+                     -> [targets]",
                 )
             }
 
@@ -1107,6 +1220,7 @@ impl<'de> Deserialize<'de> for HooksConfig {
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
                         "debounce_secs" => config.debounce_secs = map.next_value()?,
+                        "max_settle_secs" => config.max_settle_secs = Some(map.next_value()?),
                         "rate_per_minute" => config.rate_per_minute = map.next_value()?,
                         _ => {
                             let targets: Vec<String> = map.next_value().map_err(|error| {
@@ -1133,8 +1247,12 @@ impl Serialize for HooksConfig {
     {
         use serde::ser::SerializeMap;
 
-        let mut map = serializer.serialize_map(Some(2 + self.events.len()))?;
+        let settle = usize::from(self.max_settle_secs.is_some());
+        let mut map = serializer.serialize_map(Some(2 + settle + self.events.len()))?;
         map.serialize_entry("debounce_secs", &self.debounce_secs)?;
+        if let Some(secs) = self.max_settle_secs {
+            map.serialize_entry("max_settle_secs", &secs)?;
+        }
         map.serialize_entry("rate_per_minute", &self.rate_per_minute)?;
         for (event, targets) in &self.events {
             map.serialize_entry(event, targets)?;
@@ -1377,6 +1495,7 @@ impl CrosstalkConfig {
         if self.server.port == 0 {
             report.errors.push("server.port must not be 0".to_string());
         }
+        report.errors.extend(self.server.security_errors());
         if !self.server.is_loopback() && self.server.resolved_token().is_none() {
             report.warnings.push(format!(
                 "server.bind is {} with no token: anyone who can reach the port can run \
@@ -1610,6 +1729,18 @@ impl CrosstalkConfig {
                  delivery), got {}",
                 self.hooks.debounce_secs
             ));
+        }
+        if let Some(secs) = self.hooks.max_settle_secs {
+            if !secs.is_finite() || secs < 0.0 {
+                report.errors.push(format!(
+                    "hooks.max_settle_secs must be a number of seconds, got {secs}"
+                ));
+            } else if secs > HooksConfig::MAX_SETTLE_CAP_SECS {
+                report.warnings.push(format!(
+                    "hooks.max_settle_secs is {secs}; bursts settle after at most {} s",
+                    HooksConfig::MAX_SETTLE_CAP_SECS
+                ));
+            }
         }
         for (event, targets) in &self.hooks.events {
             if targets.is_empty() {
@@ -2653,6 +2784,76 @@ enabled_databases = ["US", "UK"]
 
         config.server.token = "t".to_string();
         assert!(config.validate().warnings.is_empty());
+    }
+
+    #[test]
+    fn a_reachable_daemon_needs_a_long_token() {
+        let mut config = CrosstalkConfig::default();
+        config.dispatcharr.api_key = "abc".to_string();
+        config.server.token_env = String::new();
+        config.server.token = "short".to_string();
+        // Loopback with no proxy: only this host can guess, so any token will do.
+        assert!(config.server.security_errors().is_empty());
+
+        config.server.bind = "0.0.0.0".to_string();
+        let errors = config.validate().errors;
+        assert!(
+            errors.iter().any(|error| error.contains("at least 32")),
+            "{errors:?}"
+        );
+
+        // Behind a proxy on loopback the token is just as exposed.
+        config.server.bind = "127.0.0.1".to_string();
+        config.server.trusted_proxies = vec!["127.0.0.1".to_string()];
+        assert!(!config.server.security_errors().is_empty());
+
+        config.server.token = "x".repeat(MIN_TOKEN_BYTES);
+        assert!(config.server.security_errors().is_empty());
+    }
+
+    #[test]
+    fn trusted_proxies_need_a_token_and_valid_ranges() {
+        let mut config = CrosstalkConfig::default();
+        config.server.token_env = String::new();
+        config.server.trusted_proxies = vec!["10.0.0.0/8".to_string()];
+        let errors = config.server.security_errors();
+        assert!(
+            errors.iter().any(|error| error.contains("no token")),
+            "{errors:?}"
+        );
+
+        config.server.token = "y".repeat(MIN_TOKEN_BYTES);
+        config.server.trusted_proxies = vec!["10.0.0.0/8".to_string(), "proxy".to_string()];
+        let errors = config.server.security_errors();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("server.trusted_proxies"), "{errors:?}");
+        assert!(errors[0].contains("proxy"), "{errors:?}");
+        assert_eq!(config.server.trusted_cidrs().len(), 1);
+
+        config.server.trusted_proxies = vec!["10.0.0.0/8".to_string(), "fd00::/8".to_string()];
+        assert!(config.server.security_errors().is_empty());
+
+        config.server.public_url = "crosstalk.example.com".to_string();
+        assert!(!config.server.security_errors().is_empty());
+        config.server.public_url = "https://crosstalk.example.com/".to_string();
+        assert!(config.server.security_errors().is_empty());
+        assert_eq!(
+            config.server.public_origin().as_deref(),
+            Some("https://crosstalk.example.com:443")
+        );
+    }
+
+    #[test]
+    fn the_server_table_reads_the_proxy_settings() {
+        let config: CrosstalkConfig = toml::from_str(
+            "[server]\nbind = \"127.0.0.1\"\ntrusted_proxies = [\"172.16.0.0/12\"]\n\
+             public_url = \"https://ui.example\"\nsecure_cookies = true\nhsts = true\n",
+        )
+        .expect("parse");
+        assert_eq!(config.server.trusted_proxies, vec!["172.16.0.0/12"]);
+        assert!(config.server.secure_cookies);
+        assert!(config.server.hsts);
+        assert_eq!(config.server.public_url, "https://ui.example");
     }
 
     #[test]

@@ -237,6 +237,84 @@ fn an_overlong_event_name_is_unknown_not_echoed() {
     assert!(read_event(None, &fields, &configured).is_some());
 }
 
+#[test]
+fn an_event_name_with_control_characters_is_unknown() {
+    // A newline in a name would forge a log line, and the name is echoed in the answer.
+    let configured: BTreeSet<String> = ["m3u_refresh"].into_iter().map(str::to_string).collect();
+    assert!(read_event(Some("m3u_refresh\nforged"), &BTreeMap::new(), &configured).is_none());
+    assert!(read_event(Some("m3u\u{1b}[31m"), &BTreeMap::new(), &configured).is_none());
+    let mut fields = BTreeMap::new();
+    fields.insert("event".to_string(), "m3u_refresh\r".to_string());
+    // Trailing whitespace is trimmed first, so this one is the plain name.
+    assert_eq!(
+        read_event(None, &fields, &configured)
+            .expect("trimmed")
+            .name,
+        "m3u_refresh"
+    );
+    fields.insert("event".to_string(), "m3u\u{0}refresh".to_string());
+    assert!(read_event(None, &fields, &configured).is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_steady_stream_of_deliveries_still_settles() {
+    // Deliveries every 30 s against a 60 s debounce never leave a quiet minute: without the
+    // bound the run would wait forever. With it, the burst fires `max_settle` after it began.
+    let debounce = Duration::from_secs(60);
+    let max_settle = Duration::from_secs(300);
+    let pending = Pending::new();
+    let began = tokio::time::Instant::now();
+    for _ in 0..40 {
+        tokio::time::advance(Duration::from_secs(30)).await;
+        pending.touch();
+        assert!(pending.fire_at(debounce, max_settle) <= began + max_settle);
+    }
+    assert_eq!(pending.fire_at(debounce, max_settle), began + max_settle);
+
+    // A short burst is unaffected: the quiet window still decides.
+    let pending = Pending::new();
+    let began = tokio::time::Instant::now();
+    tokio::time::advance(Duration::from_secs(10)).await;
+    pending.touch();
+    assert_eq!(
+        pending.fire_at(debounce, max_settle),
+        began + Duration::from_secs(70)
+    );
+}
+
+#[test]
+fn max_settle_defaults_to_five_debounce_windows_capped_at_fifteen_minutes() {
+    let mut hooks = crate::config::HooksConfig {
+        debounce_secs: 60.0,
+        ..Default::default()
+    };
+    assert_eq!(hooks.max_settle(), Duration::from_secs(300));
+    hooks.debounce_secs = 600.0;
+    assert_eq!(hooks.max_settle(), Duration::from_secs(900), "capped");
+    hooks.max_settle_secs = Some(120.0);
+    assert_eq!(hooks.max_settle(), Duration::from_secs(120));
+    hooks.max_settle_secs = Some(5000.0);
+    assert_eq!(hooks.max_settle(), Duration::from_secs(900));
+}
+
+#[test]
+fn max_settle_round_trips_through_the_hooks_table() {
+    let config: CrosstalkConfig = toml::from_str(
+        "[hooks]\ndebounce_secs = 30\nmax_settle_secs = 120\nm3u_refresh = [\"poke.fast\"]\n",
+    )
+    .expect("parse");
+    assert_eq!(config.hooks.max_settle_secs, Some(120.0));
+    assert_eq!(
+        config.hooks.targets("m3u_refresh"),
+        ["poke.fast".to_string()]
+    );
+    let text = toml::to_string(&config).expect("serialise");
+    assert!(text.contains("max_settle_secs = 120"), "{text}");
+    // Unset stays unset: the default is derived from the debounce, not written out.
+    let text = toml::to_string(&CrosstalkConfig::default()).expect("serialise");
+    assert!(!text.contains("max_settle_secs"), "{text}");
+}
+
 #[tokio::test]
 async fn an_unknown_or_unconfigured_event_starts_nothing() {
     let (hooks, runner) = service(config(&[("m3u_refresh", &["poke.fast"])], 0.0));

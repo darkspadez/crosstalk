@@ -20,6 +20,7 @@ pub mod limiter;
 pub mod logos;
 pub mod match_run;
 pub mod naming;
+pub mod net;
 pub mod quality;
 pub mod runner;
 pub mod scheduler;

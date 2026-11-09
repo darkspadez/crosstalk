@@ -6,13 +6,18 @@
 //! needing a reconnect path for a page an operator glances at.
 //!
 //! Authentication is a bearer token: the one in `crosstalk.toml` (or its environment variable),
-//! sent as a cookie by the login page or as an `Authorization: Bearer` header by a script.
+//! sent as an `Authorization: Bearer` header by a script, or presented once to the login page,
+//! which answers with a server-side session cookie.
 
 pub mod auth;
+pub mod client;
 pub mod csrf;
 pub mod host;
+pub mod limits;
 pub mod routes;
 pub mod security;
+pub mod session;
+pub mod sha256;
 pub mod state;
 
 pub use routes::router;

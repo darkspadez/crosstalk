@@ -16,9 +16,12 @@
 //!     protection there, and legitimate deployments sit behind reverse proxies whose Host
 //!     values are foreign by design. Rejecting those would break every proxied install
 //!     while adding nothing an attacker without the token could bypass.
-//!   * Always, on POST: when an `Origin` header is present its host must match `Host`.
-//!     Browsers send `Origin` on POSTs; a cross-site forgery carries the attacker's origin
-//!     while `Host` names the daemon, so a mismatch is a forgery even with a valid Host.
+//!   * Always, on anything but GET/HEAD/OPTIONS: when an `Origin` header is present, its
+//!     scheme, host and port must be the daemon's own origin. Browsers send `Origin` on POSTs;
+//!     a cross-site forgery carries the attacker's origin, so a mismatch is a forgery even with
+//!     a valid Host. The daemon's origin is `[server] public_url` when set (a proxy that
+//!     rewrites `Host` needs it), else what a trusted proxy's `X-Forwarded-Proto` /
+//!     `X-Forwarded-Host` say, else `http://` plus the `Host` header.
 //!
 //! A missing Host header is allowed through: direct IP clients and the test harness do not
 //! always send one, and there is nothing to compare against. The rebinding attacker cannot
@@ -29,24 +32,34 @@ use axum::http::{header, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
-/// Reject requests whose Host is not allowed, and POSTs whose Origin disagrees with Host.
+/// Reject requests whose Host is not allowed, and writes whose Origin is not this daemon's.
 pub async fn check(
     State(state): State<crate::state::AppState>,
     request: Request,
     next: Next,
 ) -> Response {
-    if request.method() == Method::POST {
-        if let Some(origin) = origin_of(&request) {
-            let host = request
-                .headers()
-                .get(header::HOST)
-                .and_then(|value| value.to_str().ok())
-                .map(host_part);
-            if let Some(host) = host {
-                if origin != host && !origin.is_empty() && !host.is_empty() {
+    let view = crate::state::ServerView::of_request(&state, &request);
+    let client = request
+        .extensions()
+        .get::<crate::client::ClientInfo>()
+        .copied()
+        .unwrap_or_else(|| crate::client::ClientInfo::of_request(&request, &view.trusted));
+
+    if !matches!(
+        *request.method(),
+        Method::GET | Method::HEAD | Method::OPTIONS
+    ) {
+        if let Some(origin) = request
+            .headers()
+            .get(header::ORIGIN)
+            .and_then(|value| value.to_str().ok())
+        {
+            let presented = crosstalk_core::net::url_origin(origin);
+            if let Some(expected) = expected_origin(&view, &client, request.headers()) {
+                if presented.as_deref() != Some(expected.as_str()) {
                     return (
                         StatusCode::FORBIDDEN,
-                        "the request origin does not match the host\n",
+                        "the request origin does not match this daemon\n",
                     )
                         .into_response();
                 }
@@ -56,9 +69,8 @@ pub async fn check(
 
     // A configured token means bearer auth is the protection (see the module docs): only
     // the tokenless loopback listener needs the Host allowlist. Both are read from the
-    // current snapshot, so a token rotation or bind change saved in the UI applies here too.
-    let snapshot = state.snapshot();
-    if snapshot.server.resolved_token().is_some() {
+    // current config, so a token rotation or bind change saved in the UI applies here too.
+    if view.token.is_some() {
         return next.run(request).await;
     }
 
@@ -68,7 +80,7 @@ pub async fn check(
         .and_then(|value| value.to_str().ok())
     {
         let host = host_part(host);
-        if !host.is_empty() && !is_allowed(&host, &snapshot.server.bind) {
+        if !host.is_empty() && !is_allowed(&host, &view.bind) {
             return (
                 StatusCode::FORBIDDEN,
                 "the request host is not this daemon: possible DNS rebinding\n",
@@ -78,6 +90,37 @@ pub async fn check(
     }
 
     next.run(request).await
+}
+
+/// The origin a browser page of this daemon posts from, when it can be known.
+///
+/// `public_url` wins; then a trusted proxy's word; then the `Host` header over plain http (the
+/// daemon itself never terminates TLS). `None` (no Host at all) skips the comparison, as a
+/// missing Host did before.
+fn expected_origin(
+    view: &crate::state::ServerView,
+    client: &crate::client::ClientInfo,
+    headers: &axum::http::HeaderMap,
+) -> Option<String> {
+    if let Some(origin) = &view.public_origin {
+        return Some(origin.clone());
+    }
+    let forwarded_proto = client
+        .via_trusted_proxy
+        .then(|| crate::client::forwarded_proto(headers))
+        .flatten();
+    let scheme = forwarded_proto.as_deref().unwrap_or("http");
+    if client.via_trusted_proxy {
+        if let Some(host) = crate::client::forwarded_host(headers) {
+            return crosstalk_core::net::origin(scheme, &host);
+        }
+    }
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())?;
+    // A Host that is no origin at all cannot match any Origin: compare against something that
+    // never equals a parsed one.
+    Some(crosstalk_core::net::origin(scheme, host).unwrap_or_else(|| "invalid".to_string()))
 }
 
 /// The host portion of a Host header value: ports stripped, brackets removed, lowercased.
@@ -137,20 +180,6 @@ fn is_loopback_v4(host: &str) -> bool {
             && part.bytes().all(|b| b.is_ascii_digit())
             && part.parse::<u8>().is_ok()
     })
-}
-
-/// The host portion of an Origin header value (`scheme://host[:port]`), if one is present.
-fn origin_of(request: &Request) -> Option<String> {
-    let origin = request
-        .headers()
-        .get(header::ORIGIN)
-        .and_then(|value| value.to_str().ok())?;
-    let authority = match origin.split_once("://") {
-        Some((_, rest)) => rest,
-        None => origin,
-    };
-    let authority = authority.split('/').next().unwrap_or(authority);
-    Some(host_part(authority))
 }
 
 #[cfg(test)]

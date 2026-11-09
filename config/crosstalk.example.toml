@@ -19,10 +19,26 @@
 # authenticates requests.
 bind = "127.0.0.1"
 port = 8730
-# Bearer token required on every request. Leave empty only while `bind` is loopback.
+# Bearer token required on every request. Leave empty only while `bind` is loopback and
+# no proxy is in front. At least 32 bytes once the daemon is reachable from elsewhere (a
+# non-loopback bind, or trusted_proxies set): `openssl rand -hex 32`.
 # Prefer the environment variable named by `token_env` so the secret stays out of the file.
 token = ""
 token_env = "CROSSTALK_TOKEN"
+# Reverse proxies allowed to name the client (addresses or CIDR ranges, IPv4 or IPv6).
+# Only a request whose socket peer is listed has its X-Forwarded-For / X-Real-IP /
+# X-Forwarded-Proto / X-Forwarded-Host believed; the per-client sign-in limit keys on
+# the address they name. Setting this requires a token.
+# trusted_proxies = ["127.0.0.1", "172.16.0.0/12"]
+trusted_proxies = []
+# The URL browsers use, when a proxy rewrites the Host header. A form POST's Origin must
+# match it (scheme, host and port).
+# public_url = "https://crosstalk.example.com"
+public_url = ""
+# Mark the session cookie Secure, and send Strict-Transport-Security, even when no
+# trusted proxy says the request came over https (both happen automatically when one does).
+secure_cookies = false
+hsts = false
 
 [dispatcharr]
 # Dispatcharr's base URL, without the /api suffix.
@@ -239,6 +255,9 @@ run_history_days = 15
 # is queued for when it frees.
 # [hooks]
 # debounce_secs = 60
+# # A burst that never goes quiet still runs this long after its first delivery
+# # (default 5 x debounce_secs, at most 900).
+# max_settle_secs = 300
 # rate_per_minute = 60
 # m3u_refresh = ["streams.match_apply"]
 # epg_refresh = ["workflow.nightly"]
