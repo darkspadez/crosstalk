@@ -548,9 +548,9 @@ synthetic lineup world: 20,000 channel(s), 500 lineup entr(y/ies)
 | `categorize_preview` / `categorize_apply` plan | **≈ 2.5 s** | The same resolve and rank; the category map is one lookup per family leader |
 | `logos_preview` / `logos_apply` plan | **≈ 0.02 s** | Without a tv-logos index (a synthetic bench never fetches) the EPG, Logo Manager and default tiers are lookups; the tv-logos fuzzy tier adds one similarity pass per candidate file per channel |
 | `sync_preview` / `sync_apply` plan, 351 entries | **≈ 1 ms** | Decide + create plan with the global number check; the rerun over the synced world plans nothing. Creates are one POST each (361 requests for 16 groups and 345 channels), which `bench streams --live --write-timing` prices on your box |
-| `create_preview` / `create_apply` plan, 50k streams | **<measured>** | Streams mode over the streams bench's world: 20k live channel identities (one batch warm, then rayon), one decision per stream on rayon, the foreign-family check through a family-key index, the create plan with the collision and number checks. One POST per created object |
-| `tidy_preview` / `tidy_apply` plan | **<measured>** | 10k owned channels judged, the tidy history read from the store (visibility rows only, indexed) |
-| host `undo` plan of a names apply | **<measured>** | The names plan recorded as a finished apply in the file store, planned back against the world it leaves |
+| `create_preview` / `create_apply` plan, 50k streams | **≈ 1.0 s** | Streams mode over the streams bench's world: 20k live channel identities (one batch warm, then rayon), one decision per stream on rayon, the foreign-family check through a family-key index, the create plan with the collision and number checks. One POST per created object |
+| `tidy_preview` / `tidy_apply` plan | **≈ 2 ms** | 10k owned channels judged, the tidy history read from the store (visibility rows only, indexed) |
+| host `undo` plan of a names apply | **≈ 0.03 s** | The names plan recorded as a finished apply in the file store, planned back against the world it leaves |
 
 The audit's performance pass (docs/audit/E-perf.md) re-took these numbers with the identity cache
 on a FILE store (the batch warm pays real commits), a synthetic tv-logos tree of 1,500 files per
@@ -559,11 +559,11 @@ included, under 10 s at 20k channels. `--json` prints the same report as one JSO
 
 | What (audit re-take) | Cost | Note |
 |---|---|---|
-| engine + merged index | **<measured>** | Index views now built on rayon |
-| `names_preview` / `names_apply` plan | **<measured>** | Batch warm (one read pass, one write transaction) before the rayon stage |
-| `categorize_preview` / `categorize_apply` plan | **<measured>** | Same warm, off the async runtime in the action |
-| `logos_preview` / `logos_apply` plan, tv-logos tier | **<measured>** | Filenames normalised once per directory, exact hits by hash, early-exit similarity at the 85 cut |
-| SLA line (`bench lineup`) | **<measured>** | PASS/FAIL against 10 s |
+| engine + merged index | **≈ 0.4 s** (was ≈ 2 s) | Index views now built on rayon |
+| `names_preview` / `names_apply` plan | **≈ 2.2 s** on a cold file store (was ≈ 7.7 s with no store) | Batch warm (one read pass, one write transaction) before the rayon stage |
+| `categorize_preview` / `categorize_apply` plan | **≈ 0.9 s** (was ≈ 2.5 s) | Same warm, off the async runtime in the action |
+| `logos_preview` / `logos_apply` plan, tv-logos tier | **≈ 0.44 s** | Filenames normalised once per directory, exact hits by hash, early-exit similarity at the 85 cut |
+| SLA line (`bench lineup`) | **PASS, slowest names 2.7 s** | PASS/FAIL against 10 s |
 
 The guide plans have their own bench (`crosstalk bench guide --synthetic`, audit E-S9): 20,000
 channels and 55,000 EPG entries in 20 sources, served by an in-process fake Dispatcharr that
@@ -578,10 +578,10 @@ crosstalk bench guide --synthetic --delay-ms 20 --json
 
 | What | Cost | Requests | Note |
 |---|---|---|---|
-| `match_preview` / `match_apply` plan | **<measured>** | **<measured>** | Every family member a walk could ask about is settled first: one horizon probe per source (an empty source answers "no" for all its entries) and one airing-now batch per 50 entries; only the rest are searched one by one |
-| `scan` plan | **<measured>** | **<measured>** | Same pre-seed over the assigned entries |
-| `heal_preview` / `heal_apply` plan | **<measured>** | **<measured>** | Pre-seed for the detection and again for the replacement walks; detection runs in batches with progress and cancel points |
-| SLA line (`bench guide`) | **<measured>** | | PASS/FAIL against 10 s |
+| `match_preview` / `match_apply` plan | **≈ 6.9 s** at 2 ms per request (scoring ≈ 2.9 s, walks ≈ 2.3 s) | 5,534 (20 probes, 722 batches, 4,790 searches) | Every family member a walk could ask about is settled first: one horizon probe per source (an empty source answers "no" for all its entries) and one airing-now batch per 50 entries; only the rest are searched one by one |
+| `scan` plan | **≈ 1.6 s** | 3,251 (15 probes, 260 batches, 2,976 searches) | Same pre-seed over the assigned entries |
+| `heal_preview` / `heal_apply` plan | **≈ 3.1 s** | 3,985 (35 probes, 358 batches, 3,593 searches) | Pre-seed for the detection and again for the replacement walks; detection runs in batches with progress and cancel points |
+| SLA line (`bench guide`) | **PASS, slowest match 6.9 s** | | PASS/FAIL against 10 s |
 
 A debug build is 10–50× slower on exactly this code and says so in its own output; quote the
 release numbers. The point of the two-request-pattern bench is the bridge question: whether REST

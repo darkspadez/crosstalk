@@ -31,7 +31,15 @@ pub fn calculate_similarity_cutoff(a: &str, b: &str, min_ratio: f64) -> f64 {
     calculate_similarity_chars(&a, &b, min_ratio)
 }
 
+/// Row length (in scalar values of the shorter input, plus one) that fits the stack
+/// buffers; longer pairs fall back to two heap rows.
+const STACK_ROW: usize = 128;
+
 /// Same as [`calculate_similarity_cutoff`] for pre-collected scalar values.
+///
+/// Allocation-free for any pair whose shorter side has fewer than [`STACK_ROW`]
+/// scalar values (every channel name in practice): the two Levenshtein rows live on
+/// the stack. This is the engine's per-pair hot path (audit E-B1 follow-up).
 pub fn calculate_similarity_chars(a: &[char], b: &[char], min_ratio: f64) -> f64 {
     if a.is_empty() || b.is_empty() {
         return 0.0;
@@ -54,9 +62,41 @@ pub fn calculate_similarity_chars(a: &[char], b: &[char], min_ratio: f64) -> f64
         }
     }
 
+    if len2 < STACK_ROW {
+        let mut previous = [0usize; STACK_ROW];
+        let mut current = [0usize; STACK_ROW];
+        levenshtein_ratio(
+            long,
+            short,
+            min_ratio,
+            &mut previous[..=len2],
+            &mut current[..=len2],
+        )
+    } else {
+        let mut previous = vec![0usize; len2 + 1];
+        let mut current = vec![0usize; len2 + 1];
+        levenshtein_ratio(long, short, min_ratio, &mut previous, &mut current)
+    }
+}
+
+/// The two-row Levenshtein ratio over `long` (the longer side) and `short`, with the
+/// cutoff's early exit. `previous_row` and `current_row` are `short.len() + 1` long;
+/// their contents on entry are irrelevant.
+fn levenshtein_ratio<'r>(
+    long: &[char],
+    short: &[char],
+    min_ratio: f64,
+    mut previous_row: &'r mut [usize],
+    mut current_row: &'r mut [usize],
+) -> f64 {
+    let len1 = long.len();
+    let len2 = short.len();
+    let max_len = len1 as f64;
+
     // Two-row Levenshtein. `previous_row[j]` mirrors the Python list exactly.
-    let mut previous_row: Vec<usize> = (0..=len2).collect();
-    let mut current_row: Vec<usize> = vec![0; len2 + 1];
+    for (j, cell) in previous_row.iter_mut().enumerate() {
+        *cell = j;
+    }
 
     for (i, c1) in long.iter().enumerate() {
         current_row[0] = i + 1;
@@ -141,6 +181,24 @@ mod tests {
             calculate_similarity("日本語", "日本語"),
             calculate_similarity("日本語", "日本語")
         );
+    }
+
+    #[test]
+    fn heap_rows_past_the_stack_buffer_score_the_same() {
+        // The shorter side is past `STACK_ROW`, so the rows come from the heap.
+        let a: String = "abcdefghij".repeat(20);
+        let mut b = a.clone();
+        b.replace_range(0..1, "z");
+        let ratio = calculate_similarity(&a, &b);
+        assert!((ratio - 199.0 / 200.0).abs() < 1e-9, "got {ratio}");
+        assert_eq!(calculate_similarity_cutoff(&a, &b, 0.999), 0.0);
+        // Either side of the boundary agrees with the definition.
+        for len in [STACK_ROW - 2, STACK_ROW - 1, STACK_ROW, STACK_ROW + 1] {
+            let a: String = "x".repeat(len + 1);
+            let b: String = "x".repeat(len);
+            let expected = len as f64 / (len + 1) as f64;
+            assert!((calculate_similarity(&a, &b) - expected).abs() < 1e-12);
+        }
     }
 
     #[test]
