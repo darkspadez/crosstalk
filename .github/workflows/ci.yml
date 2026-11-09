@@ -102,7 +102,7 @@ jobs:
           docker run -d --name crosstalk-ci -p 8730:8730 \
             --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges:true \
             -e CROSSTALK_SERVER__BIND=0.0.0.0 \
-            -e CROSSTALK_SERVER__TOKEN=ci-token \
+            -e CROSSTALK_SERVER__TOKEN=ci-token-0123456789abcdef0123456789abcdef \
             -e CROSSTALK_DISPATCHARR_API_KEY=unused \
             crosstalk:ci
           for _ in $(seq 1 30); do
@@ -113,7 +113,7 @@ jobs:
           # And it refuses an anonymous API call.
           test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8730/api/v1/apps)" = "401"
           # While the compose-style token authenticates a bearer call.
-          test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer ci-token' http://localhost:8730/api/v1/apps)" = "200"
+          test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer ci-token-0123456789abcdef0123456789abcdef' http://localhost:8730/api/v1/apps)" = "200"
           docker rm -f crosstalk-ci
       # The token_env indirection (server.token_env, default CROSSTALK_TOKEN) must keep
       # working too: operators who set the token in the container directly rely on it.
@@ -122,14 +122,14 @@ jobs:
           docker run -d --name crosstalk-ci-env -p 8730:8730 \
             --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges:true \
             -e CROSSTALK_SERVER__BIND=0.0.0.0 \
-            -e CROSSTALK_TOKEN=ci-token \
+            -e CROSSTALK_TOKEN=ci-token-0123456789abcdef0123456789abcdef \
             -e CROSSTALK_DISPATCHARR_API_KEY=unused \
             crosstalk:ci
           for _ in $(seq 1 30); do
             if curl -fsS http://localhost:8730/health >/dev/null; then break; fi
             sleep 1
           done
-          test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer ci-token' http://localhost:8730/api/v1/apps)" = "200"
+          test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer ci-token-0123456789abcdef0123456789abcdef' http://localhost:8730/api/v1/apps)" = "200"
           docker rm -f crosstalk-ci-env
 
   # The crosstalk-bridge Dispatcharr plugin (bridge/): its own tests, Django faked, plus the

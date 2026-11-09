@@ -39,9 +39,10 @@ unused-allowed-license = "allow"
 yanked = "deny"
 unmaintained = "all"
 ignore = [
-    # basic-toml is unmaintained; it comes in only through askama 0.12 / askama_axum 0.4.
-    # TODO(F-S8): remove this entry once askama is upgraded (the upgrade drops basic-toml).
-    { id = "RUSTSEC-2026-0374", reason = "basic-toml via askama 0.12; removed by the askama upgrade (F-S8)" },
+    # basic-toml is unmaintained; askama_derive 0.16.1 (a proc-macro, build time only) still
+    # reads askama's config file through it. Remove this entry when `cargo tree -i basic-toml`
+    # comes back empty (docs/audit/F-supply.md, F-S8).
+    { id = "RUSTSEC-2026-0374", reason = "basic-toml via askama_derive 0.16.1: build-time config parsing of this repository's own askama.toml, never runtime input" },
 ]
 
 [bans]
