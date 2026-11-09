@@ -9,6 +9,8 @@
 //!     the Janitor oracle with `--features oracle --oracle janitor`)
 //!   * `bench` — time the parts of a run, to decide whether REST is fast enough
 
+#![forbid(unsafe_code)]
+
 mod registry;
 mod simulate;
 

@@ -65,7 +65,7 @@ echo "==> building release binary"
 cargo build --release -q -p crosstalk --features oracle
 
 echo "==> generating inputs in $WORK"
-python3 - "$REPO" "$WORK" "$QUICK" <<'PY'
+python3 -I - "$REPO" "$WORK" "$QUICK" <<'PY'
 import csv, json, os, random, sys
 
 repo, work, quick = sys.argv[1], sys.argv[2], int(sys.argv[3])
@@ -146,7 +146,7 @@ PY
 compare_case() {
   local label="$1"; shift
   echo "==> case: $label ${*:-<defaults>}"
-  python3 "$PLUGIN/tools/match_sim.py" \
+  python3 -I "$PLUGIN/tools/match_sim.py" \
     --channels "$WORK/channels.csv" \
     --streams "$WORK/streams.m3u" \
     --threshold 80 \
@@ -187,7 +187,7 @@ compare_case countries-US --countries US
   --streams "$WORK/streams.m3u" \
   --threshold 80 \
   --out "$WORK/unified" >/dev/null
-python3 - "$(ls -d "$WORK"/py-default/*/ | head -1)" "$(ls -d "$WORK"/unified/*/ | head -1)" <<'PY'
+python3 -I - "$(ls -d "$WORK"/py-default/*/ | head -1)" "$(ls -d "$WORK"/unified/*/ | head -1)" <<'PY'
 import csv, sys
 def rows(path):
     with open(path + "per_stream_matches.csv", newline="", encoding="utf-8") as fh:

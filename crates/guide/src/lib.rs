@@ -16,6 +16,8 @@
 //! here but a host feature: one button and one command delete every sub-app's own reports, so
 //! each app does not carry its own copy.
 
+#![forbid(unsafe_code)]
+
 pub mod cleanup;
 pub mod engine;
 pub mod heal;

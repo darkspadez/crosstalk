@@ -8,3 +8,9 @@
 # The audit job also runs on a weekly schedule (see .github/workflows/ci.yml), so a
 # newly published advisory surfaces on the scheduled run rather than reddening the next
 # unrelated pull request.
+
+[output]
+# Informational warnings that fail the job too, not just vulnerabilities.
+# TODO(F-S8): add "unmaintained" once askama is upgraded; today basic-toml (unmaintained,
+# via askama 0.12 / askama_axum 0.4) would fail every run.
+deny = ["unsound", "yanked"]

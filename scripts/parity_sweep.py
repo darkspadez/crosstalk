@@ -183,6 +183,12 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    if not sys.flags.isolated:
+        # The plugin checkout goes on sys.path below; -I keeps the cwd and the
+        # user site-packages from shadowing the stdlib or the plugin's modules.
+        print("run with python3 -I", file=sys.stderr)
+        return 2
+
     logging.basicConfig(level=logging.WARNING)
 
     if not os.path.isdir(PLUGIN_INNER):

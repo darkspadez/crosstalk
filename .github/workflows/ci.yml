@@ -3,11 +3,20 @@ name: CI
 on:
   push:
     branches: [main]
+    # A release tag runs CI too: build.yml's `ci-gate` waits for this run (same commit,
+    # push event) to succeed before it publishes anything.
+    tags: ["v*"]
   pull_request:
   schedule:
     # Weekly even without code changes, so a newly published advisory surfaces on its
     # own rather than reddening the next unrelated PR.
     - cron: "0 6 * * 1"
+  # Manual runs, which is also what makes the upstream drift report reachable on demand.
+  workflow_dispatch:
+
+# Read-only token for every job; nothing in CI writes to the repository.
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -15,20 +24,25 @@ env:
 
 jobs:
   check:
+    # Pull requests (fork code: build scripts, proc macros, tests) get their own cache
+    # volume, so nothing they write can be read back by a main or tag build.
     runs-on:
       - nscloud-ubuntu-24.04-amd64-8x16-with-cache
-      - nscloud-cache-tag-crosstalk-amd64
+      - nscloud-cache-tag-crosstalk-${{ github.event_name == 'pull_request' && 'pr-' || '' }}amd64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
       # Cargo registry, git deps and target/ live on the runner's Namespace cache
       # volume, so there is no upload/download round-trip as with actions/cache.
-      - uses: namespacelabs/nscloud-cache-action@v1
+      - uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
         with:
           cache: rust
 
@@ -50,23 +64,43 @@ jobs:
       - name: Clippy (oracle build)
         run: cargo clippy --locked -p crosstalk --features oracle --all-targets -- -D warnings
 
+  # The workspace declares rust-version = "1.89" (the locked dependency tree's own floor:
+  # uuid 1.29); this proves it, so the MSRV is a tested promise rather than a guess. A check
+  # (no tests) on the oldest supported compiler. No cache volume: a cold check is a few
+  # minutes and keeps old-compiler artifacts out of it. Bump both together.
+  msrv:
+    runs-on: nscloud-ubuntu-24.04-amd64-8x16
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          toolchain: "1.89"
+      # `+1.89` overrides rust-toolchain.toml (channel stable) for this command only.
+      - name: Check on the minimum supported Rust version
+        run: cargo +1.89 check --workspace --locked
 
   docker:
     # Namespace runners hand the build to a Remote Builder (no setup-buildx needed);
     # --load brings the result back into the runner's daemon for the smoke test.
     runs-on: nscloud-ubuntu-24.04-amd64-4x8
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - name: Build the image
         run: docker buildx build --load -t crosstalk:ci .
       # The shipped mechanism: docker-compose.example.yml maps the host's
       # CROSSTALK_TOKEN into the container as CROSSTALK_SERVER__TOKEN (a direct
       # figment override of server.token), with CROSSTALK_SERVER__BIND for the bind.
       # This job mirrors that exactly, so CI exercises the compose path, not a
-      # parallel one.
+      # parallel one, including its least-privilege flags (read-only root, /tmp tmpfs,
+      # no capabilities, no-new-privileges): the daemon must start and serve under them.
       - name: The daemon starts and answers its health check
         run: |
           docker run -d --name crosstalk-ci -p 8730:8730 \
+            --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges:true \
             -e CROSSTALK_SERVER__BIND=0.0.0.0 \
             -e CROSSTALK_SERVER__TOKEN=ci-token \
             -e CROSSTALK_DISPATCHARR_API_KEY=unused \
@@ -86,6 +120,7 @@ jobs:
       - name: The token_env indirection also authenticates
         run: |
           docker run -d --name crosstalk-ci-env -p 8730:8730 \
+            --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges:true \
             -e CROSSTALK_SERVER__BIND=0.0.0.0 \
             -e CROSSTALK_TOKEN=ci-token \
             -e CROSSTALK_DISPATCHARR_API_KEY=unused \
@@ -100,35 +135,47 @@ jobs:
   audit:
     runs-on: nscloud-ubuntu-24.04-amd64-2x4
     steps:
-      - uses: actions/checkout@v4
-      - uses: taiki-e/install-action@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          tool: cargo-audit
-      # Fails by design when an advisory matches the tree: see audit.toml (comment-only,
-      # no ignores) at the repo root. The weekly schedule above means a new advisory
-      # fails the scheduled run first, not an unrelated PR.
+          persist-credentials: false
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-audit,cargo-deny
+      # Fails by design when an advisory matches the tree: see audit.toml (no ignores;
+      # unsound and yanked crates fail too) at the repo root. The weekly schedule above
+      # means a new advisory fails the scheduled run first, not an unrelated PR.
       - name: Known vulnerabilities in the dependency tree
         run: cargo audit
+      # Licences on an allow-list, advisories (again, through cargo-deny's own rules) and
+      # bans (duplicate versions warn, never fail). Policy and reasons: deny.toml.
+      - name: Licences, advisories and bans
+        run: cargo deny --locked check licenses advisories bans
 
   parity:
+    # Pull requests (fork code: build scripts, proc macros, tests) get their own cache
+    # volume, so nothing they write can be read back by a main or tag build.
     runs-on:
       - nscloud-ubuntu-24.04-amd64-8x16-with-cache
-      - nscloud-cache-tag-crosstalk-amd64
+      - nscloud-cache-tag-crosstalk-${{ github.event_name == 'pull_request' && 'pr-' || '' }}amd64
     needs: check
     timeout-minutes: 20
     # The Python plugins are pinned submodules, so every reference is always present.
     # Full history (not a shallow fetch): scripts/upstream_drift.sh compares each pin
     # against its upstream tip, which needs the commits between them.
+    # The submodules are public https URLs, so they clone without the persisted token.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           submodules: true
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: namespacelabs/nscloud-cache-action@v1
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          toolchain: stable
+      - uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
         with:
           cache: rust
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
       # Phase 3 step 4: data/merged/ and docs/data-merge-report.md are generated,
@@ -147,8 +194,8 @@ jobs:
         run: ./scripts/sim_parity.sh --quick
       - name: Primitive sweep vs the Python matcher
         run: |
-          python3 scripts/parity_sweep.py --kinds normalize,callsign,location,network --limit 300
-          python3 scripts/parity_sweep.py --kinds match,score --limit 300 --pool 60 --report
+          python3 -I scripts/parity_sweep.py --kinds normalize,callsign,location,network --limit 300
+          python3 -I scripts/parity_sweep.py --kinds match,score --limit 300 --pool 60 --report
       # Phase 3 step 8: the guide oracle diff report (docs/oracle-reports/guide.md) is
       # generated, and --check verifies it reproduces byte for byte. The report itself
       # never fails on differences (reports are not gates); the corpus/consistency gates

@@ -1,4 +1,32 @@
 # Area F report (supply chain / deployment). cargo audit (orchestrator run): 0 vulns, 1 warning basic-toml unmaintained (via askama 0.12/askama_axum 0.4).
+
+## Status (fix 6, branch audit/fix-f)
+
+| Finding | Status | What changed / what is left |
+|---|---|---|
+| F-B1 EOL Alpine 3.20 | FIXED | Dockerfile runtime `alpine:3.22@sha256:4934…898f` (3.22.8), builder `rust:1.99.1-alpine3.22@sha256:9a74…9ff0`; rust-toolchain.toml no longer copied into the builder (rustup would otherwise download today's stable and bypass the pin). ffmpeg via apk, unpinned on purpose (comment). Renovate `docker:pinDigests` keeps tag+digest moving. |
+| F-B2 shared cache volume | FIXED | ci.yml `check`/`parity` and build.yml `binaries`: PRs use `nscloud-cache-tag-crosstalk-pr-<arch>`; build.yml on `refs/tags/*` runs on a runner without `-with-cache`/cache-tag and skips nscloud-cache-action; the release image build sets `no-cache`. PR image builds still cache-only. Repo setting (approval for all outside contributors) is the orchestrator's. |
+| F-S1 ci.yml permissions | FIXED | Top-level `permissions: contents: read`; `persist-credentials: false` on all 9 checkouts (submodules are public https). |
+| F-S2 movable action refs | FIXED | Every `uses:` pinned to a full SHA with `# vX.Y.Z` (dtolnay/rust-toolchain: `stable` branch head, `toolchain: stable` explicit). The grep is empty. |
+| F-S3 releases skip CI | FIXED | ci.yml runs on `v*` tags; build.yml `ci-gate` (tags only, `actions: read`) polls the CI run for this tag/SHA/push event, up to 60 min; `image` and `release` need it. PR/main builds unchanged. README "Releases" section. Tag ruleset for `v*` still to set (repo setting). |
+| F-S4 no provenance/SBOM | FIXED | build-push `provenance: mode=max`, `sbom: true` (pushes only); `actions/attest-build-provenance` on the image digest (push-to-registry) and `dist/*.tar.gz`; `id-token`/`attestations: write` only on `image` and `release`. README has `gh attestation verify`. |
+| F-S5 licences | FIXED (needs a run) | `about.toml` + `about.hbs` -> `THIRD_PARTY_LICENSES` (build.yml `licenses` job, into tarballs and `/usr/share/doc/crosstalk/`); THIRD_PARTY_NOTICES.md: Rust crates + Alpine ffmpeg 6.1.2-r2 (GPL build, aports URL); `deny.toml` + `cargo deny --locked check licenses advisories bans` in the audit job; audit.toml `[output] deny = ["unsound","yanked"]` (unmaintained after F-S8, TODO). |
+| F-S6 compose 0.0.0.0 | FIXED | `"127.0.0.1:8730:8730"` with a reverse-proxy comment. |
+| F-S7 container privileges | FIXED | compose `read_only`, `tmpfs: [/tmp]`, `cap_drop: [ALL]`, `no-new-privileges`; same flags in the CI smoke runs; image `WORKDIR /tmp` (child-process side files land on the tmpfs) and `ENV CROSSTALK_CONFIG_DIR=/config` (the CLI's relative default). |
+| F-S8 askama / basic-toml | DEFERRED | Scheduled after the web fix; deny.toml ignores RUSTSEC-2026-0374 with a TODO, audit.toml TODO to add `unmaintained`. |
+| F-N1 toolchain/image/apk pins | PARTIAL | Image tags and digests pinned; rust-toolchain.toml stays `stable` (user decision); apk versions unpinned (Alpine drops old versions). |
+| F-N2 MSRV untested | FIXED (needs a run) | The declared 1.82 was false: the lockfile needs 1.89 (uuid 1.29; icu 2.4 needs 1.88; clap/tokio/indexmap 1.85, edition 2024). `rust-version = "1.89"` and a CI `msrv` job (`cargo +1.89 check --workspace --locked`). |
+| F-N3 python without -I | FIXED | ci.yml parity_sweep runs, sim_parity.sh (3 calls), oracle_report_guide.py's subprocess and README; parity_sweep.py refuses to run without `-I`. |
+| F-N4 drift step unreachable | FIXED | ci.yml has `workflow_dispatch`. |
+| F-N5 slim ffmpeg | OPEN | Later. |
+| F-N6 `*_FILE` secrets | OPEN | Not in this fix. |
+| F-N7 duplicate versions | FIXED | cargo-deny `multiple-versions = "warn"`; lockFileMaintenance weekly. |
+| F-N8 unsafe / killpg | PARTIAL | `#![forbid(unsafe_code)]` on crosstalk, crosstalk-core, crosstalk-matching, crosstalk-web, guide, lineup (none had unsafe). streams (the killpg) not touched here: another fixer owns it. |
+| F-N9 fragile version check | FIXED | `cargo metadata --no-deps | jq` for the `crosstalk` package. |
+| Renovate | FIXED | `renovate.json` (config:recommended, pinGitHubActionDigests, docker:pinDigests, semantic commits off, weekly lockFileMaintenance, vulnerabilityAlerts, git-submodules disabled, Cargo minor+patch grouped). PR #1 can be closed. |
+
+## Findings (original report)
+
 F-B1 BLOCKER runtime image alpine:3.20 EOL (Dockerfile:19, :32); ffmpeg decodes untrusted streams w/o CVE fixes. Fix: alpine:3.22 (or newer) pinned by digest; Renovate docker manager. Verify: cat /etc/alpine-release.
 F-B2 BLOCKER PR and release builds share one Namespace cache volume (ci.yml:18-20,31; :114-116,128; build.yml:56-58,71 tag nscloud-cache-tag-crosstalk-<arch>) -> fork PR code (build.rs/tests/proc-macros) can poison ~/.cargo/registry/src or target/ reused by v* tag builds. Fix: separate cache tag for pull_request events (crosstalk-pr-<arch>) AND release builds without cache (drop -with-cache label or cargo clean + fresh CARGO_HOME); repo setting "require approval for all outside collaborators".
 F-S1 ci.yml has no permissions: block -> top-level permissions: contents: read; persist-credentials: false on every checkout (both workflows).

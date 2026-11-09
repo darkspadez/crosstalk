@@ -9,6 +9,8 @@
 //! sent as an `Authorization: Bearer` header by a script, or presented once to the login page,
 //! which answers with a server-side session cookie.
 
+#![forbid(unsafe_code)]
+
 pub mod auth;
 pub mod client;
 pub mod csrf;
