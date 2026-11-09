@@ -2387,4 +2387,134 @@ mod tests {
             "no raw formula cell survives: {text}"
         );
     }
+
+    /// What must never reach a model or its audit trail (C-S4): the credential parts of a
+    /// provider URL, an account's name, the provider's key, and any URL at all.
+    const AI_MARKERS: [&str; 6] = [
+        "USERMARK",
+        "PASSMARK",
+        "TOKENMARK",
+        "SECRET-ACCT",
+        "KEYMARK",
+        "://",
+    ];
+
+    /// Serialises every request before passing it on, as a provider would receive it.
+    struct RecordingDecider {
+        inner: FixedDecider,
+        seen: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crosstalk_core::ai::Decider for RecordingDecider {
+        fn provider(&self) -> &str {
+            crosstalk_core::ai::Decider::provider(&self.inner)
+        }
+
+        fn calibrated(&self) -> bool {
+            crosstalk_core::ai::Decider::calibrated(&self.inner)
+        }
+
+        async fn decide(
+            &self,
+            request: &crosstalk_core::ai::DecisionRequest,
+        ) -> Result<crosstalk_core::ai::DecisionResponse> {
+            self.seen
+                .lock()
+                .expect("seen")
+                .push(serde_json::to_string(request).expect("a request serialises"));
+            crosstalk_core::ai::Decider::decide(&self.inner, request).await
+        }
+    }
+
+    #[tokio::test]
+    async fn an_ai_request_from_the_guide_match_carries_no_secret() {
+        // The verify-band fixture, with the band channel carrying a credentialed stream from
+        // a named account, and the guide entry a credentialed icon URL.
+        let (_server, mut world, base_context) = band_fixture().await;
+        let secret = "http://USERMARK:PASSMARK@provider.test/live/USERMARK/PASSMARK/1.ts\
+                      ?token=TOKENMARK";
+        world.m3u_accounts = vec![crosstalk_core::dispatcharr::M3uAccount {
+            id: 77,
+            name: "SECRET-ACCT".to_string(),
+            is_active: true,
+            server_url: Some(secret.to_string()),
+            ..crosstalk_core::dispatcharr::M3uAccount::default()
+        }];
+        world.streams = vec![crosstalk_core::dispatcharr::Stream {
+            id: 900,
+            name: BAND_CHANNEL.to_string(),
+            m3u_account: Some(77),
+            url: Some(secret.to_string()),
+            ..crosstalk_core::dispatcharr::Stream::default()
+        }];
+        world.channels[0].streams = vec![900];
+        world.entries[0].icon_url = Some(secret.to_string());
+
+        let store = crosstalk_core::store::Store::in_memory().expect("store");
+        let run_id = store
+            .start_run("guide", "match_preview", true)
+            .expect("run");
+        let mut config = (*base_context.config_arc()).clone();
+        config.ai.verify = ai_policy();
+        config.ai.providers.insert(
+            "typesafe".to_string(),
+            crosstalk_core::config::AiProviderConfig {
+                api_key: "KEYMARK".to_string(),
+                ..crosstalk_core::config::AiProviderConfig::default()
+            },
+        );
+        let context = JobContext::new(std::sync::Arc::new(config), Arc::new(VecSink::new()))
+            .with_dispatcharr(
+                base_context
+                    .dispatcharr()
+                    .expect("fixture wires a client")
+                    .clone(),
+            )
+            .for_run(
+                crate::APP_ID,
+                "match_preview",
+                run_id,
+                store.clone(),
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            );
+        let recorder = Arc::new(RecordingDecider {
+            inner: FixedDecider {
+                probability: 0.95,
+                calls: Arc::new(AtomicUsize::new(0)),
+            },
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let service = crosstalk_core::ai::AiService::with_decider("typesafe", recorder.clone());
+        let (channels, entries) = scoped(&world);
+        run(
+            &GuideApp::new(),
+            &context,
+            &GuideSettings::default(),
+            Some(&service),
+            &world,
+            &channels,
+            &entries,
+            true,
+        )
+        .await
+        .expect("preview");
+
+        let mut sent = recorder.seen.lock().expect("seen").clone();
+        assert!(!sent.is_empty(), "the band channel reached the model");
+        let stored: Vec<String> = (0..64)
+            .filter_map(|ordinal| store.ai_decision(run_id, ordinal).expect("load"))
+            .flat_map(|decision| {
+                [decision.request, decision.response, decision.attempts]
+                    .map(|value| value.to_string())
+            })
+            .collect();
+        assert!(!stored.is_empty(), "the ask was audited");
+        sent.extend(stored);
+        for text in &sent {
+            for marker in AI_MARKERS {
+                assert!(!text.contains(marker), "{marker} in {text}");
+            }
+        }
+    }
 }

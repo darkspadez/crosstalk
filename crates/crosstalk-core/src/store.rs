@@ -346,6 +346,9 @@ impl Store {
             connection: Arc::new(Mutex::new(connection)),
         };
         store.migrate(retire_running)?;
+        // Owner-only: the file, the WAL and shm the migration's `journal_mode = WAL` created
+        // (later ones inherit the file's mode), and the data directory.
+        crate::perms::restrict_store(path);
         Ok(store)
     }
 

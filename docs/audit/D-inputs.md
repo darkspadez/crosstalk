@@ -12,7 +12,7 @@
 | D7 preamble lines | Fixed: `csv_report::comment_line` (control chars -> space, `# ` added when missing) applied in `preamble`, `Report::write` and `write_report` | `crosstalk-core/src/csv_report.rs` |
 | N1 safe_cell | Fixed: first non-whitespace char decides, full-width `＝＋－＠` too, leading tab/CR/LF quoted; no BOM documented | `crosstalk-core/src/csv_report.rs` |
 | N2 hook body/name | Not here: fix 2 (web layer). `tests/webhook_props.rs` carries an `#[ignore]`d control-char property to un-ignore once N2 lands | - |
-| N3 env type guessing | Not here: fix 3 (secrets) | - |
+| N3 env type guessing | Fixed in fix 3 (secrets): overrides of `token`, `api_key`, `password`, `username`, `base_url`, `public_url` replace figment's typed value with the raw variable text (`0123456` stays `0123456`) | `crosstalk-core/src/config.rs` (`raw_string_overrides`) |
 | N4 lineup dup keys / expect | Fixed: `parse_lineup(raw, filename, detail, prefix)`, index map for repeated keys, caps (16 MiB, 10k categories, 200k entries), the embedded-file `expect` is an error | `lineup/src/lineup_file.rs` |
 | N5 user regex | Fixed: clean custom rules and `protect_regex` capped at 500 chars (pattern and replacement) and compiled with a 1 MiB size limit; streams' rules get the same size limit (`REGEX_SIZE_LIMIT`) | `lineup/src/clean.rs`, `streams/src/selection.rs` |
 | N6 tag_regex cache | Fixed: bounded (4096, starts over when full), poisoned lock recovered | `crosstalk-matching/src/normalize.rs` |

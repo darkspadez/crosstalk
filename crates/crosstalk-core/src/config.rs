@@ -16,7 +16,9 @@
 //! A sub-app's own thresholds and filters live in its own file.
 //!
 //! Secrets can be written inline or named through `*_env`, which is what a container
-//! deployment wants. Loading never logs a secret value.
+//! deployment wants; when both are set the environment wins (and `validate` says so).
+//! Loading never logs a secret value, and the `Debug` output of every section holding one
+//! prints `<redacted>` in its place.
 //!
 //! Write-back goes through `toml_edit` so comments and ordering in the operator's file
 //! survive an edit made in the web UI; a round trip through `toml` would silently drop
@@ -48,8 +50,17 @@ where
     })
 }
 
+/// What a secret field prints as in `Debug` output: whether it is set, never its value.
+fn redacted(secret: &str) -> &'static str {
+    if secret.trim().is_empty() {
+        ""
+    } else {
+        "<redacted>"
+    }
+}
+
 /// Where the daemon listens, and how it authenticates.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
     /// Interface to bind. Localhost by default, so an unconfigured daemon is not exposed.
@@ -59,7 +70,8 @@ pub struct ServerConfig {
     /// only safe while `bind` is a loopback address.
     #[serde(deserialize_with = "string_or_scalar")]
     pub token: String,
-    /// Read the token from this environment variable instead of the file.
+    /// Read the token from this environment variable. When the variable is set and not
+    /// blank it wins over `token`, so a token can be rotated without editing the file.
     #[serde(deserialize_with = "string_or_scalar")]
     pub token_env: String,
     /// Reverse proxies allowed to name the client: CIDR ranges (`10.0.0.0/8`, `::1/128`) or bare
@@ -78,6 +90,24 @@ pub struct ServerConfig {
     /// Always send `Strict-Transport-Security`. It is also sent whenever a trusted proxy says
     /// the request arrived over https.
     pub hsts: bool,
+}
+
+impl std::fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerConfig")
+            .field("bind", &self.bind)
+            .field("port", &self.port)
+            .field("token", &redacted(&self.token))
+            .field("token_env", &self.token_env)
+            .field("trusted_proxies", &self.trusted_proxies)
+            .field(
+                "public_url",
+                &crate::redact::urls_to_hosts(&self.public_url),
+            )
+            .field("secure_cookies", &self.secure_cookies)
+            .field("hsts", &self.hsts)
+            .finish()
+    }
 }
 
 impl Default for ServerConfig {
@@ -179,10 +209,12 @@ impl ServerConfig {
 }
 
 /// How to reach Dispatcharr.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DispatcharrConfig {
-    /// Base URL, without the `/api` suffix: `http://dispatcharr:9191`.
+    /// Base URL, without the `/api` suffix: `http://dispatcharr:9191`. A `user:pass@` in it
+    /// (for a reverse proxy in front of Dispatcharr) is sent as HTTP basic auth and never
+    /// printed: see [`DispatcharrConfig::api_root`].
     #[serde(deserialize_with = "string_or_scalar")]
     pub base_url: String,
     /// API key, sent as `X-API-Key`. Preferred: it does not expire.
@@ -202,6 +234,21 @@ pub struct DispatcharrConfig {
     /// Cap on concurrent HTTP requests, for the programme-data checks, the AI calls and
     /// lineup's channel writes (lineup has no write-concurrency knob of its own).
     pub concurrency: usize,
+}
+
+impl std::fmt::Debug for DispatcharrConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DispatcharrConfig")
+            .field("base_url", &split_userinfo(self.base_url.trim()).0)
+            .field("api_key", &redacted(&self.api_key))
+            .field("api_key_env", &self.api_key_env)
+            .field("username", &self.username)
+            .field("password", &redacted(&self.password))
+            .field("password_env", &self.password_env)
+            .field("timeout_secs", &self.timeout_secs)
+            .field("concurrency", &self.concurrency)
+            .finish()
+    }
 }
 
 impl Default for DispatcharrConfig {
@@ -228,14 +275,28 @@ impl DispatcharrConfig {
         resolve_secret(&self.password, &self.password_env)
     }
 
-    /// The API root every request is built from.
+    /// The API root every request is built from, without the `user:pass@` the base URL may
+    /// carry: that travels as basic auth ([`Self::base_url_userinfo`]), so this is what may
+    /// be printed, logged and quoted in an error.
     pub fn api_root(&self) -> String {
-        let base = self.base_url.trim().trim_end_matches('/');
+        let (base, _) = split_userinfo(self.base_url.trim());
+        let base = base.trim_end_matches('/');
         if base.to_lowercase().ends_with("/api") {
             base.to_string()
         } else {
             format!("{base}/api")
         }
+    }
+
+    /// The `user[:password]` in `base_url`, percent-decoded, for HTTP basic auth.
+    pub fn base_url_userinfo(&self) -> Option<(String, Option<String>)> {
+        let (_, userinfo) = split_userinfo(self.base_url.trim());
+        let userinfo = userinfo?;
+        let (user, password) = match userinfo.split_once(':') {
+            Some((user, password)) => (user, Some(percent_decode(password))),
+            None => (userinfo, None),
+        };
+        Some((percent_decode(user), password))
     }
 
     /// Whether enough is configured to authenticate at all.
@@ -245,9 +306,72 @@ impl DispatcharrConfig {
     }
 }
 
+/// The dotted keys of `table` holding an inline secret: a non-blank `token`, `api_key`,
+/// `password` or `secret` string, or a URL carrying `user:pass@`.
+fn inline_secret_keys(table: &toml::Table, prefix: &str, keys: &mut Vec<String>) {
+    for (key, value) in table {
+        let dotted = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        match value {
+            toml::Value::Table(inner) => inline_secret_keys(inner, &dotted, keys),
+            toml::Value::String(text) if !text.trim().is_empty() => {
+                let lower = key.to_ascii_lowercase();
+                let secret = matches!(lower.as_str(), "token" | "api_key" | "password" | "secret")
+                    || (text.contains("://") && split_userinfo(text.trim()).1.is_some());
+                if secret {
+                    keys.push(dotted);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `scheme://user:pass@host/path` split into `scheme://host/path` and `user:pass`.
+///
+/// The userinfo ends at the last `@` of the authority (a password may contain `@` only
+/// percent-encoded, but a hand-written one may not be). A URL without one is returned whole.
+fn split_userinfo(url: &str) -> (String, Option<&str>) {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return (url.to_string(), None);
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    match authority.rfind('@') {
+        Some(at) => (
+            format!("{scheme}://{}", &rest[at + 1..]),
+            Some(&authority[..at]).filter(|userinfo| !userinfo.is_empty()),
+        ),
+        None => (url.to_string(), None),
+    }
+}
+
+/// `%XX` escapes decoded; anything malformed is kept as written.
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let hex = |byte: u8| (byte as char).to_digit(16);
+            if let (Some(high), Some(low)) = (hex(bytes[index + 1]), hex(bytes[index + 2])) {
+                out.push((high * 16 + low) as u8);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// One AI provider endpoint. No model names here: a sub-app names the model, the host owns
 /// the connection.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AiProviderConfig {
     /// `typesafe` (native System One) or `openai_compat`.
@@ -260,6 +384,19 @@ pub struct AiProviderConfig {
     pub api_key_env: String,
     pub timeout_secs: u64,
     pub max_concurrency: usize,
+}
+
+impl std::fmt::Debug for AiProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AiProviderConfig")
+            .field("kind", &self.kind)
+            .field("base_url", &crate::redact::urls_to_hosts(&self.base_url))
+            .field("api_key", &redacted(&self.api_key))
+            .field("api_key_env", &self.api_key_env)
+            .field("timeout_secs", &self.timeout_secs)
+            .field("max_concurrency", &self.max_concurrency)
+            .finish()
+    }
 }
 
 impl Default for AiProviderConfig {
@@ -1415,10 +1552,11 @@ impl CrosstalkConfig {
             "workflows",
             "hooks",
         ];
-        let overlay: toml::Table = overlay
+        let mut overlay: toml::Table = overlay
             .into_iter()
             .filter(|(key, _)| SECTIONS.contains(&key.as_str()))
             .collect();
+        raw_string_overrides(&mut overlay, env_prefix);
 
         let mut base: toml::Table =
             toml::from_str(&before).context("serialising the configuration for overrides")?;
@@ -1434,6 +1572,54 @@ impl CrosstalkConfig {
         let after = toml::to_string(self).unwrap_or_default();
         self.env_overrides = overrides + usize::from(before != after);
         Ok(())
+    }
+
+    /// Configuration files other accounts on this host can read while they hold a secret.
+    ///
+    /// Every `*.toml` in the configuration directory (`crosstalk.toml` and each app's file)
+    /// that is group- or world-readable AND holds an inline secret (a `token`, `api_key`,
+    /// `password` or `secret` value, or a URL with `user:pass@`) is one warning, naming the
+    /// keys but never their values. Separate from [`Self::validate`], which judges the
+    /// configuration in memory: this looks at files on disk, for `validate` and `serve` to
+    /// print. Empty off Unix.
+    pub fn exposed_secret_warnings(&self) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(&self.config_dir) else {
+            return Vec::new();
+        };
+        let mut files: Vec<PathBuf> = entries
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "toml")
+            })
+            .filter(|path| path.is_file())
+            .collect();
+        files.sort();
+        let mut warnings = Vec::new();
+        for path in files {
+            if !crate::perms::readable_by_others(&path) {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(table) = toml::from_str::<toml::Table>(&text) else {
+                continue;
+            };
+            let mut keys = Vec::new();
+            inline_secret_keys(&table, "", &mut keys);
+            if keys.is_empty() {
+                continue;
+            }
+            warnings.push(format!(
+                "{} is readable by other accounts on this host (mode {:o}) and holds {}: \
+                 run `chmod 600` on it, or move the secret to its *_env variable",
+                path.display(),
+                crate::perms::mode(&path).unwrap_or_default(),
+                keys.join(", ")
+            ));
+        }
+        warnings
     }
 
     /// Absolute path of the exports directory.
@@ -1495,6 +1681,23 @@ impl CrosstalkConfig {
         if self.server.port == 0 {
             report.errors.push("server.port must not be 0".to_string());
         }
+        report.warnings.extend(
+            [
+                shadowed_secret_warning("server.token", &self.server.token, &self.server.token_env),
+                shadowed_secret_warning(
+                    "dispatcharr.api_key",
+                    &self.dispatcharr.api_key,
+                    &self.dispatcharr.api_key_env,
+                ),
+                shadowed_secret_warning(
+                    "dispatcharr.password",
+                    &self.dispatcharr.password,
+                    &self.dispatcharr.password_env,
+                ),
+            ]
+            .into_iter()
+            .flatten(),
+        );
         report.errors.extend(self.server.security_errors());
         if !self.server.is_loopback() && self.server.resolved_token().is_none() {
             report.warnings.push(format!(
@@ -1534,6 +1737,11 @@ impl CrosstalkConfig {
                     "ai.providers.{name}.max_concurrency must be at least 1"
                 ));
             }
+            report.warnings.extend(shadowed_secret_warning(
+                &format!("ai.providers.{name}.api_key"),
+                &provider.api_key,
+                &provider.api_key_env,
+            ));
             if provider.resolved_api_key().is_none() && provider.kind == "typesafe" {
                 // A local openai_compat endpoint may need no key at all; a hosted one does.
                 report.warnings.push(format!(
@@ -2620,23 +2828,80 @@ fn merge_toml_overlay(base: &mut toml::Table, overlay: toml::Table) {
 
 /// A secret from the file, or from the environment variable it names.
 ///
-/// The environment wins, so a token can be rotated without touching the file. Empty values
-/// count as unset: a blank `api_key` line should not look like a configured key.
+/// The environment wins, so a token can be rotated without touching the file (and a
+/// container's secret overrides whatever a mounted file still says). Empty values count as
+/// unset: a blank `api_key` line should not look like a configured key, and a blank
+/// variable falls back to the file.
 fn resolve_secret(inline: &str, env_name: &str) -> Option<String> {
-    let inline = inline.trim();
-    if !inline.is_empty() {
-        return Some(inline.to_string());
+    if let Some(value) = secret_from_env(env_name) {
+        return Some(value);
     }
+    let inline = inline.trim();
+    (!inline.is_empty()).then(|| inline.to_string())
+}
+
+/// The non-blank value of the variable `env_name` names, if any.
+fn secret_from_env(env_name: &str) -> Option<String> {
     let env_name = env_name.trim();
     if env_name.is_empty() {
         return None;
     }
     let value = std::env::var(env_name).ok()?;
     let value = value.trim();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_string())
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+/// The warning for a secret set both inline and through its `*_env` variable, if it is.
+fn shadowed_secret_warning(field: &str, inline: &str, env_name: &str) -> Option<String> {
+    (!inline.trim().is_empty() && secret_from_env(env_name).is_some()).then(|| {
+        format!(
+            "{field} is set in the file and in ${}: the environment value is used. Remove one \
+             so the file does not mislead the next reader.",
+            env_name.trim()
+        )
+    })
+}
+
+/// The keys whose environment overrides are taken verbatim rather than typed by figment.
+///
+/// figment guesses a type for every variable, so `CROSSTALK_SERVER__TOKEN=0123456` arrives as
+/// the integer 123456 and the leading zero is gone before [`string_or_scalar`] sees it. A
+/// secret or URL is text, whatever it looks like.
+const RAW_STRING_KEYS: [&str; 6] = [
+    "token",
+    "api_key",
+    "password",
+    "username",
+    "base_url",
+    "public_url",
+];
+
+/// Replace the typed overlay values of [`RAW_STRING_KEYS`] with the raw environment text.
+fn raw_string_overrides(overlay: &mut toml::Table, env_prefix: &str) {
+    let prefix = env_prefix.to_ascii_uppercase();
+    for (name, value) in std::env::vars_os() {
+        let (Some(name), Some(value)) = (name.to_str(), value.to_str()) else {
+            continue;
+        };
+        let upper = name.to_ascii_uppercase();
+        let Some(rest) = upper.strip_prefix(&prefix) else {
+            continue;
+        };
+        let path: Vec<String> = rest.split("__").map(str::to_ascii_lowercase).collect();
+        let Some((last, parents)) = path.split_last() else {
+            continue;
+        };
+        if parents.is_empty() || !RAW_STRING_KEYS.contains(&last.as_str()) {
+            continue;
+        }
+        // Only a value figment already put in the overlay is replaced: the walk never adds a
+        // key the typed pass did not see.
+        let table = parents.iter().try_fold(&mut *overlay, |table, key| {
+            table.get_mut(key).and_then(toml::Value::as_table_mut)
+        });
+        if let Some(table) = table.filter(|table| table.contains_key(last)) {
+            table.insert(last.clone(), toml::Value::String(value.to_string()));
+        }
     }
 }
 
@@ -3778,6 +4043,188 @@ m3u_refresh = ["streams.match_apply"]
             .expect("a digits-only token must not be read as a number");
         std::env::remove_var("CROSSTALK_TESTDIGITS_SERVER__TOKEN");
         assert_eq!(config.server.resolved_token().as_deref(), Some("123456"));
+    }
+
+    #[test]
+    fn a_secret_from_the_environment_is_kept_verbatim() {
+        // figment would read these as the integers 123456 and 42, losing the zeros.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            "[server]\nport = 1\n\n[ai.providers.llm]\nkind = \"openai_compat\"\n",
+        );
+        std::env::set_var("CROSSTALK_TESTZERO_SERVER__TOKEN", "0123456");
+        std::env::set_var("CROSSTALK_TESTZERO_DISPATCHARR__API_KEY", "00042");
+        std::env::set_var("CROSSTALK_TESTZERO_AI__PROVIDERS__LLM__API_KEY", "0x10");
+        std::env::set_var("CROSSTALK_TESTZERO_SERVER__PORT", "9001");
+        let config = CrosstalkConfig::load_prefixed(dir.path(), "CROSSTALK_TESTZERO_");
+        for name in [
+            "CROSSTALK_TESTZERO_SERVER__TOKEN",
+            "CROSSTALK_TESTZERO_DISPATCHARR__API_KEY",
+            "CROSSTALK_TESTZERO_AI__PROVIDERS__LLM__API_KEY",
+            "CROSSTALK_TESTZERO_SERVER__PORT",
+        ] {
+            std::env::remove_var(name);
+        }
+        let config = config.expect("load");
+        assert_eq!(config.server.token, "0123456");
+        assert_eq!(config.dispatcharr.api_key, "00042");
+        assert_eq!(
+            config.ai.providers.get("llm").map(|p| p.api_key.as_str()),
+            Some("0x10")
+        );
+        // A number stays a number: only the string keys are read raw.
+        assert_eq!(config.server.port, 9001);
+    }
+
+    #[test]
+    fn the_environment_wins_over_an_inline_secret_and_validate_says_so() {
+        let server = ServerConfig {
+            token: "from-the-file".to_string(),
+            token_env: "CROSSTALK_TESTPRECEDENCE_TOKEN".to_string(),
+            ..ServerConfig::default()
+        };
+        let mut config = CrosstalkConfig {
+            server: server.clone(),
+            ..CrosstalkConfig::default()
+        };
+        config.dispatcharr.api_key = "k".to_string();
+        // Unset (or blank): the file's value.
+        assert_eq!(server.resolved_token().as_deref(), Some("from-the-file"));
+        assert!(!config
+            .validate()
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("server.token is set in the file and in")));
+        std::env::set_var("CROSSTALK_TESTPRECEDENCE_TOKEN", "   ");
+        assert_eq!(server.resolved_token().as_deref(), Some("from-the-file"));
+        std::env::set_var("CROSSTALK_TESTPRECEDENCE_TOKEN", "from-the-environment");
+        let resolved = server.resolved_token();
+        let warnings = config.validate().warnings;
+        std::env::remove_var("CROSSTALK_TESTPRECEDENCE_TOKEN");
+        assert_eq!(resolved.as_deref(), Some("from-the-environment"));
+        assert!(
+            warnings.iter().any(|warning| warning.contains(
+                "server.token is set in the file and in $CROSSTALK_TESTPRECEDENCE_TOKEN"
+            )),
+            "{warnings:?}"
+        );
+        assert!(
+            !warnings.iter().any(|warning| warning.contains("from-the")),
+            "a warning never quotes the secret: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn debug_output_never_prints_a_secret() {
+        let mut config = CrosstalkConfig::default();
+        config.server.token = "TOKEN-SECRET".to_string();
+        config.dispatcharr.base_url =
+            "https://proxyuser:PROXY-SECRET@dispatcharr.test/".to_string();
+        config.dispatcharr.api_key = "KEY-SECRET".to_string();
+        config.dispatcharr.password = "PASSWORD-SECRET".to_string();
+        config.ai.providers.insert(
+            "llm".to_string(),
+            AiProviderConfig {
+                base_url: "https://u:AI-URL-SECRET@llm.test/v1?key=AI-QUERY-SECRET".to_string(),
+                api_key: "AI-KEY-SECRET".to_string(),
+                ..AiProviderConfig::default()
+            },
+        );
+        let printed = format!("{config:?}");
+        for secret in [
+            "TOKEN-SECRET",
+            "PROXY-SECRET",
+            "KEY-SECRET",
+            "PASSWORD-SECRET",
+            "AI-URL-SECRET",
+            "AI-QUERY-SECRET",
+            "AI-KEY-SECRET",
+        ] {
+            assert!(!printed.contains(secret), "{secret} in {printed}");
+        }
+        assert!(printed.contains("<redacted>"), "{printed}");
+        assert!(printed.contains("dispatcharr.test"), "{printed}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_readable_file_holding_an_inline_secret_is_warned_about() {
+        use std::os::unix::fs::PermissionsExt;
+        let chmod = |path: &Path, mode: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod")
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            "[server]\nport = 1\n\n[dispatcharr]\napi_key = \"KEY-VALUE\"\napi_key_env = \"X\"\n",
+        );
+        write(dir.path(), "streams.toml", "stream_check_delay = 1\n");
+        write(
+            dir.path(),
+            "guide.toml",
+            "[upstream]\nbase_url = \"http://u:URL-SECRET@h.test/x\"\n",
+        );
+        let config = CrosstalkConfig::load_file(dir.path()).expect("load");
+
+        for name in ["crosstalk.toml", "streams.toml", "guide.toml"] {
+            chmod(&dir.path().join(name), 0o644);
+        }
+        let warnings = config.exposed_secret_warnings();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings[0].contains("crosstalk.toml") && warnings[0].contains("dispatcharr.api_key")
+        );
+        assert!(warnings[0].contains("644"), "{warnings:?}");
+        assert!(
+            warnings[1].contains("guide.toml") && warnings[1].contains("upstream.base_url"),
+            "{warnings:?}"
+        );
+        assert!(
+            !warnings
+                .iter()
+                .any(|warning| warning.contains("KEY-VALUE") || warning.contains("URL-SECRET")),
+            "{warnings:?}"
+        );
+        assert!(!warnings
+            .iter()
+            .any(|warning| warning.contains("streams.toml")));
+
+        // Owner-only files hold whatever they like.
+        for name in ["crosstalk.toml", "guide.toml"] {
+            chmod(&dir.path().join(name), 0o600);
+        }
+        assert!(config.exposed_secret_warnings().is_empty());
+    }
+
+    #[test]
+    fn base_url_credentials_are_split_off_the_api_root() {
+        let config = DispatcharrConfig {
+            base_url: "https://proxy%40user:p%3Ass@dispatcharr.test:8443/".to_string(),
+            ..DispatcharrConfig::default()
+        };
+        assert_eq!(config.api_root(), "https://dispatcharr.test:8443/api");
+        assert_eq!(
+            config.base_url_userinfo(),
+            Some(("proxy@user".to_string(), Some("p:ss".to_string())))
+        );
+        let plain = DispatcharrConfig {
+            base_url: "http://dispatcharr:9191".to_string(),
+            ..DispatcharrConfig::default()
+        };
+        assert_eq!(plain.api_root(), "http://dispatcharr:9191/api");
+        assert_eq!(plain.base_url_userinfo(), None);
+        let user_only = DispatcharrConfig {
+            base_url: "http://admin@dispatcharr:9191/api".to_string(),
+            ..DispatcharrConfig::default()
+        };
+        assert_eq!(user_only.api_root(), "http://dispatcharr:9191/api");
+        assert_eq!(
+            user_only.base_url_userinfo(),
+            Some(("admin".to_string(), None))
+        );
     }
 
     #[test]

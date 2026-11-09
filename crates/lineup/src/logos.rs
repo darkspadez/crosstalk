@@ -89,6 +89,7 @@ use crosstalk_core::logos::{
     self, LogoQuery, LogoSource, LogoSources, TvHit, TvLogosIndex, LOGO_MATCH_THRESHOLD,
     TV_LOGOS_TREE_URL,
 };
+use crosstalk_core::redact;
 use crosstalk_core::subapp::{JobOutcome, OutcomeBuilder, SubApp};
 use crosstalk_matching::identity::{Identity, ResolveContext};
 use rayon::prelude::*;
@@ -824,7 +825,7 @@ async fn run_with_tree_url(
             output.status = "failed".to_string();
             output.reason = format!(
                 "logo {:?} could not be created, so the channel keeps its logo",
-                output.new_logo,
+                redact::url_without_secrets(&output.new_logo),
             );
         }
     }
@@ -918,11 +919,14 @@ async fn run_with_tree_url(
                 output.number.map(|n| format!("{n}")).unwrap_or_default(),
                 csv_report::safe_cell(&output.group),
                 csv_report::safe_cell(&output.old),
-                csv_report::safe_cell(&output.old_logo),
-                csv_report::safe_cell(&output.new_logo),
+                // A logo URL can carry a token in its query or userinfo: the report keeps
+                // the path, which is what identifies the image (the exact URL stays in the
+                // ownership intent, which needs it to find the logo again).
+                csv_report::safe_cell(&redact::url_without_secrets(&output.old_logo)),
+                csv_report::safe_cell(&redact::url_without_secrets(&output.new_logo)),
                 output.source.clone(),
                 output.status.clone(),
-                csv_report::safe_cell(&output.reason),
+                csv_report::safe_cell(&redact::urls_without_secrets(&output.reason)),
                 output.callsign.clone().unwrap_or_default(),
                 output.country.clone().unwrap_or_default(),
                 csv_report::safe_cell(&output.canonical),

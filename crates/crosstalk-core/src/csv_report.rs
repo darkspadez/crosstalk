@@ -181,8 +181,13 @@ pub fn write_report<F>(
 where
     F: FnOnce(&mut csv::Writer<std::fs::File>) -> Result<()>,
 {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
+    // Owner-only, like the run store: a report names every channel, stream and decision of a
+    // run, and is shared by choice, not by umask (see [`crate::perms`]).
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        crate::perms::create_private_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     // The preamble is written straight to the file, then the csv writer takes it over: a csv
@@ -190,7 +195,7 @@ where
     // comment line.
     {
         use std::io::Write;
-        let mut file = std::fs::File::create(path)
+        let mut file = crate::perms::create_private_file(path)
             .with_context(|| format!("creating the report {}", path.display()))?;
         let mut buffer = String::new();
         for line in preamble_lines {

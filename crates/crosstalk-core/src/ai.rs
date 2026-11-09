@@ -551,21 +551,17 @@ impl AiService {
     }
 }
 
-/// Scrub an error message before it reaches the audit trail: URLs lose their userinfo and
-/// query string (where proxies carry tokens) and bearer tokens are masked. The bearer key
-/// itself is sent as a header and never formatted into an error, but a provider's echoed
-/// body or an operator's `base_url` can still carry one.
+/// Scrub an error message before it reaches the audit trail: URLs shrink to
+/// `scheme://host[:port]` (their userinfo, path and query are where proxies and providers
+/// carry tokens; see [`crate::redact::urls_to_hosts`]) and bearer tokens are masked. The
+/// bearer key itself is sent as a header and never formatted into an error, but a
+/// provider's echoed body or an operator's `base_url` can still carry one.
 pub fn redact_error(text: &str) -> String {
-    static URL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     static BEARER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let url = URL.get_or_init(|| {
-        regex::Regex::new(r#"(?i)\b(https?://)(?:[^\s/@?#"']*@)?([^\s?#"']*)(?:\?[^\s#"']*)?"#)
-            .expect("valid URL pattern")
-    });
     let bearer = BEARER.get_or_init(|| {
         regex::Regex::new(r#"(?i)\bbearer\s+[^\s"',}]+"#).expect("valid bearer pattern")
     });
-    let text = url.replace_all(text, "$1$2");
+    let text = crate::redact::urls_to_hosts(text);
     bearer.replace_all(&text, "Bearer [redacted]").into_owned()
 }
 
@@ -2070,9 +2066,10 @@ mod tests {
         assert!(!clean.contains("sk-123"), "{clean}");
         assert!(!clean.contains("pa55"), "{clean}");
         assert!(!clean.contains("sk-live-abc"), "{clean}");
+        assert!(clean.contains("https://proxy.example"), "{clean}");
         assert!(
-            clean.contains("https://proxy.example/v1/chat/completions"),
-            "{clean}"
+            !clean.contains("/v1/chat"),
+            "the path is dropped too: {clean}"
         );
         assert_eq!(
             super::redact_error("the endpoint is down"),

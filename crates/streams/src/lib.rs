@@ -53,6 +53,8 @@ pub mod placeholder_scan;
 pub mod probe;
 pub mod quality;
 pub mod restore;
+#[cfg(test)]
+mod secrets_tests;
 pub mod selection;
 pub mod settings;
 pub mod sort;

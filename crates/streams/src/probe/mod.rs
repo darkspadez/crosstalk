@@ -118,6 +118,7 @@ use crosstalk_core::dispatcharr::{
 };
 use crosstalk_core::jobs::{JobContext, PacedProgress, ProgressEvent};
 use crosstalk_core::limiter::{Limiter, LimiterConfig};
+use crosstalk_core::redact;
 use crosstalk_core::store::{RunRow, RunStatus, Store, StreamHealth, Subject};
 use crosstalk_core::subapp::{JobOutcome, OutcomeBuilder, SubApp};
 use ffprobe::{ExtraFacts, MediaFacts, Parsed};
@@ -2151,7 +2152,9 @@ fn write_report(
                     verdict.format.to_string(),
                     format!("{:.1}", verdict.framerate),
                     verdict.error_type.clone(),
-                    csv_report::safe_cell(&verdict.error),
+                    // Masked when the verdict was made; shortened again here because a report
+                    // leaves the host and every error path must end at host-only URLs.
+                    csv_report::safe_cell(&redact::urls_to_hosts(&verdict.error)),
                     verdict.retries.to_string(),
                     config.connection_timeout.to_string(),
                     config.probe_timeout.to_string(),
@@ -2415,6 +2418,9 @@ fn stream_rows(
                 Some(error) => format!("{reason}; stats write failed: {error}"),
                 None => reason,
             };
+            // A stored row never carries more of a URL than its host (the stream URL is a
+            // credential; a stats-write error can echo one back).
+            let reason = redact::urls_to_hosts(&reason);
             RunRow {
                 subject: Subject::Stream,
                 channel_id: verdict.stream_id,
