@@ -410,7 +410,7 @@ where
                 let family = rank(&engine, name, &index);
                 if let Some((context, action, phase)) = progress.as_ref() {
                     let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if done % PROGRESS_EVERY == 0 || done == total {
+                    if done.is_multiple_of(PROGRESS_EVERY) || done == total {
                         let prev = max_sent.fetch_max(done, Ordering::Relaxed);
                         if done > prev {
                             context.progress(&ProgressEvent::new(

@@ -158,9 +158,9 @@ const STREAMS_PER_CHANNEL: usize = 10;
 fn family_name(index: usize) -> String {
     let network = NETWORKS[index % NETWORKS.len()];
     let slot = index / NETWORKS.len();
-    let zone = if index > 0 && index % 13 == 0 {
+    let zone = if index > 0 && index.is_multiple_of(13) {
         " West"
-    } else if index > 0 && index % 17 == 0 {
+    } else if index > 0 && index.is_multiple_of(17) {
         " East"
     } else {
         ""
@@ -1032,7 +1032,7 @@ pub fn thousands(count: usize) -> String {
     let digits = count.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, ch) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index) % 3 == 0 {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
             out.push(',');
         }
         out.push(ch);

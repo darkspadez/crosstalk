@@ -27,7 +27,7 @@ pub fn digest(data: &[u8]) -> [u8; 32] {
     // The message, a 0x80 byte, zeros to 56 mod 64, then the bit length big-endian.
     let mut tail = Vec::with_capacity(128);
     let full = data.len() - data.len() % 64;
-    for block in data[..full].chunks_exact(64) {
+    for block in data[..full].as_chunks::<64>().0 {
         compress(&mut state, block);
     }
     tail.extend_from_slice(&data[full..]);
@@ -36,12 +36,12 @@ pub fn digest(data: &[u8]) -> [u8; 32] {
         tail.push(0);
     }
     tail.extend_from_slice(&bit_len.to_be_bytes());
-    for block in tail.chunks_exact(64) {
+    for block in tail.as_chunks::<64>().0 {
         compress(&mut state, block);
     }
 
     let mut out = [0u8; 32];
-    for (chunk, word) in out.chunks_exact_mut(4).zip(state) {
+    for (chunk, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(state) {
         chunk.copy_from_slice(&word.to_be_bytes());
     }
     out
@@ -49,7 +49,7 @@ pub fn digest(data: &[u8]) -> [u8; 32] {
 
 fn compress(state: &mut [u32; 8], block: &[u8]) {
     let mut w = [0u32; 64];
-    for (index, word) in block.chunks_exact(4).enumerate() {
+    for (index, word) in block.as_chunks::<4>().0.iter().enumerate() {
         w[index] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
     }
     for index in 16..64 {
