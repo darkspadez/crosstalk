@@ -8,6 +8,8 @@
 //! Authentication is a bearer token: the one in `crosstalk.toml` (or its environment variable),
 //! sent as a cookie by the login page or as an `Authorization: Bearer` header by a script.
 
+#![forbid(unsafe_code)]
+
 pub mod auth;
 pub mod csrf;
 pub mod host;

@@ -10,6 +10,8 @@
 //! flags on [`NormalizeFlags`], [`MatchOptions`], [`profile::MatchProfile`] and the alias
 //! tables — see [`profile`] for the function-by-function diff.
 
+#![forbid(unsafe_code)]
+
 pub mod alias;
 pub mod callsign;
 pub mod country;

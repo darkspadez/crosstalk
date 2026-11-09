@@ -163,6 +163,11 @@ versioned tags plus `latest` from tagged releases (`v*`), and `edge` from every 
 to `main`. Each release also attaches static Linux binaries (amd64/arm64) with a
 `SHA256SUMS` file on the GitHub Releases page.
 
+The compose file publishes the port on `127.0.0.1` only and runs the container with a
+read-only root filesystem, a `/tmp` tmpfs, no Linux capabilities and
+`no-new-privileges`; the daemon writes only `/config`. For access from other machines, put
+a TLS reverse proxy in front of it rather than publishing `0.0.0.0:8730`.
+
 The image carries **ffmpeg** (which includes ffprobe), because `streams.probe` runs the
 real tools: IPTV Checker's stream check is two subprocesses per stream, not an HTTP
 request. Alpine installs them in `/usr/bin`, which is what `streams.toml` defaults to
@@ -187,6 +192,34 @@ alternative would be a second image, which the plan rejected.
 The UI listens on <http://localhost:8730>.
 
 > **Back up your Dispatcharr database first.** An apply rewrites guide assignments on channels.
+
+### Releases: how they are built and how to verify them
+
+A `v*` tag runs CI (`ci.yml`) and the build (`build.yml`) on the same commit. Nothing is
+published until that CI run has passed: the build's `ci-gate` job waits up to 60 minutes
+for it, and the image and the GitHub Release both depend on it. Release binaries and the
+release image are built without any shared build cache (pull requests use a separate one),
+and the tag must equal the workspace version (`cargo metadata`).
+
+Every image pushed to GHCR carries an SBOM and SLSA provenance (`mode=max`), and the image
+digest and each release tarball carry a signed GitHub build-provenance attestation. Verify
+with the GitHub CLI before you run anything:
+
+```bash
+# A release tarball (download it and SHA256SUMS from the release first)
+sha256sum -c SHA256SUMS --ignore-missing
+gh attestation verify crosstalk-v0.2.0-linux-amd64.tar.gz --repo darkspadez/crosstalk
+
+# The image (by tag or, better, by digest)
+gh attestation verify oci://ghcr.io/darkspadez/crosstalk:0.2.0 --repo darkspadez/crosstalk
+docker buildx imagetools inspect ghcr.io/darkspadez/crosstalk:0.2.0 \
+  --format '{{ json .SBOM }}'   # the SPDX SBOM BuildKit attached
+```
+
+A successful `gh attestation verify` proves the artifact was built by this repository's
+`build.yml` from the tagged commit. Releases before these attestations existed (v0.1.0)
+cannot be verified this way. Each tarball and the image (`/usr/share/doc/crosstalk/`) also
+carry `THIRD_PARTY_LICENSES`, the licence text of every Rust crate compiled in.
 
 ## Commands
 
@@ -1067,8 +1100,8 @@ cargo fmt --all
 
 ./scripts/sim_parity.sh --quick # the Janitor oracle (--features oracle) vs the Python tool, byte for byte
 ./scripts/one_matcher_check.sh  # no retired profile matcher links into the production binary
-python3 scripts/parity_sweep.py --kinds normalize,callsign,location,network --limit 300
-python3 scripts/parity_sweep.py --kinds match,score --limit 300 --pool 60
+python3 -I scripts/parity_sweep.py --kinds normalize,callsign,location,network --limit 300
+python3 -I scripts/parity_sweep.py --kinds match,score --limit 300 --pool 60
 python3 scripts/parity_sweep_sm.py --limit 300   # the StreamMapparr matcher profile, vs its own code
 python3 -I scripts/channel_ops_parity.py   # the cleanup selections and payloads
 python3 -I scripts/sort_parity.py          # the streams quality model, 840 cases
@@ -1126,5 +1159,8 @@ crosstalk is MIT; see [LICENSE](LICENSE). The code and data ported from the Disp
 plugins (EPG Janitor, Stream-Mapparr and IPTV Checker, and from phase 3 Channel-Mapparr,
 Lineuparr and Channel Name Cleaner) are credited, with each upstream licence text and pinned
 reference commit, in
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) — both files ship in the release tarball and
-in the container image, under `/usr/share/doc/crosstalk/`.
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), which also covers the Alpine ffmpeg package
+in the image (GPL). The licence texts of the Rust crates compiled in are generated at build
+time into `THIRD_PARTY_LICENSES` (`about.toml`; the allowed licences are `deny.toml`'s list).
+All three files ship in the release tarball and in the container image, under
+`/usr/share/doc/crosstalk/`.

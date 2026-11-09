@@ -6,7 +6,8 @@
 #   4. docker compose up -d --build
 #
 # The container listens on 0.0.0.0 (set below), so a token is mandatory: the daemon refuses to
-# start on a non-loopback address without one.
+# start on a non-loopback address without one. The host side publishes on 127.0.0.1 only:
+# put a reverse proxy (TLS) in front for remote access rather than exposing the port.
 services:
   crosstalk:
     build:
@@ -31,9 +32,22 @@ services:
       retries: 3
       start_period: 10s
     ports:
-      - "8730:8730"
+      # Loopback only. A reverse proxy on the host (Caddy, nginx, Traefik) terminates TLS and
+      # forwards here; list its address in [server] trusted_proxies. If the proxy runs in
+      # another container on the same network, drop `ports:` and point it at crosstalk:8730.
+      - "127.0.0.1:8730:8730"
     volumes:
       - ./config:/config
+    # Least privilege: the daemon writes only /config (the bind mount above) and /tmp, needs
+    # no Linux capabilities (unprivileged user, port above 1024) and never escalates.
+    # CI's docker smoke test runs the image with the same flags.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
     environment:
       # Bind inside the container. Without this the daemon listens on the container's loopback
       # and the published port cannot reach it.

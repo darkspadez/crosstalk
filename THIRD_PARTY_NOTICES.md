@@ -411,6 +411,33 @@ one recursive tree through the fetch cache (24 h TTL, unauthenticated, offline b
 refreshes), and a chosen logo is created on Dispatcharr by its raw GitHub URL, exactly as
 both plugins did.
 
+## Rust crates (`THIRD_PARTY_LICENSES`)
+
+The binary statically links the Rust crates in `Cargo.lock`. Their licence texts are not
+kept in this file: `cargo about generate about.hbs` (`about.toml`, run by `build.yml`)
+writes them to `THIRD_PARTY_LICENSES`, which ships next to this file in the release
+tarball and in the image under `/usr/share/doc/crosstalk/`. The licences allowed in the
+tree are the list in `deny.toml`, which CI enforces with `cargo deny check licenses`.
+
+## The container image: Alpine Linux and ffmpeg
+
+The image is built on Alpine Linux 3.22 (`Dockerfile`, pinned by digest) and installs
+Alpine's own `ffmpeg` package (which provides `ffprobe`) with `apk`; crosstalk runs both
+as separate programs and links nothing from them. At the time of writing the package is
+`ffmpeg` 6.1.2-r2 from Alpine 3.22's `community` repository (check a given image with
+`docker run --rm --entrypoint apk ghcr.io/darkspadez/crosstalk info -v ffmpeg`).
+
+Alpine builds ffmpeg with `--enable-gpl` (plus `libx264` and `libx265`, both GPL), so the
+package's licence metadata is **GPL-2.0-or-later AND LGPL-2.1-or-later** and the program as
+built is distributed under the GPL (`apk info -a ffmpeg` in the image shows the licence
+field; `ffmpeg -buildconf` shows the configure flags). The exact source and build recipe
+are Alpine's aports for that release:
+<https://gitlab.alpinelinux.org/alpine/aports/-/tree/3.22-stable/community/ffmpeg>
+(`APKBUILD` names the upstream tarball from <https://ffmpeg.org/releases/> and every
+patch). crosstalk redistributes the package unmodified, and its corresponding source is
+available from Alpine at that URL. The other Alpine packages in the image carry their own
+licences, shown the same way (`apk info -a <package>`).
+
 ## The parity gates and the drift report, over all six references
 
 The parity gates in `scripts/` compare crosstalk against each plugin at its pinned commit, and

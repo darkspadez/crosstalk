@@ -95,7 +95,7 @@ def run(cmd: list[str]) -> str:
 def sweep_section() -> dict:
     """parity_sweep match/score in report mode: counts, never failing."""
     out = run([
-        sys.executable, "scripts/parity_sweep.py",
+        sys.executable, "-I", "scripts/parity_sweep.py",
         "--kinds", "match,score", "--limit", "300", "--pool", "60", "--report",
     ])
     section = {"kinds": {}, "raw": out}

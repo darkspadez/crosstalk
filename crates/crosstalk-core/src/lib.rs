@@ -5,6 +5,8 @@
 //! lets two sub-apps share one Dispatcharr session, one AI provider table and one run store
 //! without either knowing about the other.
 
+#![forbid(unsafe_code)]
+
 pub mod ai;
 pub mod ai_gate;
 pub mod channel_ops;
