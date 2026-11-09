@@ -3492,6 +3492,32 @@ pub async fn load_owned(
     app: &str,
     dry_run: bool,
 ) -> Result<OwnedState> {
+    load_owned_bounded(context, world, app, dry_run, true).await
+}
+
+/// [`load_owned`] without the [`max_forget`] bound, for the operator's explicit
+/// `crosstalk ownership forget-deleted` after a deliberate mass deletion in Dispatcharr.
+///
+/// Every missing id is still confirmed by its own `GET`, and only a 404 forgets it; an empty
+/// listing is still refused. What goes is only the per-run cap, which exists to stop a run
+/// against the wrong instance (or a short listing nobody noticed) from forgetting a whole
+/// install in one go: here the operator is saying that the deletions were theirs. Never a
+/// dry run: a preview has nothing to force.
+pub async fn load_owned_unbounded(
+    context: &JobContext,
+    world: &World,
+    app: &str,
+) -> Result<OwnedState> {
+    load_owned_bounded(context, world, app, false, false).await
+}
+
+async fn load_owned_bounded(
+    context: &JobContext,
+    world: &World,
+    app: &str,
+    dry_run: bool,
+    bounded: bool,
+) -> Result<OwnedState> {
     let mut state = OwnedState::default();
     let Some(store) = context.store() else {
         return Ok(state);
@@ -3647,12 +3673,15 @@ pub async fn load_owned(
             );
         }
         let cap = max_forget(*owned);
-        if gone > cap {
+        if bounded && gone > cap {
             bail!(
                 "{gone} of the {owned} {kind}s {app} owns are missing from Dispatcharr's \
                  listing, more than the {cap} a run may forget at once: refusing, because a \
-                 short listing would otherwise make the next create duplicate them. Check \
-                 the listing (a proxy, a scope or a page limit) and run again."
+                 short listing (or a run against the wrong Dispatcharr) would otherwise make \
+                 the next create duplicate them. Check the listing (a proxy, a scope or a page \
+                 limit) and run again. If you deleted them in Dispatcharr on purpose, run \
+                 `crosstalk ownership forget-deleted --app {app}` once: it confirms each one \
+                 with its own GET and forgets only those that answer 404."
             );
         }
     }
@@ -8862,10 +8891,66 @@ mod tests {
         let error = load_owned(&context, &create_world(), "lineup", false)
             .await
             .expect_err("refused");
-        assert!(format!("{error:#}").contains("26 of the 26"), "{error:#}");
+        let message = format!("{error:#}");
+        assert!(message.contains("26 of the 26"), "{message}");
+        // The way out is named: the refusal would otherwise block every run of the app for
+        // good after a deliberate mass deletion.
+        assert!(
+            message.contains("ownership forget-deleted --app lineup"),
+            "{message}"
+        );
         assert_eq!(store.owned_keys("lineup").expect("query").len(), 26);
         assert_eq!(max_forget(100), 25);
         assert_eq!(max_forget(1_000), 50);
+
+        // The operator's explicit reconcile forgets them, each still confirmed by its own GET
+        // (nothing is mounted, so every one answers 404).
+        let owned = load_owned_unbounded(&context, &create_world(), "lineup")
+            .await
+            .expect("forgets");
+        assert_eq!(owned.forgotten.len(), 26);
+        assert!(owned.kept.is_empty());
+        assert!(store.owned_keys("lineup").expect("query").is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_unbounded_reconcile_still_keeps_what_answers_and_refuses_an_empty_listing() {
+        // The cap is the only thing `forget-deleted` drops: an id whose GET still answers stays
+        // owned, and an empty listing is still no deletion.
+        let store = crate::store::Store::in_memory().expect("store");
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/channels/channels/1000/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": 1000, "name": "Still here"})),
+            )
+            .mount(&server)
+            .await;
+        let (context, run_id) = connected_run_context(&store, "lineup", &server);
+        for id in 1_000..1_030 {
+            store
+                .record_ownership("channel", id, "lineup", &format!("lineup:k:{id}"), run_id)
+                .expect("record");
+        }
+        let owned = load_owned_unbounded(&context, &create_world(), "lineup")
+            .await
+            .expect("reconciles");
+        assert_eq!(owned.forgotten.len(), 29);
+        assert_eq!(owned.kept.len(), 1);
+        assert!(store.is_owned("channel", 1000).expect("query"));
+        assert_eq!(store.owned_keys("lineup").expect("query").len(), 1);
+
+        let mut world = create_world();
+        world.channels.clear();
+        let error = load_owned_unbounded(&context, &world, "lineup")
+            .await
+            .expect_err("refused");
+        assert!(
+            format!("{error:#}").contains("listed no channels"),
+            "{error:#}"
+        );
+        assert!(store.is_owned("channel", 1000).expect("query"));
     }
 
     #[tokio::test]

@@ -259,6 +259,14 @@ impl JobContext {
         self
     }
 
+    /// Attach the run store without a run of its own: for a host command that reads or
+    /// reconciles the store outside a recorded run (`crosstalk ownership forget-deleted`).
+    /// Rows are not recorded (there is no run id), but the ownership tables are reachable.
+    pub fn with_store(mut self, store: Store) -> Self {
+        self.store = Some(store);
+        self
+    }
+
     /// The app and action this context runs as, when it belongs to a recorded run.
     pub fn app(&self) -> Option<&str> {
         self.app.as_deref()

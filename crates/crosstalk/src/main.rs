@@ -50,6 +50,8 @@ enum Command {
     Undo(UndoArgs),
     /// The crosstalk-bridge Dispatcharr plugin: its shared secret, and a signed ping.
     Bridge(BridgeArgs),
+    /// The objects a sub-app created in Dispatcharr and still tracks.
+    Ownership(OwnershipArgs),
     /// Time the parts of a sub-app's run: the plan phases, and the writes they would issue.
     Bench(BenchArgs),
     /// Offline stream-to-channel match simulation, on the unified engine.
@@ -248,6 +250,30 @@ struct BridgeSecretArgs {
 }
 
 #[derive(Args, Debug)]
+struct OwnershipArgs {
+    #[command(subcommand)]
+    command: OwnershipCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum OwnershipCommand {
+    /// Forget the objects an app created that Dispatcharr no longer has, however many: the
+    /// way out after a deliberate mass deletion, when a run refuses to forget more than its
+    /// per-run cap. Each one is confirmed with its own GET first; only a 404 forgets it.
+    #[command(name = "forget-deleted")]
+    ForgetDeleted(OwnershipForgetArgs),
+}
+
+#[derive(Args, Debug)]
+struct OwnershipForgetArgs {
+    #[arg(long, default_value = "config", env = "CROSSTALK_CONFIG_DIR")]
+    config: PathBuf,
+    /// The app whose ownership to reconcile (`lineup`, `streams`).
+    #[arg(long)]
+    app: String,
+}
+
+#[derive(Args, Debug)]
 struct ExportsArgs {
     #[command(subcommand)]
     command: ExportsCommand,
@@ -385,6 +411,9 @@ fn main() -> Result<()> {
             BridgeCommand::Secret(args) => bridge_secret(args),
             BridgeCommand::Rotate(args) => bridge_rotate(args),
             BridgeCommand::Ping(args) => bridge_ping(args),
+        },
+        Command::Ownership(args) => match args.command {
+            OwnershipCommand::ForgetDeleted(args) => ownership_forget_deleted(args),
         },
     }
 }
@@ -1226,6 +1255,64 @@ fn bridge_ping(args: ConfigArgs) -> Result<()> {
     Ok(())
 }
 
+/// `ownership forget-deleted`: the ownership reconcile every run does, without its per-run
+/// cap on how many deleted objects it may forget (`channel_ops::max_forget`).
+///
+/// A run refuses when more than max(25, 5%) of what the app owns is missing from the
+/// listing, because a short listing or a run against the wrong Dispatcharr would otherwise
+/// forget a whole install and the next create would duplicate it. After a deliberate mass
+/// deletion that refusal blocks the app's runs for good, so this is the operator saying the
+/// deletions were theirs. Nothing else changes: each missing id is still confirmed by its own
+/// GET, only a 404 forgets it, an empty listing is still refused, and pending create intents
+/// are settled the way a run settles them.
+fn ownership_forget_deleted(args: OwnershipForgetArgs) -> Result<()> {
+    use crosstalk_core::dispatcharr::{WorldKind, WorldKinds};
+
+    let config = CrosstalkConfig::load(&args.config)?;
+    let registry = registry::builtin();
+    let app = args.app.trim();
+    if registry.get(app).is_none() {
+        anyhow::bail!(
+            "unknown app {app:?}; one of: {}",
+            registry
+                .iter()
+                .map(|app| app.id().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let store = Store::open_shared(config.data_dir().join("crosstalk.db"))?;
+    let context = crosstalk_core::jobs::JobContext::headless(config)
+        .connect()?
+        .with_store(store);
+    let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
+    let state = runtime.block_on(async {
+        let client = context.dispatcharr()?;
+        // Every kind the ownership tables can hold, so no kind is left for a later run.
+        let kinds = WorldKinds::only(WorldKind::Channels)
+            .with(WorldKind::Groups)
+            .with(WorldKind::Logos);
+        let world = client.load_world_with(kinds).await?;
+        crosstalk_core::channel_ops::load_owned_unbounded(&context, &world, app).await
+    })?;
+    match state.describe(false) {
+        Some(line) => println!("{line}"),
+        None => {
+            println!("ownership reconcile: nothing to do, every object {app} owns still exists")
+        }
+    }
+    for (kind, id, key) in &state.forgotten {
+        println!("forgot {kind} {id} ({key}): Dispatcharr answers 404 for it");
+    }
+    for (kind, id, key) in &state.kept {
+        println!(
+            "kept {kind} {id} ({key}): missing from the listing, but its own GET still answers \
+             or the check failed"
+        );
+    }
+    Ok(())
+}
+
 fn validate(args: ConfigArgs) -> Result<()> {
     let config = CrosstalkConfig::load(&args.config)?;
     let registry = registry::builtin();
@@ -1524,6 +1611,29 @@ mod cli_tests {
         let text = std::fs::read_to_string(dir.path().join("crosstalk.toml")).expect("read");
         assert!(!text.contains("ENV-ONLY-SECRET"), "{text}");
         assert!(file_bridge(dir.path()).secret.is_empty());
+    }
+
+    #[test]
+    fn ownership_forget_deleted_names_an_app() {
+        let Command::Ownership(OwnershipArgs {
+            command: OwnershipCommand::ForgetDeleted(args),
+        }) = parse(&[
+            "crosstalk",
+            "ownership",
+            "forget-deleted",
+            "--app",
+            "lineup",
+            "--config",
+            "/etc/crosstalk",
+        ])
+        .command
+        else {
+            panic!("not the forget-deleted command");
+        };
+        assert_eq!(args.app, "lineup");
+        assert_eq!(args.config, Path::new("/etc/crosstalk"));
+        // The app is required: forgetting across every app at once is not offered.
+        assert!(Cli::try_parse_from(["crosstalk", "ownership", "forget-deleted"]).is_err());
     }
 
     #[test]
