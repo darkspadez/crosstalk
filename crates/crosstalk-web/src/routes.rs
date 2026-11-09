@@ -114,6 +114,31 @@ pub fn router(state: AppState) -> Router {
 
 // --- templates ---------------------------------------------------------------------
 
+/// Renders an askama template as an HTML response.
+///
+/// askama 0.16 dropped its axum integration (the `askama_axum` crate, which pulled in the
+/// unmaintained `basic-toml`), so every page type gets this blanket shim instead. A render
+/// failure is a bug in a template, not in the request: it is logged and answered with 500.
+trait RenderPage {
+    fn into_response(self) -> Response;
+}
+
+impl<T: Template> RenderPage for T {
+    fn into_response(self) -> Response {
+        match self.render() {
+            Ok(body) => axum::response::Html(body).into_response(),
+            Err(error) => {
+                tracing::error!("rendering a page failed: {error}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "the page could not be rendered\n",
+                )
+                    .into_response()
+            }
+        }
+    }
+}
+
 #[derive(Template)]
 #[template(path = "login.html")]
 struct LoginTemplate {
@@ -247,8 +272,8 @@ async fn confirm_script() -> Response {
         .into_response()
 }
 
-async fn login_page() -> LoginTemplate {
-    LoginTemplate { error: None }
+async fn login_page() -> Response {
+    LoginTemplate { error: None }.into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -278,7 +303,8 @@ async fn login(
             StatusCode::UNAUTHORIZED,
             LoginTemplate {
                 error: Some("That token does not match the configured one.".to_string()),
-            },
+            }
+            .into_response(),
         )
             .into_response();
     }

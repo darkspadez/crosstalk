@@ -53,11 +53,10 @@ unicode-general-category = "1"
 unicode_names2 = "1"
 
 # Storage
-rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+rusqlite = { version = "0.41", features = ["bundled", "chrono"] }
 
 # Web UI
-askama = { version = "0.12", features = ["with-axum"] }
-askama_axum = "0.4"
+askama = "0.16"
 
 # Observability / CLI
 tracing = "0.1"

@@ -999,8 +999,9 @@ impl Store {
                 .query_row(
                     "SELECT COUNT(*) FROM ai_decisions WHERE run_id = ?1",
                     params![run_id],
-                    |row| row.get(0),
+                    |row| row.get::<_, i64>(0),
                 )
+                .map(|count| count.max(0) as u64)
                 .map_err(Into::into)
         })
     }
@@ -1067,7 +1068,8 @@ impl Store {
     pub fn run_count(&self) -> Result<u64> {
         self.with_connection(|connection| {
             connection
-                .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
+                .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get::<_, i64>(0))
+                .map(|count| count.max(0) as u64)
                 .map_err(Into::into)
         })
     }

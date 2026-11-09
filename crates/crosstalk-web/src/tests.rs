@@ -621,7 +621,8 @@ async fn a_channel_operation_row_shows_its_field_and_both_sides() {
     // A channel number is shown next to the name.
     assert!(body.contains("#2"), "{body}");
     // A hostile channel name is escaped, not rendered.
-    assert!(body.contains("&lt;img"), "{body}");
+    // (askama 0.16 escapes with numeric entities: `&#60;` rather than `&lt;`.)
+    assert!(body.contains("&#60;img"), "{body}");
     assert!(!body.contains("<img src=x"), "{body}");
 }
 
@@ -1891,7 +1892,7 @@ async fn the_dashboard_shows_a_steps_scope_override_and_failure_policy() {
     assert!(body.contains("echo.peek"), "{body}");
     assert!(body.contains("echo.poke"), "{body}");
     assert!(
-        body.contains("scope &quot;lineup&quot;"),
+        body.contains("scope &#34;lineup&#34;"),
         "the named scope is shown: {body}"
     );
     assert!(

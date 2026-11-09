@@ -10,7 +10,7 @@
 # unrelated pull request.
 
 [output]
-# Informational warnings that fail the job too, not just vulnerabilities.
-# TODO(F-S8): add "unmaintained" once askama is upgraded; today basic-toml (unmaintained,
-# via askama 0.12 / askama_axum 0.4) would fail every run.
+# Informational warnings that fail the job too, not just vulnerabilities. `unmaintained`
+# is left out on purpose: askama's derive macro depends on the unmaintained `basic-toml`
+# (RUSTSEC-2026-0374), which would fail every run until askama drops it.
 deny = ["unsound", "yanked"]
