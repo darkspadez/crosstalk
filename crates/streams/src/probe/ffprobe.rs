@@ -13,8 +13,17 @@
 //!         -analyzeduration <probe timeout × 1e6>     # µs, wait for stream data
 //!         -probesize 10000000                        # 10 MB, for slow starts
 //!         -loglevel error -show_streams -show_packets -show_format
-//!         -read_intervals %+8 <url>
+//!         -read_intervals %+8
+//!         -protocol_whitelist <PROTOCOL_WHITELIST> -i <url>
 //! ```
+//!
+//! The last line is a deliberate departure from the plugin, which passed the URL as a bare
+//! positional argument: `-i` keeps a URL that starts with `-` from being read as an option
+//! (`-report` writes a log file into the working directory), and the protocol whitelist keeps
+//! a nested input (an HLS playlist naming `file:` segments, a `concat:` list) from opening
+//! anything but the network. The URL's own scheme is checked before the tool is run at all
+//! ([`crate::probe::classify::is_probeable_url`]). The parity harness compares the command
+//! lines with this one difference normalised away.
 //!
 //! Two of those numbers are settings in the plugin and fixed here:
 //!
@@ -70,6 +79,13 @@ pub const TIMEOUT_BUFFER_SECONDS: u64 = 5;
 /// noise rather than a measurement.
 pub const MIN_PACKETS_FOR_BITRATE_CALC: usize = 30;
 
+/// `-protocol_whitelist`, for both tools: the network protocols the allow-listed URL schemes
+/// need, plus what they open underneath (`tls`/`tcp`/`udp`, `crypto` for AES-128 HLS, `hls`
+/// for `hls+http`, `httpproxy` when `http_proxy` is set — without it a proxied install would
+/// read every stream as dead). No `file`, `pipe`, `concat`, `subfile` or `data`.
+pub const PROTOCOL_WHITELIST: &str =
+    "http,https,tls,tcp,udp,rtp,rtmp,rtmps,rtsp,srt,crypto,hls,httpproxy";
+
 /// How long the ffprobe process may run for a connection timeout and probe timeout.
 pub fn total_timeout(probe_timeout_seconds: u32) -> Duration {
     Duration::from_secs(u64::from(probe_timeout_seconds) + ANALYZE_SECONDS + TIMEOUT_BUFFER_SECONDS)
@@ -102,6 +118,10 @@ pub fn command(
     args.push("-show_format".to_string());
     args.push("-read_intervals".to_string());
     args.push(format!("%+{ANALYZE_SECONDS}"));
+    // Not the plugin's: see the module doc.
+    args.push("-protocol_whitelist".to_string());
+    args.push(PROTOCOL_WHITELIST.to_string());
+    args.push("-i".to_string());
     args.push(url.to_string());
     ToolSpec::new(executable, args, total_timeout(probe_timeout_seconds))
 }
@@ -649,9 +669,16 @@ mod tests {
                 "-show_format",
                 "-read_intervals",
                 "%+8",
+                "-protocol_whitelist",
+                PROTOCOL_WHITELIST,
+                "-i",
                 "http://host/live.ts",
             ]
         );
+        // The URL is always the value of `-i`, never a positional that could parse as a flag.
+        let at = spec.args.iter().position(|arg| arg == "-i").expect("-i");
+        assert_eq!(spec.args[at + 1], "http://host/live.ts");
+        assert!(!PROTOCOL_WHITELIST.split(',').any(|p| p == "file"));
         // `probe_timeout + analysis + 5`.
         assert_eq!(spec.timeout, Duration::from_secs(20 + 8 + 5));
     }

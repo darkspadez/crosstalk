@@ -33,6 +33,7 @@ uuid.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 wiremock.workspace = true
+proptest.workspace = true
 # `test-util` gives the tests a paused clock: the limiter's spacing and rate limits are
 # measured in seconds and minutes, and a test that really slept would be slow or flaky.
 tokio = { workspace = true, features = ["test-util"] }

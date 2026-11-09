@@ -34,6 +34,7 @@
 //! unable to fire. The plugin clamps it to `max(1, min(wanted, sample - 1))` instead of obeying
 //! it literally, and so does this.
 
+use crate::probe::ffprobe::PROTOCOL_WHITELIST;
 use crate::probe::tool::ToolSpec;
 use std::time::Duration;
 
@@ -120,6 +121,9 @@ pub fn command(
     // Input options MUST precede `-i` or ffmpeg silently ignores them.
     args.push("-rw_timeout".to_string());
     args.push((u64::from(connection_timeout_seconds) * 1_000_000).to_string());
+    // Not the plugin's: the same network-only whitelist as the ffprobe pass.
+    args.push("-protocol_whitelist".to_string());
+    args.push(PROTOCOL_WHITELIST.to_string());
     args.push("-i".to_string());
     args.push(url.to_string());
     args.push("-t".to_string());
@@ -313,6 +317,8 @@ mod tests {
                 "VLC/3.0.21 LibVLC/3.0.21",
                 "-rw_timeout",
                 "10000000",
+                "-protocol_whitelist",
+                PROTOCOL_WHITELIST,
                 "-i",
                 "http://host/live.ts",
                 "-t",

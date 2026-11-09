@@ -10,7 +10,8 @@
 //!     found a fault).
 //!   * **Dead** — anything else: an error, a timeout, no video stream after retries, or a
 //!     content verdict. `error_type` says which.
-//!   * **Skipped** — NOT JUDGED: a Streamlink-only host, an HTTP 429, or an audio-only stream.
+//!   * **Skipped** — NOT JUDGED: a Streamlink-only host, an HTTP 429, an audio-only stream, or
+//!     a URL whose scheme is not one a probe may open ([`is_probeable_url`]).
 //!     Skipped exists so that destructive actions downstream (rename, move, delete) leave the
 //!     stream alone. A 429 is the provider asking us to stop, not evidence the stream is broken;
 //!     an audio-only stream is working and simply carries no video. Treating either as dead is
@@ -83,6 +84,8 @@ pub const NO_VIDEO_STREAM: &str = "No Video Stream";
 /// then excluded it from its counts: a cancelled probe is not evidence about the stream. Here it
 /// is Skipped as well as dropped, so no health row claims a verdict either.
 pub const CANCELLED: &str = "Cancelled";
+/// A URL the probe refuses to hand to ffprobe/ffmpeg (see [`is_probeable_url`]).
+pub const UNSUPPORTED_URL: &str = "Unsupported URL";
 /// A finite container duration: the provider is serving a file.
 pub const PLACEHOLDER_FILE: &str = "Placeholder File";
 /// Decodes to black.
@@ -196,6 +199,29 @@ pub fn is_streamlink_only(url: &str, hosts: &[String]) -> bool {
         let suffix = suffix.trim().trim_start_matches('.').to_lowercase();
         !suffix.is_empty() && (host == suffix || host.ends_with(&format!(".{suffix}")))
     })
+}
+
+/// The URL schemes a probe may open. Anything else (`file:`, `concat:`, a bare path, a
+/// leading `-` that ffprobe would read as an option) never reaches a tool.
+pub const PROBE_SCHEMES: [&str; 8] = [
+    "http", "https", "rtmp", "rtmps", "rtsp", "rtp", "udp", "srt",
+];
+
+/// Whether `url` is `scheme://…` with an allow-listed scheme and no control characters.
+///
+/// Not in the plugin, which handed Dispatcharr's URL to ffprobe as it came: a stream URL is
+/// provider data, and a local path or an ffmpeg pseudo-protocol in it is a local file read.
+pub fn is_probeable_url(url: &str) -> bool {
+    if url.chars().any(char::is_control) {
+        return false;
+    }
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    !rest.is_empty()
+        && PROBE_SCHEMES
+            .iter()
+            .any(|allowed| scheme.eq_ignore_ascii_case(allowed))
 }
 
 /// `_mask_url_in_error` (4665): replace the provider URL with the stream id.
@@ -431,6 +457,41 @@ mod tests {
         assert_eq!(mask_url_in_error("boom", "", 1), "boom");
         assert_eq!(mask_url_in_error("", "http://h/x", 1), "");
         assert_eq!(mask_url_in_error("boom", "http://other/x", 1), "boom");
+    }
+
+    #[test]
+    fn only_an_allow_listed_network_scheme_is_probeable() {
+        for url in [
+            "http://host/live.ts",
+            "HTTPS://host/live.m3u8",
+            "rtmp://host/app/key",
+            "rtmps://host/app/key",
+            "rtsp://host/cam",
+            "rtp://239.0.0.1:5004",
+            "udp://@239.0.0.1:1234",
+            "srt://host:9000",
+        ] {
+            assert!(is_probeable_url(url), "{url}");
+        }
+        for url in [
+            "",
+            "-report",
+            "file:/etc/passwd",
+            "file:///etc/passwd",
+            "/etc/passwd",
+            "concat:a|b",
+            "subfile:,start,0,end,0,:/etc/passwd",
+            "data:text/plain,hi",
+            "pipe:0",
+            "http://",
+            "http:/host/x",
+            "http://host/x\n-report",
+            " http://host/x",
+            "ftp://host/x",
+            "hls+http://host/x.m3u8",
+        ] {
+            assert!(!is_probeable_url(url), "{url:?}");
+        }
     }
 
     #[test]

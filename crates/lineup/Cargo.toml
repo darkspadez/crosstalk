@@ -30,6 +30,7 @@ unicode-normalization.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 wiremock.workspace = true
+proptest.workspace = true
 # The full_sync end-to-end test drives the real registry (guide + streams + lineup)
 # through the workflow runner. A test-only dependency: production code in this crate
 # never depends on guide (the direction rule only binds production edges).

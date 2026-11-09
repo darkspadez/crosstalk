@@ -169,3 +169,46 @@ async fn a_real_ffprobe_parses_a_real_feed_served_over_http() {
         "the feed carries an audio track"
     );
 }
+
+/// The `-report` hole, against a real ffprobe: run in a scratch working directory, the
+/// command the probe builds for a URL spelled `-report` must not turn it into the option that
+/// writes `ffprobe-*.log` there. Not `#[ignore]`d: it skips itself when ffprobe is absent.
+#[test]
+fn a_real_ffprobe_never_reads_a_url_as_an_option() {
+    let Some(ffprobe) = ffprobe() else {
+        eprintln!("skipping: ffprobe not found (set CROSSTALK_FFPROBE)");
+        return;
+    };
+    let settings = StreamsSettings {
+        ffprobe_path: ffprobe.display().to_string(),
+        timeout: 2,
+        probe_timeout: 2,
+        ..Default::default()
+    };
+    let config = ProbeConfig::from_settings(&settings);
+
+    let cwd = tempfile::tempdir().expect("tempdir");
+    for url in ["-report", "file:/etc/passwd", "concat:a|b"] {
+        // The probe never runs these at all (the scheme allow-list); this is the second line
+        // of defence, the command line itself, exercised as if the first had let them through.
+        let spec = crosstalk_streams::probe::ffprobe_command(&config, url);
+        let output = std::process::Command::new(&spec.program)
+            .args(&spec.args)
+            .current_dir(cwd.path())
+            .env_remove("FFREPORT")
+            .output()
+            .expect("ffprobe runs");
+        assert!(
+            !output.status.success(),
+            "{url}: ffprobe must refuse it ({})",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let reports: Vec<String> = std::fs::read_dir(cwd.path())
+            .expect("read the scratch dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("ffprobe-") && name.ends_with(".log"))
+            .collect();
+        assert!(reports.is_empty(), "{url}: wrote {reports:?}");
+    }
+}

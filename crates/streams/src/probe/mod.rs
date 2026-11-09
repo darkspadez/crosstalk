@@ -539,6 +539,16 @@ pub async fn probe_stream(
     cancelled: &Arc<AtomicBool>,
     target: &ProbeTarget<'_>,
 ) -> Result<StreamVerdict> {
+    // Not in the plugin: a URL outside the scheme allow-list never reaches a tool. Skipped, not
+    // Dead — nothing about the stream was judged, so triage leaves it alone.
+    if !classify::is_probeable_url(target.url) {
+        let mut verdict = StreamVerdict::new(target, Class::Skipped, classify::UNSUPPORTED_URL);
+        verdict.error = format!(
+            "unsupported URL: only {} streams are probed",
+            classify::PROBE_SCHEMES.join("/")
+        );
+        return Ok(verdict);
+    }
     // 4947: a Streamlink-only host cannot be validated by ffprobe. Skipped, not Dead, so no
     // destructive action downstream ever treats a YouTube stream as a broken channel.
     if classify::is_streamlink_only(target.url, &config.streamlink_hosts) {

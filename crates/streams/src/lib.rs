@@ -756,6 +756,24 @@ mod tests {
     }
 
     #[test]
+    fn a_web_save_cannot_set_a_tool_path() {
+        let fixture = Fixture::new();
+        let path = app().settings_path(fixture.dir.path());
+        let mut values = app().load_settings(&path).expect("load defaults");
+        values.insert("probe_freshness_hours", FieldValue::Number(6.0));
+        app().save_settings(&path, &values).expect("save");
+        let before = std::fs::read_to_string(&path).expect("saved");
+
+        for id in ["ffprobe_path", "ffmpeg_path"] {
+            let mut values = app().load_settings(&path).expect("load");
+            values.insert(id, FieldValue::Text("/bin/sh".into()));
+            let error = app().save_settings(&path, &values).expect_err("refused");
+            assert!(format!("{error}").contains("unknown setting"), "{error}");
+        }
+        assert_eq!(std::fs::read_to_string(&path).expect("unchanged"), before);
+    }
+
+    #[test]
     fn save_rejects_a_settings_file_that_still_holds_a_retired_key() {
         let fixture = Fixture::new();
         let path = app().settings_path(fixture.dir.path());

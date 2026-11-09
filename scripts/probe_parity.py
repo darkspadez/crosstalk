@@ -336,6 +336,24 @@ def run_rust(lines: list[dict], binary: str) -> list[dict]:
 # Comparison
 # ---------------------------------------------------------------------------------------
 
+# The one documented command-line exception (README, Differences: "`streams.probe` opens only
+# network URLs"): both tools get a network-only protocol whitelist, and the URL is always the
+# value of `-i`. Everything else in the argv must match the plugin verbatim.
+PROTOCOL_WHITELIST = "http,https,tls,tcp,udp,rtp,rtmp,rtmps,rtsp,srt,crypto,hls,httpproxy"
+
+
+def hardened_argv(argv):
+    """The plugin's argv with crosstalk's URL hardening applied, for comparison."""
+    if argv is None:
+        return None
+    argv = list(argv)
+    if "-i" in argv:
+        at = argv.index("-i")
+        return argv[:at] + ["-protocol_whitelist", PROTOCOL_WHITELIST] + argv[at:]
+    # ffprobe: the plugin's URL is the last, positional argument.
+    return argv[:-1] + ["-protocol_whitelist", PROTOCOL_WHITELIST, "-i", argv[-1]]
+
+
 def compare(name: str, expected: dict, got: dict, show: bool) -> list[str]:
     problems: list[str] = []
     for field in ("status", "error_type", "format", "error", "extra"):
@@ -354,10 +372,10 @@ def compare(name: str, expected: dict, got: dict, show: bool) -> list[str]:
             f"retry_count: plugin={expected.get('retry_count')} rust={got.get('retry_count')}"
         )
     for tool in ("ffprobe", "ffmpeg"):
-        want = (expected.get("argv") or {}).get(tool)
+        want = hardened_argv((expected.get("argv") or {}).get(tool))
         have = (got.get("argv") or {}).get(tool)
         # The plugin resolves nothing: both sides are handed `ffprobe`/`ffmpeg`, so the argv is
-        # comparable verbatim.
+        # comparable verbatim once the documented hardening is applied to the plugin's.
         if want != have:
             problems.append(f"{tool} command line:\n    plugin={want}\n    rust  ={have}")
     if problems and show:

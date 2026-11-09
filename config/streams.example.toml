@@ -227,7 +227,9 @@ streamlink_hosts = "youtube.com, youtu.be, twitch.tv, kick.com"
 # The analysis flags are fixed by the probe (show_streams, show_packets, an error-level log)
 # rather than configurable: a flag set that breaks the parser would fail every stream at once.
 # /usr/bin is where the crosstalk image installs Alpine's ffmpeg package; on Homebrew they are
-# in /opt/homebrew/bin.
+# in /opt/homebrew/bin. Both paths are set here only (the web form does not show them): each
+# must be absolute and name the tool (ffprobe / ffmpeg, or .exe), and a probe refuses a file
+# that is not executable or is world-writable.
 ffprobe_path = "/usr/bin/ffprobe"
 ffmpeg_path = "/usr/bin/ffmpeg"
 

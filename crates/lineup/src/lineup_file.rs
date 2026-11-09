@@ -248,6 +248,17 @@ pub fn parse_channel_number(raw: &serde_json::Value) -> Option<i64> {
     }
 }
 
+/// The largest lineup document [`parse_lineup`] reads (16 MiB). The biggest shipped file is
+/// well under 1 MiB; the cap is for a lineup that does not come from the embedded table.
+pub const MAX_LINEUP_BYTES: usize = 16 * 1024 * 1024;
+
+/// The most categories one lineup may hold.
+pub const MAX_CATEGORIES: usize = 10_000;
+
+/// The most entries one lineup may hold, across every category (the shipped 29 files hold
+/// 7,485 together).
+pub const MAX_ENTRIES: usize = 200_000;
+
 /// Load a lineup by name, folding categories and resolving every entry.
 ///
 /// `file` is a short name or full filename (see [`normalize_lineup_name`]); `detail` is
@@ -260,15 +271,49 @@ pub fn load_lineup(file: &str, detail: &str, group_prefix: &str) -> Result<Lineu
         known.sort_unstable();
         anyhow::anyhow!("unknown lineup file {file:?}; known: {}", known.join(", "))
     })?;
-    let raw = merged::merged_lineup_json(short).expect("a resolved name always parses");
+    let raw = merged::merged_lineup_json(short)
+        .ok_or_else(|| anyhow::anyhow!("the embedded lineup {short} is missing"))?;
+    parse_lineup(raw, &full_filename(short), detail, group_prefix)
+}
+
+/// Parse one lineup document: the whole `_load_lineup` pipeline over `raw`.
+///
+/// `filename` is the full filename (`US_Combined_lineup.json`), which carries the
+/// filename country and, without a `package`, the display name. The document is
+/// held to [`MAX_LINEUP_BYTES`], [`MAX_CATEGORIES`] and [`MAX_ENTRIES`], so a lineup
+/// from outside the embedded table cannot make a load quadratic or unbounded.
+pub fn parse_lineup(raw: &str, filename: &str, detail: &str, group_prefix: &str) -> Result<Lineup> {
+    if raw.len() > MAX_LINEUP_BYTES {
+        anyhow::bail!(
+            "invalid lineup file: {} bytes is over the {MAX_LINEUP_BYTES} byte cap ({filename})",
+            raw.len()
+        );
+    }
     let parsed: LineupJson = serde_json::from_str(raw)?;
     let package = parsed.package.as_ref().and_then(|value| value.as_str());
-    let categories = parsed
-        .categories
-        .ok_or_else(|| anyhow::anyhow!("invalid lineup file: missing 'categories' key ({file})"))?;
+    let categories = parsed.categories.ok_or_else(|| {
+        anyhow::anyhow!("invalid lineup file: missing 'categories' key ({filename})")
+    })?;
+    if categories.0.len() > MAX_CATEGORIES {
+        anyhow::bail!(
+            "invalid lineup file: {} categories is over the {MAX_CATEGORIES} cap ({filename})",
+            categories.0.len()
+        );
+    }
+    let entry_count: usize = categories
+        .0
+        .iter()
+        .filter_map(|(_, value)| value.as_array().map(Vec::len))
+        .sum();
+    if entry_count > MAX_ENTRIES {
+        anyhow::bail!(
+            "invalid lineup file: {entry_count} entries is over the {MAX_ENTRIES} cap ({filename})"
+        );
+    }
+    let short = filename.strip_suffix("_lineup.json").unwrap_or(filename);
 
     // 1. The filename country, from the FULL filename the setting may have named.
-    let filename = full_filename(short);
+    let filename = filename.to_string();
     let lineup_country = filename_country(&filename);
 
     // 2. The `CC_` entry-name prefix rewrite, before anything else sees the lineup.
@@ -466,11 +511,23 @@ impl<'de> serde::Deserialize<'de> for OrderedObject {
                 self,
                 mut map: A,
             ) -> std::result::Result<Self::Value, A::Error> {
+                // An index beside the list: a repeated key is found in O(1), so a document
+                // with many keys stays linear.
                 let mut entries: Vec<(String, serde_json::Value)> = Vec::new();
+                let mut index: std::collections::HashMap<String, usize> =
+                    std::collections::HashMap::new();
                 while let Some((key, value)) = map.next_entry::<String, serde_json::Value>()? {
-                    match entries.iter_mut().find(|(seen, _)| *seen == key) {
-                        Some((_, slot)) => *slot = value,
-                        None => entries.push((key, value)),
+                    match index.get(&key) {
+                        Some(&at) => entries[at].1 = value,
+                        None => {
+                            if entries.len() >= MAX_CATEGORIES {
+                                return Err(serde::de::Error::custom(format!(
+                                    "more than {MAX_CATEGORIES} categories"
+                                )));
+                            }
+                            index.insert(key.clone(), entries.len());
+                            entries.push((key, value));
+                        }
                     }
                 }
                 Ok(OrderedObject(entries))
@@ -775,5 +832,321 @@ mod tests {
             .map(|entry| entry.group.as_str())
             .collect();
         assert_eq!(groups.len(), 6, "{groups:?}");
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    //! Target 2 of docs/audit/D-inputs.md: `parse_lineup` over generated documents.
+    use super::*;
+    use crosstalk_matching::country::{lineuparr_category_country, lineuparr_name_country_prefix};
+    use proptest::prelude::*;
+    use serde_json::{json, Value};
+
+    fn config() -> ProptestConfig {
+        // `PROPTEST_CASES` overrides this (10_000 for a local soak).
+        ProptestConfig {
+            cases: std::env::var("PROPTEST_CASES")
+                .ok()
+                .and_then(|cases| cases.parse().ok())
+                .unwrap_or(256),
+            ..ProptestConfig::default()
+        }
+    }
+
+    const CATEGORY_NAMES: &[&str] = &[
+        "News",
+        "Sports",
+        "Regional Sports",
+        "Movies",
+        "Kids",
+        "Faith",
+        "Spanish",
+        "Music",
+        "Entertainment",
+        "Foo",
+        "All",
+        "",
+        "UK",
+        "Mexico",
+        "Ñandú",
+        "News & Info",
+    ];
+    const ENTRY_NAMES: &[&str] = &[
+        "CNN",
+        "UK_BBC One",
+        "US_ESPN",
+        "CA_",
+        "MX_Canal 5",
+        "X_Y",
+        "",
+        "ESPN HD",
+        "Ñ_Ñ",
+        "uk_lower",
+        "日本",
+    ];
+    const FILENAMES: &[&str] = &["US_Combined_lineup.json", "UK_X_lineup.json", "weird.json"];
+    const DETAILS: &[&str] = &["none", "refined", "simple", "normal", "junk"];
+
+    fn number() -> impl Strategy<Value = Option<Value>> {
+        prop_oneof![
+            any::<i64>().prop_map(|n| Some(json!(n))),
+            Just(Some(json!("923-946"))),
+            Just(Some(json!("-5"))),
+            Just(Some(json!(" 104 "))),
+            Just(Some(json!("99999999999999999999999"))),
+            Just(Some(json!(2.5))),
+            Just(Some(Value::Null)),
+            Just(Some(json!("junk"))),
+            Just(None),
+        ]
+    }
+
+    fn entry() -> impl Strategy<Value = Value> {
+        (
+            prop_oneof![
+                4 => proptest::sample::select(ENTRY_NAMES).prop_map(|name| json!(name)),
+                1 => any::<String>().prop_map(|name| json!(name)),
+                1 => Just(json!(7)),
+                1 => Just(Value::Null),
+            ],
+            number(),
+            proptest::option::of(proptest::collection::vec(
+                prop_oneof![
+                    Just(json!("Alias")),
+                    Just(json!(1)),
+                    Just(Value::Null),
+                    any::<String>().prop_map(|alias| json!(alias)),
+                ],
+                0..3,
+            )),
+        )
+            .prop_map(|(name, number, aliases)| {
+                let mut object = serde_json::Map::new();
+                object.insert("name".to_string(), name);
+                if let Some(number) = number {
+                    object.insert("number".to_string(), number);
+                }
+                if let Some(aliases) = aliases {
+                    object.insert("aliases".to_string(), Value::Array(aliases));
+                }
+                Value::Object(object)
+            })
+    }
+
+    /// `(key, value)` pairs in document order; keys repeat often, values are sometimes
+    /// not arrays.
+    fn categories() -> impl Strategy<Value = Vec<(String, Value)>> {
+        proptest::collection::vec(
+            (
+                prop_oneof![
+                    6 => proptest::sample::select(CATEGORY_NAMES).prop_map(str::to_string),
+                    1 => any::<String>(),
+                ],
+                prop_oneof![
+                    8 => proptest::collection::vec(entry(), 0..6).prop_map(Value::Array),
+                    1 => Just(json!(5)),
+                    1 => Just(json!({"name": "x"})),
+                ],
+            ),
+            0..10,
+        )
+    }
+
+    /// The document as raw text, so a repeated key reaches the parser as written.
+    fn document(package: &Option<Value>, pairs: &[(String, Value)]) -> String {
+        let body: Vec<String> = pairs
+            .iter()
+            .map(|(key, value)| format!("{}: {}", json!(key), value))
+            .collect();
+        match package {
+            Some(package) => format!(
+                "{{\"package\": {package}, \"categories\": {{{}}}}}",
+                body.join(", ")
+            ),
+            None => format!("{{\"categories\": {{{}}}}}", body.join(", ")),
+        }
+    }
+
+    /// First position, last value: what `json.load` makes of repeated keys.
+    fn deduped(pairs: &[(String, Value)]) -> Vec<(String, Value)> {
+        let mut out: Vec<(String, Value)> = Vec::new();
+        for (key, value) in pairs {
+            match out.iter_mut().find(|(seen, _)| seen == key) {
+                Some((_, slot)) => *slot = value.clone(),
+                None => out.push((key.clone(), value.clone())),
+            }
+        }
+        out
+    }
+
+    proptest! {
+        #![proptest_config(config())]
+
+        #[test]
+        fn a_lineup_parses_to_its_documented_invariants(
+            package in proptest::option::of(prop_oneof![
+                Just(json!("DIRECTV Premier")),
+                Just(json!(5)),
+                Just(Value::Null),
+                any::<String>().prop_map(|text| json!(text)),
+            ]),
+            pairs in categories(),
+            filename in proptest::sample::select(FILENAMES),
+            prefix in prop_oneof![Just(""), Just("none"), Just("DTV-"), Just("US "), Just(" X")],
+        ) {
+            let raw = document(&package, &pairs);
+            let kept = deduped(&pairs);
+            let total: usize = kept
+                .iter()
+                .filter_map(|(_, value)| value.as_array().map(Vec::len))
+                .sum();
+            for detail in DETAILS {
+                let lineup = parse_lineup(&raw, filename, detail, prefix).expect("parses");
+                prop_assert_eq!(lineup.entries.len(), total, "{} conserves entries", detail);
+                for entry in &lineup.entries {
+                    prop_assert!(lineup.categories.contains(&entry.category));
+                    prop_assert_eq!(&entry.group, &make_group_name(&lineup.prefix, &entry.category));
+                }
+                let mut seen = std::collections::HashSet::new();
+                for category in &lineup.categories {
+                    prop_assert!(seen.insert(category), "{} repeats {:?}", detail, category);
+                }
+                if *detail == "none" {
+                    prop_assert_eq!(&lineup.categories, &vec![SINGLE_GROUP_CATEGORY.to_string()]);
+                }
+            }
+
+            // `normal`: the deduped array-valued categories, in first-position order,
+            // entries flattened in file order, countries entry > category > filename.
+            let lineup = parse_lineup(&raw, filename, "normal", prefix).expect("parses");
+            let arrays: Vec<&(String, Value)> =
+                kept.iter().filter(|(_, value)| value.is_array()).collect();
+            let names: Vec<String> = arrays.iter().map(|(key, _)| key.clone()).collect();
+            prop_assert_eq!(&lineup.categories, &names);
+            let mut index = 0;
+            for (category, value) in &arrays {
+                for raw_entry in value.as_array().expect("array") {
+                    let entry = &lineup.entries[index];
+                    index += 1;
+                    let raw_name = raw_entry.get("name").and_then(Value::as_str).unwrap_or_default();
+                    let (prefix_country, stripped) = lineuparr_name_country_prefix(raw_name);
+                    prop_assert_eq!(&entry.name, stripped);
+                    prop_assert_eq!(&entry.category, category);
+                    let expected = prefix_country
+                        .map(str::to_string)
+                        .or_else(|| lineuparr_category_country(category).map(str::to_string))
+                        .or_else(|| filename_country(filename));
+                    prop_assert_eq!(&entry.country, &expected);
+                    prop_assert_eq!(
+                        entry.number,
+                        raw_entry.get("number").and_then(parse_channel_number)
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn arbitrary_documents_never_panic(raw in any::<String>(), detail in proptest::sample::select(DETAILS)) {
+            let _ = parse_lineup(&raw, "US_Combined_lineup.json", detail, "");
+        }
+
+        #[test]
+        fn arbitrary_json_values_never_panic(
+            categories in proptest::collection::vec((any::<String>(), any::<i64>()), 0..5),
+            detail in proptest::sample::select(DETAILS),
+        ) {
+            let object: serde_json::Map<String, Value> = categories
+                .into_iter()
+                .map(|(key, number)| (key, json!([number, {"name": number}, [number]])))
+                .collect();
+            let raw = json!({"categories": object}).to_string();
+            let _ = parse_lineup(&raw, "US_Combined_lineup.json", detail, "");
+        }
+
+        #[test]
+        fn a_channel_number_from_a_string_is_never_negative(text in any::<String>()) {
+            if let Some(number) = parse_channel_number(&json!(text)) {
+                prop_assert!(number >= 0, "{:?} -> {}", text, number);
+                prop_assert!(text.trim().starts_with(|c: char| c.is_ascii_digit()), "{:?}", text);
+            }
+        }
+
+        #[test]
+        fn a_channel_number_is_some_only_for_an_int_or_a_digit_led_string(value in prop_oneof![
+            any::<i64>().prop_map(|n| json!(n)),
+            any::<u64>().prop_map(|n| json!(n)),
+            any::<f64>().prop_map(|n| json!(n)),
+            "[ ]{0,2}-?[0-9]{0,5}(-[0-9]{0,3})?[ a]{0,2}".prop_map(|text| json!(text)),
+            any::<bool>().prop_map(|flag| json!(flag)),
+            Just(Value::Null),
+        ]) {
+            let parsed = parse_channel_number(&value);
+            match &value {
+                Value::Number(number) => prop_assert_eq!(parsed, number.as_i64()),
+                Value::String(text) => {
+                    if let Some(number) = parsed {
+                        prop_assert!(number >= 0);
+                        prop_assert!(text.trim().starts_with(|c: char| c.is_ascii_digit()));
+                    }
+                }
+                _ => prop_assert_eq!(parsed, None),
+            }
+        }
+
+        #[test]
+        fn only_a_shipped_name_resolves(name in any::<String>()) {
+            if let Some(short) = normalize_lineup_name(&name) {
+                prop_assert!(available_lineups().contains(&short));
+                let trimmed = name.trim();
+                prop_assert!(trimmed == short || trimmed == full_filename(short));
+            }
+            if name.contains('/') || name.contains('\\') || name.contains("..") {
+                prop_assert_eq!(normalize_lineup_name(&name), None);
+            }
+        }
+    }
+
+    #[test]
+    fn ten_thousand_categories_of_ten_parse_quickly() {
+        let mut categories = serde_json::Map::new();
+        for n in 0..MAX_CATEGORIES {
+            let entries: Vec<Value> = (0..10)
+                .map(|e| json!({"name": format!("Channel {n} {e}"), "number": e}))
+                .collect();
+            categories.insert(format!("Category {n}"), Value::Array(entries));
+        }
+        let raw = json!({"package": "Big Lineup", "categories": categories}).to_string();
+        let started = std::time::Instant::now();
+        let lineup = parse_lineup(&raw, "US_Big_lineup.json", "normal", "").expect("parses");
+        let elapsed = started.elapsed();
+        assert_eq!(lineup.entries.len(), MAX_CATEGORIES * 10);
+        // One second is the release budget; an unoptimised test build gets ten.
+        let budget = if cfg!(debug_assertions) {
+            std::time::Duration::from_secs(10)
+        } else {
+            std::time::Duration::from_secs(1)
+        };
+        assert!(elapsed < budget, "{elapsed:?}");
+
+        // One past the cap is refused, not parsed.
+        categories.insert("one too many".to_string(), json!([]));
+        let raw = json!({"categories": categories}).to_string();
+        let error = parse_lineup(&raw, "US_Big_lineup.json", "normal", "").expect_err("capped");
+        assert!(format!("{error:#}").contains("categories"), "{error:#}");
+    }
+
+    #[test]
+    fn parse_lineup_is_what_load_lineup_runs() {
+        for short in ["US_Combined", "TZ_Combined"] {
+            let raw = merged::merged_lineup_json(short).expect("embedded");
+            for detail in DETAILS {
+                let loaded = load_lineup(short, detail, "").expect("loads");
+                let parsed = parse_lineup(raw, &full_filename(short), detail, "").expect("parses");
+                assert_eq!(parsed.entries, loaded.entries);
+                assert_eq!(parsed.categories, loaded.categories);
+                assert_eq!(parsed.package, loaded.package);
+            }
+        }
     }
 }

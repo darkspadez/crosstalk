@@ -13,11 +13,18 @@
 //!   URL), because a lineup run during an outage beats no lineup run;
 //! * network failure with no body → the error propagates.
 //!
+//! [`FetchCache::fetch_validated`] takes the caller's validator: a body that
+//! fails it (an HTML error page answered with a 200, a JSON document without
+//! the expected shape) is never stored and never served, the stale copy is
+//! served instead when there is one, and a cached copy that fails it reads as a
+//! miss. Bodies are `Vec<u8>`; the parsing beyond validation is the caller's.
+//!
 //! The cache never authenticates (no tokens, no basic auth — the tv-logos tree
-//! is public), always sets `User-Agent` (`crosstalk/<version>`), and refuses to
-//! store bodies over [`FetchCache::size_cap`] (the live body is still
-//! returned, just not cached, with a warning). Bodies are `Vec<u8>`; the JSON
-//! parsing is the caller's business.
+//! is public), always sets `User-Agent` (`crosstalk/<version>`), and reads a
+//! body in chunks up to the size cap: a larger body is refused as soon as it
+//! crosses the cap (or up front, from its `Content-Length`), never buffered
+//! whole. A body that cannot be stored (read-only data dir, full disk) is
+//! still served, with a warning.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -26,10 +33,10 @@ use std::time::{Duration, SystemTime};
 /// How long a cached tv-logos tree is served without revalidating (24 h).
 pub const TV_LOGOS_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Above this a body is served but never stored (32 MiB). The recursive
-/// tv-logos tree measured 3.4 MiB / 10,966 entries on 2026-11-05, and GitHub
-/// truncates a tree response near 7 MB, so the cap leaves room for growth
-/// without ever refusing a legitimate tree.
+/// Above this a body is refused (32 MiB). The recursive tv-logos tree measured
+/// 3.4 MiB / 10,966 entries on 2026-11-05, and GitHub truncates a tree response
+/// near 7 MB, so the cap leaves room for growth without ever refusing a
+/// legitimate tree.
 pub const DEFAULT_SIZE_CAP: usize = 32 * 1024 * 1024;
 
 /// What a fetch returned.
@@ -149,15 +156,6 @@ impl FetchCache {
     }
 
     fn store(&self, url: &str, etag: Option<String>, body: &[u8]) -> Result<()> {
-        if body.len() > self.size_cap {
-            tracing::warn!(
-                url = url,
-                bytes = body.len(),
-                cap = self.size_cap,
-                "fetch cache body over the size cap: served, not stored"
-            );
-            return Ok(());
-        }
         std::fs::create_dir_all(&self.dir)
             .with_context(|| format!("creating fetch cache dir {}", self.dir.display()))?;
         let (body_path, meta_path) = self.slot(url);
@@ -179,12 +177,29 @@ impl FetchCache {
         Ok(())
     }
 
-    /// Fetch `url`, through the cache.
+    /// Fetch `url`, through the cache, accepting any body.
     ///
     /// No auth is ever attached: the client carries no credentials by
     /// construction, and this method takes no token parameter on purpose.
     pub async fn fetch(&self, url: &str) -> Result<Fetched> {
-        let cached = self.read_entry(url);
+        self.fetch_validated(url, |_| Ok(())).await
+    }
+
+    /// Fetch `url`, through the cache, serving and storing only bodies that
+    /// pass `validate`.
+    ///
+    /// A fresh body that fails is a failure like a network error: the stale
+    /// copy is served (warned) when there is a valid one, else the validation
+    /// error is returned. A cached copy that fails (written before the
+    /// validator existed) reads as a miss.
+    pub async fn fetch_validated(
+        &self,
+        url: &str,
+        validate: impl Fn(&[u8]) -> Result<()>,
+    ) -> Result<Fetched> {
+        let cached = self
+            .read_entry(url)
+            .filter(|(_, body)| validate(body).is_ok());
         if let Some((meta, body)) = &cached {
             if self.age(meta).is_some_and(|age| age < self.ttl) {
                 return Ok(Fetched {
@@ -200,79 +215,118 @@ impl FetchCache {
                 request = request.header(reqwest::header::IF_NONE_MATCH, etag);
             }
         }
-        match request.send().await {
-            Ok(response) => {
-                if response.status() == reqwest::StatusCode::NOT_MODIFIED {
-                    // A 304 we did not ask for (no cached entry, so no
-                    // If-None-Match: a misbehaving proxy) carries no body to serve.
-                    let Some((mut meta, body)) = cached else {
-                        anyhow::bail!("fetching {url} returned 304 without a cached copy");
-                    };
-                    meta.fetched_at_secs = now_secs();
-                    let (_, meta_path) = self.slot(url);
-                    let _ = write_atomic(
-                        &meta_path,
-                        &serde_json::to_vec(&meta).expect("meta serializes"),
-                    );
-                    return Ok(Fetched {
-                        body,
-                        stale: false,
-                        from_cache: false,
-                    });
-                }
-                let status = response.status();
-                // A non-success status is a failure like a network error: with a
-                // cached body the run continues on stale data (warned), without
-                // one the status is the error.
-                if !status.is_success() {
-                    match cached {
-                        Some((_, body)) => {
-                            tracing::warn!(
-                                url = url,
-                                status = status.as_u16(),
-                                "index fetch failed; serving the stale cached body"
-                            );
-                            return Ok(Fetched {
-                                body,
-                                stale: true,
-                                from_cache: true,
-                            });
-                        }
-                        None => anyhow::bail!("fetching {url} failed with HTTP {status}"),
-                    }
-                }
-                let etag = response
-                    .headers()
-                    .get(reqwest::header::ETAG)
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_string);
-                let body = response
-                    .bytes()
-                    .await
-                    .with_context(|| format!("reading fetch cache body for {url}"))?
-                    .to_vec();
-                self.store(url, etag, &body)?;
-                Ok(Fetched {
-                    body,
-                    stale: false,
-                    from_cache: false,
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                return Self::stale_or(cached, url, || {
+                    anyhow::anyhow!("fetching {url} failed: {error:#}")
                 })
             }
-            Err(error) => match cached {
-                Some((_, body)) => {
-                    tracing::warn!(
-                        url = url,
-                        error = format!("{error:#}"),
-                        "network fetch failed; serving the stale cached body"
-                    );
-                    Ok(Fetched {
-                        body,
-                        stale: true,
-                        from_cache: true,
-                    })
-                }
-                None => Err(anyhow::anyhow!("fetching {url} failed: {error:#}")),
-            },
+        };
+        if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+            // A 304 we did not ask for (no cached entry, so no If-None-Match: a
+            // misbehaving proxy) carries no body to serve.
+            let Some((mut meta, body)) = cached else {
+                anyhow::bail!("fetching {url} returned 304 without a cached copy");
+            };
+            meta.fetched_at_secs = now_secs();
+            let (_, meta_path) = self.slot(url);
+            let _ = write_atomic(
+                &meta_path,
+                &serde_json::to_vec(&meta).expect("meta serializes"),
+            );
+            return Ok(Fetched {
+                body,
+                stale: false,
+                from_cache: false,
+            });
+        }
+        let status = response.status();
+        // A non-success status is a failure like a network error: with a cached
+        // body the run continues on stale data (warned), without one the status
+        // is the error.
+        if !status.is_success() {
+            return Self::stale_or(cached, url, || {
+                anyhow::anyhow!("fetching {url} failed with HTTP {status}")
+            });
+        }
+        let etag = response
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let body = match self.read_capped(url, response).await {
+            Ok(body) => body,
+            Err(error) => return Self::stale_or(cached, url, || error),
+        };
+        if let Err(error) = validate(&body) {
+            return Self::stale_or(cached, url, || {
+                error.context(format!("{url} returned a body that is not a valid index"))
+            });
+        }
+        // The body is good; failing to keep it only costs the next run a fetch.
+        if let Err(error) = self.store(url, etag, &body) {
+            tracing::warn!(
+                url = url,
+                error = format!("{error:#}"),
+                "fetch cache store failed; serving the body uncached"
+            );
+        }
+        Ok(Fetched {
+            body,
+            stale: false,
+            from_cache: false,
+        })
+    }
+
+    /// The response body, refused once it passes the size cap.
+    async fn read_capped(&self, url: &str, mut response: reqwest::Response) -> Result<Vec<u8>> {
+        let too_big = |bytes: u64| {
+            anyhow::anyhow!(
+                "fetching {url}: the body is over the {} byte cap ({bytes} bytes or more)",
+                self.size_cap
+            )
+        };
+        if let Some(length) = response.content_length() {
+            if length > self.size_cap as u64 {
+                return Err(too_big(length));
+            }
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .with_context(|| format!("reading fetch cache body for {url}"))?
+        {
+            if body.len() + chunk.len() > self.size_cap {
+                return Err(too_big((body.len() + chunk.len()) as u64));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
+    }
+
+    /// Serve the stale cached body (warned), or fail with `error`.
+    fn stale_or(
+        cached: Option<(Meta, Vec<u8>)>,
+        url: &str,
+        error: impl FnOnce() -> anyhow::Error,
+    ) -> Result<Fetched> {
+        let error = error();
+        match cached {
+            Some((_, body)) => {
+                tracing::warn!(
+                    url = url,
+                    error = format!("{error:#}"),
+                    "index fetch failed; serving the stale cached body"
+                );
+                Ok(Fetched {
+                    body,
+                    stale: true,
+                    from_cache: true,
+                })
+            }
+            None => Err(error),
         }
     }
 }
@@ -378,7 +432,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_bodies_are_served_but_not_stored() {
+    async fn an_oversized_body_is_refused_and_never_stored() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cache =
             FetchCache::new(dir.path().to_path_buf(), Duration::from_secs(60), 4).expect("cache");
@@ -390,10 +444,214 @@ mod tests {
             .expect(2)
             .mount(&server)
             .await;
-        let out = cache.fetch(&url).await.expect("fetch");
-        assert_eq!(out.body, b"way-too-big");
-        // Not stored (over cap), so the second fetch hits the network again.
-        cache.fetch(&url).await.expect("fetch");
+        let error = cache.fetch(&url).await.expect_err("over the cap");
+        assert!(format!("{error:#}").contains("cap"), "{error:#}");
+        // Nothing stored, so the second fetch hits the network again.
+        cache.fetch(&url).await.expect_err("still over the cap");
+        assert!(cache.read_entry(&url).is_none());
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn an_oversized_body_falls_back_to_the_stale_copy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = MockServer::start().await;
+        let url = format!("{}/tree", server.uri());
+        Mock::given(method("GET"))
+            .and(path("/tree"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&server)
+            .await;
+        cache_in(dir.path()).fetch(&url).await.expect("prime");
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/tree"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; 64]))
+            .mount(&server)
+            .await;
+        let stale_cache =
+            FetchCache::new(dir.path().to_path_buf(), Duration::from_secs(0), 8).expect("cache");
+        let out = stale_cache.fetch(&url).await.expect("stale");
+        assert!(out.stale);
+        assert_eq!(out.body, b"ok");
+    }
+
+    /// The tv-logos shape, as a validator: a JSON object with a `tree` array.
+    fn json_tree(body: &[u8]) -> Result<()> {
+        let value: serde_json::Value = serde_json::from_slice(body)?;
+        anyhow::ensure!(
+            value.get("tree").is_some_and(|tree| tree.is_array()),
+            "no tree"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_invalid_200_is_never_stored_or_served_fresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = cache_in(dir.path());
+        let server = MockServer::start().await;
+        let url = format!("{}/tree", server.uri());
+        Mock::given(method("GET"))
+            .and(path("/tree"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html>rate limited</html>"))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let error = cache
+            .fetch_validated(&url, json_tree)
+            .await
+            .expect_err("HTML is not a tree");
+        assert!(
+            format!("{error:#}").contains("not a valid index"),
+            "{error:#}"
+        );
+        assert!(cache.read_entry(&url).is_none(), "nothing stored");
+        // Not cached, so the next run asks again rather than serving the page.
+        cache
+            .fetch_validated(&url, json_tree)
+            .await
+            .expect_err("again");
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn an_invalid_200_falls_back_to_the_valid_stale_copy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = MockServer::start().await;
+        let url = format!("{}/tree", server.uri());
+        Mock::given(method("GET"))
+            .and(path("/tree"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{\"tree\":[]}"))
+            .mount(&server)
+            .await;
+        cache_in(dir.path())
+            .fetch_validated(&url, json_tree)
+            .await
+            .expect("prime");
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/tree"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html></html>"))
+            .mount(&server)
+            .await;
+        let stale_cache = FetchCache::new(
+            dir.path().to_path_buf(),
+            Duration::from_secs(0),
+            1024 * 1024,
+        )
+        .expect("cache");
+        let out = stale_cache
+            .fetch_validated(&url, json_tree)
+            .await
+            .expect("stale");
+        assert!(out.stale);
+        assert_eq!(out.body, b"{\"tree\":[]}");
+        // The stale copy is still the stored one: the HTML never replaced it.
+        assert_eq!(stale_cache.read_entry(&url).expect("entry").1, out.body);
+    }
+
+    #[tokio::test]
+    async fn an_invalid_cached_copy_reads_as_a_miss() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = cache_in(dir.path());
+        let server = MockServer::start().await;
+        let url = format!("{}/tree", server.uri());
+        // Stored by the unvalidated path, as a cache written before validation existed.
+        Mock::given(method("GET"))
+            .and(path("/tree"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html></html>"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        cache.fetch(&url).await.expect("unvalidated");
+        Mock::given(method("GET"))
+            .and(path("/tree"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{\"tree\":[]}"))
+            .mount(&server)
+            .await;
+        let out = cache
+            .fetch_validated(&url, json_tree)
+            .await
+            .expect("refetch");
+        assert!(!out.from_cache, "the fresh-but-invalid copy was not served");
+        assert_eq!(out.body, b"{\"tree\":[]}");
+    }
+
+    #[tokio::test]
+    async fn a_valid_body_round_trips_through_the_cache() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = cache_in(dir.path());
+        let server = MockServer::start().await;
+        let url = format!("{}/tree", server.uri());
+        Mock::given(method("GET"))
+            .and(path("/tree"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{\"tree\":[1]}"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let first = cache.fetch_validated(&url, json_tree).await.expect("fetch");
+        let second = cache
+            .fetch_validated(&url, json_tree)
+            .await
+            .expect("cached");
+        assert!(second.from_cache && !second.stale);
+        assert_eq!(first.body, second.body);
+        server.verify().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_read_only_cache_dir_still_returns_the_body() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache_dir = dir.path().join("cache");
+        std::fs::create_dir(&cache_dir).expect("mkdir");
+        std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o555))
+            .expect("chmod");
+        // Root ignores the mode bits; the test is meaningless there.
+        if std::fs::write(cache_dir.join("probe"), b"x").is_ok() {
+            eprintln!("skipping: the cache dir is writable despite 0555 (running as root?)");
+            return;
+        }
+        let cache = cache_in(&cache_dir);
+        let server = MockServer::start().await;
+        let url = format!("{}/tree", server.uri());
+        Mock::given(method("GET"))
+            .and(path("/tree"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{\"tree\":[]}"))
+            .mount(&server)
+            .await;
+        let out = cache
+            .fetch_validated(&url, json_tree)
+            .await
+            .expect("a store failure is a warning");
+        assert_eq!(out.body, b"{\"tree\":[]}");
+        assert!(!out.stale && !out.from_cache);
+        std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("restore");
+    }
+
+    #[tokio::test]
+    async fn a_meta_naming_another_url_reads_as_a_miss() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = cache_in(dir.path());
+        let server = MockServer::start().await;
+        let url = format!("{}/tree", server.uri());
+        Mock::given(method("GET"))
+            .and(path("/tree"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("v1"))
+            .expect(2)
+            .mount(&server)
+            .await;
+        cache.fetch(&url).await.expect("v1");
+        let (_, meta_path) = cache.slot(&url);
+        let mut meta: Meta =
+            serde_json::from_slice(&std::fs::read(&meta_path).expect("meta")).expect("parse");
+        meta.url = "http://elsewhere.test/tree".to_string();
+        std::fs::write(&meta_path, serde_json::to_vec(&meta).expect("ser")).expect("write");
+        let out = cache.fetch(&url).await.expect("refetch");
+        assert!(!out.from_cache);
         server.verify().await;
     }
 
