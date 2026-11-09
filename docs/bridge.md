@@ -121,7 +121,7 @@ The plugin checks each request in this order and refuses the whole request at th
    `replayed`) A nonce is recorded only after the MAC holds, so unsigned traffic cannot fill the
    cache, and before the payload is validated, so a request that fails validation still cannot be
    replayed. Nonces live in Django's cache (`cache.add`, shared by every worker when Dispatcharr's
-   cache is Redis) for 600 s, and always in a per-process LRU of up to 200,000 entries as well.
+   cache is Redis) for 601 s (one second past the last moment a request stamped at the far edge of the window could still pass the timestamp check), and always in a per-process LRU of up to 200,000 entries as well.
 7. The payload matches the operation's schema and limits. (`invalid`, `too_large`)
 8. The operation runs inside one `transaction.atomic()`.
 

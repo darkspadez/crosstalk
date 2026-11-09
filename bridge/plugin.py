@@ -376,7 +376,10 @@ def verify(action, params, settings, now, nonces):
     nonce = envelope["nonce"]
     if not isinstance(nonce, str) or not _HEX_NONCE.match(nonce):
         raise Refused("bad_request", "nonce must be 32 lowercase hex digits")
-    ttl = 2 * REPLAY_WINDOW_SECS
+    # A nonce must outlive every moment its request could still pass the timestamp check: a
+    # request stamped at the far edge of the window (now + 300) is still in the window at
+    # now + 600, so a cache of exactly 2 x window would let it be replayed at that second.
+    ttl = 2 * REPLAY_WINDOW_SECS + 1
     shared = _shared_nonce_is_new(nonce, ttl)
     local = nonces.add(nonce, now + ttl, now)
     if shared is False or not local:

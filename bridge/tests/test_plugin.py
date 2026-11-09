@@ -355,6 +355,18 @@ class Verification(BridgeTest):
         self.assertRefused(again, "replayed")
         self.assertEqual(TABLES["Channel"][1].channel_group_id, 10)
 
+    def test_a_nonce_outlives_every_second_its_request_is_still_fresh(self):
+        # Signed at the far edge of the window (now + 300): at now + 600 the timestamp check
+        # still passes, so the nonce must still be remembered then (TTL > 2 x window).
+        params = self.signer.params("ping", {}, ts=NOW + bridge.REPLAY_WINDOW_SECS)
+        self.assertTrue(self.plugin.run("ping", params, settings())["ok"])
+        later = NOW + 2 * bridge.REPLAY_WINDOW_SECS
+        self.plugin._clock = lambda: later
+        self.assertRefused(self.plugin.run("ping", params, settings()), "replayed")
+        # One second on, the timestamp check refuses it on its own.
+        self.plugin._clock = lambda: later + 1
+        self.assertRefused(self.plugin.run("ping", params, settings()), "stale")
+
     def test_an_unsigned_flood_does_not_burn_nonces(self):
         params = self.signer.params("ping", {}, nonce="ab" * 16)
         forged = copy.deepcopy(params)
