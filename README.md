@@ -282,6 +282,37 @@ Secrets should live in the environment, not the file: the daemon refuses to save
 configuration that had environment overrides applied, so a token cannot leak into a file by
 accident.
 
+### Secrets and data at rest
+
+- **Precedence.** A secret can be written inline (`token`, `api_key`, `password`) or named
+  through its `*_env` variable (`token_env = "CROSSTALK_TOKEN"`, the default). When both are
+  set the **environment wins**, so a token rotates without editing the file; `validate` warns
+  that the file's value is shadowed. A blank variable falls back to the file. The
+  `CROSSTALK_<SECTION>__<KEY>` overrides of `token`, `api_key`, `password`, `username`,
+  `base_url` and `public_url` are taken verbatim: `CROSSTALK_SERVER__TOKEN=0123456` stays
+  `0123456`.
+- **`base_url` credentials.** A `user:pass@` in `dispatcharr.base_url` (for a proxy in front of
+  Dispatcharr) is sent as HTTP basic auth and never printed: `validate`, errors and logs show
+  the URL without it.
+- **File permissions.** The run store (`<data_dir>/crosstalk.db` and SQLite's `-wal`/`-shm`)
+  is made `0600` and its directory `0700` whenever it is opened; CSV reports are written
+  `0600` into a `0700` exports directory; a settings save writes `0600`. `validate` and
+  `serve` warn when `crosstalk.toml` or an app's `.toml` is readable by other accounts AND
+  holds an inline secret (`chmod 600` it, or move the secret to the environment). Unix only.
+- **What is stored.** Provider stream URLs are credentials (`/live/<user>/<pass>/…`,
+  `?token=`), so none is stored: run rows, `stream_health`, run summaries, CSV reports and
+  logs keep the stream id and at most `scheme://host[:port]` of any URL a tool or Dispatcharr
+  printed (`[Stream ID: 101]: Server returned 403 Forbidden`). Dispatcharr error bodies quoted
+  in errors have their `url`/`password`/`username`/`token`/`api_key` values blanked. A logo
+  URL keeps its path in reports but loses its userinfo and query; the exact URL lives only in
+  the create intent that needs it to find the logo again.
+- **AI requests** carry names, numbers, callsigns, places, scores and ids: never a URL, an
+  account name or a key (tested per gate, and the audit trail in `ai_decisions` is the
+  request as sent).
+- **Logs.** `reqwest`, `hyper` and `hyper_util` stay at `info` even under `RUST_LOG=debug`,
+  because at `debug` they log request and redirect URLs; name one in `RUST_LOG` to opt in.
+  Configuration sections print secrets as `<redacted>` in debug output.
+
 The web UI writes settings back through `toml_edit`, preserving your comments and ordering.
 Host settings saved in the UI hot-reload: the next run uses them and schedules re-arm, with
 no daemon restart (a run already in progress finishes with the settings it started with).

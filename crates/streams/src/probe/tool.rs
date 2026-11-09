@@ -57,14 +57,26 @@ pub struct ToolSpec {
     pub args: Vec<String>,
     /// Wall-clock cap. The plugin passed `subprocess.run(timeout=…)`.
     pub timeout: Duration,
+    /// Which of `args` is the probed URL, fixed when the spec is built: the value of `-i`,
+    /// or else the first argument carrying a scheme. Kept rather than re-guessed so the
+    /// masked command line hides exactly the argument the tool reads as its input, with or
+    /// without a scheme.
+    url_index: Option<usize>,
 }
 
 impl ToolSpec {
     pub fn new(program: impl Into<String>, args: Vec<String>, timeout: Duration) -> Self {
+        let url_index = args
+            .iter()
+            .position(|arg| arg == "-i")
+            .map(|at| at + 1)
+            .filter(|at| *at < args.len())
+            .or_else(|| args.iter().position(|arg| arg.contains("://")));
         Self {
             program: program.into(),
             args,
             timeout,
+            url_index,
         }
     }
 
@@ -88,11 +100,10 @@ impl ToolSpec {
     /// public. Reproduction keeps the flags (which is what an operator re-runs by hand) and
     /// loses only the secret.
     pub fn masked_command_line(&self) -> String {
-        let url = self.url();
         let mut line = self.program.clone();
-        for arg in &self.args {
+        for (index, arg) in self.args.iter().enumerate() {
             line.push(' ');
-            if Some(arg.as_str()) == url {
+            if Some(index) == self.url_index {
                 line.push_str("[stream-url]");
             } else {
                 line.push_str(arg);
@@ -106,11 +117,8 @@ impl ToolSpec {
     /// flags (`-t 6 … -f null -` for ffmpeg), so a fake keyed on "last" would key every ffmpeg
     /// call on `-`.
     pub fn url(&self) -> Option<&str> {
-        self.args
-            .iter()
-            .position(|arg| arg == "-i")
-            .and_then(|at| self.args.get(at + 1))
-            .or_else(|| self.args.iter().find(|arg| arg.contains("://")))
+        self.url_index
+            .and_then(|at| self.args.get(at))
             .map(String::as_str)
     }
 
@@ -555,6 +563,24 @@ mod tests {
             Duration::from_secs(5),
         );
         assert_eq!(plain.masked_command_line(), plain.command_line());
+
+        // The input is masked by position, so a scheme-less input is hidden too and an
+        // unrelated argument with `://` is not mistaken for it.
+        let spec = ToolSpec::new(
+            "/usr/bin/ffmpeg",
+            vec![
+                "-headers".to_string(),
+                "Referer: http://site.test/".to_string(),
+                "-i".to_string(),
+                "provider.test/live/u/p/1.ts".to_string(),
+            ],
+            Duration::from_secs(5),
+        );
+        assert_eq!(spec.url(), Some("provider.test/live/u/p/1.ts"));
+        assert_eq!(
+            spec.masked_command_line(),
+            "/usr/bin/ffmpeg -headers Referer: http://site.test/ -i [stream-url]"
+        );
     }
 
     #[tokio::test]

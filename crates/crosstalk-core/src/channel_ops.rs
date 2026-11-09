@@ -2979,7 +2979,12 @@ pub async fn apply_creates(
                 created: false,
                 group: String::new(),
                 status: RowStatus::Ok,
-                reason: format!("logo URL {:?} already exists as id {id}", logo.url),
+                // The row keeps the logo's path, not a token in its query or userinfo; the
+                // exact URL lives in the ownership intent, which matches on it.
+                reason: format!(
+                    "logo URL {:?} already exists as id {id}",
+                    crate::redact::url_without_secrets(&logo.url)
+                ),
             }),
             None => {
                 report.logos.push(CreatedOutcome {

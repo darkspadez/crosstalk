@@ -229,18 +229,28 @@ pub fn is_probeable_url(url: &str) -> bool {
 /// A probe error is written to a CSV, a run row and a log line, all of which leave the host in a
 /// report an operator may paste into an issue. The URL carries the provider credential, so it
 /// never leaves the probe: the plugin's own rule, kept.
+///
+/// The exact match only knows the URL that was probed. A tool also prints URLs it found on
+/// the way (an HLS variant or segment, a redirect target), which carry the same credentials,
+/// so every other URL left in the message is then shortened to `scheme://host[:port]`
+/// ([`crosstalk_core::redact::urls_to_hosts`]).
 pub fn mask_url_in_error(message: &str, url: &str, stream_id: i64) -> String {
-    if message.is_empty() || url.is_empty() {
-        return message.to_string();
+    if message.is_empty() {
+        return String::new();
     }
-    let masked = message.replace(url, &format!("[Stream ID: {stream_id}]"));
-    // The URL-encoded spelling appears when the tool quotes the whole request line.
-    match url_encode(url) {
-        Some(encoded) if masked.contains(&encoded) => {
-            masked.replace(&encoded, &format!("[Stream ID: {stream_id}]"))
+    let masked = if url.is_empty() {
+        message.to_string()
+    } else {
+        let masked = message.replace(url, &format!("[Stream ID: {stream_id}]"));
+        // The URL-encoded spelling appears when the tool quotes the whole request line.
+        match url_encode(url) {
+            Some(encoded) if masked.contains(&encoded) => {
+                masked.replace(&encoded, &format!("[Stream ID: {stream_id}]"))
+            }
+            _ => masked,
         }
-        _ => masked,
-    }
+    };
+    crosstalk_core::redact::urls_to_hosts(&masked)
 }
 
 /// `urllib.parse.quote(url, safe='')` for the characters a URL actually carries: everything but
@@ -457,6 +467,26 @@ mod tests {
         assert_eq!(mask_url_in_error("boom", "", 1), "boom");
         assert_eq!(mask_url_in_error("", "http://h/x", 1), "");
         assert_eq!(mask_url_in_error("boom", "http://other/x", 1), "boom");
+    }
+
+    #[test]
+    fn a_url_the_probe_did_not_ask_for_keeps_only_its_host() {
+        // An HLS segment and a redirect target: same credentials, different URLs.
+        let masked = mask_url_in_error(
+            "http://host/live/u/p/1.m3u8: redirected to http://user:pass@edge:8080/x?token=T; \
+             Failed to open segment http://edge:8080/hls/u/p/seg-1.ts",
+            "http://host/live/u/p/1.m3u8",
+            9,
+        );
+        assert_eq!(
+            masked,
+            "[Stream ID: 9]: redirected to http://edge:8080; Failed to open segment http://edge:8080"
+        );
+        assert_eq!(
+            mask_url_in_error("see http://u:p@h/live/U/P/1.ts", "", 1),
+            "see http://h",
+            "no probed URL still redacts"
+        );
     }
 
     #[test]

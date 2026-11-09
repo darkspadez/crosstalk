@@ -341,6 +341,12 @@ fn serve(args: ServeArgs) -> Result<()> {
             );
         }
 
+        // Not fatal (a file can be owner-only through its directory, or on a filesystem with
+        // no modes), but a token or key in a file every account can read is worth a line.
+        for warning in snapshot.exposed_secret_warnings() {
+            tracing::warn!("{warning}");
+        }
+
         let store = Store::open(snapshot.data_dir().join("crosstalk.db"))?;
         let registry = registry::builtin();
         let runner = JobRunner::new(registry.clone(), config.clone(), store.clone());
@@ -448,16 +454,48 @@ async fn wait_for_drain(runner: &JobRunner, timeout: std::time::Duration) {
 /// port, the schedules, and anything a run went wrong on).
 fn install_logging() {
     use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_env("RUST_LOG").unwrap_or_else(|_| {
-        EnvFilter::new(
-            "info,crosstalk_core=info,crosstalk_web=info,crosstalk_guide=info,\
-             crosstalk_streams=info",
-        )
-    });
+    let user = std::env::var("RUST_LOG").ok();
+    let filter = EnvFilter::try_new(log_directives(user.as_deref()))
+        .unwrap_or_else(|_| EnvFilter::new(log_directives(None)));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
         .try_init();
+}
+
+/// The HTTP stack's own crates, held at `info` unless `RUST_LOG` names them.
+///
+/// At `debug` reqwest and hyper log request and redirect URLs, and a provider's stream URL
+/// (or a `user:pass@` base URL) is a credential: `RUST_LOG=debug` to chase a matching
+/// problem must not put one in the log. Naming the crate explicitly is the opt-in.
+const QUIET_HTTP_CRATES: [&str; 3] = ["reqwest", "hyper", "hyper_util"];
+
+/// The filter directives: the operator's `RUST_LOG` (or the default), plus `<crate>=info` for
+/// each of [`QUIET_HTTP_CRATES`] it does not name itself.
+fn log_directives(user: Option<&str>) -> String {
+    let base = match user.map(str::trim).filter(|text| !text.is_empty()) {
+        Some(text) => text.to_string(),
+        None => "info,crosstalk_core=info,crosstalk_web=info,crosstalk_guide=info,\
+                 crosstalk_streams=info"
+            .to_string(),
+    };
+    let named = |krate: &str| {
+        base.split(',').any(|directive| {
+            let target = directive
+                .trim()
+                .split(['=', '['])
+                .next()
+                .unwrap_or_default();
+            target == krate || target.starts_with(&format!("{krate}::"))
+        })
+    };
+    let mut directives = base.clone();
+    for krate in QUIET_HTTP_CRATES {
+        if !named(krate) {
+            directives.push_str(&format!(",{krate}=info"));
+        }
+    }
+    directives
 }
 
 /// Wait for Ctrl-C or SIGTERM, so a container stop is a clean shutdown.
@@ -982,7 +1020,8 @@ fn validate(args: ConfigArgs) -> Result<()> {
         config.exports.retention_days
     );
 
-    for warning in &report.warnings {
+    let exposed = config.exposed_secret_warnings();
+    for warning in report.warnings.iter().chain(&exposed) {
         println!("warning: {warning}");
     }
     for error in &report.errors {
@@ -1105,6 +1144,26 @@ mod shutdown_tests {
 mod cli_tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn the_http_crates_stay_at_info_unless_named() {
+        let default = log_directives(None);
+        assert!(default.starts_with("info,crosstalk_core=info"), "{default}");
+        assert!(
+            default.ends_with(",reqwest=info,hyper=info,hyper_util=info"),
+            "{default}"
+        );
+        assert_eq!(
+            log_directives(Some("debug")),
+            "debug,reqwest=info,hyper=info,hyper_util=info"
+        );
+        // Naming a crate is the opt-in: it keeps the operator's level.
+        assert_eq!(
+            log_directives(Some("debug,reqwest=trace,hyper_util::client=debug")),
+            "debug,reqwest=trace,hyper_util::client=debug,hyper=info"
+        );
+        assert_eq!(log_directives(Some("  ")), default);
+    }
 
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(args).expect("the command line parses")

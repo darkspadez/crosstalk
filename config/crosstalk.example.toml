@@ -23,6 +23,8 @@ port = 8730
 # no proxy is in front. At least 32 bytes once the daemon is reachable from elsewhere (a
 # non-loopback bind, or trusted_proxies set): `openssl rand -hex 32`.
 # Prefer the environment variable named by `token_env` so the secret stays out of the file.
+# When both are set the variable wins (and `validate` warns). A file holding an inline secret
+# should be `chmod 600`: `validate` and `serve` warn when it is readable by others.
 token = ""
 token_env = "CROSSTALK_TOKEN"
 # Reverse proxies allowed to name the client (addresses or CIDR ranges, IPv4 or IPv6).

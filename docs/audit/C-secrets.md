@@ -1,4 +1,26 @@
 # Area C report (secrets/data at rest). Rule: provider stream URLs never stored; keep id + host.
+
+## Status (fix 3, secrets and data at rest)
+
+| Finding | Status | Where |
+|---|---|---|
+| C-B1 probe errors | Fixed: `redact::urls_to_hosts` (every `scheme://...` up to whitespace/quote/`<>` -> `scheme://host[:port]`; an authority that is not a plain host:port -> `[redacted]`; `%3A%2F%2F` spellings redacted whole) runs after the exact pass in `mask_url_in_error`, again on the CSV error column and on every probe row reason; `ai::redact_error` uses it (paths dropped too) | `crosstalk-core/src/redact.rs`, `streams/src/probe/{classify,mod}.rs`, `crosstalk-core/src/ai.rs`; e2e `streams/src/secrets_tests.rs` |
+| C-S1 Dispatcharr bodies | Fixed: `safe_body` blanks JSON string values under `url`/`*_url`/`password`/`username`/`token`/`api_key`/`access`/`refresh`/`secret`, then `urls_to_hosts`, then truncates; used for every quoted body; redirect `Location` loses userinfo/query | `crosstalk-core/src/dispatcharr/mod.rs` (+ tests) |
+| C-S2 base_url userinfo | Fixed: `api_root()` strips it, `base_url_userinfo()` decodes it, the client sends it as basic auth on every request (as reqwest did implicitly); reqwest errors go through `without_url()` before context | `crosstalk-core/src/{config,dispatcharr/mod}.rs` (+ tests) |
+| C-S3 precedence | Fixed: environment wins over inline (blank env falls back), docs fixed, `validate` warns when both are set (never quoting the value) | `crosstalk-core/src/config.rs` |
+| C-S4 guarantee tests | Added: recording-decider tests for the guide match gate, streams match gate and lineup names gate (serialized requests + stored `ai_decisions` request/response/attempts free of user/pass/token/account name/key/`://`); e2e probe -> match -> mirror -> sort -> triage -> restore on one on-disk store, every file under the config dir (SQLite + WAL bytes, CSVs) grepped for markers with a positive control | `guide/src/matching.rs`, `streams/src/matching.rs`, `lineup/src/names.rs`, `streams/src/secrets_tests.rs` |
+| C-S5 file modes | Fixed (Unix): store file/-wal/-shm 0600 and data dir 0700 at every open; reports created 0600 in a 0700 exports dir (existing ones tightened); `validate` and `serve` warn for a group/world-readable `*.toml` in the config dir holding an inline secret | `crosstalk-core/src/{perms,store,csv_report,config}.rs`, `crosstalk/src/main.rs` |
+| C-S6 | = A5, done in fix 2 | - |
+| C-N1 | Fixed: `ToolSpec` keeps the URL argument index (the `-i` value, else the first `://` arg); masking is by position | `streams/src/probe/tool.rs` |
+| C-N2 | Fixed: `reqwest=info,hyper=info,hyper_util=info` appended unless `RUST_LOG` names the crate | `crosstalk/src/main.rs` |
+| C-N3 | Fixed: logo URLs keep their path but lose userinfo/query in the logos CSV cells, reasons and the create row's "already exists" reason; the ownership intent keeps the exact URL | `lineup/src/logos.rs`, `crosstalk-core/src/channel_ops.rs` |
+| C-N4 | Fixed: manual `Debug` for `ServerConfig`, `DispatcharrConfig`, `AiProviderConfig` (`<redacted>`, URLs without userinfo/query) | `crosstalk-core/src/config.rs` |
+| C-N5 | Unchanged (fine) | - |
+| D-N3 | Fixed here: raw env text for secret/URL keys | `crosstalk-core/src/config.rs` |
+
+Run summaries (`runs.summary`) are not re-redacted in the runner: every error source that can
+carry a provider URL (probe, Dispatcharr bodies, reqwest, AI) is redacted where it is made, and
+a runner-wide pass would also strip the Dispatcharr API paths that make a failure readable.
 C-B1 BLOCKER probe error masking only removes exact probed URL (probe/classify.rs:206-221 mask_url_in_error); stored in CSV error column (probe/mod.rs:2144), run_rows.reason (:2398-2401), from stderr (:632, :647). HLS first-segment/redirect/variant URLs with creds leak. Fix: general redactor in crosstalk-core: any scheme://... up to space/quote -> scheme://host[:port]; apply after exact pass to every stored probe error; ai::redact_error (ai.rs:557) keeps path -> use the new redactor. Tests: unit (segment URL w/ creds in path, ?token=, userinfo -> host only); e2e with FakeToolRunner: no user/pass/token= in run_rows, stream_health, job_checkpoints, CSV.
 C-S1 Dispatcharr response bodies copied into error chains (dispatcharr/mod.rs:460-466 truncate 200; :342-352, :420-433 truncate 300) -> runs.summary (runner.rs:280,286,561,568,766,773,843), run page, logs. Fix: redactor over truncated bodies; blank JSON values for keys url/password/username/token before truncating. Test: wiremock PATCH returns {"id":"x","url":"http://p/live/u/p/1.ts"} -> error has no /live/u/p.
 C-S2 base_url with user:pass@ printed/stored (config.rs:142 api_root; main.rs:948-950 validate; dispatcharr/mod.rs:233,275,357,365,438,445; reqwest Error Display keeps url). Fix: strip userinfo in DispatcharrClient::new and send as basic auth, redacted api_root display, error.without_url() before context. Tests.

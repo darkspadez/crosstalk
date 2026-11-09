@@ -2532,4 +2532,139 @@ mod tests {
             "an accepted row is not tagged: {row:?}"
         );
     }
+
+    /// What must never reach a model or its audit trail (C-S4): the credential parts of a
+    /// provider URL, an account's name, the provider's key, and any URL at all.
+    const AI_MARKERS: [&str; 6] = [
+        "USERMARK",
+        "PASSMARK",
+        "TOKENMARK",
+        "SECRET-ACCT",
+        "KEYMARK",
+        "://",
+    ];
+
+    /// Serialises every request before passing it on, as a provider would receive it.
+    struct RecordingDecider {
+        inner: GateDecider,
+        seen: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crosstalk_core::ai::Decider for RecordingDecider {
+        fn provider(&self) -> &str {
+            crosstalk_core::ai::Decider::provider(&self.inner)
+        }
+
+        fn calibrated(&self) -> bool {
+            crosstalk_core::ai::Decider::calibrated(&self.inner)
+        }
+
+        async fn decide(
+            &self,
+            request: &crosstalk_core::ai::DecisionRequest,
+        ) -> anyhow::Result<crosstalk_core::ai::DecisionResponse> {
+            self.seen
+                .lock()
+                .expect("seen")
+                .push(serde_json::to_string(request).expect("a request serialises"));
+            crosstalk_core::ai::Decider::decide(&self.inner, request).await
+        }
+    }
+
+    #[tokio::test]
+    async fn an_ai_request_from_the_names_gate_carries_no_secret() {
+        // The tagged-unmatched gate scenario, in a world whose streams and accounts carry
+        // credentials and whose AI provider has a key: none of it may reach the model.
+        let secret = "http://USERMARK:PASSMARK@provider.test/live/USERMARK/PASSMARK/1.ts\
+                      ?token=TOKENMARK";
+        let world = World {
+            channels: vec![Channel {
+                id: 1,
+                name: "ESPN Two Extra".to_string(),
+                channel_number: Some(serde_json::json!(1.0)),
+                channel_group_id: Some(10),
+                streams: vec![900],
+                ..Channel::default()
+            }],
+            groups: vec![ChannelGroup {
+                id: 10,
+                name: "Test".to_string(),
+            }],
+            streams: vec![crosstalk_core::dispatcharr::Stream {
+                id: 900,
+                name: "ESPN Two Extra".to_string(),
+                m3u_account: Some(77),
+                url: Some(secret.to_string()),
+                ..crosstalk_core::dispatcharr::Stream::default()
+            }],
+            m3u_accounts: vec![crosstalk_core::dispatcharr::M3uAccount {
+                id: 77,
+                name: "SECRET-ACCT".to_string(),
+                is_active: true,
+                server_url: Some(secret.to_string()),
+                ..crosstalk_core::dispatcharr::M3uAccount::default()
+            }],
+            ..World::default()
+        };
+        let (server, mut config, _dir) = serve(&world).await;
+        // Served too, in case the action ever reads them: nothing from them may be sent.
+        for (route, items) in [
+            (
+                "/api/channels/streams/",
+                serde_json::to_value(&world.streams).expect("streams"),
+            ),
+            (
+                "/api/m3u/accounts/",
+                serde_json::to_value(&world.m3u_accounts).expect("accounts"),
+            ),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(ResponseTemplate::new(200).set_body_json(items))
+                .mount(&server)
+                .await;
+        }
+        config.ai.verify.enabled = true;
+        config.ai.providers.insert(
+            "typesafe".to_string(),
+            crosstalk_core::config::AiProviderConfig {
+                api_key: "KEYMARK".to_string(),
+                ..crosstalk_core::config::AiProviderConfig::default()
+            },
+        );
+        let store = Store::in_memory().expect("store");
+        let app = crate::LineupApp::new();
+        let (context, run_id) = context_for(&config, &store, "lineup", "names_preview", true);
+        let mut settings = test_settings();
+        settings.ai_gate_enabled = true;
+        let recorder = Arc::new(RecordingDecider {
+            inner: GateDecider {
+                probability: 0.95,
+                confidence: 0.95,
+            },
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let service = crosstalk_core::ai::AiService::with_decider("typesafe", recorder.clone());
+        run_with_service(&app, &context, &settings, true, Some(&service))
+            .await
+            .expect("previews");
+
+        let mut sent = recorder.seen.lock().expect("seen").clone();
+        assert!(!sent.is_empty(), "the borderline row reached the model");
+        let stored: Vec<String> = (0..64)
+            .filter_map(|ordinal| store.ai_decision(run_id, ordinal).expect("load"))
+            .flat_map(|decision| {
+                [decision.request, decision.response, decision.attempts]
+                    .map(|value| value.to_string())
+            })
+            .collect();
+        assert!(!stored.is_empty(), "the ask was audited");
+        sent.extend(stored);
+        for text in &sent {
+            for marker in AI_MARKERS {
+                assert!(!text.contains(marker), "{marker} in {text}");
+            }
+        }
+    }
 }

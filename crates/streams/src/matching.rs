@@ -6252,4 +6252,145 @@ mod tests {
         assert_eq!(gate.calls, 1);
         assert_eq!(assignment(&gate.outcome, 2).after, vec![12]);
     }
+
+    // ---------------------------------------------------------------------------------
+    // What an AI request may carry (C-S4)
+    // ---------------------------------------------------------------------------------
+
+    /// What must never reach a model or its audit trail: the parts of a provider URL that
+    /// are credentials, the account's name, the provider's key, and any URL at all.
+    const AI_MARKERS: [&str; 6] = [
+        "USERMARK",
+        "PASSMARK",
+        "TOKENMARK",
+        "SECRET-ACCT",
+        "KEYMARK",
+        "://",
+    ];
+
+    const SECRET_STREAM_URL: &str =
+        "http://USERMARK:PASSMARK@provider.test/live/USERMARK/PASSMARK/1.ts?token=TOKENMARK";
+
+    /// Serialises every request before passing it on, as a provider would receive it.
+    struct RecordingDecider {
+        inner: FixedDecider,
+        seen: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crosstalk_core::ai::Decider for RecordingDecider {
+        fn provider(&self) -> &str {
+            crosstalk_core::ai::Decider::provider(&self.inner)
+        }
+
+        fn calibrated(&self) -> bool {
+            crosstalk_core::ai::Decider::calibrated(&self.inner)
+        }
+
+        async fn decide(
+            &self,
+            request: &crosstalk_core::ai::DecisionRequest,
+        ) -> Result<crosstalk_core::ai::DecisionResponse> {
+            self.seen
+                .lock()
+                .expect("seen")
+                .push(serde_json::to_string(request).expect("a request serialises"));
+            crosstalk_core::ai::Decider::decide(&self.inner, request).await
+        }
+    }
+
+    #[tokio::test]
+    async fn an_ai_request_from_the_stream_match_carries_no_secret() {
+        // The borderline world, with every stream on a credentialed URL and every account
+        // named and pointed at one: none of it may reach the model or the audit trail.
+        let mut world = borderline_world();
+        for stream in &mut world.streams {
+            stream.url = Some(SECRET_STREAM_URL.to_string());
+        }
+        for account in &mut world.m3u_accounts {
+            account.name = format!("SECRET-ACCT {}", account.id);
+            account.server_url = Some(SECRET_STREAM_URL.to_string());
+        }
+        let settings = StreamsSettings::default();
+        let mut config = crosstalk_core::config::CrosstalkConfig::default();
+        config.ai.verify = AiVerifyConfig {
+            enabled: true,
+            provider: "typesafe".to_string(),
+            model: "stub".to_string(),
+            ..AiVerifyConfig::default()
+        };
+        config.ai.providers.insert(
+            "typesafe".to_string(),
+            crosstalk_core::config::AiProviderConfig {
+                api_key: "KEYMARK".to_string(),
+                ..crosstalk_core::config::AiProviderConfig::default()
+            },
+        );
+        let store = Store::in_memory().expect("store");
+        let run_id = store
+            .start_run("streams", "match_preview", true)
+            .expect("run");
+        let context = JobContext::new(
+            Arc::new(config),
+            Arc::new(crosstalk_core::jobs::VecSink::new()),
+        )
+        .for_run(
+            "streams",
+            "match_preview",
+            run_id,
+            store.clone(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let options = Arc::new(match_options(&settings));
+        let throughput: Arc<dyn ThroughputSource> =
+            Arc::new(quality::MemoryThroughputSource::new());
+        let mut outcome = plan(
+            &world,
+            &ScopeConfig::default(),
+            &settings,
+            &options,
+            throughput.as_ref(),
+        )
+        .expect("plan");
+        let recorder = Arc::new(RecordingDecider {
+            inner: FixedDecider {
+                probability: 0.95,
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            },
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let service = crosstalk_core::ai::AiService::with_decider("typesafe", recorder.clone());
+        let scoped = scope_channels(&world, &ScopeConfig::default()).expect("scope");
+        apply_ai_gate(
+            &mut outcome,
+            &world,
+            &scoped.channels,
+            &settings,
+            &options,
+            &throughput,
+            &context,
+            Some(&service),
+        )
+        .await
+        .expect("gate");
+
+        let mut sent = recorder.seen.lock().expect("seen").clone();
+        assert!(!sent.is_empty(), "the borderline channel reached the model");
+        // And what was stored about it.
+        let stored: Vec<String> = (0..64)
+            .filter_map(|ordinal| store.ai_decision(run_id, ordinal).expect("load"))
+            .flat_map(|decision| {
+                [decision.request, decision.response, decision.attempts]
+                    .map(|value| value.to_string())
+            })
+            .collect();
+        assert!(!stored.is_empty(), "the ask was audited");
+        sent.extend(stored);
+        for text in &sent {
+            for marker in AI_MARKERS {
+                assert!(!text.contains(marker), "{marker} in {text}");
+            }
+        }
+    }
 }

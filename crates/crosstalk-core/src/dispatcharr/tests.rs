@@ -2409,3 +2409,122 @@ async fn system_timezone_propagates_a_transport_failure_for_the_caller_to_degrad
     let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
     client.system_timezone().await.expect_err("500");
 }
+
+#[tokio::test]
+async fn an_echoed_stream_url_never_reaches_the_error() {
+    // C-S1: a write's error body echoes the object back, provider URL and all.
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/epg/sources/4/"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "id": "x",
+            "url": "http://p/live/u/p/1.ts",
+            "server_url": "http://acct:SECRET@provider.test/get.php?username=U&password=P",
+            "password": "P",
+            "detail": "see http://other.test/live/U2/P2/2.ts?token=T"
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/channels/groups/"))
+        .respond_with(
+            ResponseTemplate::new(404)
+                .set_body_string("<html>Not found: http://p/live/u/p/1.ts?token=T</html>"),
+        )
+        .mount(&server)
+        .await;
+
+    let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+    let write = client
+        .update_epg_source(4, &EpgSourceEdit::default())
+        .await
+        .expect_err("400");
+    let read = client.groups().await.expect_err("404");
+    for (error, host) in [(write, "http://other.test"), (read, "http://p")] {
+        let message = format!("{error:#}");
+        for leaked in [
+            "/live/",
+            "u/p",
+            "SECRET",
+            "token=",
+            "username=U",
+            "password=P",
+            "\"P\"",
+        ] {
+            assert!(!message.contains(leaked), "{leaked} leaked: {message}");
+        }
+        assert!(message.contains(host), "the host stays: {message}");
+    }
+}
+
+#[test]
+fn sensitive_json_values_are_blanked_before_the_cut() {
+    let body = r#"{"id": 1, "url" : "http://h/a b\"c", "API_KEY":"k", "logo_url":"http://l/x.png?t=1", "name":"ESPN"}"#;
+    assert_eq!(
+        safe_body(body, 300),
+        r#"{"id": 1, "url" : "", "API_KEY":"", "logo_url":"", "name":"ESPN"}"#
+    );
+    // Cut after scrubbing: a long body never leaves half a credential at the edge.
+    let long = format!("{}\"token\": \"{}\"", "x".repeat(10), "s".repeat(500));
+    assert_eq!(
+        safe_body(&long, 300),
+        format!("{}\"token\": \"\"", "x".repeat(10))
+    );
+}
+
+#[tokio::test]
+async fn base_url_credentials_travel_as_basic_auth_and_are_never_printed() {
+    // C-S2: `http://user:pass@host` is for a proxy in front of Dispatcharr. The pair goes in
+    // an Authorization header; the URL the client builds, quotes and logs never holds it.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/channels/groups/"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("nope"))
+        .mount(&server)
+        .await;
+    let address = server.address();
+    let with_credentials = format!("http://proxyuser:proxypass@{address}");
+    let client = DispatcharrClient::new(&config(&with_credentials)).expect("client");
+    assert_eq!(client.base(), format!("http://{address}/api"));
+    assert!(!format!("{client:?}").contains("proxypass"));
+
+    let error = client.groups().await.expect_err("404");
+    let message = format!("{error:#}");
+    assert!(!message.contains("proxypass"), "{message}");
+    assert!(!message.contains("proxyuser"), "{message}");
+
+    let requests = server.received_requests().await.expect("recorded");
+    let request = requests.last().expect("one request");
+    let authorizations: Vec<&str> = request
+        .headers
+        .get_all("authorization")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect();
+    assert!(
+        authorizations.contains(&"Basic cHJveHl1c2VyOnByb3h5cGFzcw=="),
+        "{authorizations:?}"
+    );
+    assert!(
+        authorizations.contains(&"ApiKey test-key"),
+        "{authorizations:?}"
+    );
+
+    // A transport error: reqwest's own message quotes the URL, so it is dropped before the
+    // context (which names the credential-free URL) is added.
+    let refused = DispatcharrClient::new(&DispatcharrConfig {
+        timeout_secs: 1,
+        ..config("http://proxyuser:CONNECT-SECRET@127.0.0.1:1")
+    })
+    .expect("client");
+    let error = refused
+        .groups()
+        .await
+        .expect_err("nothing listens on port 1");
+    let message = format!("{error:#}");
+    assert!(!message.contains("CONNECT-SECRET"), "{message}");
+    assert!(
+        message.contains("http://127.0.0.1:1/api/channels/groups/"),
+        "{message}"
+    );
+}
