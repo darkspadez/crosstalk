@@ -34,3 +34,6 @@ config/exports/
 
 # Planning scratch
 .remember/
+
+# Any extra cargo target directory (e.g. a profiling build with symbols)
+/target-*/
