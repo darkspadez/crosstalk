@@ -7,7 +7,8 @@
 //!
 //! Authentication is a bearer token: the one in `crosstalk.toml` (or its environment variable),
 //! sent as an `Authorization: Bearer` header by a script, or presented once to the login page,
-//! which answers with a server-side session cookie.
+//! which answers with a signed session cookie. The webhook can have a token of its own
+//! (`[hooks] token`), accepted on that route only.
 
 #![forbid(unsafe_code)]
 

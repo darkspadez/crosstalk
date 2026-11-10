@@ -166,16 +166,18 @@ runner labels (no `actionlint.yaml` lists them), as before the series. Nothing w
 
 ## Decisions I would revisit
 
-- **A9, the one-token rule for the webhook.** ADOPTED afterwards: `[hooks] token` is a
-  hook-only credential (see `docs/audit/A-web.md`, A9). The original note: Decided and
-  respected. The webhook now goes
-  through the same gate and limiter and refuses sessions, which is the strongest shape one
+- **A9, the one-token rule for the webhook.** ADOPTED afterwards in `3753591`: `[hooks] token`
+  is a hook-only credential (see `docs/audit/A-web.md`, A9). The original note: Decided and
+  respected. The webhook now goes through the same gate and limiter and refuses sessions, which is the strongest shape one
   token allows. But Dispatcharr Connect stores that token in its own database and sends it on
   every delivery; a leak there is the master token. A second, hook-only credential with the
   same limiter would confine that leak to "trigger a configured refresh". Worth revisiting once
   the first real install is behind a proxy.
-- **Sessions in memory.** A restart signs every browser out, which is the safe default and was
-  chosen knowingly; for a daemon that is restarted by every settings change that needs one, a
+- **Sessions in memory.** ADOPTED afterwards in the commit after `3753591` on
+  `fix/web-sessions-hook` ("web: signed session cookies that survive a restart"): signed
+  cookies under `<data_dir>/session.key`, sign-outs persisted in SQLite, `crosstalk sessions
+  revoke-all` (see `docs/audit/A-web.md`, A5). The original note: A restart signs every
+  browser out, which is the safe default and was chosen knowingly; for a daemon that is restarted by every settings change that needs one, a
   signed session cookie (HMAC of id + expiry under a startup key persisted in the data dir)
   would survive restarts without storing anything a leak could use.
 - **The `max_forget` cap as a hard refusal.** Kept, with the new exit, because the decision

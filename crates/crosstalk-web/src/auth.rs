@@ -2,8 +2,8 @@
 //!
 //! One master token, from `server.token` or the environment variable it names. A script sends it
 //! as `Authorization: Bearer <token>` on every request; a browser presents it once to the login
-//! page and gets a session (see [`crate::session`]), so the token itself never lives in a
-//! cookie.
+//! page and gets a signed session cookie (see [`crate::session`]), so the token itself never
+//! lives in a cookie.
 //!
 //! The Dispatcharr webhook can have its own: `[hooks] token`, accepted as a Bearer on
 //! `POST /hooks/dispatcharr` only and refused (401) everywhere else, so the credential Connect
@@ -507,12 +507,23 @@ pub async fn gate(
     // The webhook starts real work, so a browser session cannot trigger it by visiting a URL:
     // only the Bearer header counts there.
     if let (false, Some(expected)) = (is_hook, view.token.as_deref()) {
-        if let Some(id) = crate::session::session_id(request.headers()) {
-            if let Some(session) = state.sessions().touch(&id, expected) {
+        if let Some(cookie) = crate::session::cookie_value(request.headers()) {
+            if let Some(verified) = state.sessions().verify(&cookie, expected) {
                 request
                     .extensions_mut()
-                    .insert(Authenticated::Session(session));
-                return next.run(request).await;
+                    .insert(Authenticated::Session(verified.session));
+                let mut response = next.run(request).await;
+                // An active session's cookie carries its new last-seen bucket, at most once per
+                // bucket. Not on the way out: that response is clearing the cookie.
+                if let Some((value, max_age)) = verified.refreshed.filter(|_| path != "/logout") {
+                    let secure = view.secure_cookies || client.https;
+                    if let Ok(value) = header::HeaderValue::from_str(&crate::session::set_cookie(
+                        &value, max_age, secure,
+                    )) {
+                        response.headers_mut().append(header::SET_COOKIE, value);
+                    }
+                }
+                return response;
             }
         }
     }

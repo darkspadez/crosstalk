@@ -37,6 +37,8 @@ trusted_proxies = []
 # match it (scheme, host and port).
 # public_url = "https://crosstalk.example.com"
 public_url = ""
+# A browser that signs in gets a signed session cookie (12 h idle, 7 days at most) under the key
+# in [jobs] data_dir; changing this token signs every browser out.
 # Mark the session cookie Secure, and send Strict-Transport-Security, even when no
 # trusted proxy says the request came over https (both happen automatically when one does).
 secure_cookies = false
@@ -177,6 +179,10 @@ enabled_databases = ["US"]
 worker_threads = 0
 # Relative paths resolve against this file's directory.
 exports_dir = "exports"
+# The run store (crosstalk.db) and the web UI's session signing key (session.key, created 0600;
+# `serve` refuses to start while other accounts can read it). Browser sign-ins are signed
+# cookies under that key, so they survive a restart; `crosstalk sessions revoke-all` replaces
+# the key and signs everyone out.
 data_dir = "data"
 # Days of run history kept in the SQLite store. Pruned after each run finishes,
 # keeping at least the 10 newest runs per app. 0 keeps everything.

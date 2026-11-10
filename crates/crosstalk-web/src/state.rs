@@ -31,7 +31,7 @@ pub struct AppState {
     /// Per-client auth failure counting: wrong tokens on POST /login and wrong Bearer tokens on
     /// every route.
     login_limiter: Arc<crate::auth::LoginLimiter>,
-    /// Signed-in browsers.
+    /// The session signing key and the sign-out list.
     sessions: Arc<crate::session::Sessions>,
     /// Requests in flight, bounded by [`crate::limits::MAX_IN_FLIGHT`].
     in_flight: Arc<tokio::sync::Semaphore>,
@@ -57,6 +57,7 @@ impl std::fmt::Debug for AppState {
 impl AppState {
     pub fn new(registry: Registry, config: SharedConfig, runner: JobRunner, store: Store) -> Self {
         let hooks = crosstalk_core::hooks::Hooks::new(runner.clone());
+        let sessions = crate::session::Sessions::ephemeral(store.clone());
         Self {
             registry: Arc::new(registry),
             config,
@@ -65,7 +66,7 @@ impl AppState {
             scheduler: None,
             csrf_token: crate::csrf::generate_token(),
             login_limiter: Arc::new(crate::auth::LoginLimiter::default()),
-            sessions: Arc::new(crate::session::Sessions::default()),
+            sessions: Arc::new(sessions),
             in_flight: Arc::new(tokio::sync::Semaphore::new(crate::limits::MAX_IN_FLIGHT)),
             hooks,
             // The bound is read from the live configuration per delivery, so this limiter only
@@ -75,6 +76,14 @@ impl AppState {
                 std::time::Duration::from_secs(60),
             )),
         }
+    }
+
+    /// Sign sessions with the key in the data directory, so they survive a restart (see
+    /// [`crate::session::Sessions::open`]). Without this the key lives in memory and a restart
+    /// signs every browser out.
+    pub fn with_sessions(mut self, sessions: crate::session::Sessions) -> Self {
+        self.sessions = Arc::new(sessions);
+        self
     }
 
     /// Attach the armed scheduler so host settings saves can re-arm schedules.

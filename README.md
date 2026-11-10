@@ -233,6 +233,7 @@ carry `THIRD_PARTY_LICENSES`, the licence text of every Rust crate compiled in.
 | `crosstalk exports clear [--app <id>] [--yes]` | Delete the CSV reports the sub-apps wrote (the UI's **Clear exports** button does the same) |
 | `crosstalk bridge secret [--force] [--config <dir>]` | Generate the [bridge plugin](#bridge-plugin)'s shared secret, write it to `crosstalk.toml` `[bridge] secret` (0600) and print it once. Refuses when one is set (`--force` overwrites) or when `[bridge] secret_env` supplies it |
 | `crosstalk bridge rotate [--config <dir>]` | Replace the bridge secret and print the order to roll it into the plugin without breaking it |
+| `crosstalk sessions revoke-all [--config <dir>]` | Sign every browser out: replace the session key in `<data_dir>/session.key` (a running daemon notices on its next request). See [Web UI](#web-ui) |
 | `crosstalk ownership forget-deleted --app <id> [--config <dir>]` | Forget the objects an app created that Dispatcharr no longer has, however many. A run refuses to forget more than max(25, 5%) of what the app owns at once (a short listing, or a run against the wrong Dispatcharr, must never make the next create duplicate an install); after a deliberate mass deletion in Dispatcharr that refusal names this command. Each missing id is confirmed with its own GET and only a 404 forgets it; an empty listing is still refused |
 | `crosstalk bridge ping [--config <dir>]` | Send the bridge plugin a signed ping (even while `[bridge] enabled = false`) and say whether this crosstalk can use it |
 | `crosstalk bench streams --synthetic [--config <dir>] [--channels N --streams N --accounts N]` | Time the streams plans on a world built in memory: no network, no Dispatcharr. See [Scale](#scale) |
@@ -336,7 +337,9 @@ accident.
   Dispatcharr) is sent as HTTP basic auth and never printed: `validate`, errors and logs show
   the URL without it.
 - **File permissions.** The run store (`<data_dir>/crosstalk.db` and SQLite's `-wal`/`-shm`)
-  is made `0600` and its directory `0700` whenever it is opened; CSV reports are written
+  is made `0600` and its directory `0700` whenever it is opened; the session signing key
+  (`<data_dir>/session.key`) is created `0600` and `serve` refuses to start while other
+  accounts can access it; CSV reports are written
   `0600` into a `0700` exports directory; a settings save writes `0600`. `validate` and
   `serve` warn when `crosstalk.toml` or an app's `.toml` is readable by other accounts AND
   holds an inline secret (`chmod 600` it, or move the secret to the environment). Unix only.
@@ -1038,10 +1041,29 @@ The UI binds to `127.0.0.1` by default. To expose it, set `server.bind` and a `s
 of at least 32 bytes (`openssl rand -hex 32`); the daemon refuses to start on a non-loopback
 address without one, or with a shorter one. A browser signs in at `/login` with the token and
 gets a **session** cookie (`crosstalk_session`, `HttpOnly; SameSite=Strict`, plus `Secure`
-over https): a random id held in memory, never the token itself, which expires after 12 hours
-idle or 7 days at most, ends on **Sign out**, and ends on a token rotation or a daemon restart.
-A script sends `Authorization: Bearer <token>`; that header is the only way the token itself
-travels.
+over https), never the token itself. A script sends `Authorization: Bearer <token>`; that
+header is the only way the token itself travels.
+
+Sessions:
+
+- **Signed, not stored.** The cookie is a random session id with its issue time, last-seen
+  time and absolute expiry, signed with HMAC-SHA256 under a random 32-byte key in
+  `<data_dir>/session.key`. Nothing is kept per live session, so **a daemon restart (a settings
+  change that needs one, an upgrade) signs nobody out**.
+- **Expiry**: 12 hours idle, 7 days at most. An active browser's cookie is re-issued at most
+  once every 5 minutes to carry its last-seen time.
+- **Sign out** records the session id in the run store until the cookie would have expired,
+  so a copied cookie stops working at sign-out, across restarts too.
+- **Rotating the master token** signs every session out (the signature covers a digest of
+  it). **`crosstalk sessions revoke-all`** replaces the key and signs everyone out; a running
+  daemon picks the new key up on its next request.
+- **The key file** is created `0600` on first start. The daemon refuses to start while it is
+  accessible to other accounts (`chmod 600` it, or delete it to sign everyone out and get a
+  new one); if it goes missing or loose while running, every cookie is refused and sign-in
+  answers `503` until it is fixed. Anyone who can read it can forge a session, so treat the
+  data directory like the token.
+- Each session's CSRF token is derived from its id with the same key, so it too survives a
+  restart.
 
 Bots and scripts talk to the same routes the forms do, with two differences from a browser:
 

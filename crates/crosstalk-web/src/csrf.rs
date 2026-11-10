@@ -6,9 +6,9 @@
 //! a synchroniser token embedded as a hidden field in every server-rendered POST form, and
 //! checked on every request that is not a GET, HEAD or OPTIONS.
 //!
-//! Which token: a signed-in browser's session carries its own, random per session (see
-//! [`crate::session`]); a daemon with no auth token (loopback only) has no sessions and uses one
-//! random secret generated at startup.
+//! Which token: a signed-in browser's session carries its own, `HMAC(session key, "csrf" || id)`
+//! (see [`crate::session`]); a daemon with no auth token (loopback only) has no sessions and
+//! uses one random secret generated at startup.
 //!
 //! The token is accepted two ways: the `csrf_token` form field (what the templates send) or
 //! the `x-csrf-token` header (what scripts and the test suite send). `/login` is exempt: it is
@@ -45,10 +45,15 @@ pub const CSRF_HEADER: &str = "x-csrf-token";
 /// Generate the daemon's CSRF secret: 32 random bytes, hex-encoded.
 pub fn generate_token() -> String {
     let mut bytes = [0u8; 32];
-    if !os_random(&mut bytes) {
-        fallback_random(&mut bytes);
-    }
+    random_bytes(&mut bytes);
     hex(&bytes)
+}
+
+/// Fill `bytes` from the OS random source, or the fallback below when it is unavailable.
+pub fn random_bytes(bytes: &mut [u8]) {
+    if !os_random(bytes) {
+        fallback_random(bytes);
+    }
 }
 
 /// One OS random refill, reporting whether it worked.
