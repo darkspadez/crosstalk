@@ -281,13 +281,15 @@ impl Sessions {
             }
         }
         let bucket = now / refresh;
-        let refreshed = (bucket > claims.last_seen_bucket).then(|| {
-            let fresh = Claims {
-                last_seen_bucket: bucket,
-                ..claims
-            };
-            (sign(&key, token, &fresh), claims.expires_at - now)
-        });
+        // Written as a plain `if` rather than a closure: rustc 1.89 (the declared minimum)
+        // hits an internal compiler error on a closure capturing `Claims` here.
+        let refreshed = if bucket > claims.last_seen_bucket {
+            let mut fresh = claims;
+            fresh.last_seen_bucket = bucket;
+            Some((sign(&key, token, &fresh), claims.expires_at - now))
+        } else {
+            None
+        };
         Some(Verified {
             session,
             refreshed,
