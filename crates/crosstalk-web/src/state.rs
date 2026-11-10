@@ -25,10 +25,16 @@ pub struct AppState {
     /// The armed scheduler, shared with the serve path. Present in the daemon so a host
     /// settings save can re-arm schedules; absent in tests and one-shot contexts.
     pub scheduler: Option<Arc<tokio::sync::Mutex<Scheduler>>>,
-    /// Random secret generated at startup; every POST form carries it back.
+    /// Random secret generated at startup, the CSRF token of a daemon with no auth token
+    /// (signed-in browsers carry their session's own instead).
     csrf_token: String,
-    /// Per-IP sign-in failure counting for POST /login.
+    /// Per-client auth failure counting: wrong tokens on POST /login and wrong Bearer tokens on
+    /// every route.
     login_limiter: Arc<crate::auth::LoginLimiter>,
+    /// Signed-in browsers.
+    sessions: Arc<crate::session::Sessions>,
+    /// Requests in flight, bounded by [`crate::limits::MAX_IN_FLIGHT`].
+    in_flight: Arc<tokio::sync::Semaphore>,
     /// The Dispatcharr Connect webhook's debouncer and trigger.
     hooks: Arc<crosstalk_core::hooks::Hooks>,
     /// Per-IP delivery counting for the webhook route, on the same sliding-window counter the
@@ -59,6 +65,8 @@ impl AppState {
             scheduler: None,
             csrf_token: crate::csrf::generate_token(),
             login_limiter: Arc::new(crate::auth::LoginLimiter::default()),
+            sessions: Arc::new(crate::session::Sessions::default()),
+            in_flight: Arc::new(tokio::sync::Semaphore::new(crate::limits::MAX_IN_FLIGHT)),
             hooks,
             // The bound is read from the live configuration per delivery, so this limiter only
             // owns the count: its own maximum is deliberately wide open.
@@ -86,14 +94,38 @@ impl AppState {
         self.config.read().server.resolved_token()
     }
 
-    /// The CSRF secret POSTs must carry back, via form field or header.
+    /// The daemon-wide CSRF secret: what POSTs carry back on a daemon with no auth token.
     pub fn csrf_token(&self) -> &str {
         &self.csrf_token
     }
 
-    /// The sign-in failure limiter POST /login checks.
+    /// The auth failure limiter the gate and POST /login check.
     pub fn login_limiter(&self) -> &crate::auth::LoginLimiter {
         &self.login_limiter
+    }
+
+    /// The signed-in browsers.
+    pub fn sessions(&self) -> &crate::session::Sessions {
+        &self.sessions
+    }
+
+    /// The in-flight request bound.
+    pub fn in_flight(&self) -> &Arc<tokio::sync::Semaphore> {
+        &self.in_flight
+    }
+
+    /// The listener's security settings from the CURRENT config, read once per request.
+    pub fn server_view(&self) -> ServerView {
+        let config = self.config.read();
+        let server = &config.server;
+        ServerView {
+            token: server.resolved_token(),
+            trusted: server.trusted_cidrs(),
+            public_origin: server.public_origin(),
+            secure_cookies: server.secure_cookies,
+            hsts: server.hsts,
+            bind: server.bind.clone(),
+        }
     }
 
     /// The webhook route's debouncer and trigger.
@@ -104,6 +136,51 @@ impl AppState {
     /// The per-address delivery limiter the webhook route checks.
     pub fn hook_limiter(&self) -> &crate::auth::LoginLimiter {
         &self.hook_limiter
+    }
+}
+
+/// The `[server]` settings a request is judged by, read once per request (the outermost layer
+/// computes it and the inner ones reuse it from the request's extensions).
+#[derive(Debug, Clone)]
+pub struct ServerView {
+    pub token: Option<String>,
+    pub trusted: Vec<crosstalk_core::net::Cidr>,
+    pub public_origin: Option<String>,
+    pub secure_cookies: bool,
+    pub hsts: bool,
+    pub bind: String,
+}
+
+impl ServerView {
+    /// The view the outer layer attached to this request, or a fresh one.
+    pub fn of_request(state: &AppState, request: &axum::extract::Request) -> Arc<ServerView> {
+        request
+            .extensions()
+            .get::<Arc<ServerView>>()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(state.server_view()))
+    }
+}
+
+/// The CSRF token the page being rendered must embed: the signed-in session's own, or the
+/// daemon-wide one when there is no session (a daemon with no token, or a Bearer script).
+#[derive(Debug, Clone)]
+pub struct CsrfToken(pub String);
+
+#[axum::async_trait]
+impl axum::extract::FromRequestParts<AppState> for CsrfToken {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(CsrfToken(
+            match parts.extensions.get::<crate::auth::Authenticated>() {
+                Some(crate::auth::Authenticated::Session(session)) => session.csrf.clone(),
+                _ => state.csrf_token().to_string(),
+            },
+        ))
     }
 }
 
@@ -134,6 +211,10 @@ pub struct UiAction {
     /// Whether it writes, and so is worth offering "start fresh" for.
     pub writing: bool,
     pub disabled: bool,
+    /// The action's single free-text input, when it declares one: label and help for the
+    /// text field the action button renders.
+    pub input_label: Option<String>,
+    pub input_help: Option<String>,
 }
 
 /// One workflow, as the dashboard lists it.
@@ -142,6 +223,8 @@ pub struct UiWorkflow {
     pub name: String,
     /// The steps, ` → `-joined.
     pub steps: String,
+    /// Each step with its scope override and failure policy, for the steps table.
+    pub step_details: Vec<UiStep>,
     /// How many steps the entry has, for the Run button's confirmation text.
     pub step_count: usize,
     /// Whether a new pass discards each step's saved progress.
@@ -154,6 +237,17 @@ pub struct UiWorkflow {
     pub busy: bool,
     /// Whether a run of it would change nothing, which decides whether the form confirms.
     pub dry_run: bool,
+}
+
+/// One workflow step, as the dashboard's steps table and a run page's planned steps list it.
+#[derive(Debug, Clone)]
+pub struct UiStep {
+    /// The `<app>.<action>` the step runs.
+    pub action: String,
+    /// How the step's scope override reads (`scope "lineup"`, `scope groups ...`), if any.
+    pub scope: Option<String>,
+    /// Whether the workflow continues past this step's failure.
+    pub continue_on_failure: bool,
 }
 
 /// The `[hooks]` table, as the dashboard shows it (read-only).
@@ -186,6 +280,15 @@ pub fn workflows(runner: &JobRunner, config: &CrosstalkConfig, store: &Store) ->
             UiWorkflow {
                 name: info.name.clone(),
                 steps: info.steps.join(" → "),
+                step_details: info
+                    .details
+                    .iter()
+                    .map(|detail| UiStep {
+                        action: detail.action.clone(),
+                        scope: detail.scope.clone(),
+                        continue_on_failure: detail.continue_on_failure,
+                    })
+                    .collect(),
                 step_count: info.steps.len(),
                 fresh: info.fresh,
                 error: info.error,
@@ -247,10 +350,70 @@ pub fn steps_of(store: &Store, run: &RunRecord) -> Vec<RunRecord> {
     store.child_runs(run.id).unwrap_or_default()
 }
 
+/// A workflow run's PLANNED steps: each step with its scope override and failure policy.
+///
+/// The executed steps (see [`steps_of`]) carry each step's outcome; these carry the plan —
+/// which step reads which channels and which failures the workflow carries past — so the
+/// run page shows both. Empty for an ordinary run, or when the configuration no longer
+/// names the workflow.
+pub fn planned_steps(config: &CrosstalkConfig, run: &RunRecord) -> Vec<UiStep> {
+    if run.app != crosstalk_core::workflow::APP_ID {
+        return Vec::new();
+    }
+    config
+        .workflows
+        .get(&run.action)
+        .and_then(|entry| crosstalk_core::workflow::Workflow::from_entry(&run.action, entry).ok())
+        .map(|workflow| {
+            workflow
+                .steps
+                .iter()
+                .map(|step| UiStep {
+                    action: step.label(),
+                    scope: step.scope.as_ref().map(|scope| scope.describe()),
+                    continue_on_failure: step.continue_on_failure,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The workflow run a step belongs to, when it belongs to one.
 pub fn parent_of(store: &Store, run: &RunRecord) -> Option<RunRecord> {
     let parent = run.parent_run_id?;
     store.run(parent).ok().flatten()
+}
+
+/// Whether this run is itself an undo (preview or apply).
+pub fn is_undo_run(run: &RunRecord) -> bool {
+    run.action == crosstalk_core::undo::ACTION_UNDO
+}
+
+/// Whether the run page offers "Undo this run".
+///
+/// Exactly the host's own refusal check ([`crosstalk_core::undo::check_target`]): a
+/// finished, non-preview run of a known app with `ok` channel rows. Previews, live and
+/// paused runs, workflow runs (their steps are undone one by one), probes and other runs
+/// with no channel write never qualify. Failed and cancelled runs do, row by row, for the
+/// rows that landed. This is the eligibility check, not the chain rule: a run whose rows
+/// have all been superseded still offers the button, and its preview reports every row
+/// left alone. Undo runs qualify too, so undoing an undo (the redo) is one more click.
+pub fn undo_eligible(registry: &Registry, store: &Store, run: &RunRecord) -> bool {
+    crosstalk_core::undo::check_target(store, registry, run.id).is_ok()
+}
+
+/// The undo runs that reversed this run, newest first.
+///
+/// An undone run lists them so an operator can follow the chain in either direction: the
+/// undo run's page links back through its parent, this lists the other way.
+pub fn undo_runs(store: &Store, run: &RunRecord) -> Vec<RunRecord> {
+    store
+        .child_runs(run.id)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(is_undo_run)
+        .rev()
+        .collect()
 }
 
 /// One setting field, ready to render.
@@ -357,6 +520,8 @@ pub fn actions(registry: &Registry, runner: &JobRunner, app_id: &str) -> Vec<UiA
                 // An unguarded action is never disabled by another run: the guard does not
                 // apply to it.
                 disabled: busy && !action.unguarded,
+                input_label: action.input.map(|input| input.label.to_string()),
+                input_help: action.input.map(|input| input.help.to_string()),
             })
             .collect(),
         None => Vec::new(),
@@ -397,6 +562,8 @@ pub fn fields(schema: &SettingsSchema, values: &SettingsValues) -> Vec<UiField> 
                     serde_json::to_string_pretty(map).unwrap_or_else(|_| "{}".to_string()),
                     false,
                 ),
+                // The value of a secret field is its status line, never the secret.
+                (FieldKind::Secret, value) => ("secret".to_string(), value.render(), false),
                 (_, value) => ("text".to_string(), value.render(), false),
             };
 
@@ -574,6 +741,8 @@ pub fn values_from_form(
             FieldKind::Text | FieldKind::Info => {
                 values.insert(field.id, FieldValue::Text(raw.cloned().unwrap_or_default()));
             }
+            // A form never sets a secret, whatever it submits.
+            FieldKind::Secret => {}
         }
     }
 
@@ -756,6 +925,7 @@ mod tests {
             counts: serde_json::json!({"matched": 3, "skipped": 0}),
             report_path: None,
             parent_run_id: None,
+            action_input: None,
         };
         assert_eq!(counts(&run), vec![("matched".to_string(), 3)]);
     }

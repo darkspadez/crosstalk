@@ -12,6 +12,7 @@ pub fn builtin() -> Registry {
     Registry::new(vec![
         Arc::new(crosstalk_guide::GuideApp::new()),
         Arc::new(crosstalk_streams::StreamsApp::new()),
+        Arc::new(crosstalk_lineup::LineupApp::new()),
     ])
 }
 
@@ -26,6 +27,53 @@ mod tests {
         assert_eq!(app.name(), "Guide");
         assert!(!app.actions().is_empty());
         assert!(!app.schema().fields().is_empty());
+    }
+
+    #[test]
+    fn lineup_is_linked_in() {
+        // Step 13 registered `validate` and `status`; step 14 adds the `clean_*`
+        // pair and `test_name`; step 15 adds the `names_*` pair; step 16 adds the
+        // `categorize_*` and `logos_*` pairs; step 17 adds the `create_*` pair. The later
+        // pairs land with step 18.
+        let registry = builtin();
+        let app = registry.get("lineup").expect("lineup is linked");
+        assert_eq!(app.name(), "Lineup");
+        assert!(app.description().contains("channel list"));
+        let ids: Vec<&str> = app.actions().iter().map(|action| action.id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "validate",
+                "status",
+                "clean_preview",
+                "clean_apply",
+                "test_name",
+                "names_preview",
+                "names_apply",
+                "categorize_preview",
+                "categorize_apply",
+                "logos_preview",
+                "logos_apply",
+                "create_preview",
+                "create_apply",
+                "sync_preview",
+                "sync_apply",
+                "tidy_preview",
+                "tidy_apply"
+            ]
+        );
+        // Every section of the plan's settings layout is in the form.
+        let sections: Vec<&str> = app.schema().sections().map(|s| s.label).collect();
+        assert_eq!(
+            sections,
+            vec!["Clean", "Names", "Categorize", "Logos", "Create", "Sync",]
+        );
+        assert_eq!(
+            app.settings_path(std::path::Path::new("/config")),
+            std::path::Path::new("/config/lineup.toml")
+        );
+        // The named scope workflow steps scope to: `scope = "lineup"`.
+        assert!(registry.provides_named_scope("lineup"));
     }
 
     #[test]

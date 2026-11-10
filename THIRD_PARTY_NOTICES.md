@@ -177,10 +177,271 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-## The parity gates and the drift report, over all three references
+## Channel-Mapparr (Dispatcharr-Channel-Maparr-Plugin)
+
+- Upstream: <https://github.com/PiratesIRC/Dispatcharr-Channel-Maparr-Plugin>
+- Licence: MIT, Copyright (c) 2025 Pirates IRC (full text below)
+- Ported from, and where it lives: these are the reference files for the `lineup` sub-app,
+  planned in phase 3 (`plans/phase-3-lineup.md`). This list is the one
+  `scripts/upstream_drift.sh` watches for this reference, and it is the same list
+  below: a file credited here is a file whose upstream change may matter.
+  - `Channel-Maparr/plugin.py` → `crates/lineup` (`names_*`, `categorize_*`, `logos_*`,
+    `create_*`).
+  - `Channel-Maparr/fuzzy_matcher.py`, `matching_core.py` and `aliases.py` →
+    `crates/crosstalk-matching`: the unified matcher (normalisation, callsign ladder,
+    alias tables) and the channel database behind it.
+  - `Channel-Maparr/logo_matcher.py` → the unified logo resolver.
+  - `Channel-Maparr/channel_seeder.py` → `create_*` (the stations mode).
+  - `Channel-Maparr/market_index.py` and `station_affiliation.py` → OTA naming (market
+    fallback, affiliation parse).
+  - `Channel-Maparr/group_scope.py` and `wildcard_match.py` → lineup scope handling
+    (group scope and its wildcard patterns).
+  - `Channel-Maparr/plugin.json` → `crates/lineup/src/settings.rs`: the `lineup.toml`
+    schema follows the plugin's field ids, labels and help text.
+  - `Channel-Maparr/*_channels.json` (AU, BR, CA, DE, ES, FR, IN, MX, NL, NO, PL, UK,
+    US) and `Channel-Maparr/networks*.json` (`networks.json`,
+    `networks_supplemental.json`) → the merged channel database and network tables the
+    unified matcher uses.
+
+### Reference pin
+
+The plugin is a git submodule at `reference/Dispatcharr-Channel-Maparr-Plugin`, pinned so
+the parity harnesses always compare against one exact revision:
+
+    45ba787f55094f01d6b78ebaff8a35e772200846   Release 1.26.2971911
+
+`git submodule status` in a checkout is authoritative. `scripts/upstream_drift.sh` lists what
+upstream has changed since that commit in the files crosstalk ports.
+
+### Licence text, verbatim from the plugin's `LICENSE`
+
+MIT License
+
+Copyright (c) 2025 Pirates IRC
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+## Lineuparr (Dispatcharr-Lineuparr-Plugin)
+
+- Upstream: <https://github.com/PiratesIRC/Dispatcharr-Lineuparr-Plugin>
+- Licence: MIT, Copyright (c) 2026 Pirates IRC (full text below)
+- Ported from, and where it lives: these are the reference files for the `lineup` sub-app,
+  planned in phase 3 (`plans/phase-3-lineup.md`). This list is the one
+  `scripts/upstream_drift.sh` watches for this reference, and it is the same list
+  below: a file credited here is a file whose upstream change may matter.
+  - `Lineuparr/plugin.py` → `crates/lineup` (`sync_*`, `tidy_*`, the `logos` tier order
+    through the unified logo resolver) and the lineup mode of `streams.match`.
+  - `Lineuparr/fuzzy_matcher.py`, `matching_core.py` and `aliases.py` →
+    `crates/crosstalk-matching`: the unified matcher's alias and candidate scoring behind
+    the lineup mode's oracle comparisons.
+  - `Lineuparr/logo_matcher.py` → the unified logo resolver.
+  - `Lineuparr/plugin.json` → `crates/lineup/src/settings.rs`: the `lineup.toml`
+    schema follows the plugin's field ids, labels and help text.
+  - `Lineuparr/*_lineup.json` (the 29 lineup files) → the vendored lineup files under
+    `data/merged/lineups/` (see the merged-data section below).
+
+### Reference pin
+
+The plugin is a git submodule at `reference/Dispatcharr-Lineuparr-Plugin`, pinned so the
+parity harnesses always compare against one exact revision:
+
+    9f6a5ff8c0290b19bfffcf56d047052194730ac5   Release v1.26.3052143
+
+`git submodule status` in a checkout is authoritative. `scripts/upstream_drift.sh` lists what
+upstream has changed since that commit in the files crosstalk ports.
+
+### Licence text, verbatim from the plugin's `LICENSE`
+
+MIT License
+
+Copyright (c) 2026 Pirates IRC
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+## Channel Name Cleaner (dispatcharr-channel-name-cleaner)
+
+- Upstream: <https://github.com/noodlemctwoodle/dispatcharr-channel-name-cleaner>
+- Licence: MIT, Copyright (c) 2026 noodlemctwoodle (full text below)
+- Ported from, and where it lives: these are the reference files for the `lineup` sub-app,
+  planned in phase 3 (`plans/phase-3-lineup.md`). This list is the one
+  `scripts/upstream_drift.sh` watches for this reference, and it is the same list
+  below: a file credited here is a file whose upstream change may matter.
+  - `channel_name_cleaner/plugin.py` → `crates/lineup` (`clean_*`, `test_name`, the
+    generic host `undo`).
+  - `channel_name_cleaner/plugin.json` → `crates/lineup/src/settings.rs`: the clean
+    section of `lineup.toml` follows the plugin's field ids, labels and help text.
+
+### Reference pin
+
+The plugin is a git submodule at `reference/dispatcharr-channel-name-cleaner`, pinned so
+the parity harnesses always compare against one exact revision:
+
+    d68b195bab6a9ef8e540954eea74620bed0f42a5   Rewrite README: full docs (features, install, usage, settings, safety); no emojis
+
+`git submodule status` in a checkout is authoritative. `scripts/upstream_drift.sh` lists what
+upstream has changed since that commit in the files crosstalk ports.
+
+### Licence text, verbatim from the plugin's `LICENSE`
+
+MIT License
+
+Copyright (c) 2026 noodlemctwoodle
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+## Merged data set (`data/merged/`)
+
+Phase 3 (`plans/phase-3-lineup.md`, step 4) replaces the per-plugin tables with one
+merged data set, built by `scripts/data/build_merged.py` from the pinned checkouts
+above and reproducible byte for byte (`build_merged.py --check`, enforced in CI).
+Provenance per input file (path, sha256, header date), duplicates merged, field
+conflicts with both values and the winner, case-variant names, and per-plugin
+uniques are logged in `data/merged/PROVENANCE.json`, multi-canonical aliases in
+`data/merged/alias_conflicts.json`; the human-readable companion is
+`docs/data-merge-report.md`. Nothing here is newly authored: every record traces to
+one of the plugin files credited in the sections above.
+
+- `data/merged/channels/<CC>.json` (16 countries): the union of EPG Janitor's 12
+  `*_channels.json` files, Stream-Mapparr's 16 (adds DO/PE/PL/PT plus a `zones`
+  array on 31 US entries) and Channel-Mapparr's 13 (shares PL with Stream-Mapparr;
+  otherwise a same-or-older subset that contributes no name of its own),
+  deduplicated on the verbatim `channel_name` with a sorted `sources` list per
+  entry (case-only variants such as `Afro`/`AFRO` stay separate, as upstream). Newest file version wins
+  header and field conflicts. Compiled in behind `crosstalk-matching::data::merged`
+  and read by lineup's `names` and `categorize`; the per-plugin files under
+  `data/channels/` and `data/stream-mapparr/` still ship: streams' country filter
+  reads them (Stream-Mapparr's own file where it has one, else EPG Janitor's), and
+  they define the codes `[matching] enabled_databases` accepts.
+- `data/merged/stations.json`: Channel-Mapparr's `networks.json` (6,839 FCC
+  stations, 2026-08-10 LMS dump) plus `networks_supplemental.json` (WGCL) with
+  `scripts/networks_corrections.json` applied (WBMA-LD), keyed by full callsign
+  with per-entry `sources`. Stream-Mapparr's `networks.json` (1,915) is
+  byte-identical to Channel-Mapparr's pre-rebuild table, so it contributes no
+  record: its 269 differing fields resolve to Channel-Mapparr's newer values and
+  its 43 extra rows (cancelled licences that rebuild dropped) stay dropped; both
+  are listed in the provenance. EPG Janitor's `us_station_callsigns.json` is
+  folded in as the `callsign_allowlist` array (3,037 callsigns, every one resolving to a merged
+  station under the core `normalize_callsign` base form).
+- `data/merged/aliases.json`: the union of the four `aliases.py`
+  `CHANNEL_ALIASES` tables (Janitor 204 canonicals, Stream-Mapparr 198,
+  Channel-Mapparr 226, Lineuparr 297) as canonical -> aliases with per-alias
+  `sources`, plus the per-country `COUNTRY_ALIASES` unions (DO/PE from
+  Stream-Mapparr and Lineuparr; AU/FR/CA from Lineuparr). Every claim is kept;
+  the 136 alias values listed under two or more canonicals (12 disputed between
+  plugins) are recorded in `data/merged/alias_conflicts.json` for the corpus
+  step to decide.
+- `data/merged/lineups/` (29 files, 7,485 channels): Lineuparr's `*_lineup.json`
+  files copied verbatim (schema in `data/merged/lineups/README.md`).
+The merged set is compiled into the binary (`include_str!`), which is why the
+Dockerfile's build stage copies `data/`; the runtime image carries no separate data files.
+
+## tv-logos (`tv-logo/tv-logos`): a test fixture, not shipped
+
+`scripts/data/tv_logos_tree.json` is a recorded listing of the `tv-logo/tv-logos` git
+tree: `main` at `d32e347bb7c4c640dceec23957802ad9182f58a6`, recorded 2026-11-07, the
+5,892 blob paths under the `countries/<dir>/` directories Channel-Mapparr's
+`COUNTRY_DIR_MAP` names (plus `nordic/norway`). It holds paths only, no images. The logos
+oracle (`scripts/oracle_report_lineup_logos.py`) reads it so the plugins' matchers and the
+Rust resolver score the same files, offline and reproducibly (CI's `--check`).
+
+The repository publishes no licence (no `LICENSE` file; GitHub reports none), so by
+default its owners reserve all rights. The fixture copies no logo, only the file names
+and directory layout, which are largely factual (`cnn-us.png`); the residual risk is that
+the listing as a whole is a compilation its owners could object to. Mitigations: it lives
+under `scripts/` and is used only by the oracle: it is not compiled in and ships in
+neither the release tarball nor the image. A smaller hand-picked subset was rejected
+because the oracle compares fuzzy best-of-directory matches, which only mean something over
+the real directories. If the owners object, or a licence that forbids it appears, delete
+the file and regenerate it locally instead of committing it: fetch
+`https://api.github.com/repos/tv-logo/tv-logos/git/trees/main?recursive=1`, keep the
+`blob` entries whose path starts with one of those `countries/<dir>/` prefixes as
+`{"path", "type"}` objects under `tree` (with `truncated` and a `_recorded` note), then
+rerun the oracle without `--check` and re-attribute any new difference.
+
+At runtime crosstalk vendors nothing from the repository either: the resolver fetches
+one recursive tree through the fetch cache (24 h TTL, unauthenticated, offline between
+refreshes), and a chosen logo is created on Dispatcharr by its raw GitHub URL, exactly as
+both plugins did.
+
+## Rust crates (`THIRD_PARTY_LICENSES`)
+
+The binary statically links the Rust crates in `Cargo.lock`. Their licence texts are not
+kept in this file: `cargo about generate about.hbs` (`about.toml`, run by `build.yml`)
+writes them to `THIRD_PARTY_LICENSES`, which ships next to this file in the release
+tarball and in the image under `/usr/share/doc/crosstalk/`. The licences allowed in the
+tree are the list in `deny.toml`, which CI enforces with `cargo deny check licenses`.
+
+## The container image: Alpine Linux and ffmpeg
+
+The image is built on Alpine Linux 3.22 (`Dockerfile`, pinned by digest) and installs
+Alpine's own `ffmpeg` package (which provides `ffprobe`) with `apk`; crosstalk runs both
+as separate programs and links nothing from them. At the time of writing the package is
+`ffmpeg` 6.1.2-r2 from Alpine 3.22's `community` repository (check a given image with
+`docker run --rm --entrypoint apk ghcr.io/darkspadez/crosstalk info -v ffmpeg`).
+
+Alpine builds ffmpeg with `--enable-gpl` (plus `libx264` and `libx265`, both GPL), so the
+package's licence metadata is **GPL-2.0-or-later AND LGPL-2.1-or-later** and the program as
+built is distributed under the GPL (`apk info -a ffmpeg` in the image shows the licence
+field; `ffmpeg -buildconf` shows the configure flags). The exact source and build recipe
+are Alpine's aports for that release:
+<https://gitlab.alpinelinux.org/alpine/aports/-/tree/3.22-stable/community/ffmpeg>
+(`APKBUILD` names the upstream tarball from <https://ffmpeg.org/releases/> and every
+patch). crosstalk redistributes the package unmodified, and its corresponding source is
+available from Alpine at that URL. The other Alpine packages in the image carry their own
+licences, shown the same way (`apk info -a <package>`).
+
+## The parity gates and the drift report, over all six references
 
 The parity gates in `scripts/` compare crosstalk against each plugin at its pinned commit, and
 `README.md` lists every place where crosstalk deliberately behaves differently.
 `scripts/upstream_drift.sh` reports, per reference and with that reference's own list of
-ported paths, what upstream has changed since the pin — the three lists are the file lists in
+ported paths, what upstream has changed since the pin — the six lists are the file lists in
 the sections above, so a file credited here is a file the drift report watches.

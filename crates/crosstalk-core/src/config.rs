@@ -16,7 +16,9 @@
 //! A sub-app's own thresholds and filters live in its own file.
 //!
 //! Secrets can be written inline or named through `*_env`, which is what a container
-//! deployment wants. Loading never logs a secret value.
+//! deployment wants; when both are set the environment wins (and `validate` says so).
+//! Loading never logs a secret value, and the `Debug` output of every section holding one
+//! prints `<redacted>` in its place.
 //!
 //! Write-back goes through `toml_edit` so comments and ordering in the operator's file
 //! survive an edit made in the web UI; a round trip through `toml` would silently drop
@@ -48,8 +50,17 @@ where
     })
 }
 
+/// What a secret field prints as in `Debug` output: whether it is set, never its value.
+fn redacted(secret: &str) -> &'static str {
+    if secret.trim().is_empty() {
+        ""
+    } else {
+        "<redacted>"
+    }
+}
+
 /// Where the daemon listens, and how it authenticates.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
     /// Interface to bind. Localhost by default, so an unconfigured daemon is not exposed.
@@ -59,9 +70,44 @@ pub struct ServerConfig {
     /// only safe while `bind` is a loopback address.
     #[serde(deserialize_with = "string_or_scalar")]
     pub token: String,
-    /// Read the token from this environment variable instead of the file.
+    /// Read the token from this environment variable. When the variable is set and not
+    /// blank it wins over `token`, so a token can be rotated without editing the file.
     #[serde(deserialize_with = "string_or_scalar")]
     pub token_env: String,
+    /// Reverse proxies allowed to name the client: CIDR ranges (`10.0.0.0/8`, `::1/128`) or bare
+    /// addresses. Only a request whose socket peer is in one of these has its
+    /// `X-Forwarded-For` / `X-Real-IP` / `X-Forwarded-Proto` / `X-Forwarded-Host` honoured;
+    /// everyone else's forwarding headers are ignored. Non-empty requires a token.
+    pub trusted_proxies: Vec<String>,
+    /// The URL browsers use to reach the UI (`https://crosstalk.example.com`), when a proxy
+    /// rewrites `Host`. A POST's `Origin` must match it. Empty means "work it out from the
+    /// trusted proxy's `X-Forwarded-*` headers, else `Host`".
+    #[serde(deserialize_with = "string_or_scalar")]
+    pub public_url: String,
+    /// Always mark the session cookie `Secure`. It is also marked whenever a trusted proxy
+    /// says the request arrived over https.
+    pub secure_cookies: bool,
+    /// Always send `Strict-Transport-Security`. It is also sent whenever a trusted proxy says
+    /// the request arrived over https.
+    pub hsts: bool,
+}
+
+impl std::fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerConfig")
+            .field("bind", &self.bind)
+            .field("port", &self.port)
+            .field("token", &redacted(&self.token))
+            .field("token_env", &self.token_env)
+            .field("trusted_proxies", &self.trusted_proxies)
+            .field(
+                "public_url",
+                &crate::redact::urls_to_hosts(&self.public_url),
+            )
+            .field("secure_cookies", &self.secure_cookies)
+            .field("hsts", &self.hsts)
+            .finish()
+    }
 }
 
 impl Default for ServerConfig {
@@ -71,9 +117,17 @@ impl Default for ServerConfig {
             port: 8730,
             token: String::new(),
             token_env: "CROSSTALK_TOKEN".to_string(),
+            trusted_proxies: Vec::new(),
+            public_url: String::new(),
+            secure_cookies: false,
+            hsts: false,
         }
     }
 }
+
+/// The shortest token a reachable daemon accepts: 32 bytes, the length of
+/// `openssl rand -hex 16` and well past anything guessable at the limiter's rate.
+pub const MIN_TOKEN_BYTES: usize = 32;
 
 impl ServerConfig {
     /// The token to require, resolved from the environment first.
@@ -83,16 +137,84 @@ impl ServerConfig {
 
     /// Whether the bind address is a loopback address.
     pub fn is_loopback(&self) -> bool {
-        let bind = self.bind.trim();
-        bind == "localhost" || bind.starts_with("127.") || bind == "::1" || bind == "[::1]"
+        crate::net::is_loopback_bind(&self.bind)
+    }
+
+    /// The trusted proxy ranges. Entries that do not parse are dropped here; [`Self::security_errors`]
+    /// reports them, and the daemon refuses to start (or to reload) while any remain.
+    pub fn trusted_cidrs(&self) -> Vec<crate::net::Cidr> {
+        self.trusted_proxies
+            .iter()
+            .filter_map(|entry| crate::net::Cidr::parse(entry).ok())
+            .collect()
+    }
+
+    /// `public_url` as a normalised origin (`https://host:443`), when it is set and valid.
+    pub fn public_origin(&self) -> Option<String> {
+        let url = self.public_url.trim();
+        if url.is_empty() {
+            None
+        } else {
+            crate::net::url_origin(url)
+        }
+    }
+
+    /// What makes this listener unsafe to run, as errors: the daemon refuses to start with any,
+    /// and a settings save refuses to swap such a configuration in.
+    ///
+    /// * every `trusted_proxies` entry must parse as an address or CIDR range;
+    /// * trusted proxies mean the daemon is reachable from elsewhere, so a token is required;
+    /// * a token on a reachable daemon (non-loopback bind, or behind a proxy) is at least
+    ///   [`MIN_TOKEN_BYTES`] long, because it is the only thing between the internet and an
+    ///   apply;
+    /// * `public_url`, when set, is an `http(s)://host[:port]` URL.
+    pub fn security_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if let Err(bad) = crate::net::parse_cidrs(&self.trusted_proxies) {
+            for error in bad {
+                errors.push(format!(
+                    "server.trusted_proxies: {error} (use an address like 10.0.0.2 or a range \
+                     like 172.16.0.0/12)"
+                ));
+            }
+        }
+        let token = self.resolved_token();
+        let proxied = !self.trusted_proxies.is_empty();
+        if proxied && token.is_none() {
+            errors.push(
+                "server.trusted_proxies is set but no token is configured: a daemon behind a \
+                 reverse proxy is reachable from outside this host, so set server.token or \
+                 server.token_env"
+                    .to_string(),
+            );
+        }
+        if let Some(token) = &token {
+            if token.len() < MIN_TOKEN_BYTES && (proxied || !self.is_loopback()) {
+                errors.push(format!(
+                    "server.token is {} bytes; a daemon reachable from outside this host (a \
+                     non-loopback bind or trusted_proxies) needs at least {MIN_TOKEN_BYTES}. \
+                     Generate one with `openssl rand -hex 32`.",
+                    token.len()
+                ));
+            }
+        }
+        if !self.public_url.trim().is_empty() && self.public_origin().is_none() {
+            errors.push(format!(
+                "server.public_url {:?} must be an http:// or https:// URL with a host",
+                self.public_url.trim()
+            ));
+        }
+        errors
     }
 }
 
 /// How to reach Dispatcharr.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DispatcharrConfig {
-    /// Base URL, without the `/api` suffix: `http://dispatcharr:9191`.
+    /// Base URL, without the `/api` suffix: `http://dispatcharr:9191`. A `user:pass@` in it
+    /// (for a reverse proxy in front of Dispatcharr) is sent as HTTP basic auth and never
+    /// printed: see [`DispatcharrConfig::api_root`].
     #[serde(deserialize_with = "string_or_scalar")]
     pub base_url: String,
     /// API key, sent as `X-API-Key`. Preferred: it does not expire.
@@ -109,8 +231,24 @@ pub struct DispatcharrConfig {
     pub password_env: String,
     /// Per-request timeout.
     pub timeout_secs: u64,
-    /// Cap on concurrent HTTP requests, for the programme-data checks and the AI calls.
+    /// Cap on concurrent HTTP requests, for the programme-data checks, the AI calls and
+    /// lineup's channel writes (lineup has no write-concurrency knob of its own).
     pub concurrency: usize,
+}
+
+impl std::fmt::Debug for DispatcharrConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DispatcharrConfig")
+            .field("base_url", &split_userinfo(self.base_url.trim()).0)
+            .field("api_key", &redacted(&self.api_key))
+            .field("api_key_env", &self.api_key_env)
+            .field("username", &self.username)
+            .field("password", &redacted(&self.password))
+            .field("password_env", &self.password_env)
+            .field("timeout_secs", &self.timeout_secs)
+            .field("concurrency", &self.concurrency)
+            .finish()
+    }
 }
 
 impl Default for DispatcharrConfig {
@@ -137,14 +275,28 @@ impl DispatcharrConfig {
         resolve_secret(&self.password, &self.password_env)
     }
 
-    /// The API root every request is built from.
+    /// The API root every request is built from, without the `user:pass@` the base URL may
+    /// carry: that travels as basic auth ([`Self::base_url_userinfo`]), so this is what may
+    /// be printed, logged and quoted in an error.
     pub fn api_root(&self) -> String {
-        let base = self.base_url.trim().trim_end_matches('/');
+        let (base, _) = split_userinfo(self.base_url.trim());
+        let base = base.trim_end_matches('/');
         if base.to_lowercase().ends_with("/api") {
             base.to_string()
         } else {
             format!("{base}/api")
         }
+    }
+
+    /// The `user[:password]` in `base_url`, percent-decoded, for HTTP basic auth.
+    pub fn base_url_userinfo(&self) -> Option<(String, Option<String>)> {
+        let (_, userinfo) = split_userinfo(self.base_url.trim());
+        let userinfo = userinfo?;
+        let (user, password) = match userinfo.split_once(':') {
+            Some((user, password)) => (user, Some(percent_decode(password))),
+            None => (userinfo, None),
+        };
+        Some((percent_decode(user), password))
     }
 
     /// Whether enough is configured to authenticate at all.
@@ -154,9 +306,182 @@ impl DispatcharrConfig {
     }
 }
 
+/// The `crosstalk-bridge` Dispatcharr plugin: the four writes REST cannot do (see
+/// `docs/bridge.md` and [`crate::bridge`]). Off by default; when on, `serve` and `validate`
+/// ping it, and only a plugin that answers a signed ping at `min_version` or later is used.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BridgeConfig {
+    pub enabled: bool,
+    /// The shared secret every request is signed with. Generated by `crosstalk bridge secret`
+    /// and pasted once into the plugin's settings; never shown in the UI.
+    #[serde(deserialize_with = "string_or_scalar")]
+    pub secret: String,
+    /// Read the secret from this environment variable instead. When set and not blank it wins
+    /// over `secret`.
+    #[serde(deserialize_with = "string_or_scalar")]
+    pub secret_env: String,
+    /// The plugin's key in Dispatcharr: its folder name, lowercased, with `-` turned into `_` by
+    /// the zip import. The shipped zip installs as `crosstalk_bridge`.
+    #[serde(deserialize_with = "string_or_scalar")]
+    pub plugin_key: String,
+    /// The oldest plugin version this crosstalk speaks to.
+    #[serde(deserialize_with = "string_or_scalar")]
+    pub min_version: String,
+}
+
+impl std::fmt::Debug for BridgeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BridgeConfig")
+            .field("enabled", &self.enabled)
+            .field("secret", &redacted(&self.secret))
+            .field("secret_env", &self.secret_env)
+            .field("plugin_key", &self.plugin_key)
+            .field("min_version", &self.min_version)
+            .finish()
+    }
+}
+
+impl Default for BridgeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            secret: String::new(),
+            secret_env: "CROSSTALK_BRIDGE_SECRET".to_string(),
+            plugin_key: "crosstalk_bridge".to_string(),
+            min_version: crate::bridge::MIN_PLUGIN_VERSION.to_string(),
+        }
+    }
+}
+
+impl BridgeConfig {
+    /// The secret to sign with, resolved from the environment first.
+    pub fn resolved_secret(&self) -> Option<String> {
+        resolve_secret(&self.secret, &self.secret_env)
+    }
+
+    /// Whether the secret comes from the environment variable `secret_env` names.
+    pub fn secret_from_env(&self) -> bool {
+        secret_from_env(&self.secret_env).is_some()
+    }
+
+    /// What the settings form shows in place of the secret: where it comes from, never what it
+    /// is.
+    pub fn secret_status(&self) -> String {
+        if self.secret_from_env() {
+            format!("set (from ${})", self.secret_env.trim())
+        } else if self.secret.trim().is_empty() {
+            "not set: run `crosstalk bridge secret`".to_string()
+        } else {
+            "set in crosstalk.toml".to_string()
+        }
+    }
+
+    /// Configuration mistakes that make an enabled bridge unusable.
+    pub fn errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if !self.enabled {
+            return errors;
+        }
+        match self.resolved_secret() {
+            None => errors.push(
+                "bridge.enabled is on but no secret is set: run `crosstalk bridge secret`, or set \
+                 bridge.secret_env"
+                    .to_string(),
+            ),
+            Some(secret) if secret.chars().count() < crate::bridge::MIN_SECRET_CHARS => {
+                errors.push(format!(
+                    "bridge.secret is {} characters; the plugin refuses anything under {}. Run \
+                     `crosstalk bridge rotate` for a new one",
+                    secret.chars().count(),
+                    crate::bridge::MIN_SECRET_CHARS
+                ));
+            }
+            Some(_) => {}
+        }
+        if !crate::bridge::valid_plugin_key(&self.plugin_key) {
+            errors.push(format!(
+                "bridge.plugin_key {:?} must be one URL path segment (letters, digits, '-', '_', \
+                 '.')",
+                self.plugin_key
+            ));
+        }
+        if crate::bridge::parse_version(&self.min_version).is_none() {
+            errors.push(format!(
+                "bridge.min_version {:?} is not a version like 0.1.0",
+                self.min_version
+            ));
+        }
+        errors
+    }
+}
+
+/// The dotted keys of `table` holding an inline secret: a non-blank `token`, `api_key`,
+/// `password` or `secret` string, or a URL carrying `user:pass@`.
+fn inline_secret_keys(table: &toml::Table, prefix: &str, keys: &mut Vec<String>) {
+    for (key, value) in table {
+        let dotted = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        match value {
+            toml::Value::Table(inner) => inline_secret_keys(inner, &dotted, keys),
+            toml::Value::String(text) if !text.trim().is_empty() => {
+                let lower = key.to_ascii_lowercase();
+                let secret = matches!(lower.as_str(), "token" | "api_key" | "password" | "secret")
+                    || (text.contains("://") && split_userinfo(text.trim()).1.is_some());
+                if secret {
+                    keys.push(dotted);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `scheme://user:pass@host/path` split into `scheme://host/path` and `user:pass`.
+///
+/// The userinfo ends at the last `@` of the authority (a password may contain `@` only
+/// percent-encoded, but a hand-written one may not be). A URL without one is returned whole.
+fn split_userinfo(url: &str) -> (String, Option<&str>) {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return (url.to_string(), None);
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    match authority.rfind('@') {
+        Some(at) => (
+            format!("{scheme}://{}", &rest[at + 1..]),
+            Some(&authority[..at]).filter(|userinfo| !userinfo.is_empty()),
+        ),
+        None => (url.to_string(), None),
+    }
+}
+
+/// `%XX` escapes decoded; anything malformed is kept as written.
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let hex = |byte: u8| (byte as char).to_digit(16);
+            if let (Some(high), Some(low)) = (hex(bytes[index + 1]), hex(bytes[index + 2])) {
+                out.push((high * 16 + low) as u8);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// One AI provider endpoint. No model names here: a sub-app names the model, the host owns
 /// the connection.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AiProviderConfig {
     /// `typesafe` (native System One) or `openai_compat`.
@@ -169,6 +494,19 @@ pub struct AiProviderConfig {
     pub api_key_env: String,
     pub timeout_secs: u64,
     pub max_concurrency: usize,
+}
+
+impl std::fmt::Debug for AiProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AiProviderConfig")
+            .field("kind", &self.kind)
+            .field("base_url", &crate::redact::urls_to_hosts(&self.base_url))
+            .field("api_key", &redacted(&self.api_key))
+            .field("api_key_env", &self.api_key_env)
+            .field("timeout_secs", &self.timeout_secs)
+            .field("max_concurrency", &self.max_concurrency)
+            .finish()
+    }
 }
 
 impl Default for AiProviderConfig {
@@ -213,6 +551,110 @@ impl AiConfig {
     }
 }
 
+/// One link of the `[ai.verify]` escalation chain: which provider answers, and which model.
+///
+/// ```toml
+/// [ai.verify]
+/// chain = [{provider = "typesafe", model = "jev-latest"}, {provider = "llm", model = "kimi-k3"}]
+/// ```
+///
+/// The `provider` names are the keys of `[ai.providers.<name>]`, so every link is validated
+/// against the configured endpoints.
+///
+/// Both fields are required: a link missing its model must not quietly inherit
+/// `jev-latest` and send it to an endpoint that has never heard of it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AiChainEntry {
+    /// Which entry under `[ai.providers]` answers this link.
+    pub provider: String,
+    /// Model name, as the provider names it.
+    pub model: String,
+}
+
+/// The defaults the single-pair shorthand falls back to, and what a `provider`/`model` left
+/// untouched reads as when the chain is set. Validation refuses a non-default pair alongside
+/// a chain; with no way to tell an explicitly written default from an inherited one, a pair
+/// left at these values reads as "not set".
+pub const DEFAULT_VERIFY_PROVIDER: &str = "typesafe";
+pub const DEFAULT_VERIFY_MODEL: &str = "jev-latest";
+
+impl Default for AiChainEntry {
+    fn default() -> Self {
+        Self {
+            provider: DEFAULT_VERIFY_PROVIDER.to_string(),
+            model: DEFAULT_VERIFY_MODEL.to_string(),
+        }
+    }
+}
+
+impl AiChainEntry {
+    pub fn new(provider: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            provider: provider.into(),
+            model: model.into(),
+        }
+    }
+}
+
+/// Parse `[ai.verify] chain`: either inline tables in the file, or — for
+/// `CROSSTALK_AI__VERIFY__CHAIN` — a JSON string holding the same array.
+///
+/// An environment override arrives as untyped text, and figment has no syntax for a list of
+/// tables, so the JSON string is the only way to set the chain without the file. A value
+/// that parses as neither is a load error naming the field, not a silent empty chain.
+fn deserialize_ai_chain<'de, D>(deserializer: D) -> Result<Vec<AiChainEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, SeqAccess, Visitor};
+
+    struct ChainVisitor;
+
+    impl<'de> Visitor<'de> for ChainVisitor {
+        type Value = Vec<AiChainEntry>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .write_str("a list of {provider, model} tables, or a JSON string holding that list")
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return Ok(Vec::new());
+            }
+            serde_json::from_str(trimmed).map_err(|error| {
+                E::custom(format!(
+                    "ai.verify.chain: not a JSON list of {{provider, model}}: {error}"
+                ))
+            })
+        }
+
+        fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
+            self.visit_str(&value)
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut chain = Vec::new();
+            while let Some(entry) = seq.next_element()? {
+                chain.push(entry);
+            }
+            Ok(chain)
+        }
+    }
+
+    deserializer.deserialize_any(ChainVisitor)
+}
+
 /// When the AI verifier is asked, and how its answers are read: `[ai.verify]`.
 ///
 /// This was `guide.toml`'s `[ai]` block. It moved to the host file because verifying a
@@ -227,6 +669,12 @@ pub struct AiVerifyConfig {
     pub provider: String,
     /// Model name, as the provider names it: `jev-latest`, `clef`, and so on.
     pub model: String,
+    /// The escalation chain: asked in order, each link handling what the earlier ones could
+    /// not decide. Empty means "the `provider`/`model` pair above, as one link": every
+    /// existing file and every `CROSSTALK_AI__VERIFY__...` override keeps working, and setting
+    /// both the pair and the chain is a validation error.
+    #[serde(default, deserialize_with = "deserialize_ai_chain")]
+    pub chain: Vec<AiChainEntry>,
     /// Score band, inclusive, in which a heuristic result is treated as uncertain.
     pub verify_band_low: u8,
     pub verify_band_high: u8,
@@ -244,12 +692,36 @@ pub struct AiVerifyConfig {
     pub min_confidence: f64,
 }
 
+impl AiVerifyConfig {
+    /// The links the gate actually asks, in order: the chain when set, otherwise the
+    /// `provider`/`model` pair above as a single link.
+    pub fn effective_chain(&self) -> Vec<AiChainEntry> {
+        if self.chain.is_empty() {
+            vec![AiChainEntry {
+                provider: self.provider.clone(),
+                model: self.model.clone(),
+            }]
+        } else {
+            self.chain.clone()
+        }
+    }
+
+    /// Whether the shorthand pair carries a non-default value while the chain is also set.
+    /// That combination is refused by validation: with no way to tell an explicitly written
+    /// default from an inherited one, a pair left at its defaults reads as "not set".
+    pub fn has_shorthand_and_chain(&self) -> bool {
+        !self.chain.is_empty()
+            && (self.provider != DEFAULT_VERIFY_PROVIDER || self.model != DEFAULT_VERIFY_MODEL)
+    }
+}
+
 impl Default for AiVerifyConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            provider: "typesafe".to_string(),
-            model: "jev-latest".to_string(),
+            provider: DEFAULT_VERIFY_PROVIDER.to_string(),
+            model: DEFAULT_VERIFY_MODEL.to_string(),
+            chain: Vec::new(),
             verify_band_low: 80,
             verify_band_high: 94,
             rescue: true,
@@ -273,7 +745,7 @@ impl Default for AiVerifyConfig {
 /// table in an app's file would mean the form, the CSV preamble and the validation each had
 /// to know about a second place to look. Adding it later is a decision per app, not a
 /// default.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ScopeConfig {
     /// Profile names to scope to, comma-separated. The first one is used by actions that
@@ -309,12 +781,19 @@ pub struct MatchingConfig {
     pub ignore_geographic_tags: bool,
     /// Strip other parenthesised tags.
     pub ignore_misc_tags: bool,
-    /// Country database codes the matcher may draw names from. Empty means "the default
-    /// set", which is every shipped database when only one exists, otherwise the US one.
+    /// Country database codes the matcher may draw names from: any of the merged data
+    /// set's countries (`crosstalk_matching::data::merged::merged_codes`: AU, BR, CA, DE,
+    /// DO, ES, FR, IN, MX, NL, NO, PE, PL, PT, UK, US). Empty means "the default set",
+    /// which is every merged database when only one exists, otherwise the US one.
     pub enabled_databases: Vec<String>,
     /// Custom aliases, a table of `name -> [aliases]`. An entry REPLACES the built-in list
     /// for that key rather than adding to it.
     pub custom_aliases: BTreeMap<String, Vec<String>>,
+    /// The one decision cut every app matches at (goal reset, D02/T10 `janitor-95`):
+    /// a sensitivity preset (`strict`/`high`/`medium`/`low` = 95/90/80/70) or a bare
+    /// number (`"80"`). Guide's own `match_confidence_threshold` /
+    /// `heal_confidence_threshold` are retired in favour of this: one ranker, one cut.
+    pub sensitivity: String,
 }
 
 impl Default for MatchingConfig {
@@ -326,6 +805,7 @@ impl Default for MatchingConfig {
             ignore_misc_tags: true,
             enabled_databases: Vec::new(),
             custom_aliases: BTreeMap::new(),
+            sensitivity: "strict".to_string(),
         }
     }
 }
@@ -346,6 +826,9 @@ impl MatchingConfig {
     ///
     /// `crosstalk-matching` cannot depend on this crate (the dependency runs the other way),
     /// so the host hands its values over rather than the matcher reading the file.
+    ///
+    /// Oracle tooling only (streams' Stream-Mapparr profile, under `cfg(test)` /
+    /// `--features oracle`): production builds its engine from [`Self::engine_config`].
     pub fn matcher_config(&self) -> crosstalk_matching::MatcherConfig {
         crosstalk_matching::MatcherConfig {
             flags: self.normalize_flags(),
@@ -355,23 +838,44 @@ impl MatchingConfig {
         }
     }
 
-    /// Build the matcher a sub-app runs with.
-    ///
-    /// Every app builds its matcher here, so the flags, aliases and callsigns a run uses are
-    /// the ones the host file states and the profile's parity sweep guards.
-    pub fn matcher(
-        &self,
-        profile: crosstalk_matching::MatchProfile,
-    ) -> crosstalk_matching::Matcher {
-        crosstalk_matching::Matcher::from_config(&self.matcher_config(), profile)
+    /// The decision cut in force: the `[matching] sensitivity` preset resolved to 0-100
+    /// (unknown names fall back to the decided 95; see `sensitivity_preset`).
+    pub fn threshold(&self) -> u8 {
+        crosstalk_matching::engine::sensitivity_preset(&self.sensitivity)
     }
 
-    /// Which country databases to load.
+    /// Whether `sensitivity` names a preset or a bare 0-100 number.
+    pub fn sensitivity_is_valid(sensitivity: &str) -> bool {
+        let trimmed = sensitivity.trim().to_lowercase();
+        if ["low", "medium", "high", "strict"].contains(&trimmed.as_str()) {
+            return true;
+        }
+        trimmed.parse::<u8>().is_ok_and(|cut| cut <= 100)
+    }
+
+    /// The unified engine a migrated sub-app runs with (goal reset, step 8+):
+    /// the one normalizer, ladder, alias set and country rule, deciding at
+    /// [`threshold`](Self::threshold).
+    pub fn engine_config(&self) -> crosstalk_matching::engine::EngineConfig {
+        crosstalk_matching::engine::EngineConfig {
+            threshold: self.threshold(),
+            enabled_countries: self.databases(),
+            custom_aliases: self
+                .custom_aliases
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+            flags: self.normalize_flags(),
+        }
+    }
+
+    /// Which country databases to load, out of the MERGED data set (the one table
+    /// every app reads; phase 3 review).
     ///
     /// An explicit list wins. An empty list falls back to the plugin's rule: every
     /// database when only one ships, otherwise the United States one.
     pub fn databases(&self) -> Vec<String> {
-        let available = crosstalk_matching::data::available_database_codes();
+        let available = crosstalk_matching::data::merged::merged_codes();
         if !self.enabled_databases.is_empty() {
             // Deduplicated, restricted to codes that actually ship, and sorted, which is
             // what `_select_enabled_databases` does: a stored code for a database that no
@@ -556,6 +1060,268 @@ impl Serialize for ScheduleEntry {
     }
 }
 
+/// Where one workflow step reads its channels from: a scope override for that step.
+///
+/// A bare name (`scope = "lineup"`) is a named scope: the channels one app offers under that
+/// name, resolved through the [`crate::subapp::Registry`] at run time (a table there would
+/// pin the step to today's group names; a name follows the app's lineup instead). A table
+/// (`scope = { groups = "DIRECTV: *" }`) is an inline [`ScopeConfig`] that REPLACES the
+/// host `[scope]` for that step. No `scope` key means the step runs under the host `[scope]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowStepScope {
+    /// A named scope one app provides (`lineup`, or a test's fake scope).
+    Named(String),
+    /// An inline scope table, replacing the host `[scope]` for this step.
+    Table(ScopeConfig),
+}
+
+impl WorkflowStepScope {
+    /// How the override reads in the dashboard, the run page and the CLI.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Named(name) => format!("scope {name:?}"),
+            Self::Table(scope) => {
+                let mut parts = Vec::new();
+                if !scope.profiles.trim().is_empty() {
+                    parts.push(format!("profiles {:?}", scope.profiles));
+                }
+                if !scope.groups.trim().is_empty() {
+                    parts.push(format!("groups {:?}", scope.groups));
+                }
+                if !scope.ignore_groups.trim().is_empty() {
+                    parts.push(format!("ignore_groups {:?}", scope.ignore_groups));
+                }
+                if parts.is_empty() {
+                    "scope {} (every channel)".to_string()
+                } else {
+                    format!("scope {}", parts.join(", "))
+                }
+            }
+        }
+    }
+}
+
+/// Deserialize a scope override as a bare name or an inline table.
+///
+/// Hand-written rather than `#[serde(untagged)]` so a mistyped table key names the field it
+/// did not understand instead of "data did not match any variant".
+impl<'de> Deserialize<'de> for WorkflowStepScope {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{self, MapAccess, Visitor};
+
+        struct ScopeVisitor;
+
+        impl<'de> Visitor<'de> for ScopeVisitor {
+            type Value = WorkflowStepScope;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a named scope, or an inline scope table")
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> std::result::Result<Self::Value, E> {
+                Ok(WorkflowStepScope::Named(value.to_string()))
+            }
+
+            fn visit_string<E: de::Error>(
+                self,
+                value: String,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(WorkflowStepScope::Named(value))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let scope = ScopeConfig::deserialize(de::value::MapAccessDeserializer::new(map))?;
+                Ok(WorkflowStepScope::Table(scope))
+            }
+        }
+
+        deserializer.deserialize_any(ScopeVisitor)
+    }
+}
+
+impl Serialize for WorkflowStepScope {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Named(name) => serializer.serialize_str(name),
+            Self::Table(scope) => scope.serialize(serializer),
+        }
+    }
+}
+
+/// Whether a `continue_on_failure` flag reads as unset, for the save's shape.
+///
+/// A table step written without the flag reloads as a table step without it; spelling
+/// `continue_on_failure = false` everywhere would bury the steps that do carry on.
+fn continue_unset(value: &bool) -> bool {
+    !value
+}
+
+/// The table form of a workflow step: an action plus its per-step settings.
+///
+/// ```toml
+/// [workflows.full_sync]
+/// steps = [
+///   "lineup.sync_apply",
+///   { action = "streams.match_apply", scope = "lineup" },
+///   { action = "guide.match_apply", scope = { groups = "DIRECTV: *" }, continue_on_failure = true },
+/// ]
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowStepDetail {
+    /// The `<app>.<action>` to run, never another workflow.
+    pub action: String,
+    /// Where the step reads its channels from, instead of the host `[scope]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<WorkflowStepScope>,
+    /// Carry on past this step when it fails. A cancelled or paused step still stops the
+    /// workflow; the workflow itself is recorded failed when any step failed.
+    #[serde(default, skip_serializing_if = "continue_unset")]
+    pub continue_on_failure: bool,
+}
+
+/// One entry of a workflow's `steps` list: today a bare `"<app>.<action>"` string, or a
+/// table carrying that action plus a scope override and a failure policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowStepEntry {
+    /// `"streams.probe"`: the shape every existing file uses.
+    Simple(String),
+    /// `{ action = "streams.match_apply", scope = ..., continue_on_failure = ... }`.
+    Detailed(WorkflowStepDetail),
+}
+
+impl WorkflowStepEntry {
+    /// The `<app>.<action>` this entry runs.
+    pub fn action(&self) -> &str {
+        match self {
+            Self::Simple(action) => action,
+            Self::Detailed(detail) => &detail.action,
+        }
+    }
+
+    /// The step's scope override, when it carries one.
+    pub fn scope(&self) -> Option<&WorkflowStepScope> {
+        match self {
+            Self::Simple(_) => None,
+            Self::Detailed(detail) => detail.scope.as_ref(),
+        }
+    }
+
+    /// Whether the workflow continues past this step's failure.
+    pub fn continue_on_failure(&self) -> bool {
+        match self {
+            Self::Simple(_) => false,
+            Self::Detailed(detail) => detail.continue_on_failure,
+        }
+    }
+
+    /// The entry as written, for an error or a display that names the step.
+    pub fn display(&self) -> String {
+        match self {
+            Self::Simple(action) => action.clone(),
+            Self::Detailed(detail) => {
+                let mut text = detail.action.clone();
+                if let Some(scope) = &detail.scope {
+                    text.push_str(&format!(" [{}]", scope.describe()));
+                }
+                if detail.continue_on_failure {
+                    text.push_str(" [continue on failure]");
+                }
+                text
+            }
+        }
+    }
+}
+
+impl From<&str> for WorkflowStepEntry {
+    fn from(action: &str) -> Self {
+        Self::Simple(action.to_string())
+    }
+}
+
+impl From<String> for WorkflowStepEntry {
+    fn from(action: String) -> Self {
+        Self::Simple(action)
+    }
+}
+
+impl From<WorkflowStepDetail> for WorkflowStepEntry {
+    fn from(detail: WorkflowStepDetail) -> Self {
+        Self::Detailed(detail)
+    }
+}
+
+/// Deserialize a step as a bare action string or an action table.
+///
+/// Hand-written rather than `#[serde(untagged)]` so a table with a mistyped key names the
+/// key instead of falling back to "expected a string".
+impl<'de> Deserialize<'de> for WorkflowStepEntry {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{self, MapAccess, Visitor};
+
+        struct EntryVisitor;
+
+        impl<'de> Visitor<'de> for EntryVisitor {
+            type Value = WorkflowStepEntry;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(
+                    "a \"<app>.<action>\" string, or a table with action, scope and \
+                     continue_on_failure",
+                )
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> std::result::Result<Self::Value, E> {
+                Ok(WorkflowStepEntry::Simple(value.to_string()))
+            }
+
+            fn visit_string<E: de::Error>(
+                self,
+                value: String,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(WorkflowStepEntry::Simple(value))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let detail =
+                    WorkflowStepDetail::deserialize(de::value::MapAccessDeserializer::new(map))?;
+                Ok(WorkflowStepEntry::Detailed(detail))
+            }
+        }
+
+        deserializer.deserialize_any(EntryVisitor)
+    }
+}
+
+impl Serialize for WorkflowStepEntry {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            // A bare string stays a bare string: a save round-trips the shape the operator
+            // wrote (comments survive through `toml_edit`; the shape survives here).
+            Self::Simple(action) => serializer.serialize_str(action),
+            Self::Detailed(detail) => detail.serialize(serializer),
+        }
+    }
+}
+
 /// One `[workflows.<name>]` entry: a named sequence of actions the host runs in order.
 ///
 /// ```toml
@@ -563,16 +1329,18 @@ impl Serialize for ScheduleEntry {
 /// steps = ["streams.probe", "streams.sort_apply"]
 /// ```
 ///
-/// A step is an `<app>.<action>` like a schedule key, and a step may NOT be another workflow:
-/// the sequence is a flat list, so there is no recursion to guard against at run time. Steps run
-/// through the same [`crate::runner::JobRunner`] a manual or scheduled action does, which is why
-/// the scheduler's dry-run rule holds for them too: a `Read` step is a dry run and a writing
-/// step really writes.
+/// A step is an `<app>.<action>` like a schedule key, or a table carrying that action plus a
+/// scope override and a failure policy (see [`WorkflowStepDetail`]). A step may NOT be another
+/// workflow: the sequence is a flat list, so there is no recursion to guard against at run
+/// time. Steps run through the same [`crate::runner::JobRunner`] a manual or scheduled action
+/// does, which is why the scheduler's dry-run rule holds for them too: a `Read` step is a dry
+/// run and a writing step really writes.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowConfig {
-    /// The steps, in order.
-    pub steps: Vec<String>,
+    /// The steps, in order: a bare action string, or a table with the action plus its
+    /// scope override and failure policy.
+    pub steps: Vec<WorkflowStepEntry>,
     /// Start each step's backlog from the beginning when this workflow begins a new pass.
     ///
     /// Off by default, which is the resume-friendly choice: a `probe` that paused at its window's
@@ -605,6 +1373,13 @@ pub struct HooksConfig {
     /// six matches: the timer restarts on every delivery of the same event and the run happens
     /// once, after the burst settles. Zero means "run on the first delivery".
     pub debounce_secs: f64,
+    /// The longest a burst may keep postponing its run, in seconds.
+    ///
+    /// Without a bound, deliveries that keep arriving inside the debounce window (an account
+    /// refreshing every 30 s against a 60 s debounce) would restart the timer forever and the
+    /// targets would never run. Unset means five debounce windows; the value is capped at
+    /// [`HooksConfig::MAX_SETTLE_CAP_SECS`].
+    pub max_settle_secs: Option<f64>,
     /// Deliveries served per client address per minute, for the HTTP route.
     ///
     /// A hook delivery starts real work, so an unauthenticated flood (or a Connect integration
@@ -620,6 +1395,7 @@ impl Default for HooksConfig {
             // The burst window several M3U accounts need to finish: long enough to collapse a
             // refresh of a dozen accounts, short enough that a nightly match still runs promptly.
             debounce_secs: 60.0,
+            max_settle_secs: None,
             rate_per_minute: 60,
             events: BTreeMap::new(),
         }
@@ -627,6 +1403,20 @@ impl Default for HooksConfig {
 }
 
 impl HooksConfig {
+    /// The ceiling on `max_settle_secs`: a quarter of an hour.
+    pub const MAX_SETTLE_CAP_SECS: f64 = 900.0;
+
+    /// How long after a burst's FIRST delivery its targets run at the latest: `max_settle_secs`,
+    /// or five debounce windows when unset, capped at fifteen minutes.
+    pub fn max_settle(&self) -> std::time::Duration {
+        let debounce = self.debounce().as_secs_f64();
+        let secs = match self.max_settle_secs {
+            Some(secs) if secs.is_finite() && secs >= 0.0 => secs,
+            _ => debounce * 5.0,
+        };
+        std::time::Duration::from_secs_f64(secs.min(Self::MAX_SETTLE_CAP_SECS))
+    }
+
     /// The debounce window as a duration.
     pub fn debounce(&self) -> std::time::Duration {
         let millis = if self.debounce_secs.is_finite() && self.debounce_secs > 0.0 {
@@ -664,7 +1454,8 @@ impl<'de> Deserialize<'de> for HooksConfig {
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str(
-                    "a table of debounce_secs, rate_per_minute and event name -> [targets]",
+                    "a table of debounce_secs, max_settle_secs, rate_per_minute and event name \
+                     -> [targets]",
                 )
             }
 
@@ -676,6 +1467,7 @@ impl<'de> Deserialize<'de> for HooksConfig {
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
                         "debounce_secs" => config.debounce_secs = map.next_value()?,
+                        "max_settle_secs" => config.max_settle_secs = Some(map.next_value()?),
                         "rate_per_minute" => config.rate_per_minute = map.next_value()?,
                         _ => {
                             let targets: Vec<String> = map.next_value().map_err(|error| {
@@ -702,8 +1494,12 @@ impl Serialize for HooksConfig {
     {
         use serde::ser::SerializeMap;
 
-        let mut map = serializer.serialize_map(Some(2 + self.events.len()))?;
+        let settle = usize::from(self.max_settle_secs.is_some());
+        let mut map = serializer.serialize_map(Some(2 + settle + self.events.len()))?;
         map.serialize_entry("debounce_secs", &self.debounce_secs)?;
+        if let Some(secs) = self.max_settle_secs {
+            map.serialize_entry("max_settle_secs", &secs)?;
+        }
         map.serialize_entry("rate_per_minute", &self.rate_per_minute)?;
         for (event, targets) in &self.events {
             map.serialize_entry(event, targets)?;
@@ -763,6 +1559,8 @@ impl JobsConfig {
 pub struct CrosstalkConfig {
     pub server: ServerConfig,
     pub dispatcharr: DispatcharrConfig,
+    /// The `crosstalk-bridge` plugin, for the writes REST cannot do. Off by default.
+    pub bridge: BridgeConfig,
     pub ai: AiConfig,
     pub matching: MatchingConfig,
     /// What a run may touch. Shared, so every sub-app selects the same channels.
@@ -854,9 +1652,10 @@ impl CrosstalkConfig {
         let overlay: toml::Table = Figment::from(Env::prefixed(env_prefix).split("__"))
             .extract()
             .map_err(|error| anyhow::anyhow!("invalid environment override: {error}"))?;
-        const SECTIONS: [&str; 10] = [
+        const SECTIONS: [&str; 11] = [
             "server",
             "dispatcharr",
+            "bridge",
             "ai",
             "matching",
             "scope",
@@ -866,10 +1665,11 @@ impl CrosstalkConfig {
             "workflows",
             "hooks",
         ];
-        let overlay: toml::Table = overlay
+        let mut overlay: toml::Table = overlay
             .into_iter()
             .filter(|(key, _)| SECTIONS.contains(&key.as_str()))
             .collect();
+        raw_string_overrides(&mut overlay, env_prefix);
 
         let mut base: toml::Table =
             toml::from_str(&before).context("serialising the configuration for overrides")?;
@@ -885,6 +1685,54 @@ impl CrosstalkConfig {
         let after = toml::to_string(self).unwrap_or_default();
         self.env_overrides = overrides + usize::from(before != after);
         Ok(())
+    }
+
+    /// Configuration files other accounts on this host can read while they hold a secret.
+    ///
+    /// Every `*.toml` in the configuration directory (`crosstalk.toml` and each app's file)
+    /// that is group- or world-readable AND holds an inline secret (a `token`, `api_key`,
+    /// `password` or `secret` value, or a URL with `user:pass@`) is one warning, naming the
+    /// keys but never their values. Separate from [`Self::validate`], which judges the
+    /// configuration in memory: this looks at files on disk, for `validate` and `serve` to
+    /// print. Empty off Unix.
+    pub fn exposed_secret_warnings(&self) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(&self.config_dir) else {
+            return Vec::new();
+        };
+        let mut files: Vec<PathBuf> = entries
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "toml")
+            })
+            .filter(|path| path.is_file())
+            .collect();
+        files.sort();
+        let mut warnings = Vec::new();
+        for path in files {
+            if !crate::perms::readable_by_others(&path) {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(table) = toml::from_str::<toml::Table>(&text) else {
+                continue;
+            };
+            let mut keys = Vec::new();
+            inline_secret_keys(&table, "", &mut keys);
+            if keys.is_empty() {
+                continue;
+            }
+            warnings.push(format!(
+                "{} is readable by other accounts on this host (mode {:o}) and holds {}: \
+                 run `chmod 600` on it, or move the secret to its *_env variable",
+                path.display(),
+                crate::perms::mode(&path).unwrap_or_default(),
+                keys.join(", ")
+            ));
+        }
+        warnings
     }
 
     /// Absolute path of the exports directory.
@@ -946,6 +1794,30 @@ impl CrosstalkConfig {
         if self.server.port == 0 {
             report.errors.push("server.port must not be 0".to_string());
         }
+        report.warnings.extend(
+            [
+                shadowed_secret_warning("server.token", &self.server.token, &self.server.token_env),
+                shadowed_secret_warning(
+                    "dispatcharr.api_key",
+                    &self.dispatcharr.api_key,
+                    &self.dispatcharr.api_key_env,
+                ),
+                shadowed_secret_warning(
+                    "dispatcharr.password",
+                    &self.dispatcharr.password,
+                    &self.dispatcharr.password_env,
+                ),
+                shadowed_secret_warning(
+                    "bridge.secret",
+                    &self.bridge.secret,
+                    &self.bridge.secret_env,
+                ),
+            ]
+            .into_iter()
+            .flatten(),
+        );
+        report.errors.extend(self.server.security_errors());
+        report.errors.extend(self.bridge.errors());
         if !self.server.is_loopback() && self.server.resolved_token().is_none() {
             report.warnings.push(format!(
                 "server.bind is {} with no token: anyone who can reach the port can run \
@@ -984,6 +1856,11 @@ impl CrosstalkConfig {
                     "ai.providers.{name}.max_concurrency must be at least 1"
                 ));
             }
+            report.warnings.extend(shadowed_secret_warning(
+                &format!("ai.providers.{name}.api_key"),
+                &provider.api_key,
+                &provider.api_key_env,
+            ));
             if provider.resolved_api_key().is_none() && provider.kind == "typesafe" {
                 // A local openai_compat endpoint may need no key at all; a hosted one does.
                 report.warnings.push(format!(
@@ -999,13 +1876,22 @@ impl CrosstalkConfig {
             }
         }
 
-        let available = crosstalk_matching::data::available_database_codes();
+        if !MatchingConfig::sensitivity_is_valid(&self.matching.sensitivity) {
+            report.errors.push(format!(
+                "matching.sensitivity is {:?}, which is not a preset (strict/high/medium/low) \
+                 or a 0-100 number; the matcher would silently decide at 95. Pick one of the \
+                 presets or write the cut as a number, e.g. sensitivity = \"high\"",
+                self.matching.sensitivity
+            ));
+        }
+
+        let available = crosstalk_matching::data::merged::merged_codes();
         for code in &self.matching.enabled_databases {
             let upper = code.trim().to_uppercase();
             if !available.contains(&upper.as_str()) {
                 report.warnings.push(format!(
-                    "matching.enabled_databases lists {code:?}, which is not shipped \
-                     (available: {})",
+                    "matching.enabled_databases lists {code:?}, which is not in the merged \
+                     data set (available: {})",
                     available.join(", ")
                 ));
             }
@@ -1055,6 +1941,41 @@ impl CrosstalkConfig {
                 .errors
                 .push("ai.verify.enabled is on but ai.verify.model is empty".to_string());
         }
+        if verify.has_shorthand_and_chain() {
+            report.errors.push(
+                "ai.verify.chain is set and ai.verify.provider/model is also set (in the \
+                 file or a CROSSTALK_AI__VERIFY__PROVIDER/MODEL override): use the chain or \
+                 the single provider/model pair, not both (leave provider and model at their \
+                 defaults to use the chain)"
+                    .to_string(),
+            );
+        }
+        // An explicit chain names its endpoints link by link, so a typo'd provider is a
+        // validation error rather than a run that silently degrades to heuristic-only. The
+        // shorthand pair keeps its old behaviour (a warning at ask time, heuristic-only):
+        // refusing it here would turn every existing enabled-without-provider install from
+        // a warning into a failed run.
+        if verify.enabled && !verify.chain.is_empty() {
+            for (position, entry) in verify.chain.iter().enumerate() {
+                if entry.provider.trim().is_empty() {
+                    report
+                        .errors
+                        .push(format!("ai.verify.chain[{position}].provider is empty"));
+                } else if !self.ai.providers.contains_key(entry.provider.trim()) {
+                    report.errors.push(format!(
+                        "ai.verify.chain[{position}].provider names {:?}, which has no \
+                         [ai.providers.{}] entry",
+                        entry.provider,
+                        entry.provider.trim()
+                    ));
+                }
+                if entry.model.trim().is_empty() {
+                    report
+                        .errors
+                        .push(format!("ai.verify.chain[{position}].model is empty"));
+                }
+            }
+        }
 
         for (key, entry) in &self.schedules {
             if !key.contains('.') {
@@ -1085,22 +2006,43 @@ impl CrosstalkConfig {
         }
 
         // Workflows: every step must be a step and not another workflow. The registered-action
-        // check needs the registry, so it lives in `Registry::unknown_workflow_steps`; what can
+        // and named-scope checks need the registry, so they live in
+        // `Registry::unknown_workflow_steps` and `Registry::unknown_workflow_scopes`; what can
         // be checked here is the shape, which is what a step naming a workflow gets wrong.
+        // Every error names the step's index, so a ten-step workflow's typo is found at once.
         for (name, workflow) in &self.workflows {
             if workflow.steps.is_empty() {
                 report.errors.push(format!("workflows.{name} has no steps"));
             }
-            for step in &workflow.steps {
-                if step.starts_with("workflow.") {
+            for (index, step) in workflow.steps.iter().enumerate() {
+                let action = step.action();
+                if action.trim().starts_with("workflow.") {
                     report.errors.push(format!(
-                        "workflows.{name}: {step} is a workflow, and a workflow step must be an \
-                         <app>.<action>: workflows do not nest"
+                        "workflows.{name}.steps[{index}]: {action} is a workflow, and a workflow \
+                         step must be an <app>.<action>: workflows do not nest"
                     ));
-                } else if !step.contains('.') {
+                } else if !action.trim().contains('.') {
                     report.errors.push(format!(
-                        "workflows.{name}: {step} must be <app>.<action>, e.g. streams.probe"
+                        "workflows.{name}.steps[{index}]: {action} must be <app>.<action>, e.g. \
+                         streams.probe"
                     ));
+                }
+                match step.scope() {
+                    Some(WorkflowStepScope::Named(scope)) if scope.trim().is_empty() => {
+                        report.errors.push(format!(
+                            "workflows.{name}.steps[{index}]: the scope name is empty"
+                        ));
+                    }
+                    Some(WorkflowStepScope::Table(scope))
+                        if !scope.groups.trim().is_empty()
+                            && !scope.ignore_groups.trim().is_empty() =>
+                    {
+                        report.errors.push(format!(
+                            "workflows.{name}.steps[{index}]: scope.groups and \
+                             scope.ignore_groups cannot both be set: use one or the other"
+                        ));
+                    }
+                    Some(_) | None => {}
                 }
             }
         }
@@ -1114,6 +2056,18 @@ impl CrosstalkConfig {
                  delivery), got {}",
                 self.hooks.debounce_secs
             ));
+        }
+        if let Some(secs) = self.hooks.max_settle_secs {
+            if !secs.is_finite() || secs < 0.0 {
+                report.errors.push(format!(
+                    "hooks.max_settle_secs must be a number of seconds, got {secs}"
+                ));
+            } else if secs > HooksConfig::MAX_SETTLE_CAP_SECS {
+                report.warnings.push(format!(
+                    "hooks.max_settle_secs is {secs}; bursts settle after at most {} s",
+                    HooksConfig::MAX_SETTLE_CAP_SECS
+                ));
+            }
         }
         for (event, targets) in &self.hooks.events {
             if targets.is_empty() {
@@ -1252,7 +2206,9 @@ impl From<CrosstalkConfig> for SharedConfig {
 /// These live in the host file, so they need a schema of their own; without one the UI has
 /// nothing to render and the CSV preamble cannot report them under the names operators know.
 pub fn host_schema() -> crate::subapp::SettingsSchema {
-    crate::subapp::SettingsSchema::new([shared_fields(), matching_fields()].concat())
+    crate::subapp::SettingsSchema::new(
+        [shared_fields(), matching_fields(), bridge_fields()].concat(),
+    )
 }
 
 /// The shared half of [`host_schema`]: scope, export retention and the AI policy.
@@ -1370,7 +2326,23 @@ fn shared_fields() -> Vec<crate::subapp::FieldSpec> {
             FieldValue::Text("jev-latest".to_string()),
         )
         .with_placeholder("jev-latest")
-        .with_help("Model name as the provider spells it."),
+        .with_help("Model name as the provider spells it. Leave at the defaults when the chain below is set: setting both is refused.")
+        ,
+        FieldSpec::new(
+            "ai.verify.chain",
+            "_section_ai",
+            "AI Verify Chain (JSON)",
+            FieldKind::Text,
+            FieldValue::Text(String::new()),
+        )
+        .with_placeholder(r#"[{"provider": "typesafe", "model": "jev-latest"}, {"provider": "llm", "model": "kimi-k3"}]"#)
+        .with_help(
+            "Escalation chain as a JSON list of {provider, model} links, asked in order: a \
+             link that cannot decide hands the same question to the next. Empty means the \
+             provider/model pair above, as one link. Each provider must name an \
+             [ai.providers.<name>] entry in this file. The CROSSTALK_AI__VERIFY__CHAIN \
+             environment override takes the same JSON."
+        ),
         FieldSpec::new(
             "ai.verify.verify_band_low",
             "_section_ai",
@@ -1462,6 +2434,25 @@ fn matching_fields() -> Vec<crate::subapp::FieldSpec> {
 
     vec![
         FieldSpec::section(
+            "_section_threshold",
+            "Decision Threshold",
+            "The ONE cut every app matches at (guide assigns, streams attaches, lineup \
+             names). A sensitivity preset — strict/high/medium/low (95/90/80/70) — or a \
+             bare number. Guide's own per-action thresholds are retired in favour of this.",
+        ),
+        FieldSpec::new(
+            "matching.sensitivity",
+            "_section_threshold",
+            "Matching Sensitivity",
+            FieldKind::Text,
+            FieldValue::Text("strict".to_string()),
+        )
+        .with_placeholder("strict")
+        .with_help(
+            "strict/high/medium/low (95/90/80/70) or a 0-100 number. Higher is stricter: \
+             candidates below the cut never match, whatever the AI says.",
+        ),
+        FieldSpec::section(
             "_section_normalization",
             "Normalization Toggles",
             "Which kinds of tag are stripped from channel and guide names before they are \
@@ -1537,6 +2528,89 @@ fn matching_fields() -> Vec<crate::subapp::FieldSpec> {
     ]
 }
 
+/// `[bridge]`, as form fields. The secret is a [`FieldKind::Secret`](crate::subapp::FieldKind):
+/// shown masked as a status line, set and rotated only from the CLI.
+fn bridge_fields() -> Vec<crate::subapp::FieldSpec> {
+    use crate::subapp::{FieldKind, FieldSpec, FieldValue};
+
+    vec![
+        FieldSpec::section(
+            "_section_bridge",
+            "Bridge Plugin",
+            "The crosstalk-bridge Dispatcharr plugin does the four writes REST cannot: bulk \
+             stream lists, bulk stream stats, moving a channel to No Group, and generated guide \
+             entries. Off by default. When on, the daemon pings the plugin at start-up and only \
+             uses it when it answers a signed ping at the minimum version; otherwise it says why \
+             and falls back to REST where REST can do the write. Changes here take effect after \
+             a restart.",
+        ),
+        FieldSpec::new(
+            "bridge.enabled",
+            "_section_bridge",
+            "Use the Bridge Plugin",
+            FieldKind::Boolean,
+            FieldValue::Boolean(false),
+        )
+        .with_help(
+            "Needs the plugin installed and enabled in Dispatcharr, with the secret pasted \
+             into it.",
+        ),
+        FieldSpec::new(
+            "bridge.secret",
+            "_section_bridge",
+            "Bridge Secret",
+            FieldKind::Secret,
+            FieldValue::Text(String::new()),
+        )
+        .with_help(
+            "Never shown here. `crosstalk bridge secret` generates it and prints it once; \
+             `crosstalk bridge rotate` replaces it.",
+        ),
+        FieldSpec::new(
+            "bridge.plugin_key",
+            "_section_bridge",
+            "Plugin Key",
+            FieldKind::Text,
+            FieldValue::Text("crosstalk_bridge".to_string()),
+        )
+        .with_placeholder("crosstalk_bridge")
+        .with_help(
+            "The plugin's key in Dispatcharr. The release zip installs as crosstalk_bridge.",
+        ),
+        FieldSpec::new(
+            "bridge.min_version",
+            "_section_bridge",
+            "Minimum Plugin Version",
+            FieldKind::Text,
+            FieldValue::Text(crate::bridge::MIN_PLUGIN_VERSION.to_string()),
+        )
+        .with_placeholder(crate::bridge::MIN_PLUGIN_VERSION),
+    ]
+}
+
+/// The chain as the settings form holds it: empty when unset (so the preamble prints
+/// "(not set)"), otherwise the compact JSON the form parses back verbatim.
+fn chain_form_value(chain: &[AiChainEntry]) -> String {
+    if chain.is_empty() {
+        String::new()
+    } else {
+        serde_json::to_string(chain).unwrap_or_default()
+    }
+}
+
+/// Parse the chain back from the settings form. Blank clears it to the shorthand; anything
+/// else must be the JSON list the form value was rendered from.
+fn parse_chain_form_value(text: &str) -> Result<Vec<AiChainEntry>> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(trimmed).with_context(|| {
+        "ai.verify.chain must be a JSON list like ".to_string()
+            + r#"[{"provider": "typesafe", "model": "jev-latest"}]"#
+    })
+}
+
 /// The host settings as form values, for the settings page and the CSV preamble.
 pub fn host_values(config: &CrosstalkConfig) -> crate::subapp::SettingsValues {
     let mut values = shared_values(config);
@@ -1557,12 +2631,33 @@ pub fn host_values(config: &CrosstalkConfig) -> crate::subapp::SettingsValues {
         crate::subapp::FieldValue::Boolean(config.matching.ignore_misc_tags),
     );
     values.insert(
+        "matching.sensitivity",
+        crate::subapp::FieldValue::Text(config.matching.sensitivity.clone()),
+    );
+    values.insert(
         "matching.enabled_databases",
         crate::subapp::FieldValue::Text(config.matching.databases().join(", ")),
     );
     values.insert(
         "matching.custom_aliases",
         crate::subapp::FieldValue::Json(config.matching.custom_aliases.clone()),
+    );
+    values.insert(
+        "bridge.enabled",
+        crate::subapp::FieldValue::Boolean(config.bridge.enabled),
+    );
+    // The status line, never the secret.
+    values.insert(
+        "bridge.secret",
+        crate::subapp::FieldValue::Text(config.bridge.secret_status()),
+    );
+    values.insert(
+        "bridge.plugin_key",
+        crate::subapp::FieldValue::Text(config.bridge.plugin_key.clone()),
+    );
+    values.insert(
+        "bridge.min_version",
+        crate::subapp::FieldValue::Text(config.bridge.min_version.clone()),
     );
     values
 }
@@ -1596,6 +2691,10 @@ pub fn shared_values(config: &CrosstalkConfig) -> crate::subapp::SettingsValues 
         FieldValue::Text(verify.provider.clone()),
     );
     values.insert("ai.verify.model", FieldValue::Text(verify.model.clone()));
+    values.insert(
+        "ai.verify.chain",
+        FieldValue::Text(chain_form_value(&verify.chain)),
+    );
     values.insert(
         "ai.verify.verify_band_low",
         FieldValue::Number(f64::from(verify.verify_band_low)),
@@ -1664,6 +2763,9 @@ pub fn apply_host_values(
     if let Some(text) = values.text("ai.verify.model") {
         config.ai.verify.model = text.to_string();
     }
+    if let Some(text) = values.text("ai.verify.chain") {
+        config.ai.verify.chain = parse_chain_form_value(text)?;
+    }
     if let Some(number) = values.number("ai.verify.verify_band_low") {
         config.ai.verify.verify_band_low = clamp_u8(number)?;
     }
@@ -1686,6 +2788,9 @@ pub fn apply_host_values(
         config.ai.verify.min_confidence = clamp_unit(number)?;
     }
 
+    if let Some(text) = values.text("matching.sensitivity") {
+        config.matching.sensitivity = text.to_string();
+    }
     if let Some(value) = values.bool("matching.ignore_quality_tags") {
         config.matching.ignore_quality_tags = value;
     }
@@ -1708,6 +2813,17 @@ pub fn apply_host_values(
     }
     if let Some(map) = values.json("matching.custom_aliases") {
         config.matching.custom_aliases = map.clone();
+    }
+
+    // `bridge.secret` is deliberately absent: a form never sets a secret.
+    if let Some(value) = values.bool("bridge.enabled") {
+        config.bridge.enabled = value;
+    }
+    if let Some(text) = values.text("bridge.plugin_key") {
+        config.bridge.plugin_key = text.trim().to_string();
+    }
+    if let Some(text) = values.text("bridge.min_version") {
+        config.bridge.min_version = text.trim().to_string();
     }
     Ok(())
 }
@@ -1921,23 +3037,81 @@ fn merge_toml_overlay(base: &mut toml::Table, overlay: toml::Table) {
 
 /// A secret from the file, or from the environment variable it names.
 ///
-/// The environment wins, so a token can be rotated without touching the file. Empty values
-/// count as unset: a blank `api_key` line should not look like a configured key.
+/// The environment wins, so a token can be rotated without touching the file (and a
+/// container's secret overrides whatever a mounted file still says). Empty values count as
+/// unset: a blank `api_key` line should not look like a configured key, and a blank
+/// variable falls back to the file.
 fn resolve_secret(inline: &str, env_name: &str) -> Option<String> {
-    let inline = inline.trim();
-    if !inline.is_empty() {
-        return Some(inline.to_string());
+    if let Some(value) = secret_from_env(env_name) {
+        return Some(value);
     }
+    let inline = inline.trim();
+    (!inline.is_empty()).then(|| inline.to_string())
+}
+
+/// The non-blank value of the variable `env_name` names, if any.
+fn secret_from_env(env_name: &str) -> Option<String> {
     let env_name = env_name.trim();
     if env_name.is_empty() {
         return None;
     }
     let value = std::env::var(env_name).ok()?;
     let value = value.trim();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_string())
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+/// The warning for a secret set both inline and through its `*_env` variable, if it is.
+fn shadowed_secret_warning(field: &str, inline: &str, env_name: &str) -> Option<String> {
+    (!inline.trim().is_empty() && secret_from_env(env_name).is_some()).then(|| {
+        format!(
+            "{field} is set in the file and in ${}: the environment value is used. Remove one \
+             so the file does not mislead the next reader.",
+            env_name.trim()
+        )
+    })
+}
+
+/// The keys whose environment overrides are taken verbatim rather than typed by figment.
+///
+/// figment guesses a type for every variable, so `CROSSTALK_SERVER__TOKEN=0123456` arrives as
+/// the integer 123456 and the leading zero is gone before [`string_or_scalar`] sees it. A
+/// secret or URL is text, whatever it looks like.
+const RAW_STRING_KEYS: [&str; 7] = [
+    "token",
+    "api_key",
+    "password",
+    "secret",
+    "username",
+    "base_url",
+    "public_url",
+];
+
+/// Replace the typed overlay values of [`RAW_STRING_KEYS`] with the raw environment text.
+fn raw_string_overrides(overlay: &mut toml::Table, env_prefix: &str) {
+    let prefix = env_prefix.to_ascii_uppercase();
+    for (name, value) in std::env::vars_os() {
+        let (Some(name), Some(value)) = (name.to_str(), value.to_str()) else {
+            continue;
+        };
+        let upper = name.to_ascii_uppercase();
+        let Some(rest) = upper.strip_prefix(&prefix) else {
+            continue;
+        };
+        let path: Vec<String> = rest.split("__").map(str::to_ascii_lowercase).collect();
+        let Some((last, parents)) = path.split_last() else {
+            continue;
+        };
+        if parents.is_empty() || !RAW_STRING_KEYS.contains(&last.as_str()) {
+            continue;
+        }
+        // Only a value figment already put in the overlay is replaced: the walk never adds a
+        // key the typed pass did not see.
+        let table = parents.iter().try_fold(&mut *overlay, |table, key| {
+            table.get_mut(key).and_then(toml::Value::as_table_mut)
+        });
+        if let Some(table) = table.filter(|table| table.contains_key(last)) {
+            table.insert(last.clone(), toml::Value::String(value.to_string()));
+        }
     }
 }
 
@@ -2085,6 +3259,76 @@ enabled_databases = ["US", "UK"]
 
         config.server.token = "t".to_string();
         assert!(config.validate().warnings.is_empty());
+    }
+
+    #[test]
+    fn a_reachable_daemon_needs_a_long_token() {
+        let mut config = CrosstalkConfig::default();
+        config.dispatcharr.api_key = "abc".to_string();
+        config.server.token_env = String::new();
+        config.server.token = "short".to_string();
+        // Loopback with no proxy: only this host can guess, so any token will do.
+        assert!(config.server.security_errors().is_empty());
+
+        config.server.bind = "0.0.0.0".to_string();
+        let errors = config.validate().errors;
+        assert!(
+            errors.iter().any(|error| error.contains("at least 32")),
+            "{errors:?}"
+        );
+
+        // Behind a proxy on loopback the token is just as exposed.
+        config.server.bind = "127.0.0.1".to_string();
+        config.server.trusted_proxies = vec!["127.0.0.1".to_string()];
+        assert!(!config.server.security_errors().is_empty());
+
+        config.server.token = "x".repeat(MIN_TOKEN_BYTES);
+        assert!(config.server.security_errors().is_empty());
+    }
+
+    #[test]
+    fn trusted_proxies_need_a_token_and_valid_ranges() {
+        let mut config = CrosstalkConfig::default();
+        config.server.token_env = String::new();
+        config.server.trusted_proxies = vec!["10.0.0.0/8".to_string()];
+        let errors = config.server.security_errors();
+        assert!(
+            errors.iter().any(|error| error.contains("no token")),
+            "{errors:?}"
+        );
+
+        config.server.token = "y".repeat(MIN_TOKEN_BYTES);
+        config.server.trusted_proxies = vec!["10.0.0.0/8".to_string(), "proxy".to_string()];
+        let errors = config.server.security_errors();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("server.trusted_proxies"), "{errors:?}");
+        assert!(errors[0].contains("proxy"), "{errors:?}");
+        assert_eq!(config.server.trusted_cidrs().len(), 1);
+
+        config.server.trusted_proxies = vec!["10.0.0.0/8".to_string(), "fd00::/8".to_string()];
+        assert!(config.server.security_errors().is_empty());
+
+        config.server.public_url = "crosstalk.example.com".to_string();
+        assert!(!config.server.security_errors().is_empty());
+        config.server.public_url = "https://crosstalk.example.com/".to_string();
+        assert!(config.server.security_errors().is_empty());
+        assert_eq!(
+            config.server.public_origin().as_deref(),
+            Some("https://crosstalk.example.com:443")
+        );
+    }
+
+    #[test]
+    fn the_server_table_reads_the_proxy_settings() {
+        let config: CrosstalkConfig = toml::from_str(
+            "[server]\nbind = \"127.0.0.1\"\ntrusted_proxies = [\"172.16.0.0/12\"]\n\
+             public_url = \"https://ui.example\"\nsecure_cookies = true\nhsts = true\n",
+        )
+        .expect("parse");
+        assert_eq!(config.server.trusted_proxies, vec!["172.16.0.0/12"]);
+        assert!(config.server.secure_cookies);
+        assert!(config.server.hsts);
+        assert_eq!(config.server.public_url, "https://ui.example");
     }
 
     #[test]
@@ -2481,10 +3725,7 @@ fresh = true
         let config = CrosstalkConfig::load_file(dir.path()).expect("load");
         assert_eq!(
             config.workflows["nightly"].steps,
-            vec![
-                "streams.probe".to_string(),
-                "streams.sort_apply".to_string()
-            ]
+            vec!["streams.probe".into(), "streams.sort_apply".into()]
         );
         assert!(!config.workflows["nightly"].fresh, "off by default");
         assert!(config.workflows["rebuild"].fresh);
@@ -2503,21 +3744,215 @@ fresh = true
     }
 
     #[test]
-    fn a_workflow_step_cannot_be_a_workflow() {
-        // A step naming a workflow would be a cycle (or at least a sequence inside a sequence),
-        // and this port has neither: a flat list of actions is the whole feature.
+    fn workflow_steps_parse_as_strings_or_tables() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            r#"
+[workflows.full_sync]
+steps = [
+  "lineup.sync_apply",
+  { action = "streams.match_apply", scope = "lineup" },
+  { action = "guide.match_apply", scope = { groups = "DIRECTV: *" }, continue_on_failure = true },
+]
+"#,
+        );
+        let config = CrosstalkConfig::load_file(dir.path()).expect("load");
+        let steps = &config.workflows["full_sync"].steps;
+        assert_eq!(steps.len(), 3);
+        // The old string form is unchanged.
+        assert_eq!(steps[0], WorkflowStepEntry::from("lineup.sync_apply"));
+        // Nothing about the steps is an error (credentials aside: the temp file has none).
+        assert!(
+            config
+                .validate()
+                .errors
+                .iter()
+                .filter(|error| !error.contains("credentials"))
+                .all(|error| !error.contains("workflows.full_sync")),
+            "no step-shape error: {:?}",
+            config.validate().errors
+        );
+        match (&steps[1], &steps[2]) {
+            (WorkflowStepEntry::Detailed(first), WorkflowStepEntry::Detailed(second)) => {
+                assert_eq!(first.action, "streams.match_apply");
+                assert_eq!(
+                    first.scope,
+                    Some(WorkflowStepScope::Named("lineup".to_string()))
+                );
+                assert!(!first.continue_on_failure);
+                assert_eq!(second.action, "guide.match_apply");
+                assert_eq!(
+                    second.scope,
+                    Some(WorkflowStepScope::Table(ScopeConfig {
+                        groups: "DIRECTV: *".to_string(),
+                        ..ScopeConfig::default()
+                    }))
+                );
+                assert!(second.continue_on_failure);
+            }
+            other => panic!("tables parse as tables: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workflow_step_validation_names_the_bad_step() {
         let mut config = CrosstalkConfig::default();
         config.workflows.insert(
             "nightly".to_string(),
             WorkflowConfig {
-                steps: vec!["workflow.other".to_string()],
+                steps: vec![
+                    "streams.probe".into(),
+                    WorkflowStepEntry::Detailed(WorkflowStepDetail {
+                        action: "guide.match_apply".to_string(),
+                        scope: Some(WorkflowStepScope::Table(ScopeConfig {
+                            groups: "A".to_string(),
+                            ignore_groups: "B".to_string(),
+                            ..ScopeConfig::default()
+                        })),
+                        continue_on_failure: false,
+                    }),
+                    WorkflowStepEntry::Detailed(WorkflowStepDetail {
+                        action: "streams.sort_apply".to_string(),
+                        scope: Some(WorkflowStepScope::Named(String::new())),
+                        continue_on_failure: false,
+                    }),
+                ],
+                fresh: false,
+            },
+        );
+        let errors = config.validate().errors;
+        assert!(
+            errors.iter().any(|error| error
+                .contains("workflows.nightly.steps[1]: scope.groups and scope.ignore_groups")),
+            "{errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("workflows.nightly.steps[2]: the scope name")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn workflow_steps_keep_their_shape_through_a_save() {
+        // A string stays a string and a table stays a table, with the operator's comment
+        // intact: the save merges values, it does not re-render the file.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("crosstalk.toml");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            r#"# operator note
+[workflows.full_sync]
+steps = [
+  "lineup.sync_apply",
+  { action = "guide.match_apply", scope = { groups = "DIRECTV: *" }, continue_on_failure = true },
+]
+"#,
+        );
+        let config = CrosstalkConfig::load_file(dir.path()).expect("load");
+        config.save(&path).expect("save");
+        let text = std::fs::read_to_string(&path).expect("read back");
+        assert!(text.contains("# operator note"), "comments survive: {text}");
+        assert!(
+            text.contains("\"lineup.sync_apply\""),
+            "the string step stays a string: {text}"
+        );
+        assert!(
+            text.contains("continue_on_failure = true"),
+            "the table step stays a table: {text}"
+        );
+        let reloaded = CrosstalkConfig::load_file(dir.path()).expect("reload");
+        assert_eq!(
+            reloaded.workflows["full_sync"].steps,
+            config.workflows["full_sync"].steps
+        );
+    }
+
+    #[test]
+    fn workflow_steps_also_parse_as_an_array_of_tables() {
+        // TOML forbids newlines inside an inline table, so a long step reads better as
+        // `[[workflows.<name>.steps]]`. Every step is then a table; a save keeps them valid.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("crosstalk.toml");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            r#"[workflows.full_sync]
+fresh = false
+
+[[workflows.full_sync.steps]]
+action = "lineup.sync_apply"
+
+[[workflows.full_sync.steps]]
+action = "guide.match_apply"
+continue_on_failure = true
+scope = { groups = "DIRECTV: *" }
+
+[[workflows.full_sync.steps]]
+action = "streams.match_apply"
+scope = "lineup"
+"#,
+        );
+        let config = CrosstalkConfig::load_file(dir.path()).expect("load");
+        let steps = &config.workflows["full_sync"].steps;
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0].action(), "lineup.sync_apply");
+        assert!(!steps[0].continue_on_failure());
+        assert!(steps[1].continue_on_failure());
+        assert_eq!(
+            steps[1].scope(),
+            Some(&WorkflowStepScope::Table(ScopeConfig {
+                groups: "DIRECTV: *".to_string(),
+                ..ScopeConfig::default()
+            }))
+        );
+        assert_eq!(
+            steps[2].scope(),
+            Some(&WorkflowStepScope::Named("lineup".to_string()))
+        );
+
+        config.save(&path).expect("save");
+        let reloaded = CrosstalkConfig::load_file(dir.path()).expect("reload");
+        assert_eq!(reloaded.workflows["full_sync"].steps, *steps);
+    }
+
+    #[test]
+    fn a_mistyped_step_key_is_named() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            r#"[workflows.full_sync]
+steps = [{ action = "guide.match_apply", continue_on_fail = true }]
+"#,
+        );
+        let error = CrosstalkConfig::load_file(dir.path()).expect_err("unknown key");
+        assert!(
+            format!("{error:#}").contains("continue_on_fail"),
+            "the error names the key: {error:#}"
+        );
+    }
+
+    #[test]
+    fn a_workflow_step_cannot_be_a_workflow() {
+        // A step naming a workflow would be a cycle (or at least a sequence inside a
+        // sequence), and this port has neither: a flat list of actions is the whole feature.
+        let mut config = CrosstalkConfig::default();
+        config.workflows.insert(
+            "nightly".to_string(),
+            WorkflowConfig {
+                steps: vec!["workflow.other".into()],
                 fresh: false,
             },
         );
         config.workflows.insert(
             "other".to_string(),
             WorkflowConfig {
-                steps: vec!["workflow.nightly".to_string()],
+                steps: vec!["workflow.nightly".into()],
                 fresh: false,
             },
         );
@@ -2541,7 +3976,7 @@ fresh = true
         config.workflows.insert(
             "shapeless".to_string(),
             WorkflowConfig {
-                steps: vec!["probe".to_string()],
+                steps: vec!["probe".into()],
                 fresh: false,
             },
         );
@@ -2553,9 +3988,8 @@ fresh = true
             "{errors:?}"
         );
         assert!(
-            errors
-                .iter()
-                .any(|error| error.contains("workflows.shapeless: probe must be <app>.<action>")),
+            errors.iter().any(|error| error
+                .contains("workflows.shapeless.steps[0]: probe must be <app>.<action>")),
             "{errors:?}"
         );
     }
@@ -2681,10 +4115,7 @@ m3u_refresh = ["streams.match_apply"]
         let reloaded = CrosstalkConfig::load_file(dir.path()).expect("reload");
         assert_eq!(
             reloaded.workflows["nightly"].steps,
-            vec![
-                "streams.probe".to_string(),
-                "streams.sort_apply".to_string()
-            ]
+            vec!["streams.probe".into(), "streams.sort_apply".into()]
         );
         assert_eq!(
             reloaded.hooks.targets("m3u_refresh"),
@@ -2825,6 +4256,553 @@ m3u_refresh = ["streams.match_apply"]
     }
 
     #[test]
+    fn a_secret_from_the_environment_is_kept_verbatim() {
+        // figment would read these as the integers 123456 and 42, losing the zeros.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            "[server]\nport = 1\n\n[ai.providers.llm]\nkind = \"openai_compat\"\n",
+        );
+        std::env::set_var("CROSSTALK_TESTZERO_SERVER__TOKEN", "0123456");
+        std::env::set_var("CROSSTALK_TESTZERO_DISPATCHARR__API_KEY", "00042");
+        std::env::set_var("CROSSTALK_TESTZERO_AI__PROVIDERS__LLM__API_KEY", "0x10");
+        std::env::set_var("CROSSTALK_TESTZERO_SERVER__PORT", "9001");
+        let config = CrosstalkConfig::load_prefixed(dir.path(), "CROSSTALK_TESTZERO_");
+        for name in [
+            "CROSSTALK_TESTZERO_SERVER__TOKEN",
+            "CROSSTALK_TESTZERO_DISPATCHARR__API_KEY",
+            "CROSSTALK_TESTZERO_AI__PROVIDERS__LLM__API_KEY",
+            "CROSSTALK_TESTZERO_SERVER__PORT",
+        ] {
+            std::env::remove_var(name);
+        }
+        let config = config.expect("load");
+        assert_eq!(config.server.token, "0123456");
+        assert_eq!(config.dispatcharr.api_key, "00042");
+        assert_eq!(
+            config.ai.providers.get("llm").map(|p| p.api_key.as_str()),
+            Some("0x10")
+        );
+        // A number stays a number: only the string keys are read raw.
+        assert_eq!(config.server.port, 9001);
+    }
+
+    #[test]
+    fn the_environment_wins_over_an_inline_secret_and_validate_says_so() {
+        let server = ServerConfig {
+            token: "from-the-file".to_string(),
+            token_env: "CROSSTALK_TESTPRECEDENCE_TOKEN".to_string(),
+            ..ServerConfig::default()
+        };
+        let mut config = CrosstalkConfig {
+            server: server.clone(),
+            ..CrosstalkConfig::default()
+        };
+        config.dispatcharr.api_key = "k".to_string();
+        // Unset (or blank): the file's value.
+        assert_eq!(server.resolved_token().as_deref(), Some("from-the-file"));
+        assert!(!config
+            .validate()
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("server.token is set in the file and in")));
+        std::env::set_var("CROSSTALK_TESTPRECEDENCE_TOKEN", "   ");
+        assert_eq!(server.resolved_token().as_deref(), Some("from-the-file"));
+        std::env::set_var("CROSSTALK_TESTPRECEDENCE_TOKEN", "from-the-environment");
+        let resolved = server.resolved_token();
+        let warnings = config.validate().warnings;
+        std::env::remove_var("CROSSTALK_TESTPRECEDENCE_TOKEN");
+        assert_eq!(resolved.as_deref(), Some("from-the-environment"));
+        assert!(
+            warnings.iter().any(|warning| warning.contains(
+                "server.token is set in the file and in $CROSSTALK_TESTPRECEDENCE_TOKEN"
+            )),
+            "{warnings:?}"
+        );
+        assert!(
+            !warnings.iter().any(|warning| warning.contains("from-the")),
+            "a warning never quotes the secret: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn debug_output_never_prints_a_secret() {
+        let mut config = CrosstalkConfig::default();
+        config.server.token = "TOKEN-SECRET".to_string();
+        config.dispatcharr.base_url =
+            "https://proxyuser:PROXY-SECRET@dispatcharr.test/".to_string();
+        config.dispatcharr.api_key = "KEY-SECRET".to_string();
+        config.dispatcharr.password = "PASSWORD-SECRET".to_string();
+        config.bridge.secret = "BRIDGE-SECRET".to_string();
+        config.ai.providers.insert(
+            "llm".to_string(),
+            AiProviderConfig {
+                base_url: "https://u:AI-URL-SECRET@llm.test/v1?key=AI-QUERY-SECRET".to_string(),
+                api_key: "AI-KEY-SECRET".to_string(),
+                ..AiProviderConfig::default()
+            },
+        );
+        let printed = format!("{config:?}");
+        for secret in [
+            "TOKEN-SECRET",
+            "PROXY-SECRET",
+            "KEY-SECRET",
+            "PASSWORD-SECRET",
+            "AI-URL-SECRET",
+            "AI-QUERY-SECRET",
+            "AI-KEY-SECRET",
+            "BRIDGE-SECRET",
+        ] {
+            assert!(!printed.contains(secret), "{secret} in {printed}");
+        }
+        assert!(printed.contains("<redacted>"), "{printed}");
+        assert!(printed.contains("dispatcharr.test"), "{printed}");
+    }
+
+    #[test]
+    fn the_bridge_is_off_by_default_and_reads_its_section() {
+        let defaults = BridgeConfig::default();
+        assert!(!defaults.enabled);
+        assert_eq!(defaults.plugin_key, "crosstalk_bridge");
+        assert_eq!(defaults.min_version, crate::bridge::MIN_PLUGIN_VERSION);
+        assert_eq!(defaults.secret_env, "CROSSTALK_BRIDGE_SECRET");
+        assert!(
+            defaults.errors().is_empty(),
+            "a disabled bridge is never an error"
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            "[bridge]\nenabled = true\nsecret = \"0123456789\"\nsecret_env = \"\"\n\
+             plugin_key = \"crosstalk-bridge\"\nmin_version = \"0.2.0\"\n",
+        );
+        let config = CrosstalkConfig::load_file(dir.path()).expect("load");
+        assert!(config.bridge.enabled);
+        assert_eq!(config.bridge.plugin_key, "crosstalk-bridge");
+        assert_eq!(config.bridge.min_version, "0.2.0");
+        // Ten characters: the plugin would refuse every request, so validate says so.
+        let errors = config.validate().errors;
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("bridge.secret is 10 characters")),
+            "{errors:?}"
+        );
+        assert!(errors.iter().all(|error| !error.contains("0123456789")));
+
+        let mut missing = BridgeConfig {
+            enabled: true,
+            secret_env: String::new(),
+            ..BridgeConfig::default()
+        };
+        assert!(missing.errors()[0].contains("crosstalk bridge secret"));
+        missing.secret = "x".repeat(64);
+        missing.plugin_key = "../x".to_string();
+        missing.min_version = "later".to_string();
+        let errors = missing.errors();
+        assert_eq!(errors.len(), 2, "{errors:?}");
+    }
+
+    #[test]
+    fn the_bridge_secret_from_the_environment_wins_and_is_never_saved() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            "[bridge]\nsecret = \"FILE-SECRET-0123456789abcdef0123456789\"\n\
+             secret_env = \"CROSSTALK_TESTBRIDGE_SECRET\"\n",
+        );
+        std::env::set_var(
+            "CROSSTALK_TESTBRIDGE_SECRET",
+            "ENV-SECRET-0123456789abcdef0123456789",
+        );
+        let config = CrosstalkConfig::load_prefixed(dir.path(), "CROSSTALK_TESTBRIDGE_PREFIX_")
+            .expect("load");
+        let resolved = config.bridge.resolved_secret();
+        let status = config.bridge.secret_status();
+        let warnings = config.validate().warnings;
+        let mut file = CrosstalkConfig::load_file(dir.path()).expect("load file");
+        file.bridge.enabled = true;
+        file.save(dir.path().join("crosstalk.toml")).expect("save");
+        std::env::remove_var("CROSSTALK_TESTBRIDGE_SECRET");
+
+        assert_eq!(
+            resolved.as_deref(),
+            Some("ENV-SECRET-0123456789abcdef0123456789")
+        );
+        assert_eq!(status, "set (from $CROSSTALK_TESTBRIDGE_SECRET)");
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("bridge.secret is set in the file and in")));
+        let saved = std::fs::read_to_string(dir.path().join("crosstalk.toml")).expect("read");
+        assert!(!saved.contains("ENV-SECRET"), "{saved}");
+        assert!(saved.contains("FILE-SECRET"), "{saved}");
+        #[cfg(unix)]
+        assert_eq!(
+            crate::perms::mode(&dir.path().join("crosstalk.toml")).map(|mode| mode & 0o777),
+            Some(0o600)
+        );
+    }
+
+    #[test]
+    fn the_settings_form_shows_the_bridge_secret_masked_and_never_sets_it() {
+        use crate::subapp::{FieldKind, FieldValue};
+        let mut config = CrosstalkConfig::default();
+        config.bridge.secret_env = String::new();
+        config.bridge.secret = "FORM-SECRET-0123456789abcdef0123456789".to_string();
+        let schema = host_schema();
+        let field = schema
+            .editable()
+            .find(|field| field.id == "bridge.secret")
+            .expect("on the form");
+        assert_eq!(field.kind, FieldKind::Secret);
+        let values = host_values(&config);
+        assert_eq!(
+            values.get("bridge.secret"),
+            Some(&FieldValue::Text("set in crosstalk.toml".to_string()))
+        );
+        let rendered = format!("{values:?}");
+        assert!(!rendered.contains("FORM-SECRET"), "{rendered}");
+
+        // Submitting the form, even with a value under the secret's id, leaves it alone.
+        let mut submitted = values.clone();
+        submitted.insert("bridge.secret", FieldValue::Text("typed-in".to_string()));
+        submitted.insert("bridge.enabled", FieldValue::Boolean(true));
+        submitted.insert(
+            "bridge.plugin_key",
+            FieldValue::Text(" crosstalk-bridge ".to_string()),
+        );
+        let mut applied = config.clone();
+        apply_host_values(&mut applied, &submitted).expect("apply");
+        assert_eq!(applied.bridge.secret, config.bridge.secret);
+        assert!(applied.bridge.enabled);
+        assert_eq!(applied.bridge.plugin_key, "crosstalk-bridge");
+
+        config.bridge.secret.clear();
+        assert!(config.bridge.secret_status().contains("not set"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_readable_file_holding_an_inline_secret_is_warned_about() {
+        use std::os::unix::fs::PermissionsExt;
+        let chmod = |path: &Path, mode: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod")
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            "[server]\nport = 1\n\n[dispatcharr]\napi_key = \"KEY-VALUE\"\napi_key_env = \"X\"\n",
+        );
+        write(dir.path(), "streams.toml", "stream_check_delay = 1\n");
+        write(
+            dir.path(),
+            "guide.toml",
+            "[upstream]\nbase_url = \"http://u:URL-SECRET@h.test/x\"\n",
+        );
+        let config = CrosstalkConfig::load_file(dir.path()).expect("load");
+
+        for name in ["crosstalk.toml", "streams.toml", "guide.toml"] {
+            chmod(&dir.path().join(name), 0o644);
+        }
+        let warnings = config.exposed_secret_warnings();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings[0].contains("crosstalk.toml") && warnings[0].contains("dispatcharr.api_key")
+        );
+        assert!(warnings[0].contains("644"), "{warnings:?}");
+        assert!(
+            warnings[1].contains("guide.toml") && warnings[1].contains("upstream.base_url"),
+            "{warnings:?}"
+        );
+        assert!(
+            !warnings
+                .iter()
+                .any(|warning| warning.contains("KEY-VALUE") || warning.contains("URL-SECRET")),
+            "{warnings:?}"
+        );
+        assert!(!warnings
+            .iter()
+            .any(|warning| warning.contains("streams.toml")));
+
+        // Owner-only files hold whatever they like.
+        for name in ["crosstalk.toml", "guide.toml"] {
+            chmod(&dir.path().join(name), 0o600);
+        }
+        assert!(config.exposed_secret_warnings().is_empty());
+    }
+
+    #[test]
+    fn base_url_credentials_are_split_off_the_api_root() {
+        let config = DispatcharrConfig {
+            base_url: "https://proxy%40user:p%3Ass@dispatcharr.test:8443/".to_string(),
+            ..DispatcharrConfig::default()
+        };
+        assert_eq!(config.api_root(), "https://dispatcharr.test:8443/api");
+        assert_eq!(
+            config.base_url_userinfo(),
+            Some(("proxy@user".to_string(), Some("p:ss".to_string())))
+        );
+        let plain = DispatcharrConfig {
+            base_url: "http://dispatcharr:9191".to_string(),
+            ..DispatcharrConfig::default()
+        };
+        assert_eq!(plain.api_root(), "http://dispatcharr:9191/api");
+        assert_eq!(plain.base_url_userinfo(), None);
+        let user_only = DispatcharrConfig {
+            base_url: "http://admin@dispatcharr:9191/api".to_string(),
+            ..DispatcharrConfig::default()
+        };
+        assert_eq!(user_only.api_root(), "http://dispatcharr:9191/api");
+        assert_eq!(
+            user_only.base_url_userinfo(),
+            Some(("admin".to_string(), None))
+        );
+    }
+
+    #[test]
+    fn the_verify_chain_defaults_to_the_shorthand_pair() {
+        // Old files name one provider and model and no chain: that pair is the one-link
+        // chain, so every existing crosstalk.toml keeps working untouched.
+        let verify = AiVerifyConfig::default();
+        assert!(verify.chain.is_empty());
+        assert_eq!(
+            verify.effective_chain(),
+            vec![AiChainEntry::new("typesafe", "jev-latest")]
+        );
+        assert!(!verify.has_shorthand_and_chain());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            "[ai.verify]\nprovider = \"local\"\nmodel = \"m\"\n",
+        );
+        let config = CrosstalkConfig::load_file(dir.path()).expect("load");
+        assert_eq!(
+            config.ai.verify.effective_chain(),
+            vec![AiChainEntry::new("local", "m")]
+        );
+    }
+
+    #[test]
+    fn the_verify_chain_parses_from_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            r#"
+[dispatcharr]
+api_key = "k"
+
+[ai.providers.typesafe]
+kind = "typesafe"
+base_url = "https://api.typesafe.ai/v1"
+api_key = "k"
+
+[ai.providers.llm]
+kind = "openai_compat"
+base_url = "http://gpu-box:8000/v1"
+
+[ai.verify]
+enabled = true
+chain = [{provider = "typesafe", model = "jev-latest"}, {provider = "llm", model = "kimi-k3"}]
+"#,
+        );
+        let config = CrosstalkConfig::load_file(dir.path()).expect("load");
+        assert_eq!(
+            config.ai.verify.effective_chain(),
+            vec![
+                AiChainEntry::new("typesafe", "jev-latest"),
+                AiChainEntry::new("llm", "kimi-k3"),
+            ]
+        );
+        // The chain replaces the pair: the pair's own values are untouched defaults.
+        assert_eq!(config.ai.verify.provider, "typesafe");
+        assert!(config.validate().is_ok(), "{:?}", config.validate().errors);
+
+        // And it survives a save with the operator's comments.
+        config
+            .save(dir.path().join("crosstalk.toml"))
+            .expect("save");
+        let reloaded = CrosstalkConfig::load_file(dir.path()).expect("reload");
+        assert_eq!(reloaded.ai.verify.effective_chain().len(), 2);
+    }
+
+    #[test]
+    fn setting_both_the_pair_and_the_chain_is_refused() {
+        let mut config = CrosstalkConfig::default();
+        config.dispatcharr.api_key = "k".to_string();
+        config.ai.verify.enabled = true;
+        config.ai.verify.provider = "local".to_string();
+        config.ai.verify.model = "m".to_string();
+        config.ai.verify.chain = vec![AiChainEntry::new("typesafe", "jev-latest")];
+        let report = config.validate();
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("ai.verify.chain is set")
+                    && error.contains("not both")),
+            "{report:?}"
+        );
+
+        // A pair left at its defaults reads as "not set": the chain alone is fine.
+        config.ai.verify.provider = DEFAULT_VERIFY_PROVIDER.to_string();
+        config.ai.verify.model = DEFAULT_VERIFY_MODEL.to_string();
+        assert!(
+            !config
+                .validate()
+                .errors
+                .iter()
+                .any(|error| error.contains("ai.verify.chain is set")),
+            "{:?}",
+            config.validate().errors
+        );
+    }
+
+    #[test]
+    fn a_chain_link_naming_no_provider_is_refused() {
+        let mut config = CrosstalkConfig::default();
+        config.dispatcharr.api_key = "k".to_string();
+        config.ai.verify.enabled = true;
+        config.ai.verify.chain = vec![
+            AiChainEntry::new("typesafe", "jev-latest"),
+            AiChainEntry::new("llm", ""),
+        ];
+        let report = config.validate();
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("ai.verify.chain[0].provider")
+                    && error.contains("no [ai.providers.typesafe] entry")),
+            "{report:?}"
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("ai.verify.chain[1].model is empty")),
+            "{report:?}"
+        );
+
+        // Disabled, the chain is not checked: an operator can stage it before the keys.
+        config.ai.verify.enabled = false;
+        assert!(
+            config
+                .validate()
+                .errors
+                .iter()
+                .all(|error| !error.contains("ai.verify.chain[")),
+            "{:?}",
+            config.validate().errors
+        );
+    }
+
+    #[test]
+    fn the_chain_comes_from_the_environment_as_json() {
+        // Figment has no syntax for a list of tables, so the override is the JSON string
+        // holding the same array the file would hold as tables.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            "[ai.verify]\nenabled = true\n",
+        );
+        std::env::set_var(
+            "CROSSTALK_TESTCHAIN_AI__VERIFY__CHAIN",
+            r#"[{"provider": "typesafe", "model": "jev-latest"}, {"provider": "llm", "model": "kimi-k3"}]"#,
+        );
+        let config =
+            CrosstalkConfig::load_prefixed(dir.path(), "CROSSTALK_TESTCHAIN_").expect("load");
+        std::env::remove_var("CROSSTALK_TESTCHAIN_AI__VERIFY__CHAIN");
+        assert_eq!(config.env_overrides, 1);
+        assert_eq!(
+            config.ai.verify.effective_chain(),
+            vec![
+                AiChainEntry::new("typesafe", "jev-latest"),
+                AiChainEntry::new("llm", "kimi-k3"),
+            ]
+        );
+
+        // And an effective config still refuses to be saved, secrets or not.
+        let error = config
+            .save(dir.path().join("crosstalk.toml"))
+            .expect_err("refuses");
+        assert!(format!("{error}").contains("environment overrides"));
+    }
+
+    #[test]
+    fn a_chain_link_missing_its_model_is_a_load_error() {
+        // Defaulting the model would send `jev-latest` to an LLM endpoint.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            "[ai.verify]\nchain = [{provider = \"llm\"}]\n",
+        );
+        let error = CrosstalkConfig::load_file(dir.path()).expect_err("rejects");
+        assert!(format!("{error:#}").contains("model"), "{error:#}");
+    }
+
+    #[test]
+    fn a_garbled_chain_override_is_a_load_error_naming_the_field() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            "[ai.verify]\nenabled = true\n",
+        );
+        std::env::set_var(
+            "CROSSTALK_TESTCHAINBAD_AI__VERIFY__CHAIN",
+            "not json at all",
+        );
+        let error = CrosstalkConfig::load_prefixed(dir.path(), "CROSSTALK_TESTCHAINBAD_")
+            .expect_err("rejects");
+        std::env::remove_var("CROSSTALK_TESTCHAINBAD_AI__VERIFY__CHAIN");
+        assert!(
+            format!("{error:#}").contains("ai.verify.chain"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn the_chain_round_trips_through_the_settings_form() {
+        // The host page edits the chain as a JSON text field: values -> form -> values is
+        // the identity, and blank clears back to the shorthand.
+        let mut config = CrosstalkConfig::default();
+        config.ai.verify.chain = vec![AiChainEntry::new("llm", "kimi-k3")];
+        let values = shared_values(&config);
+        assert_eq!(
+            values.text("ai.verify.chain"),
+            Some(r#"[{"provider":"llm","model":"kimi-k3"}]"#)
+        );
+
+        let mut applied = CrosstalkConfig::default();
+        apply_host_values(&mut applied, &values).expect("apply");
+        assert_eq!(applied.ai.verify.chain, config.ai.verify.chain);
+
+        let mut blank = SettingsValues::new();
+        blank.insert("ai.verify.chain", FieldValue::Text(String::new()));
+        apply_host_values(&mut applied, &blank).expect("clear");
+        assert!(applied.ai.verify.chain.is_empty());
+        assert_eq!(
+            applied.ai.verify.effective_chain(),
+            vec![AiChainEntry::new("typesafe", "jev-latest")]
+        );
+
+        let mut bad = SettingsValues::new();
+        bad.insert("ai.verify.chain", FieldValue::Text("[{oops}]".to_string()));
+        let error = apply_host_values(&mut applied, &bad).expect_err("rejects");
+        assert!(format!("{error:#}").contains("ai.verify.chain"));
+    }
+
+    #[test]
     fn provider_names_must_be_lowercase_for_env_overrides() {
         let mut config = CrosstalkConfig::default();
         config.dispatcharr.api_key = "k".to_string();
@@ -2878,6 +4856,7 @@ m3u_refresh = ["streams.match_apply"]
         let schema = host_schema();
         let ids: Vec<&str> = schema.editable().map(|field| field.id).collect();
         for expected in [
+            "matching.sensitivity",
             "matching.ignore_quality_tags",
             "matching.ignore_regional_tags",
             "matching.ignore_geographic_tags",
@@ -2907,6 +4886,7 @@ m3u_refresh = ["streams.match_apply"]
             let matches = matches!(
                 (&field.kind, &field.default),
                 (crate::subapp::FieldKind::Text, FieldValue::Text(_))
+                    | (crate::subapp::FieldKind::Secret, FieldValue::Text(_))
                     | (crate::subapp::FieldKind::Number, FieldValue::Number(_))
                     | (crate::subapp::FieldKind::Boolean, FieldValue::Boolean(_))
                     | (crate::subapp::FieldKind::JsonObject, FieldValue::Json(_))
@@ -2981,6 +4961,7 @@ min_confidence = 0.6
         assert_eq!(rebuilt.scope, config.scope);
         assert_eq!(rebuilt.exports, config.exports);
         assert_eq!(rebuilt.ai.verify, config.ai.verify);
+        assert_eq!(rebuilt.matching.sensitivity, config.matching.sensitivity);
         assert_eq!(
             rebuilt.matching.custom_aliases,
             config.matching.custom_aliases
@@ -2997,6 +4978,62 @@ min_confidence = 0.6
         assert_eq!(config.ai.verify.verify_band_high, 88);
         // A field the form did not submit is left alone.
         assert_eq!(config.ai.verify.verify_band_low, 80);
+    }
+
+    #[test]
+    fn the_sensitivity_names_the_one_decision_cut() {
+        // D02/T10 `janitor-95`: the default cut is strict (95); presets and bare numbers
+        // resolve through the engine's ladder.
+        let config = CrosstalkConfig::default();
+        assert_eq!(config.matching.sensitivity, "strict");
+        assert_eq!(config.matching.threshold(), 95);
+        assert!(
+            CrosstalkConfig::default()
+                .validate()
+                .errors
+                .iter()
+                .all(|error| !error.contains("matching.sensitivity")),
+            "{:?}",
+            CrosstalkConfig::default().validate().errors
+        );
+
+        for (sensitivity, cut) in [
+            ("strict", 95),
+            ("high", 90),
+            ("medium", 80),
+            ("low", 70),
+            ("80", 80),
+        ] {
+            let mut config = CrosstalkConfig::default();
+            config.matching.sensitivity = sensitivity.to_string();
+            // (The default config has no Dispatcharr credentials, so scope this to the
+            // setting under test rather than the whole report.)
+            assert!(
+                config
+                    .validate()
+                    .errors
+                    .iter()
+                    .all(|error| !error.contains("matching.sensitivity")),
+                "{sensitivity}"
+            );
+            assert_eq!(config.matching.threshold(), cut, "{sensitivity}");
+            assert_eq!(config.matching.engine_config().threshold, cut);
+        }
+        // Unknown names and out-of-range numbers fail validation instead of silently
+        // deciding at 95.
+        for bad in ["fuzzy", "150"] {
+            let mut config = CrosstalkConfig::default();
+            config.matching.sensitivity = bad.to_string();
+            let report = config.validate();
+            assert!(!report.is_ok());
+            assert!(
+                report
+                    .errors
+                    .iter()
+                    .any(|error| error.contains("matching.sensitivity")),
+                "{bad}: {report:?}"
+            );
+        }
     }
 
     #[test]

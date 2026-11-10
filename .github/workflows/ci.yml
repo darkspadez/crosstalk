@@ -3,11 +3,20 @@ name: CI
 on:
   push:
     branches: [main]
+    # A release tag runs CI too: build.yml's `ci-gate` waits for this run (same commit,
+    # push event) to succeed before it publishes anything.
+    tags: ["v*"]
   pull_request:
   schedule:
     # Weekly even without code changes, so a newly published advisory surfaces on its
     # own rather than reddening the next unrelated PR.
     - cron: "0 6 * * 1"
+  # Manual runs, which is also what makes the upstream drift report reachable on demand.
+  workflow_dispatch:
+
+# Read-only token for every job; nothing in CI writes to the repository.
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -15,20 +24,25 @@ env:
 
 jobs:
   check:
+    # Pull requests (fork code: build scripts, proc macros, tests) get their own cache
+    # volume, so nothing they write can be read back by a main or tag build.
     runs-on:
       - nscloud-ubuntu-24.04-amd64-8x16-with-cache
-      - nscloud-cache-tag-crosstalk-amd64
+      - nscloud-cache-tag-crosstalk-${{ github.event_name == 'pull_request' && 'pr-' || '' }}amd64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
       # Cargo registry, git deps and target/ live on the runner's Namespace cache
       # volume, so there is no upload/download round-trip as with actions/cache.
-      - uses: namespacelabs/nscloud-cache-action@v1
+      - uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
         with:
           cache: rust
 
@@ -41,25 +55,54 @@ jobs:
       - name: Test
         run: cargo test --locked --workspace
 
+      # One matcher in the binary: no retired plugin-profile matcher symbol links into
+      # the production `crosstalk` (they stay as `--features oracle` tooling).
+      - name: One matcher in the binary
+        run: ./scripts/one_matcher_check.sh
+
+      # The oracle build (`simulate-streams --oracle janitor`) must keep compiling.
+      - name: Clippy (oracle build)
+        run: cargo clippy --locked -p crosstalk --features oracle --all-targets -- -D warnings
+
+  # The workspace declares rust-version = "1.89" (the locked dependency tree's own floor:
+  # uuid 1.29); this proves it, so the MSRV is a tested promise rather than a guess. A check
+  # (no tests) on the oldest supported compiler. No cache volume: a cold check is a few
+  # minutes and keeps old-compiler artifacts out of it. Bump both together.
+  msrv:
+    runs-on: nscloud-ubuntu-24.04-amd64-8x16
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          toolchain: "1.89"
+      # `+1.89` overrides rust-toolchain.toml (channel stable) for this command only.
+      - name: Check on the minimum supported Rust version
+        run: cargo +1.89 check --workspace --locked
 
   docker:
     # Namespace runners hand the build to a Remote Builder (no setup-buildx needed);
     # --load brings the result back into the runner's daemon for the smoke test.
     runs-on: nscloud-ubuntu-24.04-amd64-4x8
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - name: Build the image
         run: docker buildx build --load -t crosstalk:ci .
       # The shipped mechanism: docker-compose.example.yml maps the host's
       # CROSSTALK_TOKEN into the container as CROSSTALK_SERVER__TOKEN (a direct
       # figment override of server.token), with CROSSTALK_SERVER__BIND for the bind.
       # This job mirrors that exactly, so CI exercises the compose path, not a
-      # parallel one.
+      # parallel one, including its least-privilege flags (read-only root, /tmp tmpfs,
+      # no capabilities, no-new-privileges): the daemon must start and serve under them.
       - name: The daemon starts and answers its health check
         run: |
           docker run -d --name crosstalk-ci -p 8730:8730 \
+            --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges:true \
             -e CROSSTALK_SERVER__BIND=0.0.0.0 \
-            -e CROSSTALK_SERVER__TOKEN=ci-token \
+            -e CROSSTALK_SERVER__TOKEN=ci-token-0123456789abcdef0123456789abcdef \
             -e CROSSTALK_DISPATCHARR_API_KEY=unused \
             crosstalk:ci
           for _ in $(seq 1 30); do
@@ -70,64 +113,115 @@ jobs:
           # And it refuses an anonymous API call.
           test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8730/api/v1/apps)" = "401"
           # While the compose-style token authenticates a bearer call.
-          test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer ci-token' http://localhost:8730/api/v1/apps)" = "200"
+          test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer ci-token-0123456789abcdef0123456789abcdef' http://localhost:8730/api/v1/apps)" = "200"
           docker rm -f crosstalk-ci
       # The token_env indirection (server.token_env, default CROSSTALK_TOKEN) must keep
       # working too: operators who set the token in the container directly rely on it.
       - name: The token_env indirection also authenticates
         run: |
           docker run -d --name crosstalk-ci-env -p 8730:8730 \
+            --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges:true \
             -e CROSSTALK_SERVER__BIND=0.0.0.0 \
-            -e CROSSTALK_TOKEN=ci-token \
+            -e CROSSTALK_TOKEN=ci-token-0123456789abcdef0123456789abcdef \
             -e CROSSTALK_DISPATCHARR_API_KEY=unused \
             crosstalk:ci
           for _ in $(seq 1 30); do
             if curl -fsS http://localhost:8730/health >/dev/null; then break; fi
             sleep 1
           done
-          test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer ci-token' http://localhost:8730/api/v1/apps)" = "200"
+          test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer ci-token-0123456789abcdef0123456789abcdef' http://localhost:8730/api/v1/apps)" = "200"
           docker rm -f crosstalk-ci-env
+
+  # The crosstalk-bridge Dispatcharr plugin (bridge/): its own tests, Django faked, plus the
+  # cross-language vectors crates/crosstalk-core checks too. -I: nothing from the working
+  # directory or the environment is imported. 3.10 is the oldest Python a Dispatcharr image
+  # might run the plugin under; 3.12 is current.
+  bridge:
+    runs-on: nscloud-ubuntu-24.04-amd64-2x4
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Bridge plugin tests
+        run: python3 -I -m unittest discover -s bridge/tests -v
 
   audit:
     runs-on: nscloud-ubuntu-24.04-amd64-2x4
     steps:
-      - uses: actions/checkout@v4
-      - uses: taiki-e/install-action@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          tool: cargo-audit
-      # Fails by design when an advisory matches the tree: see audit.toml (comment-only,
-      # no ignores) at the repo root. The weekly schedule above means a new advisory
-      # fails the scheduled run first, not an unrelated PR.
+          persist-credentials: false
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-audit,cargo-deny
+      # Fails by design when an advisory matches the tree: see audit.toml (no ignores;
+      # unsound and yanked crates fail too) at the repo root. The weekly schedule above
+      # means a new advisory fails the scheduled run first, not an unrelated PR.
       - name: Known vulnerabilities in the dependency tree
         run: cargo audit
+      # Licences on an allow-list, advisories (again, through cargo-deny's own rules) and
+      # bans (duplicate versions warn, never fail). Policy and reasons: deny.toml.
+      - name: Licences, advisories and bans
+        run: cargo deny --locked check licenses advisories bans
 
   parity:
+    # Pull requests (fork code: build scripts, proc macros, tests) get their own cache
+    # volume, so nothing they write can be read back by a main or tag build.
     runs-on:
       - nscloud-ubuntu-24.04-amd64-8x16-with-cache
-      - nscloud-cache-tag-crosstalk-amd64
+      - nscloud-cache-tag-crosstalk-${{ github.event_name == 'pull_request' && 'pr-' || '' }}amd64
     needs: check
     timeout-minutes: 20
     # The Python plugins are pinned submodules, so every reference is always present.
     # Full history (not a shallow fetch): scripts/upstream_drift.sh compares each pin
     # against its upstream tip, which needs the commits between them.
+    # The submodules are public https URLs, so they clone without the persisted token.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           submodules: true
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: namespacelabs/nscloud-cache-action@v1
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          toolchain: stable
+      - uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
         with:
           cache: rust
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
+      # Phase 3 step 4: data/merged/ and docs/data-merge-report.md are generated,
+      # never hand-edited. Rebuilding them must reproduce every byte; a failure
+      # means someone edited the output instead of the plugins or the script.
+      # Well under a minute. The script refuses to run without -I.
+      # Needs the reference/ submodules checked out (this job's checkout does).
+      - name: Merged data set reproduces byte for byte
+        run: python3 -I scripts/data/build_merged.py --check
+      # The Janitor ORACLE (`--features oracle`, `simulate-streams --oracle janitor`)
+      # must stay byte-identical to the Python tool: a gate. The production simulator
+      # runs the unified engine; its difference from the tool is the script's
+      # `[unified]` report line. Step 9: streams runs the unified engine too, so
+      # `match_parity.py` and `visibility_parity.py` below are reports.
       - name: Simulate oracle vs the Python tool
         run: ./scripts/sim_parity.sh --quick
       - name: Primitive sweep vs the Python matcher
         run: |
-          python3 scripts/parity_sweep.py --kinds normalize,callsign,location,network --limit 300
-          python3 scripts/parity_sweep.py --kinds match,score --limit 300 --pool 60
+          python3 -I scripts/parity_sweep.py --kinds normalize,callsign,location,network --limit 300
+          python3 -I scripts/parity_sweep.py --kinds match,score --limit 300 --pool 60 --report
+      # Phase 3 step 8: the guide oracle diff report (docs/oracle-reports/guide.md) is
+      # generated, and --check verifies it reproduces byte for byte. The report itself
+      # never fails on differences (reports are not gates); the corpus/consistency gates
+      # below are the gate.
+      - name: Guide oracle diff report reproduces
+        run: python3 -I scripts/oracle_report_guide.py --check
       # Stream-Mapparr is the same engine under different flags, so it keeps its own sweep
       # against its own fuzzy_matcher.py and country.py. The first run covers the
       # adversarial corpus (zones, designators, alias folding, Unicode); the second walks
@@ -137,6 +231,31 @@ jobs:
         run: |
           python3 -I scripts/parity_sweep_sm.py --limit 300
           python3 -I scripts/parity_sweep_sm.py --kinds callsign,zone,country --limit 3000
+      # Corpus oracles (phase 3 step 3): each plugin's OWN matcher behind one API
+      # (scripts/corpus/oracles.py), with the disagreement reporter step 5 builds
+      # the disputed set from. Hard gate, not informational: a broken oracle would
+      # silently empty the disputed set, so this MUST fail the job. Well under a
+      # minute. -I keeps each oracle's plugin import isolated (see oracles.py).
+      - name: Corpus oracles load and answer known cases
+        run: python3 -I scripts/corpus/disagreements.py --self-test
+      # Phase 3 step 5: the labelled corpus and the decisions table are generated,
+      # never hand-edited. Both --check runs rebuild from the pinned plugins and
+      # data/merged/ and byte-compare the COMMITTED outputs (timings excluded), so
+      # a stale corpus or a hand-edited decision fails here. The ablation
+      # self-test first proves every source-patch anchor still applies to the
+      # pinned plugins. About 3 minutes together (the ablation is most of it).
+      - name: Corpus and decisions reproduce byte for byte
+        run: |
+          python3 -I scripts/corpus/ablate.py --self-test
+          python3 -I scripts/corpus/build.py --check
+          python3 -I scripts/corpus/decide.py --check
+      # Phase 3 step 6: the unified Rust engine reproduces the decided Python
+      # configuration pair by pair (normalize keys, callsigns, alias hits, same
+      # verdicts, family membership/scores) and scores the decided construction
+      # cost. Subset here (the full 28k-pair run is minutes); the full gate runs
+      # on the phase branch before merge. -I for the same oracle isolation.
+      - name: Unified engine vs the decided configuration (subset)
+        run: python3 -I scripts/corpus/engine_parity.py --limit 300 --jobs 4
       # Channel operations replace the plugin's five cleanup actions, so their selection and
       # payload logic is compared against the plugin's own code. -I keeps the harness from
       # importing anything outside the plugin checkout (which it puts on sys.path itself).
@@ -148,15 +267,17 @@ jobs:
       # `crates/streams/examples/sort_io`. ~10s over 840 cases, 1500 channels.
       - name: Streams sort vs the plugin's quality model
         run: python3 -I scripts/sort_parity.py
-      # The streams match pipeline is Stream-Mapparr's Match & Assign, ported. The harness
-      # drives the plugin's REAL `_build_channel_groups`, `_match_streams_to_channel`,
+      # Phase 3 step 9: streams runs the unified matching layer, so the plugin's
+      # collector is an oracle, not a gate. The harness drives the plugin's REAL
+      # `_build_channel_groups`, `_match_streams_to_channel`,
       # `_channels_to_update_for_group`, `_streams_to_assign`, `_same_country_ids_for` and
       # `_write_channel_streams` (with the Django stubs its own tests install, plus a fake
       # ChannelStream table) and compares every channel's final stream list with
-      # `crates/streams/examples/match_io`. ~20s over 1,800 swept cases plus randomised ones,
-      # EPG placeholder fixtures included.
-      - name: Streams match vs the plugin's collector
-        run: python3 -I scripts/match_parity.py
+      # `crates/streams/examples/match_io` in report mode (exit 0; diffs are attributed
+      # in `docs/oracle-reports/streams.md`). ~20s over 1,800 swept cases plus
+      # randomised ones, EPG placeholder fixtures included.
+      - name: Streams match vs the plugin's collector (report)
+        run: python3 -I scripts/match_parity.py --report
       # The three read-only streams tools, against the plugin's own code: its
       # `check_stream_countries_action` and `test_regex_rules_action` driven end to end, and
       # `placeholder_scan.py` imported directly (it is plain Python). The EPG placeholder path
@@ -178,12 +299,20 @@ jobs:
       # stats merge and the per-channel verdicts with `crates/streams/examples/probe_io`.
       - name: Streams probe vs the plugin's stream check
         run: python3 -I scripts/probe_parity.py
-      # Channel visibility is Stream-Mapparr's Manage Channel Visibility, ported: it drives the
-      # plugin's REAL `manage_channel_visibility_action` (with `ChannelProfileMembership` faked
-      # as a table) plus the shared `_build_channel_groups`, and compares the resulting
-      # membership per channel with `crates/streams/examples/visibility_io`.
-      - name: Streams visibility vs the plugin's own action
-        run: python3 -I scripts/visibility_parity.py
+      # Phase 3 step 9: match and visibility group by the same identity family key, so
+      # the plugin's visibility action is an oracle, not a gate. The harness drives the
+      # plugin's REAL `manage_channel_visibility_action` (with `ChannelProfileMembership`
+      # faked as a table) plus the shared grouping, and compares the resulting
+      # membership per channel with `crates/streams/examples/visibility_io` in report
+      # mode (exit 0; diffs are attributed in `docs/oracle-reports/streams.md`).
+      - name: Streams visibility vs the plugin's own action (report)
+        run: python3 -I scripts/visibility_parity.py --report
+      # Phase 3 step 9: the streams oracle diff report (docs/oracle-reports/streams.md)
+      # is generated, and --check verifies it reproduces byte for byte. The report
+      # itself never fails on differences (reports are not gates); the corpus and
+      # cross-app consistency gates are the gate.
+      - name: Streams oracle diff report reproduces
+        run: python3 -I scripts/oracle_report_streams.py --check
       # Triage and restore are IPTV Checker's seven post-actions and its Restore Recovered
       # Channels, ported. The harness runs the plugin's REAL rename/move/suffix actions in its
       # own scheduled order (with the channel table faked as a dict and the real
@@ -194,9 +323,101 @@ jobs:
       # recorded — and both are documented divergences.
       - name: Streams triage and restore vs the plugin's own actions
         run: python3 -I scripts/triage_parity.py
+      # Phase 3 step 13: the lineup loader is Lineuparr's `_load_lineup` pipeline,
+      # ported entry for entry (CC_ prefix rewrite, entry/category/filename country,
+      # detail folding, group names, numbers). The harness drives the plugin's REAL
+      # methods over all 29 files x 4 detail modes x 4 group prefixes (464 cases) and
+      # compares each entry with `crates/lineup/examples/lineup_dump`. A gate.
+      - name: Lineup files vs Lineuparr's own loader
+        run: python3 -I scripts/lineup_file_parity.py
+      # Phase 3 step 14: the clean pipeline is Channel Name Cleaner's fixed rule
+      # order, protect list, scope and collision strategies, ported onto the unified
+      # tags and the shared resolver. The harness drives the plugin's REAL
+      # `_compute_changes` (Django stubbed, channel table faked) over lineup names,
+      # merged DB names, corpus provider variants, NC test-like cases and collision
+      # scenarios x 9 settings/scope variants and compares every row (status, final
+      # name, rules, removed quality) with `crates/lineup/examples/clean_dump`. A
+      # gate: the corpus keeps existing names unique so the run measures the
+      # pipeline, not the two documented divergences (wildcard unified scope; the
+      # shared resolver's counted-slot/`skip`-cascade collision fixes, pinned by
+      # Rust unit tests instead).
+      - name: Lineup clean vs Name Cleaner's own pipeline
+        run: python3 -I scripts/clean_parity.py
+      # Phase 3 step 15: lineup names are Channel-Mapparr's canonical names (OTA
+      # template, premium canonical + tag re-attachment, unknown suffix, AI gate),
+      # ported onto the unified engine. The harness drives CM's REAL
+      # `load_and_process_channels` decision path (via scripts/corpus/oracles.py
+      # plus the OTA formatting) over OTA decorations, merged-DB provider
+      # variants, unmatched names and the disputed set x 2 settings cases, and
+      # compares every final name with `crates/lineup/examples/names_dump` (the
+      # action's own `decide_heuristic`). The report reproduces byte for byte
+      # (--check); it never fails on differences — every difference is attributed
+      # in `docs/oracle-reports/lineup-names.md` (bar: 0 unattributed).
+      - name: Lineup names oracle diff report reproduces
+        run: python3 -I scripts/oracle_report_lineup_names.py --check
+      # Phase 3 step 16: lineup categorize is Channel-Mapparr's organize step
+      # (premium category map, normalized-exact then fuzzy, get-or-create groups,
+      # bulk moves) on the unified engine — an OTA identity is never classified
+      # (CM has no callsign branch). The harness drives CM's REAL
+      # `category_groups_dry_run` decision path via
+      # scripts/corpus/oracles.py over categorized DB names, station names and
+      # the disputed set x 2 scope cases, and compares every category with
+      # `crates/lineup/examples/categorize_dump` (the action's own
+      # `decide_category`). The report reproduces byte for byte (--check); every
+      # difference is attributed in `docs/oracle-reports/lineup-categorize.md`
+      # (bar: 0 unattributed).
+      - name: Lineup categorize oracle diff report reproduces
+        run: python3 -I scripts/oracle_report_lineup_categorize.py --check
+      # Phase 3 step 16: lineup logos are Channel-Mapparr's tv-logos actions and
+      # Lineuparr's logo tiers on the unified resolver (EPG icon, Logo Manager,
+      # tv-logos, default), matched on the identity's canonical name. The harness
+      # drives both plugins' REAL `logo_matcher` functions over the SAME
+      # recorded tree (`scripts/data/tv_logos_tree.json`, tv-logos `main` recorded
+      # 2026-11-07, parsed like the Rust index) and compares every URL with
+      # `crates/lineup/examples/logos_dump` (the action's own `decide_logo`). The report reproduces byte for byte
+      # (--check); every difference is attributed in
+      # `docs/oracle-reports/lineup-logos.md` (bar: 0 unattributed).
+      - name: Lineup logos oracle diff report reproduces
+        run: python3 -I scripts/oracle_report_lineup_logos.py --check
+      # Phase 3 step 17: lineup create is Channel-Mapparr's two creation modes
+      # (`import_m3u_streams`: one channel per matched stream at max+1 with that
+      # stream attached; `create_channels_from_streams`: one channel per OTA
+      # station from unattached streams, no streams attached) on the unified
+      # engine — one channel per identity family carrying the family's streams
+      # (the documented divergence), owned `lineup:create:` keys so a rerun
+      # creates nothing (CM duplicated), the shared collision guard and the
+      # global number check. The harness drives CM's REAL import decision path
+      # via scripts/corpus/oracles.py plus the REAL `channel_seeder` planner,
+      # runs CM twice to show the duplicate-on-rerun, and compares every stream
+      # with `crates/lineup/examples/create_dump` (the action's own
+      # `decide_streams` / `decide_stations`, cross-checked per stream against
+      # `names_dump` and `categorize_dump`). The report reproduces byte for byte
+      # (--check); every difference is attributed in
+      # `docs/oracle-reports/lineup-create.md` (bar: 0 unattributed).
+      - name: Lineup create oracle diff report reproduces
+        run: python3 -I scripts/oracle_report_lineup_create.py --check
+      # Phase 3 step 18: lineup sync is Lineuparr's group + channel sync
+      # (get_or_create by name/group, lineup/auto/specific numbering, renumber
+      # existing, enable in profiles, the `All` group migration) on the
+      # owned-channel rule — owned channels keep their number on re-sync (LU
+      # renumbered every rerun), only owned channels are adopted (a foreign
+      # same-name clash is reported and skipped), the global number check, and
+      # `tidy_*` is the post-match cleanup as hide instead of delete, owned
+      # channels only. The harness drives LU's REAL `_sync_groups` +
+      # `_do_sync_channels` with ORM fakes over 29 files x 4 numbering modes x
+      # 4 detail modes, runs every case twice (rerun) and with a pre-existing
+      # foreign same-name channel plus a number squatter, vs
+      # `crates/lineup/examples/sync_dump` (the action's own `decide_sync` +
+      # `plan_sync_creates`), and
+      # the cleanup query chain vs `tidy_dump`. The report reproduces byte for
+      # byte (--check); every difference is attributed in
+      # `docs/oracle-reports/lineup-sync.md` (bar: 0 unattributed).
+      - name: Lineup sync oracle diff report reproduces
+        run: python3 -I scripts/oracle_report_lineup_sync.py --check
       # Informational, never failing: what upstream changed since each pinned reference
       # commit in the files crosstalk ports from it. Covers every reference submodule
-      # (EPG Janitor, Stream-Mapparr, IPTV Checker), each with its own ported-file list.
+      # (EPG Janitor, Stream-Mapparr, IPTV Checker, Channel-Mapparr, Lineuparr, Channel
+      # Name Cleaner), each with its own ported-file list.
       # The weekly schedule is what makes it a reminder; the script itself exits 0
       # whatever it finds (see plans/plugin-consolidation.md).
       - name: Upstream drift since each reference pin

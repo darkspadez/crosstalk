@@ -40,6 +40,11 @@
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <input type="hidden" name="dry_run" value="{% if action.kind_touches_channels %}false{% else %}true{% endif %}">
             <input type="hidden" name="confirm" value="true">
+            {% if let Some(label) = action.input_label %}
+            <label class="muted" title="{% if let Some(help) = action.input_help %}{{ help }}{% endif %}">
+              {{ label }} <input type="text" name="input" maxlength="256" placeholder="Channel name to try">
+            </label>
+            {% endif %}
             {% if action.writing %}
             <label class="muted" title="Ignore and discard any progress a paused run saved: the action starts its backlog from the beginning.">
               <input type="checkbox" name="fresh" value="true"> start fresh

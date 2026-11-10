@@ -290,6 +290,19 @@ pub struct NormalizeFlags {
     /// `remove_cinemax`), which its match passes for a channel whose name mentions `max`
     /// so `Cinemax` and `MoreMax` can meet. EPG Janitor never sets it.
     pub remove_cinemax: bool,
+    /// Unified engine (N05=janitor-split): fold `&` to ` and ` inside the core
+    /// pipeline. The shared core never does this; Janitor does. The decided
+    /// engine is the core body plus this statement.
+    pub split_ampersand: bool,
+    /// Unified engine (N06=janitor-letters): split dots only between ASCII
+    /// letters (`JusticeCentral.TV`), not between word characters (`97.2`
+    /// keeps its dot). The shared core splits on `\\w`; Janitor narrows it.
+    pub dots_letters_only: bool,
+    /// Unified engine (N07=janitor-floor): strip a trailing
+    /// `Network`/`Channel`/`TV` only when at least two tokens would remain
+    /// (`Justice Network` keeps its suffix). The shared core strips
+    /// unconditionally.
+    pub suffix_floor: bool,
 }
 
 impl Default for NormalizeFlags {
@@ -302,6 +315,9 @@ impl Default for NormalizeFlags {
             core_pipeline: false,
             rejoin_designators: false,
             remove_cinemax: false,
+            split_ampersand: false,
+            dots_letters_only: false,
+            suffix_floor: false,
         }
     }
 }
@@ -653,10 +669,17 @@ impl Normalizer {
         s = shared.letter_digit.sub(&s, "$1 $2");
         s = shared.digit_letter.sub(&s, "$1 $2");
         s = shared.hyphen.sub(&s, " ");
-        s = t.dot_between_word_chars.sub(&s, " ");
+        if f.dots_letters_only {
+            s = shared.dot_between_letters.sub(&s, " ");
+        } else {
+            s = t.dot_between_word_chars.sub(&s, " ");
+        }
         s = shared.num_words.sub_fn(&s, &number_word_as_digit);
         s = shared.camel_lower_upper_lower.sub(&s, "$1 $2");
         s = shared.camel_acronym.sub(&s, "$1 $2");
+        if f.split_ampersand {
+            s = shared.ampersand.sub(&s, " and ");
+        }
 
         if f.ignore_regional {
             s = t.region_paren_east_west.sub(&s, " ");
@@ -709,12 +732,26 @@ impl Normalizer {
             s = shared.paren_alnum.sub(&s, "");
         }
 
-        // No two-token floor here, unlike EPG Janitor: the shared core strips a trailing
-        // `Network`/`Channel`/`TV` unconditionally.
+        // N07: the decided engine keeps Janitor's two-token floor; the raw core
+        // strips unconditionally.
         s = t.the_prefix.sub(&s, "");
-        s = shared.trailing_network.sub(&s, "");
-        s = shared.trailing_channel.sub(&s, "");
-        s = shared.trailing_tv.sub(&s, "");
+        if f.suffix_floor {
+            for pattern in [
+                &shared.trailing_network,
+                &shared.trailing_channel,
+                &shared.trailing_tv,
+            ] {
+                let stripped = pattern.sub(&s, "");
+                let stripped = py_trim(&stripped);
+                if !stripped.is_empty() && py_split_whitespace(stripped).count() >= 2 {
+                    s = stripped.to_string();
+                }
+            }
+        } else {
+            s = shared.trailing_network.sub(&s, "");
+            s = shared.trailing_channel.sub(&s, "");
+            s = shared.trailing_tv.sub(&s, "");
+        }
 
         // Decorative Unicode badges (`◉`, `²`, superscript `ᴿᴬᵂ`) become spaces.
         s = s
@@ -898,17 +935,34 @@ fn rejoin_designators(normalized: &str, original: &str) -> String {
     out
 }
 
+/// How many distinct tags [`tag_regex`] keeps compiled. Tags come from settings (a handful
+/// per run), so this is never reached in practice; it bounds the cache if a caller ever feeds
+/// it names instead of tags. Past it the cache starts over.
+const TAG_REGEX_CACHE_MAX: usize = 4096;
+
+type TagMap = HashMap<String, Option<std::sync::Arc<FancyRegex>>>;
+
+fn tag_cache() -> &'static Mutex<TagMap> {
+    static CACHE: OnceLock<Mutex<TagMap>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The cache, even after a panic elsewhere poisoned it: it only ever holds complete
+/// entries, so a poisoned guard is still a consistent map.
+fn lock_tag_cache() -> std::sync::MutexGuard<'static, TagMap> {
+    tag_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Compile (and cache) the pattern for one user-configured tag.
 ///
 /// The cache is not an optimisation detail: `fancy_regex` compilation costs tens of
 /// milliseconds, and a run normalises tens of thousands of names against the same
-/// handful of tags, so compiling per call would dominate the run.
+/// handful of tags, so compiling per call would dominate the run. It holds at most
+/// [`TAG_REGEX_CACHE_MAX`] tags.
 fn tag_regex(tag: &str) -> Option<std::sync::Arc<FancyRegex>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, Option<std::sync::Arc<FancyRegex>>>>> =
-        OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-
-    if let Some(cached) = cache.lock().expect("tag cache").get(tag) {
+    if let Some(cached) = lock_tag_cache().get(tag) {
         return cached.clone();
     }
 
@@ -927,11 +981,21 @@ fn tag_regex(tag: &str) -> Option<std::sync::Arc<FancyRegex>> {
     };
     let compiled = FancyRegex::new(&pattern).ok().map(std::sync::Arc::new);
 
-    cache
-        .lock()
-        .expect("tag cache")
-        .insert(tag.to_string(), compiled.clone());
+    remember(
+        &mut lock_tag_cache(),
+        tag,
+        compiled.clone(),
+        TAG_REGEX_CACHE_MAX,
+    );
     compiled
+}
+
+/// Insert into a cache holding at most `max` entries, starting over when it is full.
+fn remember<V>(cache: &mut HashMap<String, V>, key: &str, value: V, max: usize) {
+    if cache.len() >= max && !cache.contains_key(key) {
+        cache.clear();
+    }
+    cache.insert(key.to_string(), value);
 }
 
 /// Escape a literal for a case-insensitive pattern, keeping Python's `(?i)` meaning for
@@ -1163,6 +1227,35 @@ mod tests {
     #[test]
     fn ampersand_becomes_and() {
         assert_eq!(all_on("U&Yesterday"), "U and Yesterday");
+    }
+
+    #[test]
+    fn the_tag_cache_is_bounded_and_survives_a_poisoned_lock() {
+        // Past the cap the cache starts over instead of growing.
+        let mut cache: HashMap<String, u32> = HashMap::new();
+        for n in 0..10 {
+            remember(&mut cache, &format!("tag{n}"), n, 3);
+            assert!(cache.len() <= 3, "{cache:?}");
+        }
+        assert_eq!(cache.get("tag9"), Some(&9));
+        remember(&mut cache, "tag9", 90, 3);
+        assert_eq!(
+            cache.get("tag9"),
+            Some(&90),
+            "a known key is replaced, not evicted"
+        );
+
+        // A panic while the lock is held poisons it; the next lookup still answers.
+        let _ = std::thread::spawn(|| {
+            let _guard = tag_cache().lock();
+            panic!("poison the tag cache");
+        })
+        .join();
+        assert!(tag_regex("HD").is_some());
+        assert!(
+            tag_regex("HD").is_some(),
+            "and again, from the poisoned cache"
+        );
     }
 }
 

@@ -42,6 +42,12 @@ pub struct Channel {
     #[serde(default)]
     pub hidden_from_output: bool,
     /// The channel's streams, in playback order.
+    ///
+    /// Defaulted here because write answers and test fixtures carry partial channels, but
+    /// REQUIRED in the channel listing (`DispatcharrClient::channels`): stream-list writes
+    /// REPLACE the list, so a listing that left the key out must fail rather than read as "no
+    /// streams" (tidy would hide every channel, and a sort or match would write a list built
+    /// on an empty one).
     #[serde(default)]
     pub streams: Vec<i64>,
     /// The channel this one is attached to, when the build has the column.
@@ -102,12 +108,15 @@ pub struct ChannelGroup {
 /// `channels` is the list of channel ids ENABLED in the profile, which Dispatcharr's profile
 /// serializer computes server-side (`ChannelProfileSerializer.get_channels`). That makes the
 /// profile scope filter a single request rather than one per channel.
+///
+/// `channels` is REQUIRED: a profile without the key would read as "enables nothing", which
+/// `clear_hidden` turns into "every channel is disabled" and the profile scope into "no
+/// channel is in scope".
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ChannelProfile {
     pub id: i64,
     #[serde(default)]
     pub name: String,
-    #[serde(default)]
     pub channels: Vec<i64>,
 }
 
@@ -182,6 +191,11 @@ pub struct EpgEntry {
     pub tvg_id: String,
     #[serde(default)]
     pub epg_source: Option<i64>,
+    /// The guide entry's icon (`EPGData.icon_url`, what Channel-Mapparr reads as
+    /// `epg_data__icon_url` for its EPG logo fallback). Builds that omit the key
+    /// deserialize to `None`, and the tier is skipped for those entries.
+    #[serde(default)]
+    pub icon_url: Option<String>,
 }
 
 /// One provider stream.
@@ -668,6 +682,33 @@ pub enum HasPrograms {
     No,
 }
 
+/// What a programme pre-seed ([`crate::dispatcharr::DispatcharrClient::seed_programs`]) did:
+/// the request counts a bench reports, and how many answers it settled without a search.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProgramSeed {
+    /// Distinct entries the seed was asked about (with a `tvg_id`, not already memoised).
+    pub entries: usize,
+    /// Per-source horizon requests (`epg_ends_at_or_after`), one per source.
+    pub source_requests: usize,
+    /// Sources with nothing ending inside the window.
+    pub empty_sources: usize,
+    /// `POST /epg/current-programs/` requests.
+    pub batch_requests: usize,
+    /// Entries answered "no" because their source has nothing in the window.
+    pub seeded_no: usize,
+    /// Entries answered "yes" because a programme is airing on them inside the window.
+    pub seeded_yes: usize,
+    /// A cancel stopped the seed before it asked everything.
+    pub cancelled: bool,
+}
+
+impl ProgramSeed {
+    /// Every request the seed made.
+    pub fn requests(&self) -> usize {
+        self.source_requests + self.batch_requests
+    }
+}
+
 /// The programme-data window: programmes overlapping `[start, end)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProgramWindow {
@@ -884,6 +925,21 @@ impl World {
             Some(group) => group.name.clone(),
             None => "No Group".to_string(),
         }
+    }
+
+    /// A copy holding only these channels, for a workflow step whose scope override
+    /// resolves to channel ids (see [`crate::jobs::JobContext::scoped_channels`]).
+    ///
+    /// Groups, streams, profiles, entries and accounts are untouched: matching still reads
+    /// the pools, only the channel universe shrinks. Profile memberships are left as they
+    /// are — every read of them is a per-channel test (enabled, visible, hidden), never a
+    /// universe — so a step scoped to ids sees exactly those channels. A named scope
+    /// REPLACES the host scope: pair this with an empty scope table, never with the host
+    /// one (which would filter the ids back down to it).
+    pub fn retaining_channels(&self, limit: &std::collections::HashSet<i64>) -> Self {
+        let mut world = self.clone();
+        world.channels.retain(|channel| limit.contains(&channel.id));
+        world
     }
 }
 

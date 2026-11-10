@@ -99,18 +99,21 @@ pub fn world() -> World {
                 name: "ESPN HD".to_string(),
                 tvg_id: "espn.us".to_string(),
                 epg_source: Some(SOURCE),
+                icon_url: None,
             },
             EpgEntry {
                 id: CNN_US,
                 name: "CNN [US]".to_string(),
                 tvg_id: "cnn.us".to_string(),
                 epg_source: Some(SOURCE),
+                icon_url: None,
             },
             EpgEntry {
                 id: NACA,
                 name: "Náutica Ñ".to_string(),
                 tvg_id: "naca.mx".to_string(),
                 epg_source: Some(SOURCE),
+                icon_url: None,
             },
         ],
         ..World::default()
@@ -203,6 +206,18 @@ impl Fixture {
                     ResponseTemplate::new(200)
                         .set_body_json(serde_json::json!({"count": 1, "results": [{"id": 42}]})),
                 )
+                .mount(&server)
+                .await;
+        }
+        // The per-source horizon probe of the programme pre-seed (`fields=end_time`, no
+        // tvg_id): the one source carries something in the window when any entry does.
+        if !with_programmes.is_empty() {
+            Mock::given(method("GET"))
+                .and(path("/api/epg/programs/search/"))
+                .and(query_param("fields", "end_time"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"count": 1, "results": [{"end_time": "2099-01-01T00:00:00Z"}]}),
+                ))
                 .mount(&server)
                 .await;
         }

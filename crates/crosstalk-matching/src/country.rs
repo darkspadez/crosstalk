@@ -23,6 +23,12 @@
 //! one. [`StreamMapparr`] is the port below; [`classify`] and the `parse_*`/`*_overrides`
 //! helpers are shared by every detector.
 //!
+//! Decided since (G01/G02 = `lu`): the unified engine reads ONE vocabulary,
+//! [`LINEUPARR_KNOWN_CODES`], through the `lineuparr_*` entry points — stream names
+//! ([`lineuparr_stream_country`]), lineup-file `CC_` names ([`lineuparr_name_country_prefix`])
+//! and lineup categories ([`lineuparr_category_country`]). The SM functions above stay for
+//! streams' operator prefix overrides (`stream_prefix_countries`) and the oracle harnesses.
+//!
 //! The zone helpers ([`extract_zone`]) live here too because the one-timezone country
 //! guard is a country question: `BBC One West` is one of the BBC's English regions, not a
 //! time-shifted feed, because the UK has a single time zone.
@@ -672,6 +678,8 @@ pub fn extract_zone(name: &str) -> FeedZone {
     if !maybe_zoned(name) {
         return FeedZone::Default;
     }
+    // The Stream-Mapparr transcription (the SM parity sweep's oracle): the raw name,
+    // NOT the Z08 tag strip — that is the engine's [`extract_zone_noguard`] alone.
     let west = zone_west_re().is_match(name).unwrap_or(false)
         || zone_pacific_re().is_match(name).unwrap_or(false);
     let east = !west && zone_east_re().is_match(name).unwrap_or(false);
@@ -688,9 +696,603 @@ pub fn extract_zone(name: &str) -> FeedZone {
     }
 }
 
+/// Canonical feed zone WITHOUT the single-time-zone guard (decided Z02=none).
+///
+/// Same markers as [`extract_zone`] — parenthesized `(W)`/`(E)`/`(WEST)`/`(EAST)`,
+/// standalone bare `WEST`/`EAST`, Pacific (`PACIFIC`/`(Pacific)`/`(PT)`) folding into
+/// `WEST` — read after collapsing `|`-delimited junk segments (decided N15:
+/// `Cinemax East | HD |` is East) and stripping trailing writer tags (decided Z08:
+/// `HBO West (Backup)` is West), but no `_country_has_one_timezone` escape: the
+/// corpus labels a single-time-zone region (`UK: BBC One West`) as its own channel,
+/// the semantic the guard was written against. A bare `(P)` is NOT Pacific (decided
+/// Z07=sm-strict: SM's `_ZONE_PACIFIC_RE` matches bare `PACIFIC` and `(Pacific)`/
+/// `(PT)` only). The [`zone_pacific_re`] pattern already encodes that stricter
+/// reading, so both entry points agree on `(P)`.
+pub fn extract_zone_noguard(name: &str) -> FeedZone {
+    let collapsed = crate::tags::collapse_pipe_segments(name);
+    let name = collapsed.as_ref();
+    if !maybe_zoned(name) {
+        return FeedZone::Default;
+    }
+    // Decided Z08: the zone word may carry trailing writer tags (`HBO West (Backup)`
+    // is still West), so the patterns read the name with those stripped. The strip only
+    // peels quality/junk/status tags and `+N` shifts (which stay shifts: the timeshift
+    // flag is read off the original name), never regional words, so the zone itself is
+    // always still in the core when one is reported.
+    let core = crate::tags::strip_zone_ignorable(name);
+    let west = zone_west_re().is_match(core).unwrap_or(false)
+        || zone_pacific_re().is_match(core).unwrap_or(false);
+    let east = !west && zone_east_re().is_match(core).unwrap_or(false);
+    if west {
+        FeedZone::West
+    } else if east {
+        FeedZone::East
+    } else {
+        FeedZone::Default
+    }
+}
+
+/// The name with its feed-zone marker removed, or `None` when [`extract_zone_noguard`]
+/// reads no zone.
+///
+/// The same reading as [`extract_zone_noguard`] (pipe segments collapsed, trailing
+/// writer tags peeled, the West/Pacific patterns before East), with the matched marker
+/// cut out: `Showtime (W)` -> `Showtime`, `HBO East HD` -> `HBO`. The peeled tags go
+/// too, so the result is for name matching that ignores the feed (zone feeds share
+/// their brand's logo), not for display.
+pub fn strip_zone_marker(name: &str) -> Option<String> {
+    let collapsed = crate::tags::collapse_pipe_segments(name);
+    let name = collapsed.as_ref();
+    if !maybe_zoned(name) {
+        return None;
+    }
+    let core = crate::tags::strip_zone_ignorable(name);
+    let found = [zone_west_re(), zone_pacific_re(), zone_east_re()]
+        .into_iter()
+        .find_map(|re| re.find(core).ok().flatten())?;
+    let stripped = format!("{} {}", &core[..found.start()], &core[found.end()..]);
+    Some(stripped.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+/// Zone-aware routing keep rule (decided Z01=sm-zone, Z02=none, D09=sm-both).
+///
+/// A `WEST` name keeps only `WEST` candidates; any other name keeps only non-`WEST`
+/// ones. Both sides are read with [`extract_zone_noguard`], so there is exactly one
+/// zone rule: feed separation is routing, never a second post-match filter.
+/// `(P)` names route as `DEFAULT` on both sides (decided Z07).
+pub fn zone_routing_keep(query: &str, candidate: &str) -> bool {
+    (extract_zone_noguard(query) == FeedZone::West)
+        == (extract_zone_noguard(candidate) == FeedZone::West)
+}
+
+// ---------------------------------------------------------------------------
+// Lineuparr's country detector (decided G01=lu, G02=lu, G03=lu-strict, G04=lu-counter).
+//
+// Port of the vocabulary in `reference/Dispatcharr-Lineuparr-Plugin/Lineuparr/
+// fuzzy_matcher.py:82-160`: EXCLUDES `AR` (tags Arabic-language channels, not
+// Argentina) and INCLUDES `QA`/`VN`/`PK`/`SI`/`ET` plus the feed-confirmed batches;
+// `(PLUTO <country>)` full-name map; strict cross-border rule with the US<->MX
+// shared-feed exceptions. Entry points mirror Lineuparr's: stream-name detection,
+// `CC_` lineup-name prefix split, category detection.
+// ---------------------------------------------------------------------------
+
+/// ISO-2 codes Lineuparr's lineup filenames use (one unified vocabulary, G01=lu).
+///
+/// `AR` is deliberately absent: in these feeds it tags Arabic, not Argentina.
+pub const LINEUPARR_KNOWN_CODES: [&str; 49] = [
+    "US", "UK", "CA", "AU", "DE", "FR", "IT", "ES", "NL", "BR", "MX", "IN", "IE", "SE", "NO", "DK",
+    "PT", "PL", "AT", "CH", "BE", "FI", "TR", "GR", "IR", "AL", "BG", "RO", "RU", "AZ", "HR", "TH",
+    "RS", "MK", "IL", "CO", "CR", "CY", "JP", "KR", "CZ", "HU", "NZ", "PH", "VN", "PK", "SI", "ET",
+    "QA",
+];
+
+/// ISO-3 or colloquial codes Lineuparr folds onto ISO-2.
+const LINEUPARR_ISO3_TO_ISO2: [(&str, &str); 11] = [
+    ("USA", "US"),
+    ("MEX", "MX"),
+    ("IRE", "IE"),
+    ("GER", "DE"),
+    ("FRA", "FR"),
+    ("ITA", "IT"),
+    ("ESP", "ES"),
+    ("NLD", "NL"),
+    ("BRA", "BR"),
+    ("IND", "IN"),
+    ("ETH", "ET"),
+];
+
+/// `(PLUTO <COUNTRY>)` full-name variants Lineuparr recognises in the M3U.
+const LINEUPARR_PLUTO_MAP: [(&str, &str); 16] = [
+    ("USA", "US"),
+    ("US", "US"),
+    ("UK", "UK"),
+    ("BRAZIL", "BR"),
+    ("SWEDEN", "SE"),
+    ("NORWAY", "NO"),
+    ("DENMARK", "DK"),
+    ("GERMANY", "DE"),
+    ("SPAIN", "ES"),
+    ("FRANCE", "FR"),
+    ("ITALY", "IT"),
+    ("CANADA", "CA"),
+    ("MEXICO", "MX"),
+    ("INDIA", "IN"),
+    ("IRELAND", "IE"),
+    ("AUSTRALIA", "AU"),
+];
+
+/// Genuinely shared cross-border feeds, keyed by unordered country pair (G03=lu-strict).
+///
+/// Comparison keys are accent-folded lowercase alphanumerics (`NBC Universo` ->
+/// `nbcuniverso`). US<->MX only: the US Spanish-language networks whose M3U feeds are
+/// frequently tagged MEX/(MX) even though they are the US feed.
+const LINEUPARR_CROSS_BORDER_SHARED: [(&str, &str); 13] = [
+    ("US", "univision"),
+    ("US", "unimas"),
+    ("US", "telemundo"),
+    ("US", "galavision"),
+    ("US", "universo"),
+    ("US", "nbcuniverso"),
+    ("US", "tudn"),
+    ("US", "telexitos"),
+    ("US", "bandamax"),
+    ("US", "tlnovelas"),
+    ("US", "univisiontlnovelas"),
+    ("US", "telemundodeportes"),
+    ("US", "universonbc"),
+];
+
+fn lineuparr_known(code: &str) -> Option<&'static str> {
+    LINEUPARR_KNOWN_CODES
+        .iter()
+        .find(|known| **known == code)
+        .copied()
+}
+
+fn lineuparr_normalize_token(token: &str) -> Option<&'static str> {
+    if token.is_empty() {
+        return None;
+    }
+    let upper = token.to_uppercase();
+    if NON_COUNTRY_PREFIXES.contains(&upper.as_str()) {
+        return None;
+    }
+    if let Some(code) = lineuparr_known(&upper) {
+        return Some(code);
+    }
+    LINEUPARR_ISO3_TO_ISO2
+        .iter()
+        .find(|(key, _)| *key == upper)
+        .and_then(|(_, mapped)| lineuparr_known(mapped))
+}
+
+fn lineuparr_pluto_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        // re.IGNORECASE in LU (`(Pluto UK) POP` is tagged UK).
+        Regex::new(&ci(r"^\s*\(\s*PLUTO\s+([A-Za-z]+)\s*\)")).expect("static regex")
+    })
+}
+
+fn lineuparr_delim_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(&pythonize(r"^\s*([A-Za-z]{2,3})\s*[-:|\u{2503}\u{2502}]"))
+            .expect("static regex")
+    })
+}
+
+fn lineuparr_bare_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(&ci(r"^\s*(US|UK|CA|AU|FR|DE|MX|MEX|FRA|GER)\s+")).expect("static regex")
+    })
+}
+
+fn lineuparr_glued_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(&ci(r"^\s*(US|UK)(?:SD|HD|FHD|UHD|FD|HEVC|4K|8K)\b")).expect("static regex")
+    })
+}
+
+/// Lineuparr's `detect_stream_country`: ISO-2 code from a stream name's leading marker.
+///
+/// Recognises `(US) ...`, `(USA) ...`, `US: ...`, `MEX: ...`, `(PLUTO UK) ...`
+/// (case-insensitive). `None` when no recognised marker is present, so callers keep
+/// unlabeled streams (fail-open).
+///
+/// Decided N15: the name collapses first (`UK | Sky Sports | HD` reads as
+/// `UK: Sky Sports`, the delimited marker the reader already takes; `USA | HD |`
+/// reads as the bare code `USA`, which no marker form takes, so the USA Network
+/// name stays country-less like the cleaned `USA`).
+pub fn lineuparr_stream_country(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        return None;
+    }
+    let collapsed = crate::tags::collapse_pipe_segments(name);
+    let name = collapsed.as_ref();
+    if let Ok(Some(caps)) = lineuparr_pluto_re().captures(name) {
+        if let Some(group) = caps.get(1) {
+            let upper = group.as_str().to_uppercase();
+            if let Some((_, code)) = LINEUPARR_PLUTO_MAP.iter().find(|(key, _)| *key == upper) {
+                return lineuparr_known(code);
+            }
+            return None;
+        }
+    }
+    if let Ok(Some(caps)) = wrapped_re().captures(name) {
+        if let Some(group) = caps.get(1) {
+            return lineuparr_normalize_token(group.as_str());
+        }
+    }
+    if let Ok(Some(caps)) = lineuparr_delim_re().captures(name) {
+        if let Some(group) = caps.get(1) {
+            return lineuparr_normalize_token(group.as_str());
+        }
+    }
+    if let Ok(Some(caps)) = lineuparr_bare_re().captures(name) {
+        if let Some(group) = caps.get(1) {
+            return lineuparr_normalize_token(group.as_str());
+        }
+    }
+    if let Ok(Some(caps)) = lineuparr_glued_re().captures(name) {
+        if let Some(group) = caps.get(1) {
+            return lineuparr_normalize_token(group.as_str());
+        }
+    }
+    if usa_bare_re().is_match(name).unwrap_or(false) {
+        return Some("US");
+    }
+    None
+}
+
+/// The name without its leading delimited country marker (`US: CNN HD` -> `CNN HD`,
+/// `UK | Sky One` -> `Sky One`): the marker [`lineuparr_stream_country`] reads in its
+/// delimited form, recognised codes only (`TV - ...`, `NFL: ...` and network prefixes
+/// stay). Unchanged when there is no marker or nothing follows it.
+pub fn strip_delimited_country_marker(name: &str) -> &str {
+    if let Ok(Some(caps)) = lineuparr_delim_re().captures(name) {
+        if let (Some(whole), Some(group)) = (caps.get(0), caps.get(1)) {
+            if lineuparr_normalize_token(group.as_str()).is_some() {
+                let rest = name[whole.end()..].trim_start();
+                if !rest.is_empty() {
+                    return rest;
+                }
+            }
+        }
+    }
+    name
+}
+
+/// Lineuparr's `detect_name_country_prefix`: split a `CC_` prefix off a lineup name.
+///
+/// Returns `(country, stripped)` or `(None, name)` unchanged when there is no
+/// recognised prefix. Only the curated codes are accepted, so `MTV_Live` is left alone.
+pub fn lineuparr_name_country_prefix(channel_name: &str) -> (Option<&'static str>, &str) {
+    if channel_name.is_empty() {
+        return (None, channel_name);
+    }
+    let bytes = channel_name.as_bytes();
+    if bytes.len() > 3 {
+        if let Some(underscore) = channel_name.find('_') {
+            if underscore == 2 || underscore == 3 {
+                let head = &channel_name[..underscore];
+                let rest = &channel_name[underscore + 1..];
+                if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+                    let upper = head.to_uppercase();
+                    if let Some(code) = lineuparr_normalize_token(&upper) {
+                        if head.chars().all(|c| c.is_ascii_alphabetic()) {
+                            return (Some(code), rest);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (None, channel_name)
+}
+
+/// Lineuparr's `detect_category_country`: country from a lineup category name.
+///
+/// Port of `detect_category_country` in
+/// `reference/Dispatcharr-Lineuparr-Plugin/Lineuparr/fuzzy_matcher.py`.
+/// Single-country lineups carry one country code in the filename and use plain theme
+/// categories (`News`, `Sports`); mixed-country lineups encode each channel's country in
+/// the category name (`AU| AUSTRALIA VIP`, `UK: Sports`, `NZ Movies`). Returns a
+/// whitelisted ISO-2 code, or `None` for ordinary theme categories so the caller falls
+/// back to the lineup-level code.
+///
+/// Two branches with deliberately different breadth, as in the plugin:
+///   - delimiter branch (`XX:`/`XX-`/`XX|`): accepts ANY code in the full
+///     [`LINEUPARR_KNOWN_CODES`] set;
+///   - bare-space branch (`XX Movies`): restricted to the curated set below, so a plain
+///     word cannot be eaten by a space-separated token.
+///
+/// The token vocabulary is Lineuparr's (decided G01=lu): `AR` is absent (it tags
+/// Arabic-language channels, not Argentina), and `QA`/`VN`/`PK`/`SI`/`ET` are present.
+pub fn lineuparr_category_country(category_name: &str) -> Option<&'static str> {
+    if category_name.is_empty() {
+        return None;
+    }
+    static DELIM_RE: std::sync::OnceLock<fancy_regex::Regex> = std::sync::OnceLock::new();
+    static BARE_RE: std::sync::OnceLock<fancy_regex::Regex> = std::sync::OnceLock::new();
+    // `re.match(r'^\s*([A-Za-z]{2,3})\s*[-:|┃│]', ...)`.
+    let delim = DELIM_RE.get_or_init(|| {
+        fancy_regex::Regex::new(&crate::pyre::pythonize(
+            r"^\s*([A-Za-z]{2,3})\s*[-:|\u{2503}\u{2502}]",
+        ))
+        .expect("static regex")
+    });
+    if let Ok(Some(caps)) = delim.captures(category_name) {
+        if let Some(group) = caps.get(1) {
+            return lineuparr_normalize_token(group.as_str());
+        }
+    }
+    // `re.match(r'^\s*(US|UK|CA|AU|NZ|FR|DE|MX|MEX|FRA|GER)\s+', ..., re.IGNORECASE)`.
+    let bare = BARE_RE.get_or_init(|| {
+        fancy_regex::Regex::new(&ci(r"^\s*(US|UK|CA|AU|NZ|FR|DE|MX|MEX|FRA|GER)\s+"))
+            .expect("static regex")
+    });
+    if let Ok(Some(caps)) = bare.captures(category_name) {
+        if let Some(group) = caps.get(1) {
+            return lineuparr_normalize_token(group.as_str());
+        }
+    }
+    None
+}
+
+/// Accent-fold, lowercase, strip to alphanumerics (Lineuparr's `_fold_key`).
+pub fn lineuparr_fold_key(name: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    name.nfd()
+        .filter(|c| {
+            unicode_general_category::get_general_category(*c)
+                != unicode_general_category::GeneralCategory::NonspacingMark
+        })
+        .collect::<String>()
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect()
+}
+
+/// Whether a cross-border channel/stream country pair is allowed (G03=lu-strict).
+///
+/// Strict by default: a lineup accepts only streams tagged with its own country (plus
+/// untagged streams, handled by callers via [`Relationship::Unknown`]). The ONLY
+/// exceptions are the genuinely shared US<->MX feeds in
+/// [`LINEUPARR_CROSS_BORDER_SHARED`], matched on the folded channel key.
+pub fn lineuparr_cross_border_ok(
+    channel_country: &str,
+    stream_country: &str,
+    channel_name: &str,
+) -> bool {
+    if channel_country == stream_country {
+        return true;
+    }
+    let pair_is_us_mx = (channel_country == "US" && stream_country == "MX")
+        || (channel_country == "MX" && stream_country == "US");
+    if !pair_is_us_mx {
+        return false;
+    }
+    let key = lineuparr_fold_key(channel_name);
+    LINEUPARR_CROSS_BORDER_SHARED
+        .iter()
+        .any(|(code, shared)| *code == "US" && *shared == key)
+}
+
+/// Filter accounting for the country rule (G04=lu-counter): reporting only, never
+/// changes a verdict by itself.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CountryFilterCount {
+    pub kept: u64,
+    pub dropped_foreign: u64,
+    pub kept_unknown: u64,
+}
+
+impl CountryFilterCount {
+    pub fn record(&mut self, relationship: Relationship) {
+        match relationship {
+            Relationship::Same => self.kept += 1,
+            Relationship::Unknown => {
+                self.kept += 1;
+                self.kept_unknown += 1;
+            }
+            Relationship::Foreign => self.dropped_foreign += 1,
+        }
+    }
+}
+
+/// Lineuparr's country detector (decided G01/G02): one [`CountryDetector`] impl.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Lineuparr;
+
+/// The decided country detector value.
+pub const LINEUPARR: Lineuparr = Lineuparr;
+
+impl CountryDetector for Lineuparr {
+    fn country_from_group(&self, text: &str) -> Option<&'static str> {
+        if text.is_empty() {
+            return None;
+        }
+        if let Some(code) = lineuparr_stream_country(text) {
+            return Some(code);
+        }
+        scan_words(text, group_aliases())
+    }
+
+    fn country_from_name(&self, text: &str) -> Option<&'static str> {
+        if text.is_empty() {
+            return None;
+        }
+        if let Some(code) = lineuparr_stream_country(text) {
+            return Some(code);
+        }
+        scan_words(text, name_aliases())
+    }
+
+    fn country_from_prefix_overrides(
+        &self,
+        text: &str,
+        overrides: &BTreeMap<String, &'static str>,
+    ) -> Option<&'static str> {
+        country_from_prefix_overrides(text, overrides)
+    }
+}
+
+/// M3U group-header skip (decided Z05=lu-skip).
+///
+/// True for playlist group/section separators like `##### EUROSPORT #####` or
+/// `## 24/7 COMEDY ##`: a run of 2+ `#`/`=`/`*` is decorative (no real channel name
+/// contains `##`/`==`/`**`); pipes need 3+ since a single `|` is a common in-name
+/// separator. Headers are not real names and are excluded from matching.
+pub fn is_group_header(name: &str) -> bool {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(&pythonize(r"[#=*]{2,}|\|{3,}")).expect("static regex"));
+    re.is_match(name).unwrap_or(false)
+}
+
+/// Tags preserved for display re-attachment (decided D09=sm-both).
+///
+/// SM's `extract_tags`: regional (parenthesized first, else the last bare word among
+/// East/West/Pacific/Central/Mountain/Atlantic), extra parenthesized tags (skipping a
+/// leading prefix tag, ignored tags, regional indicators and callsigns) and bracketed
+/// quality tags. Runs beside [`extract_zone_noguard`]: routing reads the zone, display
+/// re-attaches these.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NameTags {
+    pub regional: Option<String>,
+    pub extra_tags: Vec<String>,
+    pub quality_tags: Vec<String>,
+}
+
+/// Extract display tags from a name (SM's `extract_tags`, D09 `sm-both`).
+pub fn extract_tags(name: &str, user_ignored_tags: &[&str]) -> NameTags {
+    static REGIONAL_PAREN: OnceLock<Regex> = OnceLock::new();
+    static REGIONAL_WORD: OnceLock<Regex> = OnceLock::new();
+    static PAREN: OnceLock<Regex> = OnceLock::new();
+    static BRACKET: OnceLock<Regex> = OnceLock::new();
+    static CALLSIGN_TAG: OnceLock<Regex> = OnceLock::new();
+    let regional_paren = REGIONAL_PAREN.get_or_init(|| {
+        Regex::new(&ci(r"\((East|West|Pacific|Central|Mountain|Atlantic)\)")).expect("static regex")
+    });
+    let regional_word = REGIONAL_WORD.get_or_init(|| {
+        Regex::new(&ci(
+            r"\b(East|West|Pacific|Central|Mountain|Atlantic)\b(?!.*\b(East|West|Pacific|Central|Mountain|Atlantic)\b)",
+        ))
+        .expect("static regex")
+    });
+    let paren =
+        PAREN.get_or_init(|| Regex::new(&pythonize(r"\(([^\)]+)\)")).expect("static regex"));
+    let bracket =
+        BRACKET.get_or_init(|| Regex::new(&pythonize(r"\[([^\]]+)\]")).expect("static regex"));
+    let callsign_tag = CALLSIGN_TAG.get_or_init(|| {
+        Regex::new(&pythonize(r"^[KW][A-Z]{3}(?:-(?:TV|CD|LP|DT|LD))?$")).expect("static regex")
+    });
+
+    let mut tags = NameTags::default();
+    if let Ok(Some(caps)) = regional_paren.captures(name) {
+        if let Some(group) = caps.get(1) {
+            let mut regional = group.as_str().to_string();
+            if let Some(first) = regional.get_mut(..1) {
+                first.make_ascii_uppercase();
+            }
+            tags.regional = Some(regional);
+        }
+    } else if let Ok(Some(caps)) = regional_word.captures(name) {
+        if let Some(group) = caps.get(1) {
+            let mut regional = group.as_str().to_string();
+            if let Some(first) = regional.get_mut(..1) {
+                first.make_ascii_uppercase();
+            }
+            tags.regional = Some(regional);
+        }
+    }
+
+    let paren_tags: Vec<String> = paren
+        .captures_iter(name)
+        .flatten()
+        .filter_map(|caps| caps.get(1).map(|m| m.as_str().to_string()))
+        .collect();
+    let first_is_prefix = crate::pyre::py_trim(name).starts_with('(');
+    for (idx, tag) in paren_tags.iter().enumerate() {
+        if idx == 0 && first_is_prefix {
+            continue;
+        }
+        if user_ignored_tags.contains(&format!("({tag})").as_str())
+            || user_ignored_tags.contains(&format!("[{tag}]").as_str())
+        {
+            continue;
+        }
+        let upper = tag.to_uppercase();
+        if matches!(
+            upper.as_str(),
+            "EAST" | "WEST" | "PACIFIC" | "CENTRAL" | "MOUNTAIN" | "ATLANTIC"
+        ) {
+            continue;
+        }
+        if callsign_tag.is_match(&upper).unwrap_or(false) {
+            continue;
+        }
+        tags.extra_tags.push(format!("({tag})"));
+    }
+    for caps in bracket.captures_iter(name).flatten() {
+        let Some(group) = caps.get(1) else {
+            continue;
+        };
+        let tag = group.as_str().to_string();
+        if !user_ignored_tags.contains(&format!("[{tag}]").as_str())
+            && !user_ignored_tags.contains(&format!("({tag})").as_str())
+        {
+            tags.quality_tags.push(format!("[{tag}]"));
+        }
+    }
+    tags
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lineuparr_category_country_matches_the_plugin() {
+        // Mixed-country lineups encode the country in the category name; theme
+        // categories fall back to the lineup-level code (None here).
+        for (category, expected) in [
+            ("AU| AUSTRALIA VIP", Some("AU")),
+            ("UK: Sports", Some("UK")),
+            ("NZ Movies", Some("NZ")),
+            ("US News", Some("US")),
+            ("MEX Bein Sports", Some("MX")),
+            ("News", None),
+            ("Sports", None),
+            // Theme words a delimiter must not eat: not whitelisted codes.
+            ("Sci-Fi", None),
+            ("On-Demand", None),
+            ("German", None),
+            ("IT Crowd", None),
+            ("", None),
+        ] {
+            assert_eq!(
+                lineuparr_category_country(category),
+                expected,
+                "{category:?}"
+            );
+        }
+        // `AR` is deliberately absent: it tags Arabic, not Argentina.
+        assert_eq!(lineuparr_category_country("AR: beIN DRAMA"), None);
+        // Lineuparr's newer batch resolves too.
+        assert_eq!(lineuparr_category_country("QA: beIN Sports"), Some("QA"));
+        assert_eq!(lineuparr_category_country("VN Movies"), None);
+    }
+
+    #[test]
+    fn lineuparr_pluto_marker_is_case_insensitive() {
+        assert_eq!(lineuparr_stream_country("(PLUTO UK) POP"), Some("UK"));
+        assert_eq!(lineuparr_stream_country("(Pluto UK) POP"), Some("UK"));
+        assert_eq!(lineuparr_stream_country("(pluto germany) mtv"), Some("DE"));
+    }
 
     #[test]
     fn prefix_forms_resolve() {
@@ -872,10 +1474,149 @@ mod tests {
     }
 
     #[test]
+    fn zone_words_before_trailing_tags_still_route() {
+        // Decided Z08 (step 9 review): a zone word followed by a trailing writer tag
+        // is still a zone word — the zone is read after stripping the shared tag
+        // vocabulary (quality, junk, status; `+1` stays a shift, not a zone).
+        for (name, zone) in [
+            ("HBO West (Backup)", FeedZone::West),
+            ("HBO West [4K]", FeedZone::West),
+            ("ITV1 (Central West) HD", FeedZone::West),
+            ("HBO (West) [HD]", FeedZone::West),
+            ("ESPN West +1", FeedZone::West),
+            ("ESPN East (Backup)", FeedZone::East),
+            ("HBO Pacific (Backup)", FeedZone::West),
+        ] {
+            assert_eq!(extract_zone_noguard(name), zone, "{name:?}");
+        }
+        // The guarded `extract_zone` stays SM's transcription: SM reads these as
+        // Default (its tails cover only its own quality list), and the SM parity
+        // sweep checks that function against the plugin.
+        assert_eq!(extract_zone("HBO West (Backup)"), FeedZone::Default);
+        assert_eq!(extract_zone("Antenna TV Pacific [HD]"), FeedZone::Default);
+        // The shift survives the strip: the zone read peels `+1`, the timeshift flag
+        // still reads the original name.
+        assert!(crate::engine::is_time_shift("ESPN West +1"));
+        assert!(!crate::engine::is_time_shift("ESPN West"));
+        // Stripping never invents a zone: untagged and unknown-tagged names stay put,
+        // and words merely containing a zone word are prose, not feeds.
+        for name in [
+            "HBO",
+            "HBO (Backup)",
+            "HBO [4K]",
+            "CNN (Moldova)",
+            "West Ham TV",
+            "Westworld",
+            "Western Movies",
+            "Easter Parade",
+        ] {
+            assert_eq!(extract_zone_noguard(name), FeedZone::Default, "{name:?}");
+        }
+        // A whole-tag name and a leading-space tag keep their text (never stripped to
+        // empty); superscript marks strip like their plain spellings.
+        assert_eq!(crate::tags::strip_zone_ignorable("[HD]"), "[HD]");
+        assert_eq!(crate::tags::strip_zone_ignorable("HD (Backup)"), "HD");
+        assert_eq!(crate::tags::strip_zone_ignorable(" HD"), " HD");
+        assert_eq!(crate::tags::strip_zone_ignorable("HBO West ᴴᴰ"), "HBO West");
+        assert_eq!(
+            crate::tags::strip_zone_ignorable("HBO West (Backup) (Moldova)"),
+            "HBO West (Backup) (Moldova)"
+        );
+        assert_eq!(
+            crate::tags::strip_zone_ignorable("Sky Sports (Backup) West"),
+            "Sky Sports (Backup) West"
+        );
+    }
+
+    #[test]
+    fn zone_markers_strip_on_the_engines_own_reading() {
+        for (name, stripped) in [
+            ("Showtime (W)", "Showtime"),
+            ("Showtime (E)", "Showtime"),
+            ("HBO East HD", "HBO"),
+            ("HBO West (Backup)", "HBO"),
+            ("Starz (Pacific)", "Starz"),
+            ("Cinemax East | HD |", "Cinemax"),
+        ] {
+            assert_eq!(
+                strip_zone_marker(name).as_deref(),
+                Some(stripped),
+                "{name:?}"
+            );
+            assert_ne!(extract_zone_noguard(name), FeedZone::Default, "{name:?}");
+        }
+        // No zone read, nothing stripped: prose words and a bare `(P)` (decided Z07).
+        for name in [
+            "HBO",
+            "West Ham TV",
+            "Westworld",
+            "Easter Parade",
+            "Starz (P)",
+        ] {
+            assert_eq!(strip_zone_marker(name), None, "{name:?}");
+            assert_eq!(extract_zone_noguard(name), FeedZone::Default, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn pipe_segments_collapse_before_zone_and_country() {
+        // Decided N15 (step-14 review): `|` residue never reaches the key or the
+        // zone/country reads — junk segments drop, the rest join with a space.
+        // Keys keep the zone word and the meaningful pipe part.
+        let engine = crate::engine::UnifiedEngine::decided();
+        // N02=core strips the bare zone word for scoring, so the key is the
+        // bare channel (the step-14 spec: key `cinemax`, zone East).
+        assert_eq!(engine.normalize_key("Cinemax East | HD |"), "Cinemax");
+        assert_eq!(
+            engine.normalize_key("Sky Sports | Premier League"),
+            "Sky Sports Premier League"
+        );
+        assert_eq!(engine.normalize_key("UK | Sky Sports | HD"), "Sky Sports");
+        // Zones read through the pipes.
+        assert_eq!(extract_zone_noguard("Cinemax East | HD |"), FeedZone::East);
+        assert_eq!(
+            extract_zone_noguard("UK | Sky Sports West | HD"),
+            FeedZone::West
+        );
+        assert_eq!(
+            extract_zone_noguard("West Ham TV | HD |"),
+            FeedZone::Default
+        );
+        // A leading country-code segment stays a country marker: the collapsed
+        // space form reads exactly like the `:`/`|` marker forms (no regress).
+        assert_eq!(lineuparr_stream_country("UK | Sky Sports"), Some("UK"));
+        assert_eq!(lineuparr_stream_country("UK: Sky Sports"), Some("UK"));
+        assert_eq!(lineuparr_stream_country("UK Sky Sports"), Some("UK"));
+        assert_eq!(lineuparr_stream_country("UK | Sky Sports | HD"), Some("UK"));
+        assert_eq!(lineuparr_stream_country("HD | UK | Sky One"), Some("UK"));
+        // A bare code is not a marker (the decided rule): `USA | HD |` (USA
+        // Network) collapses to `USA`, which no marker form takes.
+        assert_eq!(lineuparr_stream_country("USA | HD |"), None);
+        assert_eq!(lineuparr_stream_country("USA"), None);
+    }
+
+    #[test]
     fn detect_via_the_trait() {
         let detector: &dyn CountryDetector = &STREAM_MAPPARR;
         assert_eq!(detector.country_from_name("US: ESPN"), Some("US"));
         assert_eq!(detector.country_from_group("Canada"), Some("CA"));
         assert_eq!(extract_zone("HBO West"), FeedZone::West);
+    }
+
+    #[test]
+    fn the_delimited_country_marker_strips() {
+        assert_eq!(strip_delimited_country_marker("US: CNN HD"), "CNN HD");
+        assert_eq!(strip_delimited_country_marker("UK | Sky One"), "Sky One");
+        assert_eq!(strip_delimited_country_marker("USA - ESPN"), "ESPN");
+        // Not a country, or nothing after it: unchanged.
+        for name in [
+            "TV - Shopping",
+            "NFL: RedZone",
+            "CBS - AL Birmingham (WIAT)",
+            "US:",
+            "CNN",
+        ] {
+            assert_eq!(strip_delimited_country_marker(name), name, "{name}");
+        }
     }
 }

@@ -5,6 +5,7 @@ members = [
     "crates/crosstalk-core",
     "crates/guide",
     "crates/streams",
+    "crates/lineup",
     "crates/crosstalk-web",
     "crates/crosstalk",
 ]
@@ -12,7 +13,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.89"
 license = "MIT"
 repository = "https://github.com/darkspadez/crosstalk"
 
@@ -23,6 +24,7 @@ crosstalk-core = { path = "crates/crosstalk-core" }
 crosstalk-web = { path = "crates/crosstalk-web" }
 crosstalk-guide = { path = "crates/guide" }
 crosstalk-streams = { path = "crates/streams" }
+crosstalk-lineup = { path = "crates/lineup" }
 
 # Async / runtime
 tokio = { version = "1", features = ["full"] }
@@ -32,7 +34,7 @@ futures = "0.3"
 # HTTP
 axum = { version = "0.7", features = ["macros"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["fs", "trace"] }
+tower-http = { version = "0.6", features = ["fs", "trace", "timeout"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
 
 # Serialization / config
@@ -51,11 +53,10 @@ unicode-general-category = "1"
 unicode_names2 = "1"
 
 # Storage
-rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+rusqlite = { version = "0.41", features = ["bundled", "chrono"] }
 
 # Web UI
-askama = { version = "0.12", features = ["with-axum"] }
-askama_axum = "0.4"
+askama = "0.16"
 
 # Observability / CLI
 tracing = "0.1"
@@ -74,6 +75,9 @@ csv = "1"
 # Dev
 tempfile = "3"
 wiremock = "0.6"
+# Property tests for the input parsers (docs/audit/D-inputs.md). `PROPTEST_CASES` sets the
+# case count; each test file defaults to 256.
+proptest = "1"
 
 [profile.release]
 # Release binaries (and the Docker image) ship without symbol tables. Panics still

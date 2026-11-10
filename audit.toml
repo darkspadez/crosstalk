@@ -8,3 +8,9 @@
 # The audit job also runs on a weekly schedule (see .github/workflows/ci.yml), so a
 # newly published advisory surfaces on the scheduled run rather than reddening the next
 # unrelated pull request.
+
+[output]
+# Informational warnings that fail the job too, not just vulnerabilities. `unmaintained`
+# is left out on purpose: askama's derive macro depends on the unmaintained `basic-toml`
+# (RUSTSEC-2026-0374), which would fail every run until askama drops it.
+deny = ["unsound", "yanked"]

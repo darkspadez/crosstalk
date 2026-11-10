@@ -16,9 +16,13 @@
 //! here but a host feature: one button and one command delete every sub-app's own reports, so
 //! each app does not carry its own copy.
 
+#![forbid(unsafe_code)]
+
 pub mod cleanup;
+pub mod engine;
 pub mod heal;
 pub mod matching;
+mod programs;
 pub mod scan;
 pub mod scope;
 pub mod settings;
@@ -388,8 +392,7 @@ impl GuideApp {
 
         let client = context.dispatcharr()?;
         let world = client.load_world().await?;
-        let scoped_channels =
-            crosstalk_core::scope::scope_channels(&world, &context.config().scope)?;
+        let scoped_channels = context.scoped_channels(&world)?;
 
         let result = scan::run(self, context, &settings, &world, &scoped_channels).await?;
         Ok(scan::outcome(&result))
@@ -451,8 +454,7 @@ impl GuideApp {
         ));
         let world = client.load_world().await?;
 
-        let scoped_channels =
-            crosstalk_core::scope::scope_channels(&world, &context.config().scope)?;
+        let scoped_channels = context.scoped_channels(&world)?;
         let scoped_entries = scope::scope_entries(&world, &settings.epg_sources_to_match);
 
         if scoped_channels.channels.is_empty() {
@@ -499,8 +501,7 @@ impl GuideApp {
         let client = context.dispatcharr()?;
         let world = client.load_world().await?;
 
-        let scoped_channels =
-            crosstalk_core::scope::scope_channels(&world, &context.config().scope)?;
+        let scoped_channels = context.scoped_channels(&world)?;
         let filter = scope::heal_source_filter(&settings);
         let scoped_entries = scope::scope_entries(&world, filter);
 
@@ -515,7 +516,8 @@ impl GuideApp {
         )
         .await?;
         // Same rule as auto-match: whatever healed stays recorded, and the run says cancelled.
-        let mut outcome = heal::outcome(&result, dry_run, settings.heal_confidence_threshold);
+        // The cut is the ONE host cut (D02/T10): heal's own threshold is retired.
+        let mut outcome = heal::outcome(&result, dry_run, context.config().matching.threshold());
         if context.is_cancelled() {
             outcome = outcome.with_cancelled();
         }
@@ -870,11 +872,16 @@ mod tests {
 
     #[test]
     fn validate_settings_catches_a_hand_edited_file() {
+        // Step 8 (D02/T10): the guide thresholds are retired, so a hand-edited file that
+        // still holds one fails at load with a pointer to the host cut.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = app().settings_path(dir.path());
         std::fs::write(&path, "match_confidence_threshold = 0\n").expect("seed");
         let error = app().validate_settings(&path).expect_err("rejects");
-        assert!(format!("{error}").contains("at least 1"));
+        assert!(
+            format!("{error:#}").contains("[matching] sensitivity"),
+            "{error:#}"
+        );
     }
 
     #[test]
@@ -1024,5 +1031,111 @@ mod tests {
             .await
             .expect_err("unknown");
         assert!(format!("{error}").contains("no action"));
+    }
+
+    #[tokio::test]
+    async fn a_step_scope_override_bounds_a_match_preview_to_that_group() {
+        // The step runs under `scope = { groups = "News" }`: only CNN (2) and Télé-Québec
+        // (4) are in scope, so ESPN (1, Sports) — which would match its programmes-bearing
+        // entry — is left alone. The override travels as the context's scope, exactly as
+        // the workflow executor sets it.
+        use crosstalk_core::config::{ScopeConfig, WorkflowStepScope};
+
+        let world = test_support::world();
+        let fixture = test_support::Fixture::start(&world, &[test_support::ESPN_HD]).await;
+        let store = crosstalk_core::store::Store::in_memory().expect("store");
+        let context = fixture
+            .context_for_run(APP_ID, ACTION_MATCH_PREVIEW, &store)
+            .with_scope_override(Some(WorkflowStepScope::Table(ScopeConfig {
+                groups: "News".to_string(),
+                ..ScopeConfig::default()
+            })));
+        let run_id = context.run_id().expect("run id");
+
+        let outcome = app()
+            .dispatch(ACTION_MATCH_PREVIEW, &context, true)
+            .await
+            .expect("preview");
+        assert!(
+            !outcome.summary.contains("No channels are in scope"),
+            "{}",
+            outcome.summary
+        );
+
+        let rows = store.rows(run_id).expect("rows");
+        assert!(!rows.is_empty(), "the override still matches News channels");
+        for row in &rows {
+            assert!(
+                [2, 4].contains(&row.channel_id),
+                "only News channels are touched: {rows:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_workflow_step_scope_override_reaches_a_real_match() {
+        // End to end through the executor: the workflow carries the step's override in its
+        // run options, the runner hands it to the action's context, and the match plans and
+        // records only the overridden group.
+        use crosstalk_core::config::{
+            SharedConfig, WorkflowConfig, WorkflowStepDetail, WorkflowStepEntry, WorkflowStepScope,
+        };
+        use crosstalk_core::runner::JobRunner;
+        use crosstalk_core::store::Store;
+        use crosstalk_core::subapp::Registry;
+        use std::sync::Arc;
+
+        let world = test_support::world();
+        let fixture = test_support::Fixture::start(&world, &[test_support::ESPN_HD]).await;
+        let store = Store::in_memory().expect("store");
+        let mut config = fixture.config.clone();
+        config.workflows.insert(
+            "news_only".to_string(),
+            WorkflowConfig {
+                steps: vec![WorkflowStepEntry::Detailed(WorkflowStepDetail {
+                    action: "guide.match_preview".to_string(),
+                    scope: Some(WorkflowStepScope::Table(
+                        crosstalk_core::config::ScopeConfig {
+                            groups: "News".to_string(),
+                            ..crosstalk_core::config::ScopeConfig::default()
+                        },
+                    )),
+                    continue_on_failure: false,
+                })],
+                fresh: false,
+            },
+        );
+        let runner = JobRunner::new(
+            Registry::new(vec![Arc::new(GuideApp::new())]),
+            SharedConfig::new(config),
+            store.clone(),
+        );
+        let outcome = crosstalk_core::workflow::run_to_completion(
+            &runner,
+            "news_only",
+            false,
+            crosstalk_core::runner::RunOptions::default(),
+        )
+        .await
+        .expect("runs");
+        assert!(!outcome.is_failed(), "{}", outcome.summary);
+
+        let record = store
+            .recent_runs_for(crosstalk_core::workflow::APP_ID, 1)
+            .expect("runs")
+            .into_iter()
+            .next()
+            .expect("a workflow run");
+        let steps = store.child_runs(record.id).expect("steps");
+        assert_eq!(steps.len(), 1, "{steps:?}");
+        assert_eq!(steps[0].status, crosstalk_core::store::RunStatus::Succeeded);
+        let rows = store.rows(steps[0].id).expect("rows");
+        assert!(!rows.is_empty(), "the override still matches News channels");
+        for row in &rows {
+            assert!(
+                [2, 4].contains(&row.channel_id),
+                "only News channels are touched: {rows:?}"
+            );
+        }
     }
 }

@@ -23,7 +23,7 @@
 //!     (so two workflows never interleave), it is cancellable by its run id like any action, and
 //!     its steps are ordinary runs of their own apps that point back at it.
 
-use crate::config::{CrosstalkConfig, SharedConfig};
+use crate::config::{CrosstalkConfig, SharedConfig, WorkflowStepScope};
 use crate::jobs::{JobContext, ProgressEvent, ProgressSink};
 use crate::store::{RunStatus, Store};
 use crate::subapp::{ActionKind, JobOutcome, OutcomeStatus, Registry};
@@ -59,6 +59,14 @@ pub struct RunOptions {
     /// Recorded on the run row (`parent_run_id`) so the workflow's run page can list its steps.
     /// Nothing else reads it: a step is an ordinary run in every other respect.
     pub parent_run: Option<i64>,
+    /// A workflow step's scope override, replacing the host `[scope]` for this run.
+    ///
+    /// Set by the workflow executor from the step; every other caller leaves it unset.
+    pub scope_override: Option<WorkflowStepScope>,
+    /// The action's single free-text input (`--input` on the CLI, the text field on the
+    /// web action button). Carried into the [`JobContext`](crate::jobs::JobContext) and
+    /// stored in the run record. `None` means no input was passed.
+    pub input: Option<String>,
 }
 
 impl RunOptions {
@@ -77,6 +85,20 @@ impl RunOptions {
     /// Record this run as a step of the given workflow run.
     pub fn with_parent(mut self, parent_run_id: i64) -> Self {
         self.parent_run = Some(parent_run_id);
+        self
+    }
+
+    /// Replace the host `[scope]` for this run with a workflow step's scope override.
+    pub fn with_scope_override(mut self, scope: Option<WorkflowStepScope>) -> Self {
+        self.scope_override = scope;
+        self
+    }
+
+    /// Carry the action's single free-text input into the run.
+    pub fn with_input(mut self, input: Option<String>) -> Self {
+        self.input = input
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty());
         self
     }
 }
@@ -141,6 +163,40 @@ struct RunSlot {
     busy: Arc<Mutex<HashMap<String, i64>>>,
     finish: Arc<Mutex<HashMap<i64, Arc<AtomicBool>>>>,
     finished: bool,
+    /// Dropped with the slot, which stops the beat.
+    _heartbeat: Heartbeat,
+}
+
+/// Keeps a live run's `heartbeat_at` fresh, so a daemon starting beside it (a CLI run, say)
+/// can tell it from a run a crash left `running` (see `Store::open`). Stops when dropped,
+/// which is when the run's slot is.
+struct Heartbeat(Option<tokio::task::JoinHandle<()>>);
+
+impl Heartbeat {
+    fn start(store: Store, run_id: i64) -> Self {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return Self(None);
+        };
+        Self(Some(runtime.spawn(async move {
+            let mut interval = tokio::time::interval(crate::store::HEARTBEAT_INTERVAL);
+            // The first tick is immediate, and `insert_run` already stamped the row.
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                if let Err(error) = store.heartbeat(run_id) {
+                    tracing::warn!(run_id, "could not record the run's heartbeat: {error:#}");
+                }
+            }
+        })))
+    }
+}
+
+impl Drop for Heartbeat {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
 }
 
 impl RunSlot {
@@ -494,6 +550,7 @@ impl JobRunner {
             .registry
             .find_action(app_id, action_id)
             .with_context(|| format!("no action {action_id:?} in sub-app {app_id:?}"))?;
+        crate::subapp::check_action_input(&spec, options.input.as_deref())?;
 
         let (run_id, cancel_flag) =
             self.reserve(app_id, spec.id, spec.unguarded, dry_run, &options)?;
@@ -512,6 +569,7 @@ impl JobRunner {
                 busy: Arc::clone(&runner.busy),
                 finish: Arc::clone(&runner.finish),
                 finished: false,
+                _heartbeat: Heartbeat::start(runner.store.clone(), run_id),
             };
 
             let sink = Arc::new(BroadcastSink {
@@ -599,6 +657,7 @@ impl JobRunner {
             .registry
             .find_action(app_id, action_id)
             .with_context(|| format!("no action {action_id:?} in sub-app {app_id:?}"))?;
+        crate::subapp::check_action_input(&spec, options.input.as_deref())?;
 
         let (run_id, cancel_flag) =
             self.reserve(app_id, spec.id, spec.unguarded, dry_run, &options)?;
@@ -610,6 +669,7 @@ impl JobRunner {
             busy: Arc::clone(&self.busy),
             finish: Arc::clone(&self.finish),
             finished: false,
+            _heartbeat: Heartbeat::start(self.store.clone(), run_id),
         };
 
         let sink = Arc::new(BroadcastSink {
@@ -652,6 +712,189 @@ impl JobRunner {
         outcome
     }
 
+    /// The checks every undo passes before it reserves the app's slot.
+    ///
+    /// A refused target ([`crate::undo::check_target`]) records no run at all, and the undo
+    /// always links to the run it reverses: `parent_run_id` is the undone run, whatever the
+    /// caller passed, because that link is what the run pages follow in both directions.
+    fn check_undo(
+        &self,
+        app_id: &str,
+        target_run_id: i64,
+        options: RunOptions,
+    ) -> Result<RunOptions> {
+        let target = crate::undo::check_target(&self.store, &self.registry, target_run_id)?;
+        if target.app != app_id {
+            bail!(
+                "run #{target_run_id} belongs to {:?}, not {app_id:?}: undo it through its \
+                 own app",
+                target.app
+            );
+        }
+        Ok(options.with_parent(target_run_id))
+    }
+
+    /// Start an undo of one run, and return immediately.
+    ///
+    /// The host-level path for [`crate::undo::ACTION_UNDO`]: a reserved action every app gets
+    /// without declaring it, so it never appears in schedules, workflows or hook targets.
+    /// The run is recorded under the target run's app with `parent_run_id` set to the undone
+    /// run, takes the app's run guard like any write, and is cancellable.
+    pub fn start_undo(
+        &self,
+        app_id: &str,
+        target_run_id: i64,
+        dry_run: bool,
+    ) -> Result<StartedRun> {
+        self.start_undo_with(app_id, target_run_id, dry_run, RunOptions::default())
+    }
+
+    /// Start an undo run with explicit [`RunOptions`].
+    ///
+    /// The undo always links to the undone run (`parent_run_id`), replacing any parent in
+    /// `options`.
+    pub fn start_undo_with(
+        &self,
+        app_id: &str,
+        target_run_id: i64,
+        dry_run: bool,
+        options: RunOptions,
+    ) -> Result<StartedRun> {
+        let options = self.check_undo(app_id, target_run_id, options)?;
+
+        let (run_id, cancel_flag) =
+            self.reserve(app_id, crate::undo::ACTION_UNDO, false, dry_run, &options)?;
+
+        let runner = self.clone();
+        let started_app = app_id.to_string();
+        let registry = Arc::clone(&self.registry);
+        tokio::spawn(async move {
+            let slot = RunSlot {
+                run_id,
+                app: started_app.clone(),
+                store: runner.store.clone(),
+                active: Arc::clone(&runner.active),
+                busy: Arc::clone(&runner.busy),
+                finish: Arc::clone(&runner.finish),
+                finished: false,
+                _heartbeat: Heartbeat::start(runner.store.clone(), run_id),
+            };
+
+            let sink = Arc::new(BroadcastSink {
+                sender: runner.sender.clone(),
+                active: Arc::clone(&runner.active),
+                run_id,
+            });
+            let context = runner.context_for(
+                &started_app,
+                crate::undo::ACTION_UNDO,
+                run_id,
+                Arc::clone(&cancel_flag),
+                sink.clone(),
+                &options,
+            );
+            // An undo always writes channel data (or previews doing so), so it always
+            // needs Dispatcharr.
+            let context = match context.connect() {
+                Ok(context) => context,
+                Err(error) => {
+                    slot.finish(
+                        RunStatus::Failed,
+                        Some(&format!("{error:#}")),
+                        &serde_json::json!({}),
+                        None,
+                    );
+                    runner.prune_history();
+                    let mut event = ProgressEvent::new(crate::undo::ACTION_UNDO, 0, 0, "failed");
+                    event.done = true;
+                    event.summary = Some(format!("{error:#}"));
+                    sink.publish(&event);
+                    return;
+                }
+            };
+
+            let outcome = crate::undo::run_undo(&registry, target_run_id, &context, dry_run).await;
+            let cancelled = cancel_flag.load(Ordering::SeqCst);
+            let (status, summary, counts, report) = recorded_outcome(&outcome, cancelled);
+
+            slot.finish(status, summary.as_deref(), &counts, report.as_deref());
+            runner.prune_history();
+
+            let mut event = ProgressEvent::new(crate::undo::ACTION_UNDO, 0, 0, status.as_str());
+            event.done = true;
+            event.summary = summary;
+            sink.publish(&event);
+        });
+
+        Ok(StartedRun {
+            run_id,
+            app: app_id.to_string(),
+            action: crate::undo::ACTION_UNDO.to_string(),
+            dry_run,
+        })
+    }
+
+    /// Run an undo to completion, for the one-shot CLI and tests.
+    ///
+    /// Takes the same reservation as [`JobRunner::start_undo`], so a one-shot undo and a
+    /// scheduled run cannot write the same channels at once.
+    pub async fn run_undo_to_completion_with(
+        &self,
+        app_id: &str,
+        target_run_id: i64,
+        dry_run: bool,
+        options: RunOptions,
+    ) -> Result<JobOutcome> {
+        let options = self.check_undo(app_id, target_run_id, options)?;
+
+        let (run_id, cancel_flag) =
+            self.reserve(app_id, crate::undo::ACTION_UNDO, false, dry_run, &options)?;
+        let slot = RunSlot {
+            run_id,
+            app: app_id.to_string(),
+            store: self.store.clone(),
+            active: Arc::clone(&self.active),
+            busy: Arc::clone(&self.busy),
+            finish: Arc::clone(&self.finish),
+            finished: false,
+            _heartbeat: Heartbeat::start(self.store.clone(), run_id),
+        };
+
+        let sink = Arc::new(BroadcastSink {
+            sender: self.sender.clone(),
+            active: Arc::clone(&self.active),
+            run_id,
+        });
+        let context = self.context_for(
+            app_id,
+            crate::undo::ACTION_UNDO,
+            run_id,
+            Arc::clone(&cancel_flag),
+            sink,
+            &options,
+        );
+        let context = match context.connect() {
+            Ok(context) => context,
+            Err(error) => {
+                slot.finish(
+                    RunStatus::Failed,
+                    Some(&format!("{error:#}")),
+                    &serde_json::json!({}),
+                    None,
+                );
+                self.prune_history();
+                return Err(error);
+            }
+        };
+
+        let outcome = crate::undo::run_undo(&self.registry, target_run_id, &context, dry_run).await;
+        let cancelled = cancel_flag.load(Ordering::SeqCst);
+        let (status, summary, counts, report) = recorded_outcome(&outcome, cancelled);
+        slot.finish(status, summary.as_deref(), &counts, report.as_deref());
+        self.prune_history();
+        outcome
+    }
+
     /// The context one run gets.
     ///
     /// Snapshot at run start: a settings save while this run is in flight changes the next run,
@@ -667,10 +910,20 @@ impl JobRunner {
         options: &RunOptions,
     ) -> JobContext {
         let snapshot = Arc::new(self.config.snapshot());
+        // The run record keeps the input: `insert_run` leaves it NULL and this fills it
+        // in, so the one INSERT column list stays the single place new columns land.
+        if let Some(input) = options.input.as_deref() {
+            if let Err(error) = self.store.set_run_input(run_id, input) {
+                tracing::warn!(run_id, "could not record the run's input: {error:#}");
+            }
+        }
         JobContext::new(snapshot, sink)
             .for_run(app_id, action_id, run_id, self.store.clone(), cancel_flag)
             .with_deadline(options.deadline)
             .with_live_runs(Arc::clone(&self.active))
+            .with_scope_override(options.scope_override.clone())
+            .with_registry(self.registry.as_ref().clone())
+            .with_input(options.input.clone())
     }
 
     /// Delete run history older than the configured retention.
@@ -775,6 +1028,7 @@ impl JobRunner {
                 busy: Arc::clone(&self.busy),
                 finish: Arc::clone(&self.finish),
                 finished: false,
+                _heartbeat: Heartbeat::start(self.store.clone(), run_id),
             }),
             runner: self.clone(),
         })

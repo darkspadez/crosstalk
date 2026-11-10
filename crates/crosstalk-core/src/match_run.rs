@@ -9,14 +9,15 @@
 //! live one, lineup will walk entries looking for a logo. The order and the tie-break are the
 //! same for all of them, which is why they live here rather than in each app.
 //!
-//! The parallel scoring stage in front of the walk is shared too ([`score_names`]): every app
-//! scores a list of query names against the same kind of candidate index, and the work scales
+//! The parallel scoring stage in front of the walk is shared too ([`score_families`]): every
+//! app scores a list of query names against one unified-engine index, and the work scales
 //! with cores rather than with the async runtime.
 
 use crate::dispatcharr::{EpgEntry, Stream};
 use crate::jobs::{JobContext, ProgressEvent};
 use anyhow::{Context, Result};
-use crosstalk_matching::pipeline::{CandidateIndex, Matcher, Scored};
+use crosstalk_matching::engine::{EngineIndex, EngineRanked, UnifiedEngine};
+use crosstalk_matching::pipeline::Scored;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -92,11 +93,33 @@ impl Candidate for Stream {
 /// The app-specific half of a walk: does this candidate actually carry something usable?
 ///
 /// Guide asks Dispatcharr whether the entry has programme data; streams will ask whether the
-/// stream is alive. A failed check is "no", never an error: one broken candidate must not fail
-/// a run that can still match the rest.
+/// stream is alive. A failed check is [`Probed::Unknown`], never an error and never "no": one
+/// broken candidate must not fail a run that can still match the rest, and a REST blip must
+/// not make the walk settle for a lower-ranked candidate.
 #[async_trait::async_trait]
 pub trait CandidateProbe<C: Candidate>: Send + Sync {
-    async fn carries_data(&self, candidate: &C) -> bool;
+    async fn carries_data(&self, candidate: &C) -> Probed;
+}
+
+/// What a [`CandidateProbe`] found out about one candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Probed {
+    /// The candidate carries data.
+    Yes,
+    /// The candidate was checked and carries nothing.
+    No,
+    /// The check failed: the candidate may or may not carry data.
+    Unknown,
+}
+
+impl From<bool> for Probed {
+    fn from(has: bool) -> Self {
+        if has {
+            Probed::Yes
+        } else {
+            Probed::No
+        }
+    }
 }
 
 /// A probe for callers with nothing to check: always carries data.
@@ -109,8 +132,8 @@ pub struct NoProbe;
 
 #[async_trait::async_trait]
 impl<C: Candidate + Sync> CandidateProbe<C> for NoProbe {
-    async fn carries_data(&self, _candidate: &C) -> bool {
-        true
+    async fn carries_data(&self, _candidate: &C) -> Probed {
+        Probed::Yes
     }
 }
 
@@ -134,6 +157,9 @@ pub struct WalkResult {
     /// The model's pick and its score, when it accepted a name whose every same-name
     /// candidate is empty.
     pub ai_empty: Option<(String, u8)>,
+    /// The candidate whose check failed and stopped the walk, if one did. The channel is left
+    /// unmatched rather than settling for a lower-ranked candidate.
+    pub unknown: Option<String>,
 }
 
 impl WalkResult {
@@ -189,18 +215,27 @@ where
                     continue;
                 }
                 let has = if !rules.validate {
-                    true
+                    Probed::Yes
                 } else {
                     if context.is_cancelled() {
                         return WalkResult::empty();
                     }
                     probe.carries_data(entry).await
                 };
-                if has {
-                    return WalkResult {
-                        chosen: Some(rank_position),
-                        ..WalkResult::empty()
-                    };
+                match has {
+                    Probed::Yes => {
+                        return WalkResult {
+                            chosen: Some(rank_position),
+                            ..WalkResult::empty()
+                        };
+                    }
+                    Probed::Unknown => {
+                        return WalkResult {
+                            unknown: Some(entry.name().to_string()),
+                            ..WalkResult::empty()
+                        };
+                    }
+                    Probed::No => {}
                 }
             }
             let score = ranked.get(position).map(|candidate| candidate.score);
@@ -208,6 +243,7 @@ where
                 chosen: None,
                 best_rejected: score,
                 ai_empty: score.map(|score| (picked_name, score)),
+                unknown: None,
             };
         }
         return WalkResult::empty();
@@ -228,25 +264,37 @@ where
             return WalkResult {
                 chosen: Some(rank_position),
                 best_rejected,
-                ai_empty: None,
+                ..WalkResult::empty()
             };
         }
         if context.is_cancelled() {
             return WalkResult::empty();
         }
-        if probe.carries_data(entry).await {
-            return WalkResult {
-                chosen: Some(rank_position),
-                best_rejected,
-                ai_empty: None,
-            };
+        match probe.carries_data(entry).await {
+            Probed::Yes => {
+                return WalkResult {
+                    chosen: Some(rank_position),
+                    best_rejected,
+                    ..WalkResult::empty()
+                };
+            }
+            // A failed check stops the walk: the next candidate is only "better" than this
+            // one if this one is really empty, which nobody knows.
+            Probed::Unknown => {
+                return WalkResult {
+                    best_rejected,
+                    unknown: Some(entry.name().to_string()),
+                    ..WalkResult::empty()
+                };
+            }
+            Probed::No => {}
         }
         best_rejected = Some(candidate.score);
     }
     WalkResult {
         chosen: None,
         best_rejected,
-        ai_empty: None,
+        ..WalkResult::empty()
     }
 }
 
@@ -290,21 +338,57 @@ pub struct ScoreProgress<'a> {
     pub phase: &'a str,
 }
 
-/// Score every query name against the candidate index, in parallel.
+/// Score every query name against one shared engine index, in parallel, returning the
+/// best identity FAMILY per query (the unified selection rule: the top's family, in
+/// rank order, at the engine's cut).
 ///
-/// Runs on a blocking thread with rayon, so a big scope never stalls the async runtime. Order
-/// is preserved on collect, so the result is in query order. `progress` is optional because a
-/// short stage (heal scores only the broken channels) is not worth a progress bar.
-pub async fn score_names(
+/// Every migrated app scores one candidate list per run and fans the queries out over
+/// rayon, so a big scope never stalls the async runtime. Order is preserved on collect, so the result is in query order.
+/// `progress` is optional because a short stage (heal scores only the broken channels)
+/// is not worth a progress bar.
+pub async fn score_families(
     names: &[String],
-    matcher: Arc<Matcher>,
-    index: Arc<CandidateIndex>,
-    tags: &[String],
+    engine: Arc<UnifiedEngine>,
+    index: Arc<EngineIndex>,
     progress: Option<ScoreProgress<'_>>,
-) -> Result<Vec<Vec<Scored>>> {
+) -> Result<Vec<Vec<EngineRanked>>> {
+    rank_all(names, engine, index, progress, |engine, name, index| {
+        engine.rank_index(name, index)
+    })
+    .await
+    .context("the family scoring stage panicked")
+}
+
+/// The AI shortlist twin of [`score_families`]: the same ranker without the family cut
+/// ([`UnifiedEngine::shortlist_index_in`]), for queries whose family came back empty at
+/// the decision cut. `engine` is the run's engine re-cut at the `[ai.verify]` floor
+/// ([`UnifiedEngine::with_threshold`]), so the borderline candidates the decision cut
+/// discards are still there to offer the model; the index is the run's own.
+pub async fn score_shortlists(
+    names: &[String],
+    engine: Arc<UnifiedEngine>,
+    index: Arc<EngineIndex>,
+) -> Result<Vec<Vec<EngineRanked>>> {
+    rank_all(names, engine, index, None, |engine, name, index| {
+        engine.shortlist_index_in(name, None, index)
+    })
+    .await
+    .context("the AI shortlist stage panicked")
+}
+
+/// Rank every name with `rank` on a rayon pool, in query order, publishing progress.
+async fn rank_all<F>(
+    names: &[String],
+    engine: Arc<UnifiedEngine>,
+    index: Arc<EngineIndex>,
+    progress: Option<ScoreProgress<'_>>,
+    rank: F,
+) -> std::result::Result<Vec<Vec<EngineRanked>>, tokio::task::JoinError>
+where
+    F: Fn(&UnifiedEngine, &str, &EngineIndex) -> Vec<EngineRanked> + Send + Sync + 'static,
+{
     let total = names.len();
     let names = names.to_vec();
-    let tags = tags.to_vec();
     let progress = progress.map(|progress| {
         (
             progress.context.clone(),
@@ -315,7 +399,6 @@ pub async fn score_names(
 
     tokio::task::spawn_blocking(move || {
         use rayon::prelude::*;
-        let tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
         let counter = AtomicUsize::new(0);
         // Published `current` must be monotonic: rayon workers finish out of order, so a
         // later-finishing worker with a smaller `done` must not move the bar backwards. Only
@@ -324,10 +407,10 @@ pub async fn score_names(
         names
             .par_iter()
             .map(|name| {
-                let ranked = matcher.score_candidates(name, &index, &tag_refs, None);
+                let family = rank(&engine, name, &index);
                 if let Some((context, action, phase)) = progress.as_ref() {
                     let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if done % PROGRESS_EVERY == 0 || done == total {
+                    if done.is_multiple_of(PROGRESS_EVERY) || done == total {
                         let prev = max_sent.fetch_max(done, Ordering::Relaxed);
                         if done > prev {
                             context.progress(&ProgressEvent::new(
@@ -339,12 +422,11 @@ pub async fn score_names(
                         }
                     }
                 }
-                ranked
+                family
             })
             .collect()
     })
     .await
-    .context("the scoring stage panicked")
 }
 
 /// Whether an AI gate would ask the model about this channel's best candidate.
@@ -376,17 +458,33 @@ mod tests {
         }
     }
 
-    /// Answer from the candidate's own flag, and count the calls.
+    /// Answer from the candidate's own flag, and count the calls. A candidate named
+    /// `"Broken"` answers [`Probed::Unknown`], like a failed lookup.
     struct FlagProbe {
         calls: Arc<AtomicUsize>,
     }
 
     #[async_trait::async_trait]
     impl CandidateProbe<Entry> for FlagProbe {
-        async fn carries_data(&self, candidate: &Entry) -> bool {
+        async fn carries_data(&self, candidate: &Entry) -> Probed {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            candidate.live
+            if candidate.name == "Broken" {
+                return Probed::Unknown;
+            }
+            Probed::from(candidate.live)
         }
+    }
+
+    #[tokio::test]
+    async fn a_failed_check_stops_the_walk_instead_of_settling_for_the_next_candidate() {
+        let context = JobContext::for_tests(Default::default());
+        let probe = probe();
+        let candidates = vec![entry(1, "Broken", true), entry(2, "B", true)];
+        let ranked = vec![scored(100, 0), scored(99, 1)];
+        let walked = walk(&context, &candidates, &ranked, None, rules(85), &probe).await;
+        assert_eq!(walked.chosen, None, "the second candidate is not taken");
+        assert_eq!(walked.unknown, Some("Broken".to_string()));
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
     }
 
     fn probe() -> FlagProbe {
@@ -571,13 +669,14 @@ mod tests {
             Arc::new(crate::config::CrosstalkConfig::default()),
             sink.clone(),
         );
-        let matcher = Arc::new(Matcher::with_shipped_defaults());
+        let engine = Arc::new(UnifiedEngine::decided());
         let names = vec!["ESPN".to_string(), "CNN".to_string()];
-        let index = Arc::new(CandidateIndex::build(
+        let index = Arc::new(EngineIndex::build(
             &["ESPN HD".to_string(), "CNN".to_string()],
-            &matcher,
+            &engine,
+            &crosstalk_matching::identity::ResolveContext::default(),
         ));
-        let scored = score_names(&names, Arc::clone(&matcher), index, &matcher.tags(), None)
+        let scored = score_families(&names, Arc::clone(&engine), index, None)
             .await
             .expect("scored");
         assert_eq!(scored.len(), 2);

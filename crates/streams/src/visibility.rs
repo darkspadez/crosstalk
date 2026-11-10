@@ -18,11 +18,13 @@
 //!
 //! Two properties of the plugin matter for a port:
 //!
-//!   * **the grouping is Match & Assign's** (`_build_channel_groups`), not a copy: with the
-//!     country filter on, `cnn@@US` and `cnn@@UK` are two groups, and collapsing them would
-//!     enable one country's channel and disable the other's (bug-158 review I1). The grouping
-//!     is reused here through [`crate::matching::build_groups`], the same function a match
-//!     run groups with;
+//!   * **the grouping is Match & Assign's** (one identity family key per group), not a
+//!     copy: with the country filter on, two countries never share a group, and
+//!     collapsing them would enable one country's channel and disable the other's
+//!     (bug-158 review I1). The grouping is reused here through
+//!     [`crate::matching::build_groups`], the same function a match run groups with; step
+//!     9 keys it by identity family, so visibility and match group the same channels
+//!     together.
 //!   * **the channel set is the profile(s) loaded by the plugin's own load step**, which is the
 //!     channels ENABLED in the selected profiles. So a channel a previous run disabled is not
 //!     in the set any more and cannot be re-enabled by a later run: crosstalk reads the same
@@ -94,7 +96,7 @@
 use crate::matching::{self, MatchOptions};
 use crate::settings::StreamsSettings;
 use anyhow::{bail, Result};
-use crosstalk_core::channel_ops::{self, Field, Op, ReportSpec, Selection, SetValue};
+use crosstalk_core::channel_ops::{self, Field, Op, ReportSpec, SetValue};
 use crosstalk_core::config::{MatchingConfig, ScopeConfig};
 use crosstalk_core::csv_report;
 use crosstalk_core::dispatcharr::{ChannelProfile, World, WorldKind, WorldKinds};
@@ -215,13 +217,24 @@ pub fn host_profile<'a>(world: &'a World, scope: &ScopeConfig) -> Result<&'a Cha
 /// Pure: nothing is written and the world is not modified. The grouping and the priority
 /// order come from [`crate::matching`], so the groups a visibility run enables one channel in
 /// are exactly the groups a match run assigns streams to.
+///
+/// `limit` bounds the race to these channel ids (a workflow step's named scope): the latch
+/// picks among the bound channels only, which filtering the outcome afterwards could not do.
+/// With a bound, `scope` only names the profile written (the ids REPLACE its channel
+/// filters). `None` plans the whole scope, exactly as before.
 pub fn plan(
     world: &World,
     scope: &ScopeConfig,
     settings: &StreamsSettings,
     matching_config: &MatchingConfig,
+    limit: Option<&std::collections::HashSet<i64>>,
 ) -> Result<VisibilityOutcome> {
-    plan_with_options(world, scope, &MatchOptions::new(settings, matching_config))
+    plan_with_options(
+        world,
+        scope,
+        &MatchOptions::new(settings, matching_config),
+        limit,
+    )
 }
 
 /// [`plan`], with the match options supplied instead of resolved from settings.
@@ -234,12 +247,26 @@ pub fn plan_with_options(
     world: &World,
     scope: &ScopeConfig,
     options: &MatchOptions,
+    limit: Option<&std::collections::HashSet<i64>>,
 ) -> Result<VisibilityOutcome> {
     world.require(WorldKind::Channels)?;
     world.require(WorldKind::Profiles)?;
 
     let host = host_profile(world, scope)?;
-    let scoped = scope_channels(world, scope)?;
+    // A step override resolving to channel ids REPLACES the host scope: the race runs
+    // among exactly these channels, so `scope` only names the profile being written (its
+    // groups and profile filters do not narrow the ids back down).
+    let mut scoped = match limit {
+        Some(_) => scope_channels(world, &ScopeConfig::default())?,
+        None => scope_channels(world, scope)?,
+    };
+    if let Some(limit) = limit {
+        scoped
+            .channels
+            .retain(|channel| limit.contains(&channel.id));
+        scoped.filter_description =
+            format!("in the step's scope ({} channel(s))", scoped.channels.len());
+    }
 
     let group_names: HashMap<i64, String> = world
         .groups
@@ -248,16 +275,19 @@ pub fn plan_with_options(
         .collect();
     let tags: Vec<String> = options.ignore_tags.clone();
     let tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
-    // `_build_channel_groups(channels, channels_data, logger, ignore_tags, ignore_q,
-    // ignore_r, ignore_g, ignore_m, restrict_matching_to_country)` — the same call Match &
-    // Assign makes, through the same function.
+    // One grouping for match and visibility (step 9): the identity family key — the same
+    // call Match & Assign makes, through the same function. The normalizer is the
+    // unified engine's (one normalizer), not the retired SM profile's. A lineup step
+    // carries the lineup country like Match & Assign does (`apply_scope_hints`).
     let groups = matching::build_groups(
         &scoped.channels,
         &options.database,
-        options.matcher.normalizer(),
+        options.engine.normalizer(),
         &tag_refs,
         options.restrict_matching_to_country,
         &group_names,
+        &options.engine,
+        options.lineup_country.as_deref(),
     );
 
     // One set, not a `Vec::contains` per channel: at 20k channels the vector scan would be a
@@ -273,7 +303,10 @@ pub fn plan_with_options(
             .iter()
             .filter(|channel| host_enabled.contains(&channel.id))
             .count(),
-        description: format!("channels in scope{}", scope_suffix(scope)),
+        description: match limit {
+            Some(_) => format!("channels {}", scoped.filter_description),
+            None => format!("channels in scope{}", scope_suffix(scope)),
+        },
         ..VisibilityOutcome::default()
     };
 
@@ -336,7 +369,6 @@ pub async fn run(
         "streams.visibility_{}",
         if dry_run { "preview" } else { "apply" }
     );
-    let scope = context.config().scope.clone();
 
     // Channels (their lists and numbers), groups (the grouping key reads group names for a
     // channel's country), profiles (the scope filter AND the membership being written). No
@@ -350,13 +382,26 @@ pub async fn run(
     ));
     let world = client.load_world_with(kinds).await?;
 
+    // The step's channel universe: a table override replaces `[scope]`; a named scope
+    // resolving to ids replaces it with exactly those channels (the latch below then races
+    // only them, which post-filtering could not do).
+    let resolved = context.resolve_scope(&world)?;
+    // An id bound carries no profile (its table is empty), and the profile is this action's
+    // subject, not its universe: it stays the host `[scope] profiles` one.
+    let scope_for_plan = if resolved.limit.is_some() {
+        &context.config().scope
+    } else {
+        &resolved.tables
+    };
     context.progress(&crosstalk_core::jobs::ProgressEvent::new(
         "streams.visibility",
         0,
         0,
         "grouping channels",
     ));
-    let outcome = plan(&world, &scope, settings, &context.config().matching)?;
+    let mut options = MatchOptions::new(settings, &context.config().matching);
+    options.apply_scope_hints(settings, &resolved.scope_hints);
+    let outcome = plan_with_options(&world, scope_for_plan, &options, resolved.limit.as_ref())?;
     if outcome.channels == 0 {
         return Ok(JobOutcome::new(
             "No channels are in scope. Check the group and profile settings in crosstalk.toml.",
@@ -367,7 +412,9 @@ pub async fn run(
         field: Field::Membership(outcome.profile_id),
         values: outcome.values(),
     }];
-    let op_plan = channel_ops::plan(&world, &Selection::in_scope(&scope), &operations)?;
+    // The write plan starts from the run's channel universe, so a step override
+    // bounds the write like `[scope]` bounds an ordinary run.
+    let op_plan = channel_ops::plan(&world, &context.base_selection(&world)?, &operations)?;
 
     let applied = if dry_run || op_plan.changes.is_empty() {
         None
@@ -597,10 +644,34 @@ mod tests {
     }
 
     #[test]
+    fn a_step_bound_races_only_its_channels_and_keeps_the_host_profile() {
+        // A named scope bounding the step to channels 1 and 2: [HD] (3) is outside the
+        // bound, so the ESPN race is between 1 and 2 only — and the host table, whose
+        // groups filter excludes every channel, only names the profile written.
+        let world = visibility_world();
+        let (settings, matching) = options();
+        let host = ScopeConfig {
+            groups: "Nothing Matches".to_string(),
+            ..scope()
+        };
+        let limit: std::collections::HashSet<i64> = [1, 2].into_iter().collect();
+        let outcome = plan(&world, &host, &settings, &matching, Some(&limit)).expect("plan");
+        assert_eq!(outcome.profile_id, 4);
+        assert_eq!(outcome.channels, 2);
+        assert_eq!(outcome.winners.len(), 1, "{:?}", outcome.winners);
+        assert!(!outcome.winners.contains(&3), "{:?}", outcome.winners);
+        assert!(
+            outcome.end_state.keys().all(|id| limit.contains(id)),
+            "only bound channels are planned: {:?}",
+            outcome.end_state
+        );
+    }
+
+    #[test]
     fn the_first_eligible_channel_of_each_group_is_the_one_left_enabled() {
         let world = visibility_world();
         let (settings, matching) = options();
-        let outcome = plan(&world, &scope(), &settings, &matching).expect("plan");
+        let outcome = plan(&world, &scope(), &settings, &matching, None).expect("plan");
         // ESPN's group: [HD] wins on the quality tag before the channel number is read.
         assert!(outcome.winners.contains(&3), "{:?}", outcome.winners);
         assert!(
@@ -628,7 +699,7 @@ mod tests {
         world.channels[6].streams = vec![7];
         world.channels[7].streams = vec![8];
         let (settings, matching) = options();
-        let outcome = plan(&world, &scope(), &settings, &matching).expect("plan");
+        let outcome = plan(&world, &scope(), &settings, &matching, None).expect("plan");
         assert!(outcome.winners.contains(&51), "{:?}", outcome.winners);
         assert!(!outcome.winners.contains(&50));
     }
@@ -640,7 +711,7 @@ mod tests {
             channel.streams.clear();
         }
         let (settings, matching) = options();
-        let outcome = plan(&world, &scope(), &settings, &matching).expect("plan");
+        let outcome = plan(&world, &scope(), &settings, &matching, None).expect("plan");
         assert!(outcome.winners.is_empty());
         assert!(outcome.end_state.values().all(|enabled| !enabled));
         assert_eq!(outcome.groups_without_winner, 4, "every group goes dark");
@@ -671,7 +742,7 @@ mod tests {
         let host = host_profile(&world, &scope).expect("host");
         assert_eq!(host.id, 7);
         let (settings, matching) = options();
-        let outcome = plan(&world, &scope, &settings, &matching).expect("plan");
+        let outcome = plan(&world, &scope, &settings, &matching, None).expect("plan");
         assert_eq!(outcome.profile_id, 7);
         // The channel set is the UNION of the named profiles: TNT, Bravo and channel 51 are
         // enabled in "All" only, and they still take part.
@@ -699,7 +770,7 @@ mod tests {
             ..ScopeConfig::default()
         };
         let (settings, matching) = options();
-        let outcome = plan(&world, &scope, &settings, &matching).expect("plan");
+        let outcome = plan(&world, &scope, &settings, &matching, None).expect("plan");
         assert!(outcome.winners.contains(&3), "{:?}", outcome.winners);
         assert_eq!(outcome.withheld, vec![3]);
         assert_eq!(outcome.end_state.get(&3), Some(&false));

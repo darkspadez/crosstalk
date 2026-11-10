@@ -53,6 +53,8 @@ pub mod placeholder_scan;
 pub mod probe;
 pub mod quality;
 pub mod restore;
+#[cfg(test)]
+mod secrets_tests;
 pub mod selection;
 pub mod settings;
 pub mod sort;
@@ -510,13 +512,14 @@ impl StreamsApp {
         }
 
         // What the settings resolve to, so an operator can see the numbers a run will use
-        // without reading the file: the preset is a name, the run needs a threshold.
+        // without reading the file: one matcher, one cut in `[matching]` (step 9).
         let rules = selection::RuleSet::parse(&settings.stream_name_regex_rules);
+        let matching = &context.config().matching;
         let mut outcome = JobOutcome::new(format!(
-            "Settings valid. match_sensitivity {:?} is a threshold of {}, {} regex rule(s) \
-             active, AI verification {}.",
-            settings.match_sensitivity,
-            settings.match_threshold(),
+            "Settings valid. One matcher at [matching] sensitivity {:?} (cut {}), {} regex \
+             rule(s) active, AI verification {}.",
+            matching.sensitivity,
+            matching.threshold(),
             rules.rules.len(),
             if context.config().ai.verify.enabled {
                 "on"
@@ -755,6 +758,24 @@ mod tests {
     }
 
     #[test]
+    fn a_web_save_cannot_set_a_tool_path() {
+        let fixture = Fixture::new();
+        let path = app().settings_path(fixture.dir.path());
+        let mut values = app().load_settings(&path).expect("load defaults");
+        values.insert("probe_freshness_hours", FieldValue::Number(6.0));
+        app().save_settings(&path, &values).expect("save");
+        let before = std::fs::read_to_string(&path).expect("saved");
+
+        for id in ["ffprobe_path", "ffmpeg_path"] {
+            let mut values = app().load_settings(&path).expect("load");
+            values.insert(id, FieldValue::Text("/bin/sh".into()));
+            let error = app().save_settings(&path, &values).expect_err("refused");
+            assert!(format!("{error}").contains("unknown setting"), "{error}");
+        }
+        assert_eq!(std::fs::read_to_string(&path).expect("unchanged"), before);
+    }
+
+    #[test]
     fn save_rejects_a_settings_file_that_still_holds_a_retired_key() {
         let fixture = Fixture::new();
         let path = app().settings_path(fixture.dir.path());
@@ -785,11 +806,8 @@ mod tests {
             "{}",
             outcome.summary
         );
-        assert!(
-            outcome.summary.contains("threshold of 80"),
-            "{}",
-            outcome.summary
-        );
+        // Step 9: one matcher, one cut in `[matching]` (D02/T10).
+        assert!(outcome.summary.contains("(cut 95)"), "{}", outcome.summary);
         assert_eq!(outcome.counts.get("warnings"), Some(&0));
         assert_eq!(outcome.counts.get("regex_rules"), Some(&0));
     }

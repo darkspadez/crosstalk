@@ -492,3 +492,548 @@ mod stream_mapparr_tests {
         assert!(map.contains_key("PE"));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Merged phase-3 data set (`data/merged/`, built by
+// `scripts/data/build_merged.py` from all four plugins' shipped tables).
+//
+// This is the one deduplicated union the unified engine of phase 3 step 6 will
+// match against: one channel database per country, one station table keyed by
+// callsign, one alias table, and Lineuparr's lineup files. It is NOT wired
+// into matching yet (step 6 does that); the existing per-plugin profiles
+// above keep loading their current files, so every parity gate stays at 0.
+//
+// The build script reproduces `data/merged/` byte for byte
+// (`build_merged.py --check`, enforced in CI); the tests below pin the merge
+// counts against the embedded `PROVENANCE.json`.
+// ---------------------------------------------------------------------------
+
+/// The merged data set: one union channel database per country.
+pub mod merged {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::OnceLock;
+
+    /// Country code -> merged union `<CC>.json` (compact JSON, see
+    /// `scripts/data/build_merged.py`).
+    pub const MERGED_CHANNEL_DATABASES: [(&str, &str); 16] = [
+        ("AU", include_str!("../../../data/merged/channels/AU.json")),
+        ("BR", include_str!("../../../data/merged/channels/BR.json")),
+        ("CA", include_str!("../../../data/merged/channels/CA.json")),
+        ("DE", include_str!("../../../data/merged/channels/DE.json")),
+        ("DO", include_str!("../../../data/merged/channels/DO.json")),
+        ("ES", include_str!("../../../data/merged/channels/ES.json")),
+        ("FR", include_str!("../../../data/merged/channels/FR.json")),
+        ("IN", include_str!("../../../data/merged/channels/IN.json")),
+        ("MX", include_str!("../../../data/merged/channels/MX.json")),
+        ("NL", include_str!("../../../data/merged/channels/NL.json")),
+        ("NO", include_str!("../../../data/merged/channels/NO.json")),
+        ("PE", include_str!("../../../data/merged/channels/PE.json")),
+        ("PL", include_str!("../../../data/merged/channels/PL.json")),
+        ("PT", include_str!("../../../data/merged/channels/PT.json")),
+        ("UK", include_str!("../../../data/merged/channels/UK.json")),
+        ("US", include_str!("../../../data/merged/channels/US.json")),
+    ];
+
+    /// The merged station table (`data/merged/stations.json`).
+    pub const MERGED_STATIONS_JSON: &str = include_str!("../../../data/merged/stations.json");
+
+    /// The merged tag vocabulary (`data/merged/tags.json`, phase 3 step 7).
+    pub const MERGED_TAGS_JSON: &str = include_str!("../../../data/merged/tags.json");
+
+    /// The merged alias table (`data/merged/aliases.json`).
+    pub const MERGED_ALIASES_JSON: &str = include_str!("../../../data/merged/aliases.json");
+
+    /// The machine-readable merge log (`data/merged/PROVENANCE.json`).
+    pub const MERGED_PROVENANCE_JSON: &str = include_str!("../../../data/merged/PROVENANCE.json");
+
+    /// Lineup name -> verbatim Lineuparr lineup file.
+    pub const MERGED_LINEUPS: [(&str, &str); 29] = [
+        (
+            "AU_Foxtel",
+            include_str!("../../../data/merged/lineups/AU_Foxtel_lineup.json"),
+        ),
+        (
+            "CA_Telus-Optik",
+            include_str!("../../../data/merged/lineups/CA_Telus-Optik_lineup.json"),
+        ),
+        (
+            "DO_Altice",
+            include_str!("../../../data/merged/lineups/DO_Altice_lineup.json"),
+        ),
+        (
+            "DO_Claro",
+            include_str!("../../../data/merged/lineups/DO_Claro_lineup.json"),
+        ),
+        (
+            "DO_Combined",
+            include_str!("../../../data/merged/lineups/DO_Combined_lineup.json"),
+        ),
+        (
+            "ES_Movistar",
+            include_str!("../../../data/merged/lineups/ES_Movistar_lineup.json"),
+        ),
+        (
+            "FR_CanalPlus",
+            include_str!("../../../data/merged/lineups/FR_CanalPlus_lineup.json"),
+        ),
+        (
+            "FR_CanalPlus_TNT",
+            include_str!("../../../data/merged/lineups/FR_CanalPlus_TNT_lineup.json"),
+        ),
+        (
+            "NL_KPN",
+            include_str!("../../../data/merged/lineups/NL_KPN_lineup.json"),
+        ),
+        (
+            "NL_ODIDO",
+            include_str!("../../../data/merged/lineups/NL_ODIDO_lineup.json"),
+        ),
+        (
+            "PE_Claro",
+            include_str!("../../../data/merged/lineups/PE_Claro_lineup.json"),
+        ),
+        (
+            "QA_beIN-MENA",
+            include_str!("../../../data/merged/lineups/QA_beIN-MENA_lineup.json"),
+        ),
+        (
+            "TZ_Azam-TV",
+            include_str!("../../../data/merged/lineups/TZ_Azam-TV_lineup.json"),
+        ),
+        (
+            "TZ_Combined",
+            include_str!("../../../data/merged/lineups/TZ_Combined_lineup.json"),
+        ),
+        (
+            "TZ_DStv-Premium",
+            include_str!("../../../data/merged/lineups/TZ_DStv-Premium_lineup.json"),
+        ),
+        (
+            "UK_Combined",
+            include_str!("../../../data/merged/lineups/UK_Combined_lineup.json"),
+        ),
+        (
+            "UK_Freeview",
+            include_str!("../../../data/merged/lineups/UK_Freeview_lineup.json"),
+        ),
+        (
+            "UK_SkyTV",
+            include_str!("../../../data/merged/lineups/UK_SkyTV_lineup.json"),
+        ),
+        (
+            "UK_SkyTV_ENG_full",
+            include_str!("../../../data/merged/lineups/UK_SkyTV_ENG_full_lineup.json"),
+        ),
+        (
+            "UK_SkyTV_ENG_simple",
+            include_str!("../../../data/merged/lineups/UK_SkyTV_ENG_simple_lineup.json"),
+        ),
+        (
+            "US_Combined",
+            include_str!("../../../data/merged/lineups/US_Combined_lineup.json"),
+        ),
+        (
+            "US_DirecTV-Premier",
+            include_str!("../../../data/merged/lineups/US_DirecTV-Premier_lineup.json"),
+        ),
+        (
+            "US_DISH-Top250",
+            include_str!("../../../data/merged/lineups/US_DISH-Top250_lineup.json"),
+        ),
+        (
+            "US_Optimum",
+            include_str!("../../../data/merged/lineups/US_Optimum_lineup.json"),
+        ),
+        (
+            "US_Spectrum-Tampa-Bay-All",
+            include_str!("../../../data/merged/lineups/US_Spectrum-Tampa-Bay-All_lineup.json"),
+        ),
+        (
+            "US_Spectrum-Tampa-Bay-No-Spanish",
+            include_str!(
+                "../../../data/merged/lineups/US_Spectrum-Tampa-Bay-No-Spanish_lineup.json"
+            ),
+        ),
+        (
+            "US_Spectrum-Tampa-Bay-Spanish-Only",
+            include_str!(
+                "../../../data/merged/lineups/US_Spectrum-Tampa-Bay-Spanish-Only_lineup.json"
+            ),
+        ),
+        (
+            "US_Verizon-FIOS",
+            include_str!("../../../data/merged/lineups/US_Verizon-FIOS_lineup.json"),
+        ),
+        (
+            "US_Verizon-FIOS-All-11743",
+            include_str!("../../../data/merged/lineups/US_Verizon-FIOS-All-11743_lineup.json"),
+        ),
+    ];
+
+    /// One entry of a merged per-country channel database.
+    ///
+    /// The dedup key is the verbatim `channel_name` (see the build script);
+    /// `sources` names the plugins whose files carried the entry.
+    #[derive(Debug, Clone, serde::Deserialize)]
+    pub struct MergedChannelEntry {
+        pub channel_name: String,
+        pub category: Option<String>,
+        #[serde(rename = "type")]
+        pub kind: Option<String>,
+        pub zones: Option<Vec<String>>,
+        #[serde(default)]
+        pub sources: Vec<String>,
+    }
+
+    /// One merged per-country channel database.
+    #[derive(Debug, Clone, serde::Deserialize)]
+    pub struct MergedChannelDatabase {
+        pub country_code: String,
+        pub country_name: Option<String>,
+        pub version: Option<String>,
+        pub channels: Vec<MergedChannelEntry>,
+    }
+
+    /// One entry of the merged station table, keyed by full callsign.
+    #[derive(Debug, Clone, serde::Deserialize)]
+    pub struct MergedStation {
+        pub callsign: String,
+        pub network_affiliation: Option<String>,
+        pub community_served_city: Option<String>,
+        pub community_served_state: Option<String>,
+        pub tv_virtual_channel: Option<String>,
+        pub facility_id: Option<String>,
+        pub active_ind: Option<String>,
+        pub station_class: Option<String>,
+        #[serde(default)]
+        pub sources: Vec<String>,
+    }
+
+    /// The merged station table plus Janitor's callsign allowlist.
+    #[derive(Debug, Clone, serde::Deserialize)]
+    pub struct MergedStationsFile {
+        pub stations: HashMap<String, MergedStation>,
+        pub callsign_allowlist: Vec<String>,
+    }
+
+    /// One alias value and the plugins that list it under its canonical.
+    #[derive(Debug, Clone, serde::Deserialize)]
+    pub struct MergedAliasEntry {
+        pub alias: String,
+        #[serde(default)]
+        pub sources: Vec<String>,
+    }
+
+    /// The merged alias table: canonical -> aliases, plus per-country tables.
+    ///
+    /// The union of every plugin's claims: an alias listed under two or more
+    /// canonicals is kept under each (both accept it, as in every plugin) and
+    /// recorded in `data/merged/alias_conflicts.json` for the corpus step to
+    /// decide reverse (alias -> canonical) lookups.
+    #[derive(Debug, Clone, serde::Deserialize)]
+    pub struct MergedAliasesFile {
+        pub aliases: HashMap<String, Vec<MergedAliasEntry>>,
+        pub country_aliases: HashMap<String, HashMap<String, Vec<MergedAliasEntry>>>,
+    }
+
+    /// Codes of every merged country database, sorted.
+    pub fn merged_codes() -> Vec<&'static str> {
+        let mut codes: Vec<&'static str> = MERGED_CHANNEL_DATABASES
+            .iter()
+            .map(|(code, _)| *code)
+            .collect();
+        codes.sort_unstable();
+        codes
+    }
+
+    /// Raw JSON for one merged country database.
+    pub fn merged_database_json(code: &str) -> Option<&'static str> {
+        MERGED_CHANNEL_DATABASES
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(code))
+            .map(|(_, json)| *json)
+    }
+
+    /// Names of every merged lineup file (without the `_lineup.json` suffix).
+    pub fn merged_lineup_names() -> Vec<&'static str> {
+        MERGED_LINEUPS.iter().map(|(name, _)| *name).collect()
+    }
+
+    /// Raw JSON for one merged lineup file.
+    pub fn merged_lineup_json(name: &str) -> Option<&'static str> {
+        MERGED_LINEUPS
+            .iter()
+            .find(|(candidate, _)| *candidate == name)
+            .map(|(_, json)| *json)
+    }
+
+    /// One merged per-country channel database, parsed once per process (the ONE
+    /// loader every app reads merged channel names, categories and countries from:
+    /// lineup's names/categorize/create, streams' country filter).
+    ///
+    /// `code` is case-insensitive; `None` for a code no merged database carries.
+    pub fn merged_channels(code: &str) -> Option<&'static MergedChannelDatabase> {
+        static CACHED: [OnceLock<MergedChannelDatabase>; MERGED_CHANNEL_DATABASES.len()] =
+            [const { OnceLock::new() }; MERGED_CHANNEL_DATABASES.len()];
+        let position = MERGED_CHANNEL_DATABASES
+            .iter()
+            .position(|(candidate, _)| candidate.eq_ignore_ascii_case(code))?;
+        Some(CACHED[position].get_or_init(|| {
+            serde_json::from_str(MERGED_CHANNEL_DATABASES[position].1)
+                .expect("merged channel database parse")
+        }))
+    }
+
+    /// Every label a merged database uses for its own country, lowercased: each
+    /// `country_code` and `country_name` (`us`, `united states`, `uk`, `united
+    /// kingdom`, ...). The one definition of "this category is a country, not a
+    /// category" (lineup's categorize).
+    pub fn merged_country_labels() -> &'static HashSet<String> {
+        static CACHED: OnceLock<HashSet<String>> = OnceLock::new();
+        CACHED.get_or_init(|| {
+            let mut labels = HashSet::new();
+            for (code, _) in MERGED_CHANNEL_DATABASES {
+                labels.insert(code.to_lowercase());
+                if let Some(db) = merged_channels(code) {
+                    labels.insert(db.country_code.trim().to_lowercase());
+                    if let Some(name) = db.country_name.as_deref() {
+                        labels.insert(name.trim().to_lowercase());
+                    }
+                }
+            }
+            labels
+        })
+    }
+
+    /// The parsed merged station table, cached per process.
+    pub fn merged_stations() -> &'static MergedStationsFile {
+        static CACHED: OnceLock<MergedStationsFile> = OnceLock::new();
+        CACHED.get_or_init(|| {
+            serde_json::from_str(MERGED_STATIONS_JSON).expect("merged stations parse")
+        })
+    }
+
+    /// The parsed merged alias table, cached per process.
+    pub fn merged_aliases() -> &'static MergedAliasesFile {
+        static CACHED: OnceLock<MergedAliasesFile> = OnceLock::new();
+        CACHED.get_or_init(|| {
+            serde_json::from_str(MERGED_ALIASES_JSON).expect("merged aliases parse")
+        })
+    }
+
+    /// The parsed merge provenance log, cached per process.
+    pub fn merged_provenance() -> &'static serde_json::Value {
+        static CACHED: OnceLock<serde_json::Value> = OnceLock::new();
+        CACHED.get_or_init(|| {
+            serde_json::from_str(MERGED_PROVENANCE_JSON).expect("provenance parses")
+        })
+    }
+
+    /// Full-plus-base station keys, as the plugins' `channel_lookup` holds them:
+    /// every station under its full callsign and, when different, under its
+    /// `normalize_callsign` base form.
+    fn merged_station_keys() -> &'static HashSet<String> {
+        static CACHED: OnceLock<HashSet<String>> = OnceLock::new();
+        CACHED.get_or_init(|| {
+            let mut keys = HashSet::new();
+            for key in merged_stations().stations.keys() {
+                keys.insert(key.clone());
+                keys.insert(crate::callsign::normalize_callsign(key));
+            }
+            keys
+        })
+    }
+
+    /// Whether this callsign is a real station in the merged table.
+    ///
+    /// Membership is what Janitor's allowlist vouches for: an exact key hit,
+    /// or a hit under the core `normalize_callsign` base form (the merge
+    /// report verifies every allowlisted callsign resolves this way, e.g.
+    /// allowlisted `KAAH` via merged `KAAH-TV`).
+    pub fn is_merged_station(callsign: &str) -> bool {
+        let wanted = callsign.trim().to_uppercase();
+        if wanted.is_empty() {
+            return false;
+        }
+        merged_station_keys().contains(&wanted)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn provenance_count(path: &str) -> usize {
+            merged_provenance()
+                .pointer(path)
+                .unwrap_or_else(|| panic!("{path} in PROVENANCE.json"))
+                .as_u64()
+                .unwrap_or_else(|| panic!("{path} is a number")) as usize
+        }
+
+        #[test]
+        fn every_merged_database_parses_and_matches_provenance() {
+            assert_eq!(merged_codes().len(), 16, "{:?}", merged_codes());
+            for code in merged_codes() {
+                let json = merged_database_json(code).expect("database resolves");
+                let db: MergedChannelDatabase =
+                    serde_json::from_str(json).unwrap_or_else(|e| panic!("{code}: {e}"));
+                assert_eq!(db.country_code, code);
+                assert!(!db.channels.is_empty(), "{code} is not empty");
+                let expected = provenance_count(&format!("/channels/{code}/rows_out"));
+                assert_eq!(db.channels.len(), expected, "{code} count");
+                // Lowercase lookup resolves, unknown codes do not.
+                assert!(merged_database_json(&code.to_lowercase()).is_some());
+            }
+            assert_eq!(merged_database_json("ZZ"), None);
+            // The US database carries the zones field the merge preserves.
+            let us: MergedChannelDatabase =
+                serde_json::from_str(merged_database_json("US").expect("US")).expect("US parses");
+            assert!(
+                us.channels.iter().any(|c| c.zones.is_some()),
+                "SM zones survive the merge"
+            );
+            for entry in &us.channels {
+                assert!(
+                    !entry.sources.is_empty(),
+                    "{} has sources",
+                    entry.channel_name
+                );
+            }
+            // Case-only variants are distinct entries in the sources and stay so.
+            let afro: Vec<_> = us
+                .channels
+                .iter()
+                .filter(|c| c.channel_name.eq_ignore_ascii_case("afro"))
+                .map(|c| (c.channel_name.as_str(), c.kind.as_deref()))
+                .collect();
+            assert_eq!(
+                afro,
+                [("AFRO", Some("Regional")), ("Afro", Some("National"))],
+                "case variants kept apart"
+            );
+        }
+
+        #[test]
+        fn stations_parse_and_match_provenance() {
+            let stations = merged_stations();
+            assert_eq!(
+                stations.stations.len(),
+                provenance_count("/stations/rows_out")
+            );
+            // CM's table + supplemental only: SM's file is CM's predecessor and
+            // its extra rows are cancelled licences, which stay dropped.
+            assert_eq!(
+                stations.stations.len(),
+                provenance_count("/stations/rows_in/CM")
+                    + provenance_count("/stations/rows_in/CM-supplemental")
+            );
+            assert!(!is_merged_station("DWHTV"), "cancelled licence dropped");
+            assert_eq!(
+                stations.callsign_allowlist.len(),
+                provenance_count("/stations/allowlist_in")
+            );
+            // Every allowlisted callsign resolves, exactly or by base form.
+            for callsign in &stations.callsign_allowlist {
+                assert!(is_merged_station(callsign), "{callsign} is a station");
+                assert!(
+                    is_merged_station(&callsign.to_lowercase()),
+                    "{callsign} matches case-insensitively"
+                );
+            }
+            assert!(!is_merged_station("ZZZZ"));
+            assert!(!is_merged_station(""));
+        }
+
+        #[test]
+        fn aliases_parse_and_match_provenance_with_conflicts_kept() {
+            let aliases = merged_aliases();
+            assert_eq!(
+                aliases.aliases.len(),
+                provenance_count("/aliases/canonicals_out")
+            );
+            let rows: usize = aliases.aliases.values().map(Vec::len).sum();
+            assert_eq!(rows, provenance_count("/aliases/aliases_out"));
+            for (country, table) in &aliases.country_aliases {
+                let expected =
+                    provenance_count(&format!("/aliases/countries/{country}/canonicals_out"));
+                assert_eq!(table.len(), expected, "{country} canonicals");
+            }
+            // A multi-canonical alias is kept under EVERY claimant (union) and
+            // listed in alias_conflicts.json for step 5 to decide.
+            let detail: serde_json::Value =
+                serde_json::from_str(include_str!("../../../data/merged/alias_conflicts.json"))
+                    .expect("alias_conflicts parses");
+            let conflicts = detail["conflicts"].as_array().expect("conflicts array");
+            assert_eq!(conflicts.len(), provenance_count("/aliases/conflict_count"));
+            assert!(!conflicts.is_empty(), "the merge records conflicts");
+            for conflict in conflicts {
+                let alias = conflict["alias"].as_str().expect("alias is a string");
+                let claimants = conflict["claimed_by"].as_object().expect("claimants");
+                assert!(claimants.len() > 1, "{alias} has several claimants");
+                for canonical in claimants.keys() {
+                    assert!(
+                        aliases.aliases[canonical]
+                            .iter()
+                            .any(|entry| entry.alias == alias),
+                        "{alias} kept under {canonical}"
+                    );
+                }
+            }
+            // Behaviour every plugin agrees on survives: FS 1 -> FS1 and Fox Sports 1.
+            for canonical in ["FS1", "Fox Sports 1"] {
+                assert!(aliases.aliases[canonical].iter().any(|e| e.alias == "FS 1"));
+            }
+        }
+
+        #[test]
+        fn tags_parse_and_match_provenance() {
+            let tags: serde_json::Value =
+                serde_json::from_str(MERGED_TAGS_JSON).expect("merged tags parse");
+            let list = tags
+                .get("tags")
+                .and_then(|v| v.as_array())
+                .expect("tags array");
+            assert_eq!(list.len(), provenance_count("/tags/tags_out"));
+            // Every kind in the table is documented, and every entry's kind too.
+            let kinds = tags
+                .get("kinds")
+                .and_then(|v| v.as_object())
+                .expect("kinds map");
+            for entry in list {
+                let kind = entry.get("kind").and_then(|k| k.as_str()).expect("kind");
+                assert!(kinds.contains_key(kind), "{kind} documented");
+                assert!(
+                    entry
+                        .get("sources")
+                        .and_then(|s| s.as_array())
+                        .is_some_and(|s| !s.is_empty()),
+                    "{} has sources",
+                    entry.get("token").and_then(|t| t.as_str()).unwrap_or("?")
+                );
+            }
+        }
+
+        #[test]
+        fn lineups_parse_and_match_provenance() {
+            assert_eq!(merged_lineup_names().len(), 29);
+            let mut total = 0usize;
+            for name in merged_lineup_names() {
+                let json = merged_lineup_json(name).expect("lineup resolves");
+                let parsed: serde_json::Value =
+                    serde_json::from_str(json).unwrap_or_else(|e| panic!("{name}: {e}"));
+                let categories = parsed
+                    .get("categories")
+                    .and_then(|v| v.as_object())
+                    .expect("categories");
+                assert!(!categories.is_empty(), "{name} has categories");
+                total += categories
+                    .values()
+                    .filter_map(|v| v.as_array())
+                    .map(Vec::len)
+                    .sum::<usize>();
+            }
+            assert_eq!(total, provenance_count("/lineups/channels"));
+            assert_eq!(merged_lineup_json("XX"), None);
+        }
+    }
+}

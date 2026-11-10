@@ -272,6 +272,7 @@ impl Case {
                     name: String::new(),
                     tvg_id: entry.tvg_id.clone(),
                     epg_source: Some(1),
+                    icon_url: None,
                 })
                 .collect(),
             streams: self
@@ -295,8 +296,11 @@ impl Case {
 
     fn settings(&self) -> StreamsSettings {
         let input = &self.settings;
+        // Step 9: the per-app cut is retired — the case preset rides the host
+        // `[matching]` sensitivity instead (see `matching()` below); the struct field
+        // is gone, so the input value is only read there.
+        let _ = &input.match_sensitivity;
         StreamsSettings {
-            match_sensitivity: input.match_sensitivity.clone(),
             overwrite_streams: input.overwrite_streams,
             keep_custom_streams: input.keep_custom_streams,
             allow_same_name_streams: input.allow_same_name_streams,
@@ -336,6 +340,12 @@ impl Case {
             ignore_regional_tags: self.settings.ignore_regional,
             ignore_geographic_tags: self.settings.ignore_geographic,
             ignore_misc_tags: self.settings.ignore_misc,
+            // Step 9 (D02/T10): one cut in `[matching]` — the case's retired SM preset
+            // maps onto the host sensitivity (`relaxed`/`normal`/`strict`/`exact` =
+            // 70/80/90/95), so threshold-varying parity cases keep varying the cut.
+            sensitivity: crosstalk_streams::settings::sensitivity_for_preset(
+                &self.settings.match_sensitivity,
+            ),
             ..defaults
         }
     }

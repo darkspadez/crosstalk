@@ -76,7 +76,7 @@
 
 use crate::settings::StreamsSettings;
 use anyhow::Result;
-use crosstalk_core::channel_ops::{self, Field, Op, Plan, Selection, SetValue};
+use crosstalk_core::channel_ops::{self, Field, Op, Plan, SetValue};
 use crosstalk_core::config::ScopeConfig;
 use crosstalk_core::csv_report::{self, Report};
 use crosstalk_core::dispatcharr::{Channel, World, WorldKind, WorldKinds};
@@ -606,7 +606,6 @@ pub async fn run(
         "streams.mirror_{}",
         if dry_run { "preview" } else { "apply" }
     );
-    let scope = context.config().scope.clone();
 
     // Every slice a mirror fill reads: channels (their own lists), groups (report names),
     // profiles (the scope's profile filter), streams (provider ids, accounts, names) and the
@@ -624,13 +623,26 @@ pub async fn run(
     ));
     let world = client.load_world_with(kinds).await?;
 
+    // The step's channel universe: a table override replaces `[scope]`; a named scope
+    // resolving to ids replaces it with exactly those channels (the filtered world, planned
+    // against an empty table, holds only them).
+    let resolved = context.resolve_scope(&world)?;
+    let filtered;
+    let plan_world: &World = match &resolved.limit {
+        Some(limit) => {
+            filtered = world.retaining_channels(limit);
+            &filtered
+        }
+        None => &world,
+    };
+
     context.progress(&crosstalk_core::jobs::ProgressEvent::new(
         "streams.mirror",
         0,
         0,
         "planning mirror backups",
     ));
-    let outcome = plan(&world, &scope)?;
+    let outcome = plan(plan_world, &resolved.tables)?;
     if !outcome.any_grouped_account {
         // The plugin's own wording (`9594`).
         return Ok(JobOutcome::new(
@@ -661,7 +673,9 @@ pub async fn run(
             field: Field::Streams,
             values,
         }];
-        channel_ops::plan(&world, &Selection::in_scope(&scope), &operations)?
+        // The write plan starts from the run's channel universe, so a step override
+        // bounds the write like `[scope]` bounds an ordinary run.
+        channel_ops::plan(&world, &context.base_selection(&world)?, &operations)?
     };
 
     let applied = if dry_run || op_plan.changes.is_empty() {

@@ -173,7 +173,21 @@ def main() -> int:
         default=os.path.join(REPO, "target", "debug", "examples", "normalize_io"),
         help="path to the normalize_io example binary",
     )
+    parser.add_argument(
+        "--report",
+        action="store_true",
+        help="report mode for the retired-profile kinds (match, score): print the "
+        "summary and exit 0 whatever is found, for the guide oracle report. The "
+        "primitive kinds (normalize, callsign, location, network) still test code "
+        "the unified engine uses and always gate, with or without --report.",
+    )
     args = parser.parse_args()
+
+    if not sys.flags.isolated:
+        # The plugin checkout goes on sys.path below; -I keeps the cwd and the
+        # user site-packages from shadowing the stdlib or the plugin's modules.
+        print("run with python3 -I", file=sys.stderr)
+        return 2
 
     logging.basicConfig(level=logging.WARNING)
 
@@ -196,9 +210,19 @@ def main() -> int:
     names = corpus(args.limit)
     kinds = [kind.strip() for kind in args.kinds.split(",") if kind.strip()]
 
+    # Step 8: guide migrated onto the unified engine, so the EpgJanitor-profile kinds
+    # (match, score) are oracle tooling now: in report mode they print the summary and
+    # never fail. The primitive kinds still test code the unified engine uses.
     status = 0
     for kind in kinds:
-        status |= sweep(kind, names, args)
+        mismatches = sweep(kind, names, args)
+        if args.report and kind in ("match", "score"):
+            print(
+                f"[report] kind={kind} mismatches={mismatches} (oracle tooling: the "
+                f"guide runs the unified engine now; see docs/oracle-reports/guide.md)",
+            )
+        else:
+            status |= mismatches
     return status
 
 
@@ -255,7 +279,7 @@ def sweep_per_name(kind: str, names: list[str], matcher, args) -> int:
         print(f"  name={name!r}\n    python={expected!r}\n    rust  ={got!r}")
     if len(mismatches) > args.show:
         print(f"  ... and {len(mismatches) - args.show} more")
-    return 1 if mismatches else 0
+    return len(mismatches)
 
 
 def sweep_match(kind: str, names: list[str], matcher, args) -> int:
@@ -327,7 +351,7 @@ def sweep_match(kind: str, names: list[str], matcher, args) -> int:
         print(f"  query={query!r} tags={tags}\n    python={expected}\n    rust  ={got}")
     if len(mismatches) > args.show:
         print(f"  ... and {len(mismatches) - args.show} more")
-    return 1 if mismatches else 0
+    return len(mismatches)
 
 
 def python_score(channel_name, epg_names, matcher, alias_map, tags) -> list:
@@ -483,7 +507,7 @@ def sweep_normalize(names: list[str], matcher, args) -> int:
         print(f"  name={name!r} flags={flags} tags={tags}\n    python={expected!r}\n    rust  ={got!r}")
     if len(mismatches) > args.show:
         print(f"  ... and {len(mismatches) - args.show} more")
-    return 1 if mismatches else 0
+    return len(mismatches)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,50 @@
+{
+  "name": "crosstalk bridge",
+  "version": "0.1.0",
+  "description": "The four bulk writes crosstalk needs that Dispatcharr's REST API cannot do: stream-list assignment, stream stats, clearing a channel's group, and generated guide entries. Every request is HMAC-signed with a secret crosstalk generates; nothing here reads, deletes channels, or runs anything else.",
+  "author": "crosstalk",
+  "license": "MIT",
+  "help_url": "https://github.com/darkspadez/crosstalk/blob/main/docs/bridge.md",
+  "fields": [
+    {
+      "id": "about",
+      "label": "How this works",
+      "type": "info",
+      "description": "crosstalk calls this plugin through Dispatcharr's plugin-run API. Paste the secret printed by `crosstalk bridge secret` below and enable the plugin. There are no buttons: every action needs a signed request from crosstalk."
+    },
+    {
+      "id": "secret",
+      "label": "Secret",
+      "type": "string",
+      "input_type": "password",
+      "default": "",
+      "placeholder": "paste the output of `crosstalk bridge secret`",
+      "help_text": "At least 32 characters. Requests signed with anything else are refused. Ignored while CROSSTALK_BRIDGE_SECRET is set in Dispatcharr's environment, which keeps the secret out of the database (see docs/bridge.md)."
+    },
+    {
+      "id": "previous_secret",
+      "label": "Previous secret (rotation)",
+      "type": "string",
+      "input_type": "password",
+      "default": "",
+      "help_text": "While rotating: the old secret, still accepted until the time below. Clear it once every crosstalk instance uses the new one. Ignored while CROSSTALK_BRIDGE_PREVIOUS_SECRET is set."
+    },
+    {
+      "id": "grace_until",
+      "label": "Accept the previous secret until",
+      "type": "string",
+      "default": "",
+      "placeholder": "2026-11-10T12:00:00Z",
+      "help_text": "An ISO 8601 UTC time or unix seconds. Empty or past: the previous secret is refused. Ignored while CROSSTALK_BRIDGE_GRACE_UNTIL is set."
+    },
+    {
+      "id": "epg_sources",
+      "label": "EPG sources guide writes may use",
+      "type": "string",
+      "default": "",
+      "placeholder": "e.g. 12, 13",
+      "help_text": "Comma-separated EPG source ids crosstalk may write generated guide entries and programmes into. Empty refuses every guide write."
+    }
+  ],
+  "actions": []
+}

@@ -218,7 +218,7 @@ fn main() -> anyhow::Result<()> {
 fn run_case(case: &Case) -> anyhow::Result<Value> {
     let world = case.world();
     // The case's database and tag flags, in the options the plan groups with.
-    let outcome = visibility::plan_with_options(&world, &case.scope(), &case.options())?;
+    let outcome = visibility::plan_with_options(&world, &case.scope(), &case.options(), None)?;
 
     let mut end_state: Vec<Value> = outcome
         .end_state

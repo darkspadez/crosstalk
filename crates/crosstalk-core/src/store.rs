@@ -97,6 +97,10 @@ pub struct RunRecord {
     /// the workflow's run page can list its steps without a second table and without guessing
     /// from timestamps which runs belong together.
     pub parent_run_id: Option<i64>,
+    /// The action's single free-text input (`--input` / the web field), when the run
+    /// carried one. `None` for every run that did not: inputs postdate every existing
+    /// row, and the column is nullable so old rows read back as "no input".
+    pub action_input: Option<String>,
 }
 
 /// What a run row is about.
@@ -105,7 +109,8 @@ pub struct RunRecord {
 /// measures provider streams, and the guide's watchdog checks EPG sources. Rather than reuse
 /// `channel_id` for an id from another table (which made a row impossible to read without
 /// knowing which action wrote it, and could aim a restore at whatever channel carried that
-/// number), the row says what its id belongs to.
+/// number), the row says what its id belongs to. Creates add groups and logos to the set:
+/// a create row's `channel_id` carries the new group's or logo's id.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Subject {
@@ -116,6 +121,10 @@ pub enum Subject {
     Stream,
     /// An EPG source, as the watchdog records (`channel_id` carries the source id).
     EpgSource,
+    /// A channel group, as create rows record (`channel_id` carries the group id).
+    Group,
+    /// A logo, as create rows record (`channel_id` carries the logo id).
+    Logo,
 }
 
 impl Subject {
@@ -125,6 +134,8 @@ impl Subject {
             Self::Channel => "channel",
             Self::Stream => "stream",
             Self::EpgSource => "epg_source",
+            Self::Group => "group",
+            Self::Logo => "logo",
         }
     }
 
@@ -135,6 +146,8 @@ impl Subject {
             Self::Channel => "Channel",
             Self::Stream => "Stream",
             Self::EpgSource => "EPG source",
+            Self::Group => "Group",
+            Self::Logo => "Logo",
         }
     }
 
@@ -144,6 +157,8 @@ impl Subject {
         match text {
             "stream" => Self::Stream,
             "epg_source" => Self::EpgSource,
+            "group" => Self::Group,
+            "logo" => Self::Logo,
             _ => Self::Channel,
         }
     }
@@ -153,6 +168,26 @@ impl std::fmt::Display for Subject {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
+}
+
+/// A create about to be sent, recorded before its POST (the `ownership_intent` table).
+///
+/// What was posted is what the next run's reconcile looks the object up by: `name` for a
+/// group, `url` for a logo, `name` + `group_id` + `number` for a channel, and only among
+/// objects with an id above `after_id` (the highest id of that kind in the world the plan
+/// was made from), so a user's own same-named object is never mistaken for it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateIntent {
+    /// `group`, `logo` or `channel`.
+    pub kind: String,
+    pub app: String,
+    pub owner_key: String,
+    pub name: String,
+    pub group_id: Option<i64>,
+    pub number: Option<f64>,
+    pub url: Option<String>,
+    pub after_id: i64,
+    pub run_id: i64,
 }
 
 /// One row of a run: what it is about (a channel, a stream, an EPG source) and what was
@@ -180,6 +215,12 @@ pub struct RunRow {
     pub reason: String,
     /// What the model said, when it was asked. Empty when it was not.
     pub ai_decision: Option<String>,
+    /// The app-defined ownership key of a created object (`lineup:<file>:<category>:<name>`),
+    /// written by create rows alongside the new id. A later run planning the same key finds
+    /// the object it already made instead of creating a duplicate. `None` for every row that
+    /// is not about a created object.
+    #[serde(default)]
+    pub owner_key: Option<String>,
     /// The channel field a channel operation wrote (`name`, `channel_group_id`, `epg_data_id`,
     /// `hidden_from_output`, `profile_membership:<id>`), empty for a matching row.
     ///
@@ -224,7 +265,7 @@ pub struct StreamHealth {
 }
 
 /// One AI request and its answer, kept for auditing why a row was accepted.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AiDecision {
     pub row_ordinal: i64,
     pub provider: String,
@@ -234,6 +275,27 @@ pub struct AiDecision {
     pub output_tokens: i64,
     pub request: serde_json::Value,
     pub response: serde_json::Value,
+    /// Every chain link asked, in order: `{provider, model, result, ...}`. The last entry
+    /// with a response decided; earlier ones were undecided or failed. Empty for rows
+    /// written before the chain existed, which asked exactly one link.
+    #[serde(default)]
+    pub attempts: serde_json::Value,
+}
+
+impl Default for AiDecision {
+    fn default() -> Self {
+        Self {
+            row_ordinal: 0,
+            provider: String::new(),
+            model: String::new(),
+            latency_ms: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            request: serde_json::Value::Null,
+            response: serde_json::Value::Null,
+            attempts: serde_json::json!([]),
+        }
+    }
 }
 
 /// The store handle. Cloneable and cheap: the connection is shared.
@@ -284,6 +346,9 @@ impl Store {
             connection: Arc::new(Mutex::new(connection)),
         };
         store.migrate(retire_running)?;
+        // Owner-only: the file, the WAL and shm the migration's `journal_mode = WAL` created
+        // (later ones inherit the file's mode), and the data directory.
+        crate::perms::restrict_store(path);
         Ok(store)
     }
 
@@ -315,6 +380,10 @@ impl Store {
             connection.execute_batch(
                 r#"
                 PRAGMA journal_mode = WAL;
+                -- Under WAL, NORMAL syncs at checkpoints rather than on every commit: a
+                -- power cut can lose the last transactions but never corrupts the file,
+                -- and a run writes many small transactions (E-S1).
+                PRAGMA synchronous = NORMAL;
                 PRAGMA foreign_keys = ON;
                 PRAGMA busy_timeout = 5000;
 
@@ -372,6 +441,7 @@ impl Store {
                     output_tokens INTEGER NOT NULL DEFAULT 0,
                     request       TEXT    NOT NULL DEFAULT '{}',
                     response      TEXT    NOT NULL DEFAULT '{}',
+                    attempts      TEXT    NOT NULL DEFAULT '[]',
                     PRIMARY KEY (run_id, row_ordinal)
                 );
 
@@ -408,22 +478,80 @@ impl Store {
                     edge_ip              TEXT,
                     consecutive_failures INTEGER NOT NULL DEFAULT 0
                 );
+
+                -- Shared channel identities (phase 3 step 6): one row per distinct resolved
+                -- input, namespaced by `data_version` (merged-data provenance sha +
+                -- decisions sha + engine version + the engine settings identities
+                -- depend on, see `UnifiedEngine::identity_version`). A data, rule or
+                -- settings change yields a new version, so stale rows are never read
+                -- — only pruned.
+                CREATE TABLE IF NOT EXISTS identity_cache (
+                    input_key     TEXT NOT NULL,
+                    data_version  TEXT NOT NULL,
+                    identity_json TEXT NOT NULL,
+                    cached_at     TEXT NOT NULL,
+                    PRIMARY KEY (input_key, data_version)
+                );
+                CREATE INDEX IF NOT EXISTS identity_cache_version ON identity_cache(data_version);
+
+                -- Which objects crosstalk created (or explicitly adopted): one row per object,
+                -- keyed by what it is and its Dispatcharr id. The key is app-defined
+                -- (`lineup:<file>:<category>:<name>`): a later run planning the same key finds
+                -- the object it already made instead of creating a duplicate, and hide/renumber
+                -- passes touch only what their app owns. A pre-existing same-named object an
+                -- app adopts for matching is recorded here too, so adoption and creation share
+                -- the one query. Idempotent: the table is created on every open and never
+                -- altered, and `record_ownership` inserts `OR IGNORE`, so a repeat records
+                -- nothing new and the first owner wins.
+                CREATE TABLE IF NOT EXISTS ownership (
+                    kind       TEXT NOT NULL,
+                    object_id  INTEGER NOT NULL,
+                    app        TEXT NOT NULL,
+                    owner_key  TEXT NOT NULL,
+                    run_id     INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (kind, object_id)
+                );
+                CREATE INDEX IF NOT EXISTS ownership_app_key ON ownership(app, owner_key);
+
+                -- A create that was SENT but whose answer has not been recorded yet: written
+                -- before the POST goes out, turned into an `ownership` row when the answer
+                -- lands. A process that dies in between leaves the intent behind, and the next
+                -- run's reconcile looks the object up by what was posted (exact name + group
+                -- + number for a channel, name for a group, URL for a logo, newer than
+                -- `after_id`) and adopts it — or drops the intent when nothing landed — so a
+                -- crash can neither duplicate a channel nor orphan one.
+                CREATE TABLE IF NOT EXISTS ownership_intent (
+                    kind       TEXT NOT NULL,
+                    app        TEXT NOT NULL,
+                    owner_key  TEXT NOT NULL,
+                    name       TEXT NOT NULL,
+                    group_id   INTEGER,
+                    number     REAL,
+                    url        TEXT,
+                    after_id   INTEGER NOT NULL,
+                    run_id     INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (kind, app, owner_key)
+                );
                 "#,
             )?;
+            add_run_row_columns(connection)?;
+            // After the column migration: an older `run_rows` gains `field` above. Serves
+            // the field-history and rows-of-fields reads, which filter on it (E-S8).
+            connection.execute_batch(
+                "CREATE INDEX IF NOT EXISTS run_rows_field ON run_rows(run_id, field);",
+            )?;
+            add_run_columns(connection)?;
             // A run left `running` by a crash or a restart can never finish, and pruning
             // skips running rows, so it would otherwise show as live forever. Only the
-            // daemon's own open retires: a second process cannot tell a live run from a
-            // stale one, and retiring a live run rewrites history under it.
+            // daemon's own open retires, and only the rows it can PROVE dead (see
+            // `retire_dead_runs`): a CLI run in another process is live, and retiring it
+            // would rewrite history under it and free its app's slot while it writes.
             if retire_running {
-                connection.execute(
-                    "UPDATE runs SET status = 'failed', \
-                     summary = COALESCE(summary, 'the daemon restarted while this run was in progress'), \
-                     finished_at = COALESCE(finished_at, ?1) WHERE status = 'running'",
-                    params![chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)],
-                )?;
+                retire_dead_runs(connection)?;
             }
-            add_run_row_columns(connection)?;
-            add_run_columns(connection)?;
+            add_ai_decision_columns(connection)?;
             // Before the index below: the rename turns `janitor` rows into `guide` rows, and
             // must not be the statement that trips over it.
             rename_recorded_history(connection)?;
@@ -482,6 +610,18 @@ impl Store {
         self.insert_run(app, action, dry_run, false, None)
     }
 
+    /// [`Store::start_run`] for a run tied to another: a workflow step to its workflow, or an
+    /// undo to the run it reverses (see [`Store::insert_run`]).
+    pub fn start_child_run(
+        &self,
+        app: &str,
+        action: &str,
+        dry_run: bool,
+        parent_run_id: i64,
+    ) -> Result<i64> {
+        self.insert_run(app, action, dry_run, false, Some(parent_run_id))
+    }
+
     /// Start a run that does not take the app's one-live-run slot.
     ///
     /// For an action that only reads the run store (`status`, the dashboard's own questions):
@@ -496,9 +636,10 @@ impl Store {
     /// Insert one run row: the one place the column list and the slot flags live, so a new column
     /// cannot be forgotten by one of the callers.
     ///
-    /// `parent_run_id` is the workflow run a step belongs to (see [`crate::workflow`]); the
-    /// runner passes it from [`crate::runner::RunOptions::parent_run`], which is how a step run
-    /// stays an ordinary run of its own app with an ordinary slot rule.
+    /// `parent_run_id` is the workflow run a step belongs to (see [`crate::workflow`]), or
+    /// the run an undo reverses (see [`crate::undo`]); the runner passes it from
+    /// [`crate::runner::RunOptions::parent_run`], which is how a step run stays an ordinary
+    /// run of its own app with an ordinary slot rule.
     pub(crate) fn insert_run(
         &self,
         app: &str,
@@ -511,7 +652,8 @@ impl Store {
         self.with_connection(|connection| {
             connection.execute(
                 "INSERT INTO runs (app, action, dry_run, started_at, status, counts, unguarded, \
-                 parent_run_id) VALUES (?1, ?2, ?3, ?4, ?5, '{}', ?6, ?7)",
+                 parent_run_id, pid, host, heartbeat_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, '{}', ?6, ?7, ?8, ?9, ?4)",
                 params![
                     app,
                     action,
@@ -520,9 +662,24 @@ impl Store {
                     RunStatus::Running.as_str(),
                     i64::from(unguarded),
                     parent_run_id,
+                    i64::from(std::process::id()),
+                    host_id(),
                 ],
             )?;
             Ok(connection.last_insert_rowid())
+        })
+    }
+
+    /// Stamp a live run's `heartbeat_at`, which is how another process's daemon start tells
+    /// it from a run a crash left `running`. A finished run is left alone.
+    pub fn heartbeat(&self, run_id: i64) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        self.with_connection(|connection| {
+            connection.execute(
+                "UPDATE runs SET heartbeat_at = ?2 WHERE id = ?1 AND status = 'running'",
+                params![run_id, now],
+            )?;
+            Ok(())
         })
     }
 
@@ -554,6 +711,25 @@ impl Store {
         })
     }
 
+    /// Record the action's single free-text input on its run row.
+    ///
+    /// Called right after `insert_run` by the runner, so the input lands in the run
+    /// record whatever the action then does with it. A no-op for an empty input: the
+    /// column stays NULL, which reads back as "no input".
+    pub fn set_run_input(&self, run_id: i64, input: &str) -> Result<()> {
+        let input = input.trim();
+        if input.is_empty() {
+            return Ok(());
+        }
+        self.with_connection(|connection| {
+            connection.execute(
+                "UPDATE runs SET action_input = ?2 WHERE id = ?1",
+                params![run_id, input],
+            )?;
+            Ok(())
+        })
+    }
+
     /// Append rows to a run, in one transaction.
     pub fn append_rows(&self, run_id: i64, rows: &[RunRow]) -> Result<()> {
         if rows.is_empty() {
@@ -566,9 +742,9 @@ impl Store {
                     "INSERT OR REPLACE INTO run_rows (run_id, ordinal, channel_id, channel_name, \
                      channel_group, channel_number, current_epg_name, epg_data_id, epg_name, \
                      epg_source, score, method, status, reason, ai_decision, field, \
-                     before_value, after_value, subject) \
+                     before_value, after_value, subject, owner_key) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
-                     ?16, ?17, ?18, ?19)",
+                     ?16, ?17, ?18, ?19, ?20)",
                 )?;
                 for row in rows {
                     statement.execute(params![
@@ -591,6 +767,7 @@ impl Store {
                         row.before_value,
                         row.after_value,
                         row.subject.as_str(),
+                        row.owner_key,
                     ])?;
                 }
             }
@@ -603,11 +780,12 @@ impl Store {
     pub fn record_ai_decision(&self, run_id: i64, decision: &AiDecision) -> Result<()> {
         let request = serde_json::to_string(&decision.request)?;
         let response = serde_json::to_string(&decision.response)?;
+        let attempts = serde_json::to_string(&decision.attempts)?;
         self.with_connection(|connection| {
             connection.execute(
                 "INSERT OR REPLACE INTO ai_decisions (run_id, row_ordinal, provider, model, \
-                 latency_ms, input_tokens, output_tokens, request, response) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 latency_ms, input_tokens, output_tokens, request, response, attempts) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     run_id,
                     decision.row_ordinal,
@@ -618,6 +796,7 @@ impl Store {
                     decision.output_tokens,
                     request,
                     response,
+                    attempts,
                 ],
             )?;
             Ok(())
@@ -829,8 +1008,9 @@ impl Store {
                 .query_row(
                     "SELECT COUNT(*) FROM ai_decisions WHERE run_id = ?1",
                     params![run_id],
-                    |row| row.get(0),
+                    |row| row.get::<_, i64>(0),
                 )
+                .map(|count| count.max(0) as u64)
                 .map_err(Into::into)
         })
     }
@@ -840,12 +1020,13 @@ impl Store {
         self.with_connection(|connection| {
             let mut statement = connection.prepare(
                 "SELECT row_ordinal, provider, model, latency_ms, input_tokens, output_tokens, \
-                 request, response FROM ai_decisions WHERE run_id = ?1 AND row_ordinal = ?2",
+                 request, response, attempts FROM ai_decisions WHERE run_id = ?1 AND row_ordinal = ?2",
             )?;
             statement
                 .query_row(params![run_id, ordinal], |row| {
                     let request: String = row.get(6)?;
                     let response: String = row.get(7)?;
+                    let attempts: String = row.get(8)?;
                     Ok(AiDecision {
                         row_ordinal: row.get(0)?,
                         provider: row.get(1)?,
@@ -855,6 +1036,8 @@ impl Store {
                         output_tokens: row.get(5)?,
                         request: serde_json::from_str(&request).unwrap_or_default(),
                         response: serde_json::from_str(&response).unwrap_or_default(),
+                        attempts: serde_json::from_str(&attempts)
+                            .unwrap_or(serde_json::json!([])),
                     })
                 })
                 .optional()
@@ -894,7 +1077,8 @@ impl Store {
     pub fn run_count(&self) -> Result<u64> {
         self.with_connection(|connection| {
             connection
-                .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
+                .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get::<_, i64>(0))
+                .map(|count| count.max(0) as u64)
                 .map_err(Into::into)
         })
     }
@@ -978,6 +1162,366 @@ impl Store {
                 params![app, action],
             )?;
             Ok(removed > 0)
+        })
+    }
+
+    /// A cached identity for (`input_key`, `data_version`), or `None`.
+    ///
+    /// Rows are namespaced by data version, so a merged-data or rule change never
+    /// reads a stale identity: it simply misses and re-resolves. A row that no
+    /// longer parses is dropped rather than failing the run (same rule as
+    /// [`Store::load_checkpoint`]).
+    pub fn identity_cache_get(
+        &self,
+        input_key: &str,
+        data_version: &str,
+    ) -> Result<Option<String>> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT identity_json FROM identity_cache WHERE input_key = ?1 AND data_version = ?2",
+                    params![input_key, data_version],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(Into::into)
+        })
+    }
+
+    /// [`identity_cache_get`](Self::identity_cache_get) for many keys under one lock:
+    /// the rows that exist, by key. A run warms thousands of identities at once, and
+    /// one statement per key through the shared connection would serialize them.
+    pub fn identity_cache_get_many(
+        &self,
+        input_keys: &[String],
+        data_version: &str,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare_cached(
+                "SELECT identity_json FROM identity_cache WHERE input_key = ?1 AND data_version = ?2",
+            )?;
+            let mut found = std::collections::HashMap::new();
+            for key in input_keys {
+                let json: Option<String> = statement
+                    .query_row(params![key, data_version], |row| row.get(0))
+                    .optional()?;
+                if let Some(json) = json {
+                    found.insert(key.clone(), json);
+                }
+            }
+            Ok(found)
+        })
+    }
+
+    /// [`identity_cache_put`](Self::identity_cache_put) for many rows in ONE
+    /// transaction (one commit, not one fsync per identity).
+    pub fn identity_cache_put_many(
+        &self,
+        rows: &[(String, String)],
+        data_version: &str,
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let cached_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        self.with_connection(|connection| {
+            let transaction = connection.unchecked_transaction()?;
+            {
+                let mut statement = transaction.prepare_cached(
+                    "INSERT INTO identity_cache (input_key, data_version, identity_json, cached_at) \
+                     VALUES (?1, ?2, ?3, ?4) ON CONFLICT(input_key, data_version) DO UPDATE SET \
+                     identity_json = excluded.identity_json, cached_at = excluded.cached_at",
+                )?;
+                for (key, json) in rows {
+                    statement.execute(params![key, data_version, json, cached_at])?;
+                }
+            }
+            transaction.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Store one resolved identity, replacing any row for the same key + version.
+    pub fn identity_cache_put(
+        &self,
+        input_key: &str,
+        data_version: &str,
+        identity_json: &str,
+    ) -> Result<()> {
+        let cached_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        self.with_connection(|connection| {
+            connection.execute(
+                "INSERT INTO identity_cache (input_key, data_version, identity_json, cached_at) \
+                 VALUES (?1, ?2, ?3, ?4) ON CONFLICT(input_key, data_version) DO UPDATE SET \
+                 identity_json = excluded.identity_json, cached_at = excluded.cached_at",
+                params![input_key, data_version, identity_json, cached_at],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Drop every cached identity from a data version other than `keep_version`.
+    ///
+    /// Returns the number of rows removed. Called after a resolve run warms the
+    /// current version, so one data/rule/settings change does not grow the table
+    /// forever. Every app shares the one `[matching]` engine, hence one version;
+    /// rows of any other version are stale by definition.
+    pub fn identity_cache_prune(&self, keep_version: &str) -> Result<u64> {
+        self.with_connection(|connection| {
+            let removed = connection.execute(
+                "DELETE FROM identity_cache WHERE data_version != ?1",
+                params![keep_version],
+            )?;
+            Ok(removed as u64)
+        })
+    }
+
+    /// Record that this app created (or explicitly adopted) an object under its key.
+    ///
+    /// Idempotent: `INSERT OR IGNORE` on `(kind, object_id)`, so re-recording the same object
+    /// — a retried apply, a re-run over the same plan — changes nothing, and the first owner
+    /// wins when two apps claim one object. `created_at` is the first recording, RFC 3339.
+    ///
+    /// Answers whether `app` owns the object afterwards: `false` means another app already
+    /// did, and this claim was NOT recorded — an adopter must not then treat it as its own.
+    pub fn record_ownership(
+        &self,
+        kind: &str,
+        object_id: i64,
+        app: &str,
+        owner_key: &str,
+        run_id: i64,
+    ) -> Result<bool> {
+        let created = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        self.with_connection(|connection| {
+            connection.execute(
+                "INSERT OR IGNORE INTO ownership (kind, object_id, app, owner_key, run_id, \
+                 created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![kind, object_id, app, owner_key, run_id, created],
+            )?;
+            let owner: String = connection.query_row(
+                "SELECT app FROM ownership WHERE kind = ?1 AND object_id = ?2",
+                params![kind, object_id],
+                |row| row.get(0),
+            )?;
+            Ok(owner == app)
+        })
+    }
+
+    /// Record intents for creates about to be sent, in one transaction.
+    ///
+    /// Written before the POSTs go out (see the `ownership_intent` table): a replace, so a
+    /// rerun's fresh intent supersedes a stale one for the same key.
+    pub fn record_intents(&self, intents: &[CreateIntent]) -> Result<()> {
+        if intents.is_empty() {
+            return Ok(());
+        }
+        let created = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        self.with_connection(|connection| {
+            let transaction = connection.unchecked_transaction()?;
+            {
+                let mut statement = transaction.prepare(
+                    "INSERT OR REPLACE INTO ownership_intent (kind, app, owner_key, name, \
+                     group_id, number, url, after_id, run_id, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                )?;
+                for intent in intents {
+                    statement.execute(params![
+                        intent.kind,
+                        intent.app,
+                        intent.owner_key,
+                        intent.name,
+                        intent.group_id,
+                        intent.number,
+                        intent.url,
+                        intent.after_id,
+                        intent.run_id,
+                        created,
+                    ])?;
+                }
+            }
+            transaction.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Turn an intent into ownership: record the object and drop the intent, atomically.
+    ///
+    /// The ownership insert is [`Self::record_ownership`]'s `OR IGNORE` (first owner wins).
+    pub fn settle_intent(
+        &self,
+        kind: &str,
+        object_id: i64,
+        app: &str,
+        owner_key: &str,
+        run_id: i64,
+    ) -> Result<()> {
+        let created = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        self.with_connection(|connection| {
+            let transaction = connection.unchecked_transaction()?;
+            transaction.execute(
+                "INSERT OR IGNORE INTO ownership (kind, object_id, app, owner_key, run_id, \
+                 created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![kind, object_id, app, owner_key, run_id, created],
+            )?;
+            transaction.execute(
+                "DELETE FROM ownership_intent WHERE kind = ?1 AND app = ?2 AND owner_key = ?3",
+                params![kind, app, owner_key],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })
+    }
+
+    /// [`Self::settle_intent`] for many objects of one kind, in ONE transaction: a create
+    /// stage settles everything it landed together rather than paying a commit per object.
+    /// `settled` is `(object id, owner key)`.
+    pub fn settle_intents(
+        &self,
+        kind: &str,
+        app: &str,
+        run_id: i64,
+        settled: &[(i64, String)],
+    ) -> Result<()> {
+        if settled.is_empty() {
+            return Ok(());
+        }
+        let created = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        self.with_connection(|connection| {
+            let transaction = connection.unchecked_transaction()?;
+            {
+                let mut own = transaction.prepare(
+                    "INSERT OR IGNORE INTO ownership (kind, object_id, app, owner_key, run_id, \
+                     created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                )?;
+                let mut forget = transaction.prepare(
+                    "DELETE FROM ownership_intent WHERE kind = ?1 AND app = ?2 AND owner_key = ?3",
+                )?;
+                for (object_id, owner_key) in settled {
+                    own.execute(params![kind, object_id, app, owner_key, run_id, created])?;
+                    forget.execute(params![kind, app, owner_key])?;
+                }
+            }
+            transaction.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Forget an intent whose object never landed.
+    pub fn drop_intent(&self, kind: &str, app: &str, owner_key: &str) -> Result<()> {
+        self.with_connection(|connection| {
+            connection.execute(
+                "DELETE FROM ownership_intent WHERE kind = ?1 AND app = ?2 AND owner_key = ?3",
+                params![kind, app, owner_key],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Every intent one app left unsettled, oldest first.
+    pub fn pending_intents(&self, app: &str) -> Result<Vec<CreateIntent>> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT kind, app, owner_key, name, group_id, number, url, after_id, run_id \
+                 FROM ownership_intent WHERE app = ?1 ORDER BY created_at, kind, owner_key",
+            )?;
+            let rows = statement.query_map(params![app], |row| {
+                Ok(CreateIntent {
+                    kind: row.get(0)?,
+                    app: row.get(1)?,
+                    owner_key: row.get(2)?,
+                    name: row.get(3)?,
+                    group_id: row.get(4)?,
+                    number: row.get(5)?,
+                    url: row.get(6)?,
+                    after_id: row.get(7)?,
+                    run_id: row.get(8)?,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
+    }
+
+    /// Drop the ownership of an object that no longer exists in Dispatcharr.
+    ///
+    /// Ids are never reused upstream (Postgres sequences), so a missing id is gone for good:
+    /// keeping its row would make a create plan believe its key is still made.
+    pub fn forget_ownership(&self, kind: &str, object_id: i64) -> Result<()> {
+        self.with_connection(|connection| {
+            connection.execute(
+                "DELETE FROM ownership WHERE kind = ?1 AND object_id = ?2",
+                params![kind, object_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Whether any app owns this object.
+    ///
+    /// What hide/renumber passes ask before touching a channel: an object nobody owns is a
+    /// user's own, never crosstalk's to renumber or hide.
+    pub fn is_owned(&self, kind: &str, object_id: i64) -> Result<bool> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT 1 FROM ownership WHERE kind = ?1 AND object_id = ?2",
+                    params![kind, object_id],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map(|found| found.is_some())
+                .map_err(Into::into)
+        })
+    }
+
+    /// Who owns this object, if anyone: `(app, owner_key, run_id)`.
+    pub fn owner_of(&self, kind: &str, object_id: i64) -> Result<Option<(String, String, i64)>> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT app, owner_key, run_id FROM ownership WHERE kind = ?1 AND object_id = ?2",
+                    params![kind, object_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+                .map_err(Into::into)
+        })
+    }
+
+    /// Every object id one app owns under one key, with what each id is.
+    ///
+    /// The create plan's dedup query: planning an object with a key that is already owned
+    /// finds the object the earlier run made instead of creating a duplicate.
+    pub fn owned_ids(&self, app: &str, owner_key: &str) -> Result<Vec<(String, i64)>> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT kind, object_id FROM ownership WHERE app = ?1 AND owner_key = ?2 \
+                 ORDER BY kind, object_id",
+            )?;
+            let rows = statement.query_map(params![app, owner_key], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
+    }
+
+    /// Everything one app owns: `(kind, object_id, owner_key)`.
+    ///
+    /// What hide/renumber passes list before they run: the owned channels of one lineup, the
+    /// owned groups of one triage config.
+    pub fn owned_keys(&self, app: &str) -> Result<Vec<(String, i64, String)>> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT kind, object_id, owner_key FROM ownership WHERE app = ?1 \
+                 ORDER BY kind, object_id",
+            )?;
+            let rows = statement.query_map(params![app], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
         })
     }
 
@@ -1138,6 +1682,90 @@ fn add_column(connection: &Connection, table: &str, name: &str, definition: &str
 /// allowed to run while another run of the same app is live. The DEFAULT is the backfill — every
 /// row written before this column existed was a guarded run — so the partial index can be built
 /// on top of it without a pass over history.
+/// How often a live run stamps its `heartbeat_at`.
+pub const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A `running` row whose heartbeat is older than this is dead, whoever ran it: ten missed
+/// beats.
+fn stale_heartbeat() -> chrono::Duration {
+    chrono::Duration::seconds(300)
+}
+
+/// This machine, as a run row records it: the kernel's boot id where there is one (a
+/// container shares its host's, and a reboot changes it), otherwise the host name.
+fn host_id() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .filter(|name| !name.trim().is_empty())
+        // Neither: one machine is the only setup that shares a store file anyway.
+        .unwrap_or_else(|| "local".to_string())
+}
+
+/// Whether process `pid` exists, where the platform can say (`/proc`); `None` elsewhere.
+fn pid_alive(pid: i64) -> Option<bool> {
+    if !std::path::Path::new("/proc/self").exists() {
+        return None;
+    }
+    Some(std::path::Path::new(&format!("/proc/{pid}")).exists())
+}
+
+/// Retire the `running` rows that are provably dead, at the daemon's start.
+///
+/// A row is dead when it predates the liveness columns (no heartbeat), when its heartbeat is
+/// older than [`stale_heartbeat`], or when it was started on THIS machine by a process that is
+/// gone — including this very pid, because nothing of this process has started a run yet
+/// (a container's daemon is pid 1 on every start). Anything else is a live run of another
+/// process (a CLI run) and keeps its row and its app's slot.
+/// One `running` row's liveness columns: id, pid, host, heartbeat.
+type RunningRow = (i64, Option<i64>, Option<String>, Option<String>);
+
+fn retire_dead_runs(connection: &Connection) -> Result<()> {
+    let now = chrono::Utc::now();
+    let host = host_id();
+    let own_pid = i64::from(std::process::id());
+    let mut statement = connection
+        .prepare("SELECT id, pid, host, heartbeat_at FROM runs WHERE status = 'running'")?;
+    let running: Vec<RunningRow> = statement
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let dead: Vec<i64> = running
+        .into_iter()
+        .filter(|(_, pid, row_host, heartbeat)| {
+            let beat = heartbeat
+                .as_deref()
+                .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+                .map(|beat| beat.with_timezone(&chrono::Utc));
+            let Some(beat) = beat else {
+                return true;
+            };
+            if now - beat > stale_heartbeat() {
+                return true;
+            }
+            let same_host = row_host.as_deref() == Some(host.as_str());
+            match pid {
+                Some(pid) if same_host => *pid == own_pid || pid_alive(*pid) == Some(false),
+                _ => false,
+            }
+        })
+        .map(|(id, ..)| id)
+        .collect();
+    let finished = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    for id in dead {
+        connection.execute(
+            "UPDATE runs SET status = 'failed', \
+             summary = COALESCE(summary, 'the daemon restarted while this run was in progress'), \
+             finished_at = COALESCE(finished_at, ?2) WHERE id = ?1 AND status = 'running'",
+            params![id, finished],
+        )?;
+    }
+    Ok(())
+}
+
 fn add_run_columns(connection: &Connection) -> Result<()> {
     let mut statement = connection.prepare("PRAGMA table_info(runs)")?;
     let existing: std::collections::HashSet<String> = statement
@@ -1148,6 +1776,15 @@ fn add_run_columns(connection: &Connection) -> Result<()> {
         // The workflow link. Nullable, so every row written before it existed reads back as a
         // run that was started on its own, which is what it was.
         ("parent_run_id", "INTEGER"),
+        // The action's single free-text input. Nullable, so every run recorded before
+        // inputs existed reads back as "no input", which is what it had.
+        ("action_input", "TEXT"),
+        // Who runs it and whether it is alive: the process id, the machine (boot id or host
+        // name) and the last heartbeat. A row without them predates them, and a daemon start
+        // treats it as dead, which is what the old rule did for every running row.
+        ("pid", "INTEGER"),
+        ("host", "TEXT"),
+        ("heartbeat_at", "TEXT"),
     ] {
         if !existing.contains(name) {
             // A daemon and a CLI opening together can both see the column missing: the second
@@ -1178,6 +1815,9 @@ fn add_run_row_columns(connection: &Connection) -> Result<()> {
         // The DEFAULT is the backfill for every ordinary row: before this column existed all
         // of them were about a channel. The watchdog's rows are the exception, below.
         ("subject", "TEXT NOT NULL DEFAULT 'channel'"),
+        // The ownership key of a created object. Nullable, so every row written before it
+        // existed reads back as "not a created object", which is what it was.
+        ("owner_key", "TEXT"),
     ] {
         if !existing.contains(name) {
             // Same lost-race tolerance as `add_run_columns`: two processes migrating together
@@ -1194,6 +1834,29 @@ fn add_run_row_columns(connection: &Connection) -> Result<()> {
             "UPDATE run_rows SET subject = 'epg_source' \
              WHERE field = 'epg_source' AND subject != 'epg_source'",
             [],
+        )?;
+    }
+    Ok(())
+}
+
+/// Add the columns the AI audit gained after the first release.
+///
+/// `CREATE TABLE IF NOT EXISTS` leaves an existing `ai_decisions` alone, so a store written
+/// by an earlier build would reject the new inserts. The column is defaulted, so an old row
+/// reads back as "one link asked", which is what it was: the chain did not exist yet.
+fn add_ai_decision_columns(connection: &Connection) -> Result<()> {
+    let mut statement = connection.prepare("PRAGMA table_info(ai_decisions)")?;
+    let existing: std::collections::HashSet<String> = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<_>>()?;
+    // Same lost-race tolerance as `add_run_columns`: two processes migrating together
+    // must not fail the second open.
+    if !existing.contains("attempts") {
+        add_column(
+            connection,
+            "ai_decisions",
+            "attempts",
+            "TEXT NOT NULL DEFAULT '[]'",
         )?;
     }
     Ok(())
@@ -1251,7 +1914,7 @@ fn map_stream_health(row: &rusqlite::Row<'_>) -> rusqlite::Result<StreamHealth> 
 /// same columns, and a column added to the table but missed in one query would make that query
 /// fail at runtime instead of at compile time.
 const RUN_COLUMNS: &str = "id, app, action, dry_run, started_at, finished_at, status, summary, \
-     counts, report_path, parent_run_id";
+     counts, report_path, parent_run_id, action_input";
 
 /// One `runs` row, from the columns [`RUN_COLUMNS`] selects.
 fn map_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
@@ -1269,13 +1932,14 @@ fn map_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
         counts: serde_json::from_str(&counts).unwrap_or_default(),
         report_path: row.get(9)?,
         parent_run_id: row.get(10)?,
+        action_input: row.get(11)?,
     })
 }
 
 /// The `run_rows` columns a [`RunRow`] is built from, in the order [`map_run_row`] reads them.
 const RUN_ROW_COLUMNS: &str = "ordinal, channel_id, channel_name, channel_group, \
      channel_number, current_epg_name, epg_data_id, epg_name, epg_source, score, method, \
-     status, reason, ai_decision, field, before_value, after_value, subject";
+     status, reason, ai_decision, field, before_value, after_value, subject, owner_key";
 
 /// One `run_rows` row, from the columns [`RUN_ROW_COLUMNS`] selects.
 fn map_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRow> {
@@ -1299,6 +1963,7 @@ fn map_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRow> {
         field: row.get(14)?,
         before_value: row.get(15)?,
         after_value: row.get(16)?,
+        owner_key: row.get(18)?,
     })
 }
 
@@ -1647,6 +2312,7 @@ mod tests {
             field: String::new(),
             before_value: None,
             after_value: None,
+            owner_key: None,
         }
     }
 
@@ -2164,6 +2830,40 @@ mod tests {
     }
 
     #[test]
+    fn a_daemon_start_keeps_a_live_cli_run_and_retires_a_dead_one() {
+        // S2: the CLI's run (another live process, heartbeat fresh) keeps its row and its
+        // app's slot; a run whose heartbeat stopped long ago is retired.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("crosstalk.db");
+        let cli = Store::open_shared(&path).expect("shared open");
+        let live = cli.start_run("guide", "match_apply", false).expect("live");
+        let dead = cli.start_run("streams", "sort_apply", false).expect("dead");
+        cli.with_connection(|connection| {
+            // pid 1 is always alive where `/proc` can say, and never this test process.
+            connection.execute("UPDATE runs SET pid = 1 WHERE id = ?1", params![live])?;
+            connection.execute(
+                "UPDATE runs SET heartbeat_at = '2020-01-01T00:00:00Z' WHERE id = ?1",
+                params![dead],
+            )?;
+            Ok(())
+        })
+        .expect("arrange");
+        cli.heartbeat(live).expect("beat");
+
+        let daemon = Store::open(&path).expect("daemon open");
+        assert_eq!(
+            daemon.run(live).expect("run").expect("present").status,
+            RunStatus::Running
+        );
+        assert_eq!(
+            daemon.run(dead).expect("run").expect("present").status,
+            RunStatus::Failed
+        );
+        // The live run still holds guide's slot across processes.
+        assert!(daemon.start_run("guide", "scan", true).is_err());
+    }
+
+    #[test]
     fn a_second_live_run_for_the_same_app_is_refused() {
         // The cross-process guard: the busy map cannot see another process, so the store
         // itself refuses a second `running` row per app. Finished rows never conflict, and
@@ -2224,6 +2924,9 @@ mod tests {
             output_tokens: 40,
             request: serde_json::json!({"state": "x"}),
             response: serde_json::json!({"answers": {}}),
+            attempts: serde_json::json!([
+                {"provider": "typesafe", "model": "jev-latest", "result": "decided"},
+            ]),
         };
         store.record_ai_decision(run_id, &decision).expect("record");
 
@@ -2233,7 +2936,60 @@ mod tests {
             .expect("present");
         assert_eq!(loaded.model, "jev-latest");
         assert_eq!(loaded.latency_ms, 120);
+        assert_eq!(loaded.attempts, decision.attempts);
         assert!(store.ai_decision(run_id, 4).expect("load").is_none());
+    }
+
+    #[test]
+    fn ai_decision_attempts_default_to_empty_for_old_rows() {
+        // A database written before the chain existed has no `attempts` column: opening it
+        // backfills the column, and its rows read back as "one link asked", which is what
+        // they were.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("store.sqlite");
+        {
+            let connection = rusqlite::Connection::open(&path).expect("open");
+            connection
+                .execute_batch(
+                    "CREATE TABLE runs (id INTEGER PRIMARY KEY AUTOINCREMENT, app TEXT NOT \
+                     NULL, action TEXT NOT NULL, dry_run INTEGER NOT NULL, started_at TEXT NOT \
+                     NULL, finished_at TEXT, status TEXT NOT NULL, summary TEXT, counts TEXT \
+                     NOT NULL DEFAULT '{}', report_path TEXT, parent_run_id INTEGER); \
+                     CREATE TABLE ai_decisions (run_id INTEGER NOT NULL, row_ordinal INTEGER \
+                     NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, latency_ms INTEGER \
+                     NOT NULL DEFAULT 0, input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens \
+                     INTEGER NOT NULL DEFAULT 0, request TEXT NOT NULL DEFAULT '{}', response \
+                     TEXT NOT NULL DEFAULT '{}', PRIMARY KEY (run_id, row_ordinal));",
+                )
+                .expect("old schema");
+            connection
+                .execute(
+                    "INSERT INTO runs (app, action, dry_run, started_at, status, counts) \
+                     VALUES ('guide', 'match_preview', 1, '2026-01-01T00:00:00Z', 'succeeded', '{}')",
+                    [],
+                )
+                .expect("run");
+            connection
+                .execute(
+                    "INSERT INTO ai_decisions (run_id, row_ordinal, provider, model) VALUES \
+                     (1, 0, 'typesafe', 'jev-latest')",
+                    [],
+                )
+                .expect("decision");
+        }
+        // Opening migrates idempotently: the column appears, and opening again changes
+        // nothing.
+        let store = Store::open(&path).expect("migrate");
+        let reopened = Store::open(&path).expect("migrate again");
+        for store in [&store, &reopened] {
+            let loaded = store.ai_decision(1, 0).expect("load").expect("present");
+            assert_eq!(loaded.provider, "typesafe");
+            assert_eq!(
+                loaded.attempts,
+                serde_json::json!([]),
+                "an old row asked exactly one link"
+            );
+        }
     }
 
     #[test]

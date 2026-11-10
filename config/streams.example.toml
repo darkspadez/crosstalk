@@ -69,10 +69,8 @@ ignore_tags = ""
 # How a channel's stream list is decided. With overwrite_streams on, Match & Assign REPLACES
 # the channel's whole list, so preview first and read the CSV.
 
-# How closely a stream name must match a channel name: relaxed (70) accepts more matches with
-# more false positives, normal (80) is balanced, strict (90) wants high confidence, exact (95)
-# is near-exact only.
-match_sensitivity = "normal"
+# NOTE (step 9): the match cut is `[matching] sensitivity` in crosstalk.toml (one ranker,
+# one cut, D02/T10). A `match_sensitivity` key here fails at load with a pointer there.
 # On: remove every existing stream and replace it with the matched ones, so a channel can end
 # a run with fewer streams than it started with. Off: add matches to what is there.
 overwrite_streams = true
@@ -86,6 +84,12 @@ allow_same_name_streams = false
 # Only match streams detected as the same country as the channel. A stream with no
 # recognizable country marker is not dropped, it sorts behind same-country matches.
 restrict_matching_to_country = false
+# In a scope = "lineup" step, restrict matching to the lineup file's country (lineup
+# mode). The step's channels are already lineup's owned channels; this is the country
+# half: with it on (the default) the step matches as if the filter above was on, with
+# the lineup file's two-letter country as the default. A channel whose identity names a
+# different known country keeps its own. Off matches like an ordinary run.
+lineup_mode_country_restriction = true
 # PREFIX=COUNTRY pairs telling the country filter what a provider prefix means, for a prefix
 # that names a platform rather than a country. Only consulted when nothing else identified
 # the stream, and only at the start of a name: NOW=UK, GO=US.
@@ -223,7 +227,9 @@ streamlink_hosts = "youtube.com, youtu.be, twitch.tv, kick.com"
 # The analysis flags are fixed by the probe (show_streams, show_packets, an error-level log)
 # rather than configurable: a flag set that breaks the parser would fail every stream at once.
 # /usr/bin is where the crosstalk image installs Alpine's ffmpeg package; on Homebrew they are
-# in /opt/homebrew/bin.
+# in /opt/homebrew/bin. Both paths are set here only (the web form does not show them): each
+# must be absolute and name the tool (ffprobe / ffmpeg, or .exe), and a probe refuses a file
+# that is not executable or is world-writable.
 ffprobe_path = "/usr/bin/ffprobe"
 ffmpeg_path = "/usr/bin/ffmpeg"
 

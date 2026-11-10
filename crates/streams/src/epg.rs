@@ -496,6 +496,7 @@ mod tests {
             name: String::new(),
             tvg_id: tvg_id.to_string(),
             epg_source: Some(1),
+            icon_url: None,
         }
     }
 

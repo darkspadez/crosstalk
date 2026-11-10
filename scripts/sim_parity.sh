@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
-# Parity oracle: `crosstalk simulate-streams` versus the Python plugin's tools/match_sim.py.
+# Parity oracle: `crosstalk simulate-streams --oracle janitor` versus the Python plugin's
+# tools/match_sim.py.
 #
 # Builds a channels CSV and a provider M3U from the shipped channel databases, runs both
 # simulators over the same inputs, and compares the report files byte for byte. Any
-# difference is a port bug, so this is the gate before the guide sub-app is wired up.
+# difference is a port bug in the Janitor ORACLE (the retired pipeline, built only with
+# `--features oracle`); the production simulator runs the unified engine, and its
+# difference from the Python tool is printed as a report line at the end (never a
+# failure: that difference is the migration, attributed in docs/oracle-reports/).
 #
 # Several configurations are compared, not just the defaults: the default flags, a
 # --no-ignore-quality run, a --custom-aliases run, and a --countries US run. The stream
@@ -11,10 +15,12 @@
 # tools de-duplicate by name before matching.
 #
 # Usage:
-#   scripts/sim_parity.sh [--quick] [--keep]
+#   scripts/sim_parity.sh [--quick] [--keep] [--report]
 #
 #   --quick   smaller corpus, for a fast local check (default is the full corpus)
 #   --keep    keep the work directory and print its path
+#   --report  report mode (step 8): print the per-file summary and exit 0 whatever is
+#             found, for the guide oracle report.
 #
 # Requires python3 and the reference checkout at reference/Dispatcharr-EPG-Janitor-Plugin.
 set -euo pipefail
@@ -27,10 +33,12 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PLUGIN="$REPO/reference/Dispatcharr-EPG-Janitor-Plugin"
 QUICK=0
 KEEP=0
+REPORT=0
 for arg in "$@"; do
   case "$arg" in
     --quick) QUICK=1 ;;
     --keep) KEEP=1 ;;
+    --report) REPORT=1 ;;
     *) echo "unknown argument: $arg" >&2; exit 2 ;;
   esac
 done
@@ -54,10 +62,10 @@ cleanup() {
 trap cleanup EXIT
 
 echo "==> building release binary"
-cargo build --release -q -p crosstalk
+cargo build --release -q -p crosstalk --features oracle
 
 echo "==> generating inputs in $WORK"
-python3 - "$REPO" "$WORK" "$QUICK" <<'PY'
+python3 -I - "$REPO" "$WORK" "$QUICK" <<'PY'
 import csv, json, os, random, sys
 
 repo, work, quick = sys.argv[1], sys.argv[2], int(sys.argv[3])
@@ -138,13 +146,13 @@ PY
 compare_case() {
   local label="$1"; shift
   echo "==> case: $label ${*:-<defaults>}"
-  python3 "$PLUGIN/tools/match_sim.py" \
+  python3 -I "$PLUGIN/tools/match_sim.py" \
     --channels "$WORK/channels.csv" \
     --streams "$WORK/streams.m3u" \
     --threshold 80 \
     --out "$WORK/py-$label" "$@" >/dev/null
 
-  "$REPO/target/release/crosstalk" simulate-streams \
+  "$REPO/target/release/crosstalk" simulate-streams --oracle janitor \
     --channels "$WORK/channels.csv" \
     --streams "$WORK/streams.m3u" \
     --threshold 80 \
@@ -172,9 +180,49 @@ compare_case no-ignore-quality --no-ignore-quality
 compare_case custom-aliases --custom-aliases "$WORK/custom_aliases.json"
 compare_case countries-US --countries US
 
+# The production simulator (the unified engine) against the Python tool's default run:
+# a report line, never a failure.
+"$REPO/target/release/crosstalk" simulate-streams \
+  --channels "$WORK/channels.csv" \
+  --streams "$WORK/streams.m3u" \
+  --threshold 80 \
+  --out "$WORK/unified" >/dev/null
+python3 -I - "$(ls -d "$WORK"/py-default/*/ | head -1)" "$(ls -d "$WORK"/unified/*/ | head -1)" <<'PY'
+import csv, sys
+def rows(path):
+    with open(path + "per_stream_matches.csv", newline="", encoding="utf-8") as fh:
+        return {row["stream_name"]: row for row in csv.DictReader(fh)}
+py, rs = rows(sys.argv[1]), rows(sys.argv[2])
+# Every channel whose identity family takes the stream in the unified run (two
+# spellings of one identity both take it, decided A05); `best_channel` is the first.
+families = {}
+with open(sys.argv[2] + "families.csv", newline="", encoding="utf-8") as fh:
+    for row in csv.DictReader(fh):
+        families.setdefault(row["stream_name"], set()).add(row["channel"])
+taken = lambda row: row["best_channel"] if row["passed"] == "True" else ""
+both = sum(1 for name in py if taken(py[name]) and taken(py[name]) == taken(rs.get(name, py[name])))
+extra = sum(1 for name in py if taken(rs.get(name, {"best_channel": "", "passed": "False"})) and not taken(py[name]))
+fewer = sum(1 for name in py if taken(py[name]) and not taken(rs.get(name, {"best_channel": "", "passed": "False"})))
+others = [name for name in py if taken(py[name]) and taken(rs.get(name, {"best_channel": "", "passed": "False"}))
+          and taken(py[name]) != taken(rs[name])]
+same_identity = sum(1 for name in others if taken(py[name]) in families.get(name, ()))
+print(f"[unified] {len(py)} stream(s): {both} take the same channel as match_sim.py, "
+      f"{fewer} only the Python tool passes, {extra} only the unified engine passes, "
+      f"{len(others)} pass to a different channel, of which {same_identity} also pass to the "
+      f"Python tool's channel (two spellings of one identity, decided A05; both take the stream) "
+      f"(report; the migration diff)")
+PY
+
 if [ "$status" -eq 0 ]; then
   echo "==> parity OK"
 else
   echo "==> parity FAILED" >&2
+fi
+if [ "$REPORT" -eq 1 ]; then
+  # Report mode (step 8, guide oracle report): the per-file lines above are the
+  # summary; never fail.
+  echo "[report] sim_parity differing-files exit was $status (the Janitor oracle; see " \
+    "docs/oracle-reports/guide.md)"
+  exit 0
 fi
 exit "$status"

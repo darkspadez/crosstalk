@@ -56,6 +56,10 @@ pub const UNLISTED_PRIORITY: usize = 999;
 pub const REGEX_RULES_MAX: usize = 50;
 /// Stream-Mapparr's `REGEX_PATTERN_MAX_LEN`: per pattern and per replacement.
 pub const REGEX_PATTERN_MAX_LEN: usize = 500;
+/// The compiled-size cap on an operator's pattern (1 MiB, a tenth of `regex`'s default). A
+/// 500-character pattern can still ask for a large program (`\w{100}` repeated); this keeps
+/// one setting from holding megabytes per rule. Not in the plugin.
+pub const REGEX_SIZE_LIMIT: usize = 1 << 20;
 /// Stream-Mapparr's `REGEX_NAME_MAX_LEN`: longer names skip pre-processing.
 pub const REGEX_NAME_MAX_LEN: usize = 500;
 /// Stream-Mapparr's `REGEX_GROWTH_FACTOR`: per-name output cap, times the original length.
@@ -394,13 +398,22 @@ impl RegexRun {
 /// operator hunting for a typo when the real problem is that Python's `re` has features Rust's
 /// engine deliberately does not.
 fn compile_pattern(pattern: &str) -> Result<Regex> {
-    Regex::new(pattern).map_err(|error| {
-        anyhow::anyhow!(
-            "invalid stream name pattern {pattern:?}: {error}. Rust's regex engine is not \
+    regex::RegexBuilder::new(pattern)
+        .size_limit(REGEX_SIZE_LIMIT)
+        .build()
+        .map_err(|error| {
+            if let regex::Error::CompiledTooBig(limit) = error {
+                return anyhow::anyhow!(
+                    "stream name pattern {pattern:?} compiles past the {limit}-byte limit; \
+                     simplify it (fewer or smaller repetitions)"
+                );
+            }
+            anyhow::anyhow!(
+                "invalid stream name pattern {pattern:?}: {error}. Rust's regex engine is not \
              Python's `re`: backreferences (\\1), lookaround ((?=…), (?<=…)) and conditionals \
              are not supported, and a pattern that needs one has to be rewritten"
-        )
-    })
+            )
+        })
 }
 
 /// Translate a Python `re.sub` replacement into the syntax Rust's `regex` expands.
@@ -423,7 +436,10 @@ fn compile_pattern(pattern: &str) -> Result<Regex> {
 ///   * An escape Python rejects (`\d`, an unclosed `\g<`, a trailing backslash) is refused
 ///     here rather than copied through, which is what would otherwise produce a silent `\d`
 ///     in a stream name.
-fn translate_replacement(replacement: &str, regex: &Regex) -> Result<String> {
+///
+/// The one translator for every Python-replacement setting: lineup's `clean` custom rules
+/// use it too, so the same replacement text means the same thing in both apps.
+pub fn translate_replacement(replacement: &str, regex: &Regex) -> Result<String> {
     let groups = regex.captures_len() - 1;
     let named: Vec<&str> = regex.capture_names().flatten().collect();
     let check_numbered = |number: usize, raw: &str| -> Result<()> {
@@ -1013,6 +1029,28 @@ impl<'a> StreamPool<'a> {
 
     pub fn is_eligible(&self, id: i64) -> bool {
         self.eligible_ids.contains(&id)
+    }
+
+    /// A stream as the quality key sees it: its stats, custom flag and this run's M3U
+    /// priority (an id the pool does not know is unlisted, with no stats). The one view
+    /// `match` ranks a channel's streams on and `lineup.create` orders a new channel's by.
+    pub fn quality_view(&self, id: i64) -> crate::quality::StreamView<'a> {
+        match self.get(id) {
+            Some(stream) => crate::quality::StreamView {
+                id,
+                name: &stream.name,
+                stats: Some(&stream.stream_stats),
+                m3u_priority: self.priority.get(&id).copied().unwrap_or(UNLISTED_PRIORITY),
+                is_custom: stream.is_custom,
+            },
+            None => crate::quality::StreamView {
+                id,
+                name: "",
+                stats: None,
+                m3u_priority: UNLISTED_PRIORITY,
+                is_custom: false,
+            },
+        }
     }
 
     /// The name MATCHING sees for a stream, or `None` when it is not eligible this run.

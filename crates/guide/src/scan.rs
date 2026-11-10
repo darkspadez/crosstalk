@@ -8,8 +8,10 @@
 //! The programme check is the one match and heal already use: `has_programs` over
 //! `ProgramWindow::ahead(check_hours)`, bounded by the client's concurrency cap, memoised per
 //! entry and window, cancelled between batches and reported per batch. A channel whose assigned
-//! entry the world does not know (or that carries no source) counts as empty, which is what the
-//! plugin's own query would answer.
+//! entry carries no source counts as empty, which is what the plugin's own query would answer.
+//! A channel whose assigned entry the world does NOT know is `unchecked`, never missing: a
+//! short or empty entry listing would otherwise put every assigned channel in the result set a
+//! cleanup clears. An empty entry listing while in-scope channels carry guides refuses the scan.
 //!
 //! There is deliberately NO age limit on the result set (see [`last_scan`]): every cleanup
 //! action re-plans from the current Dispatcharr state, so an old scan can only be out of date,
@@ -180,17 +182,21 @@ pub async fn run(
     let check_hours = settings.check_hours;
     let window = ProgramWindow::ahead(check_hours);
 
+    refuse_without_entries(world, scoped_channels)?;
+
     let entry_by_id: HashMap<i64, &EpgEntry> = world
         .entries
         .iter()
         .map(|entry| (entry.id, entry))
         .collect();
 
-    // Which channels need a request at all. A channel with no guide, or a guide the world does
-    // not know, needs none: the first is not the plugin's set, the second has nothing to ask.
+    // Which channels need a request at all. A channel with no guide, a source-less guide or a
+    // guide the world does not know needs none: the first is not the plugin's set, the second
+    // has nothing to ask, and the third cannot be judged from this listing.
     enum Check {
         Unassigned,
         Empty,
+        Unknown,
         Ask(String, i64),
     }
     let checks: Vec<Check> = scoped_channels
@@ -203,7 +209,7 @@ pub async fn run(
                     Some(source) => Check::Ask(entry.tvg_id.clone(), source),
                     None => Check::Empty,
                 },
-                None => Check::Empty,
+                None => Check::Unknown,
             },
         })
         .collect();
@@ -218,6 +224,15 @@ pub async fn run(
         checked as u64,
         "checking programme data",
     ));
+
+    // Settle what one request per source and per 50 entries can (E-B1); the loop below
+    // then answers those from the memo and searches only the rest.
+    let asked: Vec<&EpgEntry> = scoped_channels
+        .channels
+        .iter()
+        .filter_map(|channel| entry_by_id.get(&channel.current_epg_id()?).copied())
+        .collect();
+    crate::programs::seed(context, client, world, asked, &window, PROGRESS_ACTION).await;
 
     let concurrency = context.config().dispatcharr.concurrency.max(1);
     let mut answered: Vec<Option<HasPrograms>> = checks.iter().map(|_| None).collect();
@@ -294,6 +309,11 @@ pub async fn run(
         }
         let has = match &checks[ordinal] {
             Check::Unassigned => continue,
+            // Not in the entry listing: a short read must never look like a missing guide.
+            Check::Unknown => {
+                unchecked += 1;
+                continue;
+            }
             Check::Empty => HasPrograms::No,
             Check::Ask(..) => match answered[ordinal] {
                 Some(answer) => answer,
@@ -352,6 +372,30 @@ pub async fn run(
         check_hours,
         cancelled,
     })
+}
+
+/// Refuse to judge guides from an empty entry listing while in-scope channels carry guides.
+///
+/// An empty `/epg/epgdata/` answer next to assigned channels is a broken read (a proxy, a
+/// restarting server), not "every guide is gone"; acting on it would clear or reassign every
+/// assignment in scope. Shared by scan and heal.
+pub fn refuse_without_entries(world: &World, scoped_channels: &ScopedChannels) -> Result<()> {
+    if !world.entries.is_empty() {
+        return Ok(());
+    }
+    let assigned = scoped_channels
+        .channels
+        .iter()
+        .filter(|channel| channel.current_epg_id().is_some())
+        .count();
+    if assigned > 0 {
+        bail!(
+            "Dispatcharr listed no EPG entries, yet {assigned} in-scope channel(s) carry a guide \
+             assignment: refusing to judge guides from an empty listing. Check that the EPG \
+             sources are loaded and that /api/epg/epgdata/ answers, then run again."
+        );
+    }
+    Ok(())
 }
 
 fn write_report(
@@ -683,6 +727,32 @@ mod tests {
                 .all(|query| !query.contains("cnn.us")),
             "the source-less entry is never asked about"
         );
+    }
+
+    #[tokio::test]
+    async fn a_guide_missing_from_the_entry_listing_is_unchecked_not_missing() {
+        // B1: a short entry read must never put a channel in the result set a cleanup clears.
+        let mut world = test_support::world();
+        world.entries.retain(|entry| entry.id != CNN_US);
+        let fixture = Fixture::start(&world, &[ESPN_HD]).await;
+        let context = fixture.context();
+
+        let result = scan(&fixture, &context, &world).await.expect("scan");
+        assert!(result.rows.iter().all(|row| row.channel_id != 2));
+        assert_eq!(result.unchecked, 1);
+    }
+
+    #[tokio::test]
+    async fn an_empty_entry_listing_with_assigned_channels_refuses_the_scan() {
+        // B1: `200 {}` (or `[]`) from /epg/epgdata/ next to assigned channels is a broken
+        // read; the scan refuses instead of reporting every guide missing.
+        let mut world = test_support::world();
+        world.entries.clear();
+        let fixture = Fixture::start(&world, &[ESPN_HD]).await;
+        let context = fixture.context();
+
+        let error = scan(&fixture, &context, &world).await.expect_err("empty");
+        assert!(format!("{error:#}").contains("no EPG entries"), "{error:#}");
     }
 
     #[tokio::test]

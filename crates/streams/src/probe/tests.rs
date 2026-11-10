@@ -229,6 +229,33 @@ fn an_unattached_stream_is_probed_only_when_the_setting_asks() {
 }
 
 #[test]
+fn a_step_bound_keeps_the_orphan_rule_on_the_whole_world() {
+    // A workflow step bound to channel 2 probes channel 2's stream and the real orphan;
+    // channel 1's own streams are attached (to a channel outside the bound), not orphans.
+    let world = probe_world();
+    let on = StreamsSettings {
+        probe_unattached_streams: true,
+        ..settings()
+    };
+    let limit: std::collections::HashSet<i64> = [PROBE_CHANNEL_TWO].into_iter().collect();
+    let selection = select_within(
+        &world,
+        &ScopeConfig::default(),
+        Some(&limit),
+        &on,
+        &HashMap::new(),
+        Utc::now(),
+    )
+    .expect("selection");
+    assert_eq!(selection.channels.len(), 1);
+    assert_eq!(selection.channels[0].channel_id, PROBE_CHANNEL_TWO);
+    assert_eq!(selection.unattached, 1);
+    let mut ids = selection.stream_ids();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![PROBE_FEED_THREE, PROBE_FEED_ORPHAN]);
+}
+
+#[test]
 fn a_fresh_stream_is_skipped_and_a_stale_one_is_due() {
     let world = probe_world();
     let now = Utc::now();
@@ -620,6 +647,54 @@ async fn a_streamlink_host_is_skipped_without_running_anything() {
     assert_eq!(verdict.error_type, "Skipped");
     assert!(verdict.error.contains("Streamlink-only"));
     assert!(tools.calls().is_empty(), "nothing was run");
+}
+
+#[tokio::test]
+async fn a_url_outside_the_scheme_allow_list_is_skipped_without_running_anything() {
+    let config = content_config();
+    for url in ["-report", "file:/etc/passwd", "/etc/passwd", "concat:a|b"] {
+        let tools = runner();
+        let verdict = probe(&tools, &config, url, 11).await;
+        assert_eq!(verdict.class, Class::Skipped, "{url}");
+        assert_eq!(verdict.error_type, classify::UNSUPPORTED_URL, "{url}");
+        assert_eq!(verdict.health_class, "skipped", "{url}");
+        assert!(verdict.error.contains("unsupported URL"), "{url}");
+        assert!(
+            !verdict.error.contains(url),
+            "the URL stays out of the error"
+        );
+        assert!(!verdict.writes_stats(), "{url}");
+        assert!(tools.calls().is_empty(), "{url}: nothing was run");
+    }
+}
+
+#[tokio::test]
+async fn both_tools_get_the_url_as_i_and_the_protocol_whitelist() {
+    let url = "http://provider.test/a.ts";
+    let tools = runner()
+        .answering("ffprobe", url, alive(1920, 1080, "50/1"))
+        .answering("ffmpeg", url, ToolOutput::new(0, "", ""));
+    let verdict = probe(&tools, &content_config(), url, 12).await;
+    assert_eq!(verdict.class, Class::Alive, "{}", verdict.error);
+    let calls = tools.calls();
+    assert_eq!(calls.len(), 2, "ffprobe, then the content pass");
+    for spec in &calls {
+        let name = spec.program_name();
+        let at = spec.args.iter().position(|arg| arg == "-i").expect("-i");
+        assert_eq!(spec.args[at + 1], url, "{name}");
+        assert_eq!(
+            spec.args.iter().filter(|arg| arg.as_str() == url).count(),
+            1,
+            "{name}: the URL appears once, as the value of -i"
+        );
+        let wl = spec
+            .args
+            .iter()
+            .position(|arg| arg == "-protocol_whitelist")
+            .expect("-protocol_whitelist");
+        assert!(wl < at, "{name}: an input option must precede -i");
+        assert_eq!(spec.args[wl + 1], ffprobe::PROTOCOL_WHITELIST, "{name}");
+    }
 }
 
 #[tokio::test]

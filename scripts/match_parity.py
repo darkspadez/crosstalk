@@ -1375,6 +1375,10 @@ def run_rust(cases, binary):
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--show", type=int, default=8, help="mismatches to print")
+    parser.add_argument("--report", action="store_true",
+                        help="report mode (step 9): print the summary and exit 0 "
+                        "whatever is found, for the oracle diff report. The plugin is "
+                        "the oracle; differences trace to decisions rows.")
     parser.add_argument("--cases", type=int, default=None, help="cap the swept corpus")
     parser.add_argument("--random", type=int, default=120, help="randomised cases to add")
     parser.add_argument("--seed", type=int, default=20261102, help="seed for the random cases")
@@ -1439,6 +1443,9 @@ def main() -> int:
 
     print(f"[match] {mismatches} mismatch(es) over {len(cases)} case(s), "
           f"{compared} channel(s) compared, {written} of them written")
+    if args.report:
+        print("[report] exit 0: differences are oracle diffs, not failures")
+        return 0
     return 1 if mismatches else 0
 
 

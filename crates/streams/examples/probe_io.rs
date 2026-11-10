@@ -337,13 +337,11 @@ fn run_aggregate(channels: &[ChannelInput]) -> Value {
     json!({ "channels": verdicts })
 }
 
-/// The five format labels, so the harness can spell them the same way.
+/// The five format labels, read off the shared quality model so the harness spells them
+/// the same way the run does (`QualityTier::parse_label` over `IC_FORMAT_LABELS`).
 fn static_format(text: &str) -> &'static str {
-    match text {
-        "UHD" => "UHD",
-        "FHD" => "FHD",
-        "HD" => "HD",
-        "SD" => "SD",
-        _ => "Unknown",
-    }
+    use crosstalk_core::quality::QualityTier;
+    QualityTier::parse_label(text)
+        .map(|tier| tier.ic_label())
+        .unwrap_or("Unknown")
 }

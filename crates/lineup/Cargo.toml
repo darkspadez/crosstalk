@@ -1,0 +1,39 @@
+[package]
+name = "crosstalk-lineup"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "crosstalk sub-app: the channel list itself — names, numbers, groups, logos, creation"
+
+[dependencies]
+crosstalk-core.workspace = true
+crosstalk-matching.workspace = true
+# Direction rule: lineup -> streams only (create reuses the StreamPool selection and
+# the quality order, so a created channel carries exactly what streams.match would
+# attach). streams must never depend on lineup: its lineup mode (step 19) reads lineup's
+# channels through core (store ownership keys), never through this crate. Cargo refuses
+# the cycle, so breaking the rule fails the build.
+crosstalk-streams.workspace = true
+
+anyhow.workspace = true
+# The AI gate fans out like guide's (audit E-S2).
+futures.workspace = true
+rayon.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+toml.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+regex.workspace = true
+unicode-normalization.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+wiremock.workspace = true
+proptest.workspace = true
+# The full_sync end-to-end test drives the real registry (guide + streams + lineup)
+# through the workflow runner. A test-only dependency: production code in this crate
+# never depends on guide (the direction rule only binds production edges).
+crosstalk-guide.workspace = true

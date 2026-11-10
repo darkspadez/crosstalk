@@ -1278,7 +1278,6 @@ mod tests {
         // once and only ids survive.
         let settings = GuideSettings {
             watchdog_exclude_source_ids: "22, 40 ,x".to_string(),
-            match_confidence_threshold: 70,
             ..GuideSettings::default()
         };
         let coerced = WatchdogSettings::coerce(&settings);
@@ -1947,6 +1946,7 @@ mod tests {
                         name: format!("guide {source}"),
                         tvg_id: format!("tvg.{source}"),
                         epg_source: Some(source),
+                        icon_url: None,
                     })
                     .collect(),
                 ..World::default()

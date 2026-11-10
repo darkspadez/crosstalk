@@ -5,9 +5,14 @@
 //!   * `run`     — run one sub-app action once, without the daemon
 //!   * `validate` — check configuration against Dispatcharr
 //!   * `exports clear` — delete the CSV reports the sub-apps wrote
-//!   * `simulate-streams` — offline stream-to-channel match simulation (the parity oracle)
+//!   * `bridge secret|rotate|ping` — the `crosstalk-bridge` plugin's secret, and a signed ping
+//!   * `simulate-streams` — offline stream-to-channel match simulation (the unified engine;
+//!     the Janitor oracle with `--features oracle --oracle janitor`)
 //!   * `bench` — time the parts of a run, to decide whether REST is fast enough
 
+#![forbid(unsafe_code)]
+
+mod bench_guide;
 mod registry;
 mod simulate;
 
@@ -41,9 +46,15 @@ enum Command {
     Validate(ConfigArgs),
     /// Manage the CSV reports the sub-apps write.
     Exports(ExportsArgs),
+    /// Undo a finished apply run: reverse the rows that are still in effect.
+    Undo(UndoArgs),
+    /// The crosstalk-bridge Dispatcharr plugin: its shared secret, and a signed ping.
+    Bridge(BridgeArgs),
+    /// The objects a sub-app created in Dispatcharr and still tracks.
+    Ownership(OwnershipArgs),
     /// Time the parts of a sub-app's run: the plan phases, and the writes they would issue.
     Bench(BenchArgs),
-    /// Offline stream-to-channel match simulation.
+    /// Offline stream-to-channel match simulation, on the unified engine.
     #[command(name = "simulate-streams")]
     SimulateStreams(SimulateArgs),
 }
@@ -79,6 +90,25 @@ struct RunArgs {
     /// the scope, for instance.
     #[arg(long)]
     fresh: bool,
+    /// The action's single free-text input, for actions that declare one
+    /// (`lineup test_name --input "<text>"`). Refused for actions without an input.
+    #[arg(long)]
+    input: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct UndoArgs {
+    /// The run to undo, for example `crosstalk undo 42`.
+    run_id: i64,
+    /// Change nothing; write the report only. `--preview` is accepted as a synonym.
+    #[arg(long = "dry-run", alias = "preview")]
+    dry_run: bool,
+    /// Confirm an undo that changes data. Without it, an apply is refused.
+    #[arg(long, short = 'y')]
+    yes: bool,
+    /// Directory holding the configuration files.
+    #[arg(long, default_value = "config", env = "CROSSTALK_CONFIG_DIR")]
+    config: PathBuf,
 }
 
 #[derive(Args, Debug)]
@@ -91,6 +121,67 @@ struct BenchArgs {
 enum BenchTarget {
     /// Benchmark the streams sub-app: match, sort, mirror and visibility plans.
     Streams(StreamsBenchArgs),
+    /// Benchmark the lineup sub-app: clean, names, categorize, logos, sync, create, tidy and
+    /// undo plans.
+    Lineup(LineupBenchArgs),
+    /// Benchmark the guide sub-app: match, scan and heal against a fake Dispatcharr.
+    Guide(GuideBenchArgs),
+}
+
+/// `bench guide` has one mode, synthetic: a world built in memory, served by an
+/// in-process fake Dispatcharr that counts every request. The flag is still required, so
+/// the command says what it measured.
+#[derive(Args, Debug)]
+struct GuideBenchArgs {
+    /// Directory holding the configuration files.
+    #[arg(long, default_value = "config", env = "CROSSTALK_CONFIG_DIR")]
+    config: PathBuf,
+    /// Time a synthetic world against a fake Dispatcharr. No network beyond loopback.
+    #[arg(long, required = true)]
+    synthetic: bool,
+    /// Synthetic channels to build.
+    #[arg(long, default_value_t = 20_000)]
+    channels: usize,
+    /// Synthetic EPG entries to build.
+    #[arg(long, default_value_t = 55_000)]
+    entries: usize,
+    /// EPG sources the entries are spread over.
+    #[arg(long, default_value_t = 20)]
+    sources: usize,
+    /// What every fake request waits before it answers, in milliseconds.
+    #[arg(long = "delay-ms", default_value_t = 2)]
+    delay_ms: u64,
+    /// Print the report as JSON instead of lines.
+    #[arg(long)]
+    json: bool,
+}
+
+/// `bench lineup` has one mode, synthetic: the lineup plans read the whole world and
+/// write per-channel values, so a live timing would be the streams bench's `--live` read
+/// again. The flag is still required, so the command says what it measured.
+#[derive(Args, Debug)]
+struct LineupBenchArgs {
+    /// Directory holding the configuration files.
+    #[arg(long, default_value = "config", env = "CROSSTALK_CONFIG_DIR")]
+    config: PathBuf,
+    /// Time a synthetic world built in memory. No network, no Dispatcharr.
+    #[arg(long, required = true)]
+    synthetic: bool,
+    /// Synthetic channels to build for the clean/names/categorize/logos plans.
+    #[arg(long, default_value_t = 20_000)]
+    channels: usize,
+    /// Lineup entries to sync (the first N of the configured lineup file).
+    #[arg(long = "lineup-channels", default_value_t = 500)]
+    lineup_channels: usize,
+    /// Streams the create plan imports from.
+    #[arg(long, default_value_t = 50_000)]
+    streams: usize,
+    /// Synthetic tv-logos files per country directory, for the logos fuzzy tier.
+    #[arg(long = "tv-logos-per-country", default_value_t = 1_500)]
+    tv_logos_per_country: usize,
+    /// Print the report as JSON instead of lines.
+    #[arg(long)]
+    json: bool,
 }
 
 /// One of `--synthetic` or `--live` must be chosen: a bench that silently measured nothing
@@ -134,6 +225,55 @@ struct ConfigArgs {
 }
 
 #[derive(Args, Debug)]
+struct BridgeArgs {
+    #[command(subcommand)]
+    command: BridgeCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum BridgeCommand {
+    /// Generate the bridge secret, write it to crosstalk.toml [bridge] and print it once.
+    Secret(BridgeSecretArgs),
+    /// Replace the bridge secret with a new one, and print how to roll it into the plugin.
+    Rotate(ConfigArgs),
+    /// Send the plugin a signed ping and say whether this crosstalk can use it.
+    Ping(ConfigArgs),
+}
+
+#[derive(Args, Debug)]
+struct BridgeSecretArgs {
+    #[arg(long, default_value = "config", env = "CROSSTALK_CONFIG_DIR")]
+    config: PathBuf,
+    /// Replace a secret that is already set. `bridge rotate` is the usual way to do that.
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Args, Debug)]
+struct OwnershipArgs {
+    #[command(subcommand)]
+    command: OwnershipCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum OwnershipCommand {
+    /// Forget the objects an app created that Dispatcharr no longer has, however many: the
+    /// way out after a deliberate mass deletion, when a run refuses to forget more than its
+    /// per-run cap. Each one is confirmed with its own GET first; only a 404 forgets it.
+    #[command(name = "forget-deleted")]
+    ForgetDeleted(OwnershipForgetArgs),
+}
+
+#[derive(Args, Debug)]
+struct OwnershipForgetArgs {
+    #[arg(long, default_value = "config", env = "CROSSTALK_CONFIG_DIR")]
+    config: PathBuf,
+    /// The app whose ownership to reconcile (`lineup`, `streams`).
+    #[arg(long)]
+    app: String,
+}
+
+#[derive(Args, Debug)]
 struct ExportsArgs {
     #[command(subcommand)]
     command: ExportsCommand,
@@ -166,8 +306,9 @@ struct SimulateArgs {
     /// Provider M3U.
     #[arg(long)]
     streams: PathBuf,
-    /// Score a candidate must reach to count as passed.
-    #[arg(long, default_value_t = 80)]
+    /// The decision cut: a stream passes as a member of the channel's best identity
+    /// family at this score (the `[matching]` cut; 95 is `strict`, the default).
+    #[arg(long, default_value_t = crosstalk_matching::DEFAULT_THRESHOLD)]
     threshold: u8,
     /// Rows written per stream to top_n.csv.
     #[arg(long = "top-n", default_value_t = 5)]
@@ -202,6 +343,12 @@ struct SimulateArgs {
     /// Do not strip miscellaneous parenthesised tags before comparing.
     #[arg(long = "no-ignore-misc")]
     no_ignore_misc: bool,
+    /// Oracle builds only (`--features oracle`): run a retired plugin pipeline instead
+    /// of the unified engine. `janitor` is EPG Janitor's `tools/match_sim.py`, ported
+    /// byte for byte, for `scripts/sim_parity.sh`.
+    #[cfg(feature = "oracle")]
+    #[arg(long, value_parser = ["janitor"])]
+    oracle: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -228,6 +375,13 @@ fn main() -> Result<()> {
                 countries: args.countries,
                 out: args.out,
                 tags,
+                #[cfg(feature = "oracle")]
+                matching: match args.oracle.as_deref() {
+                    Some("janitor") => simulate::Matching::Janitor,
+                    _ => simulate::Matching::Unified,
+                },
+                #[cfg(not(feature = "oracle"))]
+                matching: simulate::Matching::Unified,
             };
             match simulate::run(&options) {
                 Ok(out) => {
@@ -245,10 +399,21 @@ fn main() -> Result<()> {
         Command::Run(args) => run_once(args),
         Command::Bench(args) => match args.target {
             BenchTarget::Streams(args) => bench_streams(args),
+            BenchTarget::Lineup(args) => bench_lineup(args),
+            BenchTarget::Guide(args) => bench_guide(args),
         },
         Command::Validate(args) => validate(args),
+        Command::Undo(args) => undo_once(args),
         Command::Exports(args) => match args.command {
             ExportsCommand::Clear(args) => clear_exports(args),
+        },
+        Command::Bridge(args) => match args.command {
+            BridgeCommand::Secret(args) => bridge_secret(args),
+            BridgeCommand::Rotate(args) => bridge_rotate(args),
+            BridgeCommand::Ping(args) => bridge_ping(args),
+        },
+        Command::Ownership(args) => match args.command {
+            OwnershipCommand::ForgetDeleted(args) => ownership_forget_deleted(args),
         },
     }
 }
@@ -270,6 +435,29 @@ fn serve(args: ServeArgs) -> Result<()> {
                  exposing the daemon. Anyone who can reach the port could run apply actions.",
                 snapshot.server.bind
             );
+        }
+        // The listener rules the configuration report calls errors: a token too short for a
+        // reachable daemon, trusted proxies without a token, a range or public URL that does
+        // not parse. Each would leave the daemon weaker than the operator thinks it is.
+        let security = snapshot.server.security_errors();
+        if !security.is_empty() {
+            anyhow::bail!(
+                "refusing to start with an unsafe [server] configuration:\n  - {}",
+                security.join("\n  - ")
+            );
+        }
+
+        // Not fatal (a file can be owner-only through its directory, or on a filesystem with
+        // no modes), but a token or key in a file every account can read is worth a line.
+        for warning in snapshot.exposed_secret_warnings() {
+            tracing::warn!("{warning}");
+        }
+
+        // The bridge is checked once, here: a plugin that is missing, too old or does not
+        // verify crosstalk's signature leaves the bridge-backed paths on REST for this run of
+        // the daemon, and the line below says why. A settings save does not re-check it.
+        if snapshot.bridge.enabled {
+            println!("{}", activate_bridge(&snapshot).await.describe());
         }
 
         let store = Store::open(snapshot.data_dir().join("crosstalk.db"))?;
@@ -331,13 +519,10 @@ fn serve(args: ServeArgs) -> Result<()> {
             );
         }
 
-        // With `ConnectInfo`: without it the login limiter's `ConnectInfo<SocketAddr>`
-        // extractor is always `None` and every client shares the one fallback bucket, so ten
-        // bad POSTs from anyone would lock out every browser login. Note the limit of this:
-        // behind a reverse proxy every client arrives with the proxy's address, so the
-        // limiter is effectively global there too — there is no trusted-proxy or
-        // X-Forwarded-For support yet, so do not put a login-bearing listener behind one
-        // expecting per-client limiting.
+        // With `ConnectInfo`: without it every client shares the one fallback limiter bucket,
+        // so ten bad tokens from anyone would lock everyone out. Behind a reverse proxy, list
+        // the proxy in `[server] trusted_proxies` so the client address comes from its
+        // `X-Forwarded-For` instead of the proxy's own socket.
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
@@ -382,16 +567,48 @@ async fn wait_for_drain(runner: &JobRunner, timeout: std::time::Duration) {
 /// port, the schedules, and anything a run went wrong on).
 fn install_logging() {
     use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_env("RUST_LOG").unwrap_or_else(|_| {
-        EnvFilter::new(
-            "info,crosstalk_core=info,crosstalk_web=info,crosstalk_guide=info,\
-             crosstalk_streams=info",
-        )
-    });
+    let user = std::env::var("RUST_LOG").ok();
+    let filter = EnvFilter::try_new(log_directives(user.as_deref()))
+        .unwrap_or_else(|_| EnvFilter::new(log_directives(None)));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
         .try_init();
+}
+
+/// The HTTP stack's own crates, held at `info` unless `RUST_LOG` names them.
+///
+/// At `debug` reqwest and hyper log request and redirect URLs, and a provider's stream URL
+/// (or a `user:pass@` base URL) is a credential: `RUST_LOG=debug` to chase a matching
+/// problem must not put one in the log. Naming the crate explicitly is the opt-in.
+const QUIET_HTTP_CRATES: [&str; 3] = ["reqwest", "hyper", "hyper_util"];
+
+/// The filter directives: the operator's `RUST_LOG` (or the default), plus `<crate>=info` for
+/// each of [`QUIET_HTTP_CRATES`] it does not name itself.
+fn log_directives(user: Option<&str>) -> String {
+    let base = match user.map(str::trim).filter(|text| !text.is_empty()) {
+        Some(text) => text.to_string(),
+        None => "info,crosstalk_core=info,crosstalk_web=info,crosstalk_guide=info,\
+                 crosstalk_streams=info"
+            .to_string(),
+    };
+    let named = |krate: &str| {
+        base.split(',').any(|directive| {
+            let target = directive
+                .trim()
+                .split(['=', '['])
+                .next()
+                .unwrap_or_default();
+            target == krate || target.starts_with(&format!("{krate}::"))
+        })
+    };
+    let mut directives = base.clone();
+    for krate in QUIET_HTTP_CRATES {
+        if !named(krate) {
+            directives.push_str(&format!(",{krate}=info"));
+        }
+    }
+    directives
 }
 
 /// Wait for Ctrl-C or SIGTERM, so a container stop is a clean shutdown.
@@ -454,8 +671,8 @@ fn run_workflow_once(args: RunArgs, name: &str) -> Result<()> {
     let writes = !crosstalk_core::workflow::scheduled_dry_run(&registry, &config, name);
     if writes && !args.yes && !args.dry_run {
         println!("workflow {name}: {} step(s)", workflow.steps.len());
-        for step in workflow.labels() {
-            println!("  {step}");
+        for step in &workflow.steps {
+            println!("  {}", step.describe());
         }
         anyhow::bail!(
             "refusing to run workflow {name:?} without --yes: it changes data. Add --yes to \
@@ -475,8 +692,12 @@ fn run_workflow_once(args: RunArgs, name: &str) -> Result<()> {
             current.started_at,
         );
     }
-    let runner = JobRunner::new(registry, SharedConfig::new(config), store);
+    let bridge_enabled = config.bridge.enabled;
     let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
+    if bridge_enabled {
+        println!("{}", runtime.block_on(activate_bridge(&config)).describe());
+    }
+    let runner = JobRunner::new(registry, SharedConfig::new(config), store);
     let options = if args.fresh {
         crosstalk_core::runner::RunOptions::default().fresh()
     } else {
@@ -597,13 +818,27 @@ fn run_once(args: RunArgs) -> Result<()> {
             current.started_at,
         );
     }
-    let runner = JobRunner::new(registry, SharedConfig::new(config), store);
+    // An input for an action that declares none is a typo (or a copy-paste from another
+    // action's command line): refuse it rather than silently dropping the text.
+    if args.input.is_some() && action.input.is_none() {
+        anyhow::bail!(
+            "action {:?} takes no input: --input is only for actions that declare one (for \
+             example `lineup test_name`)",
+            action.id
+        );
+    }
+    let bridge_enabled = config.bridge.enabled;
     let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
-    let options = if args.fresh {
+    if bridge_enabled {
+        println!("{}", runtime.block_on(activate_bridge(&config)).describe());
+    }
+    let runner = JobRunner::new(registry, SharedConfig::new(config), store);
+    let mut options = if args.fresh {
         crosstalk_core::runner::RunOptions::default().fresh()
     } else {
         crosstalk_core::runner::RunOptions::default()
     };
+    options = options.with_input(args.input.clone());
     let outcome = runtime.block_on(runner.run_to_completion_with(
         &args.app,
         action.id,
@@ -622,6 +857,71 @@ fn run_once(args: RunArgs) -> Result<()> {
     }
     if let Some(path) = &outcome.report_path {
         println!("  report: {}", path.display());
+    }
+    Ok(())
+}
+
+/// `undo <run-id>`: reverse a finished apply run's rows that are still in effect.
+///
+/// A preview (`--dry-run`/`--preview`) plans and reports without writing; an apply needs
+/// `--yes`, like every other write. The undo is itself a recorded, undoable run under the
+/// target run's app with `parent_run_id` set to the undone run.
+fn undo_once(args: UndoArgs) -> Result<()> {
+    let config = CrosstalkConfig::load(&args.config)?;
+    let registry = registry::builtin();
+
+    // `open_shared`, never `open`: this is a second process on the daemon's file, and a plain
+    // open would retire the daemon's live `running` rows out from under it (see `run_once`).
+    let store = Store::open_shared(config.data_dir().join("crosstalk.db"))?;
+    // The host's refusals first (a preview, a workflow run, a probe, a pruned run...): they
+    // say why nothing can be undone, which beats asking for --yes on a run that can't be.
+    let target = crosstalk_core::undo::check_target(&store, &registry, args.run_id)?;
+    if !args.dry_run && !args.yes {
+        println!(
+            "undoing run #{} ({} {}) reverses its rows that are still in effect.",
+            target.id, target.app, target.action
+        );
+        anyhow::bail!(
+            "refusing to undo run #{} without --yes: it changes data. Add --yes to proceed, \
+             or --dry-run to preview what it would reverse",
+            args.run_id
+        );
+    }
+
+    let live = store.running_runs(&target.app)?;
+    if let Some(current) = live.first() {
+        anyhow::bail!(
+            "{} already has {} #{} in progress (started {}); wait for it to finish or cancel \
+             it. If no daemon is running, this row is stale from a crash and clears when the \
+             daemon next starts.",
+            target.app,
+            current.action,
+            current.id,
+            current.started_at,
+        );
+    }
+    let bridge_enabled = config.bridge.enabled;
+    let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
+    if bridge_enabled {
+        println!("{}", runtime.block_on(activate_bridge(&config)).describe());
+    }
+    let runner = JobRunner::new(registry, SharedConfig::new(config), store);
+    let outcome = runtime.block_on(runner.run_undo_to_completion_with(
+        &target.app,
+        args.run_id,
+        args.dry_run,
+        crosstalk_core::runner::RunOptions::default(),
+    ))?;
+
+    println!("{}", outcome.summary);
+    for (key, value) in &outcome.counts {
+        println!("  {key}: {value}");
+    }
+    if let Some(path) = &outcome.report_path {
+        println!("  report: {}", path.display());
+    }
+    if args.dry_run {
+        println!("preview only: rerun with --yes to apply the undo");
     }
     Ok(())
 }
@@ -683,12 +983,81 @@ fn bench_streams(args: StreamsBenchArgs) -> Result<()> {
     Ok(())
 }
 
+/// `bench lineup --synthetic`: the lineup plans at the plan's scale (20k channels, a
+/// 500-entry lineup), over the lineup settings in front of the operator.
+fn bench_lineup(args: LineupBenchArgs) -> Result<()> {
+    let config = CrosstalkConfig::load(&args.config)?;
+    let registry = registry::builtin();
+    let app = registry
+        .get(crosstalk_lineup::APP_ID)
+        .expect("the lineup app is registered");
+    let settings_path = app.settings_path(&config.config_dir);
+    let settings = crosstalk_lineup::settings::load(&settings_path)?;
+    let options = crosstalk_lineup::bench::SyntheticOptions {
+        channels: args.channels,
+        lineup_channels: args.lineup_channels,
+        streams: args.streams,
+        tv_logos_per_country: args.tv_logos_per_country,
+    };
+    let mut report = crosstalk_lineup::bench::synthetic(&settings, &config.matching, &options)?;
+    report
+        .notes
+        .insert(0, format!("settings: {}", settings_path.display()));
+    print_bench(&report, args.json)
+}
+
+/// `bench guide --synthetic`: match, scan and heal at the plan's scale (20k channels, 55k
+/// EPG entries) against an in-process fake Dispatcharr, with request counts.
+fn bench_guide(args: GuideBenchArgs) -> Result<()> {
+    let config = CrosstalkConfig::load(&args.config)?;
+    let registry = registry::builtin();
+    let app = registry
+        .get(crosstalk_guide::APP_ID)
+        .expect("the guide app is registered");
+    let settings_path = app.settings_path(&config.config_dir);
+    let settings = crosstalk_guide::settings::load(&settings_path)?;
+    let options = bench_guide::GuideBenchOptions {
+        channels: args.channels,
+        entries: args.entries,
+        sources: args.sources,
+        delay_ms: args.delay_ms,
+    };
+    let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
+    let mut report = runtime.block_on(bench_guide::synthetic(&config, &settings, &options))?;
+    report
+        .notes
+        .insert(0, format!("settings: {}", settings_path.display()));
+    print_bench(&report, args.json)
+}
+
+/// A bench report as lines, or as one JSON document with `--json`.
+fn print_bench(report: &crosstalk_streams::bench::BenchReport, json: bool) -> Result<()> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report.to_json()).context("serializing the report")?
+        );
+    } else {
+        report.print();
+    }
+    Ok(())
+}
+
 /// The preview action that stands in for an apply action.
 ///
 /// Every writing action is a `<verb>_preview` / `<verb>_apply` pair, so `--dry-run` on an apply
 /// is redirected to its preview rather than trusting the apply to honour the flag.
+/// The lineup pairs are listed before their steps land, so a `--dry-run` on a future
+/// apply already finds its preview.
 fn preview_counterpart(action: &str) -> Option<&'static str> {
     match action {
+        "clean_apply" => Some("clean_preview"),
+        "names_apply" => Some("names_preview"),
+        "categorize_apply" => Some("categorize_preview"),
+        "logos_apply" => Some("logos_preview"),
+        "create_apply" => Some("create_preview"),
+        "sync_apply" => Some("sync_preview"),
+        "tidy_apply" => Some("tidy_preview"),
         "match_apply" => Some("match_preview"),
         "heal_apply" => Some("heal_preview"),
         "tag_missing_apply" => Some("tag_missing_preview"),
@@ -776,6 +1145,174 @@ fn clear_exports(args: ExportsClearArgs) -> Result<()> {
     Ok(())
 }
 
+/// Ping the bridge and remember the verdict for this process (see
+/// [`crosstalk_core::bridge::check_and_activate`]).
+async fn activate_bridge(config: &CrosstalkConfig) -> crosstalk_core::bridge::BridgeStatus {
+    match crosstalk_core::DispatcharrClient::new(&config.dispatcharr) {
+        Ok(client) => crosstalk_core::bridge::check_and_activate(config, &client).await,
+        Err(error) => crosstalk_core::bridge::BridgeStatus::Unavailable {
+            reason: format!("{error:#}"),
+        },
+    }
+}
+
+/// The file-only configuration a bridge command may write a secret into, refusing when the
+/// environment supplies the secret: the environment wins, so a secret written to the file
+/// would never be used, and the environment value must never be written to the file.
+fn bridge_file_config(dir: &std::path::Path) -> Result<CrosstalkConfig> {
+    let config = CrosstalkConfig::load_file(dir)?;
+    if config.bridge.secret_from_env() {
+        anyhow::bail!(
+            "the bridge secret comes from ${} in this environment, which wins over \
+             crosstalk.toml: put the new secret there instead (`openssl rand -hex 32` makes \
+             one), and nothing is written to the file",
+            config.bridge.secret_env.trim()
+        );
+    }
+    Ok(config)
+}
+
+/// `bridge secret`: generate the shared secret, save it to `[bridge] secret` (the file is
+/// written 0600) and print it once, with where to paste it.
+fn bridge_secret(args: BridgeSecretArgs) -> Result<()> {
+    let mut config = bridge_file_config(&args.config)?;
+    if !config.bridge.secret.trim().is_empty() && !args.force {
+        anyhow::bail!(
+            "crosstalk.toml already has a bridge secret: `crosstalk bridge rotate` replaces it \
+             without breaking the bridge, or add --force to overwrite it"
+        );
+    }
+    let secret = crosstalk_core::bridge::generate_secret()?;
+    config.bridge.secret = secret.clone();
+    let path = args.config.join("crosstalk.toml");
+    config.save(&path)?;
+    println!("wrote [bridge] secret to {} (mode 0600)", path.display());
+    println!();
+    println!("{secret}");
+    println!();
+    println!("This is the only time it is printed. Next:");
+    println!(
+        "  1. In Dispatcharr, Plugins -> crosstalk bridge: paste it into Secret, or set \
+         CROSSTALK_BRIDGE_SECRET in Dispatcharr's environment (keeps it out of its database)"
+    );
+    println!("  2. Enable the plugin, then set [bridge] enabled = true in crosstalk.toml");
+    println!("  3. `crosstalk bridge ping` checks the result");
+    Ok(())
+}
+
+/// `bridge rotate`: a new secret in `[bridge] secret`, and the order to roll it into the plugin
+/// so nothing breaks: the plugin accepts the old one as its previous secret until the grace
+/// time while crosstalk restarts on the new one.
+fn bridge_rotate(args: ConfigArgs) -> Result<()> {
+    let mut config = bridge_file_config(&args.config)?;
+    if config.bridge.secret.trim().is_empty() {
+        anyhow::bail!(
+            "crosstalk.toml has no bridge secret yet: `crosstalk bridge secret` makes one"
+        );
+    }
+    let secret = crosstalk_core::bridge::generate_secret()?;
+    config.bridge.secret = secret.clone();
+    let path = args.config.join("crosstalk.toml");
+    config.save(&path)?;
+    let grace = (chrono::Utc::now() + chrono::Duration::hours(24))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    println!(
+        "wrote the new [bridge] secret to {} (mode 0600)",
+        path.display()
+    );
+    println!();
+    println!("{secret}");
+    println!();
+    println!("This is the only time it is printed. Roll it in this order:");
+    println!(
+        "  1. In the plugin, move the current Secret into Previous secret and set \"Accept \
+         the previous secret until\" to {grace}"
+    );
+    println!("     (or CROSSTALK_BRIDGE_PREVIOUS_SECRET / CROSSTALK_BRIDGE_GRACE_UNTIL)");
+    println!("  2. Paste the new secret into Secret (or CROSSTALK_BRIDGE_SECRET)");
+    println!("  3. Restart crosstalk: it signs with the new secret from then on");
+    println!("  4. `crosstalk bridge ping`, then clear Previous secret in the plugin");
+    Ok(())
+}
+
+/// `bridge ping`: a signed ping with the configured secret, whether or not `[bridge]` is
+/// enabled, so an install can be checked before it is switched on.
+fn bridge_ping(args: ConfigArgs) -> Result<()> {
+    let mut config = CrosstalkConfig::load(&args.config)?;
+    let enabled = config.bridge.enabled;
+    config.bridge.enabled = true;
+    let client = crosstalk_core::DispatcharrClient::new(&config.dispatcharr)?;
+    let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
+    let status = runtime.block_on(crosstalk_core::bridge::check(&config, &client));
+    println!("{}", status.describe());
+    if let crosstalk_core::bridge::BridgeStatus::Unavailable { .. } = status {
+        anyhow::bail!("the bridge plugin is not usable");
+    }
+    if !enabled {
+        println!("[bridge] enabled is false: set it to true to use the plugin");
+    }
+    Ok(())
+}
+
+/// `ownership forget-deleted`: the ownership reconcile every run does, without its per-run
+/// cap on how many deleted objects it may forget (`channel_ops::max_forget`).
+///
+/// A run refuses when more than max(25, 5%) of what the app owns is missing from the
+/// listing, because a short listing or a run against the wrong Dispatcharr would otherwise
+/// forget a whole install and the next create would duplicate it. After a deliberate mass
+/// deletion that refusal blocks the app's runs for good, so this is the operator saying the
+/// deletions were theirs. Nothing else changes: each missing id is still confirmed by its own
+/// GET, only a 404 forgets it, an empty listing is still refused, and pending create intents
+/// are settled the way a run settles them.
+fn ownership_forget_deleted(args: OwnershipForgetArgs) -> Result<()> {
+    use crosstalk_core::dispatcharr::{WorldKind, WorldKinds};
+
+    let config = CrosstalkConfig::load(&args.config)?;
+    let registry = registry::builtin();
+    let app = args.app.trim();
+    if registry.get(app).is_none() {
+        anyhow::bail!(
+            "unknown app {app:?}; one of: {}",
+            registry
+                .iter()
+                .map(|app| app.id().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let store = Store::open_shared(config.data_dir().join("crosstalk.db"))?;
+    let context = crosstalk_core::jobs::JobContext::headless(config)
+        .connect()?
+        .with_store(store);
+    let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
+    let state = runtime.block_on(async {
+        let client = context.dispatcharr()?;
+        // Every kind the ownership tables can hold, so no kind is left for a later run.
+        let kinds = WorldKinds::only(WorldKind::Channels)
+            .with(WorldKind::Groups)
+            .with(WorldKind::Logos);
+        let world = client.load_world_with(kinds).await?;
+        crosstalk_core::channel_ops::load_owned_unbounded(&context, &world, app).await
+    })?;
+    match state.describe(false) {
+        Some(line) => println!("{line}"),
+        None => {
+            println!("ownership reconcile: nothing to do, every object {app} owns still exists")
+        }
+    }
+    for (kind, id, key) in &state.forgotten {
+        println!("forgot {kind} {id} ({key}): Dispatcharr answers 404 for it");
+    }
+    for (kind, id, key) in &state.kept {
+        println!(
+            "kept {kind} {id} ({key}): missing from the listing, but its own GET still answers \
+             or the check failed"
+        );
+    }
+    Ok(())
+}
+
 fn validate(args: ConfigArgs) -> Result<()> {
     let config = CrosstalkConfig::load(&args.config)?;
     let registry = registry::builtin();
@@ -814,7 +1351,8 @@ fn validate(args: ConfigArgs) -> Result<()> {
         config.exports.retention_days
     );
 
-    for warning in &report.warnings {
+    let exposed = config.exposed_secret_warnings();
+    for warning in report.warnings.iter().chain(&exposed) {
         println!("warning: {warning}");
     }
     for error in &report.errors {
@@ -834,20 +1372,29 @@ fn validate(args: ConfigArgs) -> Result<()> {
         println!("error: hooks.{event} target {target:?} does not name a known action or workflow");
         failed = true;
     }
+    for (workflow, scope) in registry.unknown_workflow_scopes(&config) {
+        println!("error: workflow {workflow:?} scope {scope:?} names no scope this build provides");
+        failed = true;
+    }
     for workflow in crosstalk_core::workflow::describe(&config) {
         match (&workflow.error, workflow.steps.is_empty()) {
             (_, true) => println!("workflow {}: no steps", workflow.name),
             (Some(error), _) => println!("workflow {}: {error}", workflow.name),
-            (None, _) => println!(
-                "workflow {}: {} step(s){}",
-                workflow.name,
-                workflow.steps.len(),
-                if workflow.fresh {
-                    ", each new pass starts from the beginning"
-                } else {
-                    ""
+            (None, _) => {
+                println!(
+                    "workflow {}: {} step(s){}",
+                    workflow.name,
+                    workflow.steps.len(),
+                    if workflow.fresh {
+                        ", each new pass starts from the beginning"
+                    } else {
+                        ""
+                    }
+                );
+                for detail in &workflow.details {
+                    println!("  {}", detail.describe());
                 }
-            ),
+            }
         }
     }
     for (event, targets) in crosstalk_core::hooks::describe(&config.hooks) {
@@ -871,6 +1418,33 @@ fn validate(args: ConfigArgs) -> Result<()> {
             Some(window) => println!("schedule {}: window {window}", entry.key),
             None => println!("schedule {}: no window (runs to the end)", entry.key),
         }
+    }
+
+    // A configuration error (enabled without a secret...) is already reported above; this is
+    // whether the plugin itself answers. Not a failure: a run falls back to REST without it.
+    if config.bridge.enabled && config.bridge.errors().is_empty() {
+        let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
+        let status = match crosstalk_core::DispatcharrClient::new(&config.dispatcharr) {
+            Ok(client) => runtime.block_on(crosstalk_core::bridge::check(&config, &client)),
+            Err(error) => crosstalk_core::bridge::BridgeStatus::Unavailable {
+                reason: format!("{error:#}"),
+            },
+        };
+        match status {
+            crosstalk_core::bridge::BridgeStatus::Unavailable { .. } => {
+                println!("warning: {}", status.describe());
+            }
+            _ => println!("{}", status.describe()),
+        }
+    } else {
+        println!(
+            "bridge: {}",
+            if config.bridge.enabled {
+                "enabled but misconfigured (see the errors)"
+            } else {
+                "disabled"
+            }
+        );
     }
 
     for app in registry.iter() {
@@ -929,8 +1503,147 @@ mod cli_tests {
     use super::*;
     use std::path::Path;
 
+    #[test]
+    fn the_http_crates_stay_at_info_unless_named() {
+        let default = log_directives(None);
+        assert!(default.starts_with("info,crosstalk_core=info"), "{default}");
+        assert!(
+            default.ends_with(",reqwest=info,hyper=info,hyper_util=info"),
+            "{default}"
+        );
+        assert_eq!(
+            log_directives(Some("debug")),
+            "debug,reqwest=info,hyper=info,hyper_util=info"
+        );
+        // Naming a crate is the opt-in: it keeps the operator's level.
+        assert_eq!(
+            log_directives(Some("debug,reqwest=trace,hyper_util::client=debug")),
+            "debug,reqwest=trace,hyper_util::client=debug,hyper=info"
+        );
+        assert_eq!(log_directives(Some("  ")), default);
+    }
+
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(args).expect("the command line parses")
+    }
+
+    fn bridge_command(args: &[&str]) -> BridgeCommand {
+        match parse(args).command {
+            Command::Bridge(BridgeArgs { command }) => command,
+            other => panic!("expected a bridge command, got {other:?}"),
+        }
+    }
+
+    /// The `[bridge]` table as the file holds it.
+    fn file_bridge(dir: &Path) -> crosstalk_core::config::BridgeConfig {
+        CrosstalkConfig::load_file(dir).expect("load").bridge
+    }
+
+    #[test]
+    fn bridge_secret_writes_once_and_rotate_replaces_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A file the operator wrote, with a comment the save must keep. `secret_env` names a
+        // variable nothing sets, so the machine running the tests cannot shadow the file.
+        std::fs::write(
+            dir.path().join("crosstalk.toml"),
+            "# mine\n[bridge]\nsecret_env = \"CROSSTALK_TEST_UNSET_BRIDGE_SECRET\"\n",
+        )
+        .expect("write");
+        let config = dir.path().to_str().expect("utf-8 path");
+
+        let BridgeCommand::Secret(args) =
+            bridge_command(&["crosstalk", "bridge", "secret", "--config", config])
+        else {
+            panic!("not the secret command");
+        };
+        bridge_secret(args).expect("generated");
+        let first = file_bridge(dir.path()).secret;
+        assert_eq!(first.len(), 64);
+        let text = std::fs::read_to_string(dir.path().join("crosstalk.toml")).expect("read");
+        assert!(text.contains("# mine"), "{text}");
+        #[cfg(unix)]
+        assert_eq!(
+            crosstalk_core::perms::mode(&dir.path().join("crosstalk.toml")),
+            Some(0o600)
+        );
+
+        // A second `secret` would break the plugin's copy: refused without --force.
+        let BridgeCommand::Secret(args) =
+            bridge_command(&["crosstalk", "bridge", "secret", "--config", config])
+        else {
+            panic!("not the secret command");
+        };
+        let error = bridge_secret(args).expect_err("refused");
+        assert!(format!("{error}").contains("bridge rotate"), "{error}");
+        assert_eq!(file_bridge(dir.path()).secret, first);
+
+        let BridgeCommand::Rotate(args) =
+            bridge_command(&["crosstalk", "bridge", "rotate", "--config", config])
+        else {
+            panic!("not the rotate command");
+        };
+        bridge_rotate(args).expect("rotated");
+        let second = file_bridge(dir.path()).secret;
+        assert_eq!(second.len(), 64);
+        assert_ne!(second, first);
+    }
+
+    #[test]
+    fn a_bridge_secret_from_the_environment_is_never_written_to_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("crosstalk.toml"),
+            "[bridge]\nsecret_env = \"CROSSTALK_TEST_SET_BRIDGE_SECRET\"\n",
+        )
+        .expect("write");
+        std::env::set_var("CROSSTALK_TEST_SET_BRIDGE_SECRET", "ENV-ONLY-SECRET");
+        let result = bridge_secret(BridgeSecretArgs {
+            config: dir.path().to_path_buf(),
+            force: true,
+        });
+        let rotated = bridge_rotate(ConfigArgs {
+            config: dir.path().to_path_buf(),
+        });
+        std::env::remove_var("CROSSTALK_TEST_SET_BRIDGE_SECRET");
+        let error = result.expect_err("refused");
+        assert!(format!("{error}").contains("CROSSTALK_TEST_SET_BRIDGE_SECRET"));
+        assert!(rotated.is_err());
+        let text = std::fs::read_to_string(dir.path().join("crosstalk.toml")).expect("read");
+        assert!(!text.contains("ENV-ONLY-SECRET"), "{text}");
+        assert!(file_bridge(dir.path()).secret.is_empty());
+    }
+
+    #[test]
+    fn ownership_forget_deleted_names_an_app() {
+        let Command::Ownership(OwnershipArgs {
+            command: OwnershipCommand::ForgetDeleted(args),
+        }) = parse(&[
+            "crosstalk",
+            "ownership",
+            "forget-deleted",
+            "--app",
+            "lineup",
+            "--config",
+            "/etc/crosstalk",
+        ])
+        .command
+        else {
+            panic!("not the forget-deleted command");
+        };
+        assert_eq!(args.app, "lineup");
+        assert_eq!(args.config, Path::new("/etc/crosstalk"));
+        // The app is required: forgetting across every app at once is not offered.
+        assert!(Cli::try_parse_from(["crosstalk", "ownership", "forget-deleted"]).is_err());
+    }
+
+    #[test]
+    fn bridge_ping_takes_a_config_dir() {
+        let BridgeCommand::Ping(args) =
+            bridge_command(&["crosstalk", "bridge", "ping", "--config", "/etc/crosstalk"])
+        else {
+            panic!("not the ping command");
+        };
+        assert_eq!(args.config, Path::new("/etc/crosstalk"));
     }
 
     fn clear_args(args: &[&str]) -> ExportsClearArgs {
@@ -1057,6 +1770,7 @@ mod cli_tests {
                 dry_run: false,
                 yes: true,
                 fresh: false,
+                input: None,
             },
             "offline",
         )
@@ -1087,6 +1801,7 @@ mod cli_tests {
                 dry_run: false,
                 yes: false,
                 fresh: false,
+                input: None,
             },
             "offline",
         )
@@ -1153,6 +1868,87 @@ mod cli_tests {
         }
     }
 
+    fn undo_args(args: &[&str]) -> UndoArgs {
+        match parse(args).command {
+            Command::Undo(args) => args,
+            other => panic!("expected an undo command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn undo_takes_a_run_id_and_defaults_to_applying() {
+        // `crosstalk undo 42` reverses run 42; without --yes it is refused, like every
+        // other write, and --preview/--dry-run previews instead.
+        let args = undo_args(&["crosstalk", "undo", "42"]);
+        assert_eq!(args.run_id, 42);
+        assert!(!args.dry_run);
+        assert!(!args.yes, "an undo is never the default");
+        assert_eq!(args.config, Path::new("config"));
+
+        let args = undo_args(&["crosstalk", "undo", "42", "--preview", "--yes"]);
+        assert!(args.dry_run);
+        let args = undo_args(&["crosstalk", "undo", "7", "--dry-run"]);
+        assert!(args.dry_run);
+        assert_eq!(args.run_id, 7);
+    }
+
+    #[test]
+    fn undo_without_yes_is_refused_and_records_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("crosstalk.toml"), "").expect("seed");
+        let seed = Store::open_shared(dir.path().join("data").join("crosstalk.db")).expect("store");
+        let run_id = seed
+            .start_run("guide", "match_apply", false)
+            .expect("start");
+        seed.finish_run(
+            run_id,
+            crosstalk_core::store::RunStatus::Succeeded,
+            None,
+            &serde_json::json!({}),
+            None,
+        )
+        .expect("finish");
+        seed.append_rows(
+            run_id,
+            &[crosstalk_core::store::RunRow {
+                channel_id: 1,
+                field: "epg_data_id".to_string(),
+                before_value: Some("none".to_string()),
+                after_value: Some("4".to_string()),
+                status: "ok".to_string(),
+                ..crosstalk_core::store::RunRow::default()
+            }],
+        )
+        .expect("rows");
+        let error = undo_once(UndoArgs {
+            run_id,
+            dry_run: false,
+            yes: false,
+            config: dir.path().to_path_buf(),
+        })
+        .expect_err("refused");
+        assert!(format!("{error}").contains("--yes"), "{error}");
+        assert_eq!(
+            seed.run_count().expect("count"),
+            1,
+            "the target run is the only record: nothing started"
+        );
+    }
+
+    #[test]
+    fn undo_of_an_unknown_run_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("crosstalk.toml"), "").expect("seed");
+        let error = undo_once(UndoArgs {
+            run_id: 9999,
+            dry_run: true,
+            yes: true,
+            config: dir.path().to_path_buf(),
+        })
+        .expect_err("fails");
+        assert!(format!("{error}").contains("no run"), "{error:#}");
+    }
+
     fn bare_bench_args(config: std::path::PathBuf) -> StreamsBenchArgs {
         StreamsBenchArgs {
             config,
@@ -1193,6 +1989,59 @@ mod cli_tests {
         assert_eq!(args.channels, 500);
         assert_eq!(args.streams, 1_000);
         assert_eq!(args.accounts, 5);
+    }
+
+    #[test]
+    fn bench_lineup_is_synthetic_with_the_plan_sizes() {
+        let args = match parse(&["crosstalk", "bench", "lineup", "--synthetic"]).command {
+            Command::Bench(BenchArgs {
+                target: BenchTarget::Lineup(args),
+            }) => args,
+            other => panic!("expected a bench lineup command, got {other:?}"),
+        };
+        assert!(args.synthetic);
+        assert_eq!(args.channels, 20_000);
+        assert_eq!(args.lineup_channels, 500);
+        assert_eq!(args.config, Path::new("config"));
+        // The mode is spelled out: a bench that measured nothing in particular is refused.
+        assert!(Cli::try_parse_from(["crosstalk", "bench", "lineup"]).is_err());
+        let small = match parse(&[
+            "crosstalk",
+            "bench",
+            "lineup",
+            "--synthetic",
+            "--channels",
+            "300",
+            "--lineup-channels",
+            "40",
+        ])
+        .command
+        {
+            Command::Bench(BenchArgs {
+                target: BenchTarget::Lineup(args),
+            }) => args,
+            other => panic!("expected a bench lineup command, got {other:?}"),
+        };
+        assert_eq!(small.channels, 300);
+        assert_eq!(small.lineup_channels, 40);
+        assert_eq!(small.streams, 50_000);
+        assert!(!small.json);
+    }
+
+    #[test]
+    fn bench_guide_is_synthetic_with_the_plan_sizes() {
+        let args = match parse(&["crosstalk", "bench", "guide", "--synthetic", "--json"]).command {
+            Command::Bench(BenchArgs {
+                target: BenchTarget::Guide(args),
+            }) => args,
+            other => panic!("expected a bench guide command, got {other:?}"),
+        };
+        assert!(args.synthetic);
+        assert!(args.json);
+        assert_eq!(args.channels, 20_000);
+        assert_eq!(args.entries, 55_000);
+        assert_eq!(args.delay_ms, 2);
+        assert!(Cli::try_parse_from(["crosstalk", "bench", "guide"]).is_err());
     }
 
     #[test]
@@ -1402,5 +2251,206 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+/// Cross-app consistency (phase 3 goal reset, step 9): one name must yield the same
+/// identity and the same family in guide, streams and the shared cache, and match and
+/// visibility must group the same channels together.
+#[cfg(test)]
+mod cross_app_consistency_tests {
+    use super::Store;
+    use crosstalk_matching::engine::UnifiedEngine;
+    use crosstalk_matching::identity::ResolveContext;
+
+    fn matching_config() -> crosstalk_core::config::MatchingConfig {
+        crosstalk_core::config::MatchingConfig::default()
+    }
+
+    fn world(channels: &[&str], streams: &[&str]) -> crosstalk_core::World {
+        use crosstalk_core::dispatcharr::{Channel, Stream, World};
+        use serde_json::json;
+        World {
+            channels: channels
+                .iter()
+                .enumerate()
+                .map(|(i, name)| Channel {
+                    id: i as i64 + 1,
+                    name: (*name).to_string(),
+                    channel_number: Some(json!(i as i64 + 1)),
+                    channel_group_id: Some(100),
+                    streams: Vec::new(),
+                    ..Channel::default()
+                })
+                .collect(),
+            streams: streams
+                .iter()
+                .enumerate()
+                .map(|(i, name)| Stream {
+                    id: 20000 + i as i64,
+                    name: (*name).to_string(),
+                    m3u_account: Some(1),
+                    channel_group: Some(100),
+                    stream_stats: json!({"width": 1920, "height": 1080}),
+                    ..Stream::default()
+                })
+                .collect(),
+            groups: vec![crosstalk_core::dispatcharr::ChannelGroup {
+                id: 100,
+                name: "TVE".to_string(),
+            }],
+            m3u_accounts: vec![crosstalk_core::dispatcharr::M3uAccount {
+                id: 1,
+                name: "Main".to_string(),
+                is_active: true,
+                ..Default::default()
+            }],
+            ..World::default()
+        }
+    }
+
+    #[test]
+    fn one_name_resolves_to_one_identity_through_every_app_cache() {
+        // Guide and streams share the host run engine and one store: the same input
+        // resolves to the same identity no matter who asks, and the store row is one
+        // version-keyed entry both apps read.
+        let store = Store::in_memory().expect("store");
+        let matching = matching_config();
+        let guide_engine =
+            crosstalk_core::engine_run::RunEngine::for_config(&matching, Some(store.clone()));
+        let streams_engine =
+            crosstalk_core::engine_run::RunEngine::for_config(&matching, Some(store.clone()));
+        let ctx = ResolveContext::default();
+        for name in ["US: ESPN HD", "BBC One", "Cinemax (WNCF)", "HBO West"] {
+            assert_eq!(
+                guide_engine.resolve(name, &ctx),
+                streams_engine.resolve(name, &ctx),
+                "{name}: guide and streams disagree"
+            );
+            assert_eq!(
+                guide_engine.resolve(name, &ctx),
+                crosstalk_matching::identity::resolve_with(
+                    &UnifiedEngine::new(&matching.engine_config()),
+                    name,
+                    &ctx
+                ),
+                "{name}: the cache disagrees with a fresh resolve"
+            );
+        }
+    }
+
+    #[test]
+    fn one_name_gets_the_same_epg_entry_family_and_stream_family() {
+        // Identical candidate pools on both sides: guide's engine family over the
+        // EPG-entry names and streams' attached stream family over the same names
+        // must pick the same family (canonical names, in rank order).
+        let matching = matching_config();
+        let engine = UnifiedEngine::new(&matching.engine_config());
+        let names: Vec<String> = ["ESPN", "ESPN HD", "ESPN 2", "CNN"]
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        let index = crosstalk_matching::engine::EngineIndex::build(
+            &names,
+            &engine,
+            &ResolveContext::default(),
+        );
+        let guide_family: Vec<String> = engine
+            .rank_index("US: ESPN HD", &index)
+            .iter()
+            .map(|member| names[member.index].clone())
+            .collect();
+
+        let world = world(&["US: ESPN HD"], &["ESPN", "ESPN HD", "ESPN 2", "CNN"]);
+        let settings = crosstalk_streams::settings::StreamsSettings::default();
+        let options = crosstalk_streams::matching::MatchOptions::new(&settings, &matching);
+        let throughput = crosstalk_streams::quality::MemoryThroughputSource::new();
+        let outcome = crosstalk_streams::matching::plan(
+            &world,
+            &crosstalk_core::config::ScopeConfig::default(),
+            &settings,
+            &options,
+            &throughput,
+        )
+        .expect("plan");
+        let by_name: std::collections::HashMap<i64, String> = world
+            .streams
+            .iter()
+            .map(|stream| (stream.id, stream.name.clone()))
+            .collect();
+        let assignment = outcome
+            .assignments
+            .iter()
+            .find(|row| row.channel_name == "US: ESPN HD")
+            .expect("the channel is assigned");
+        let stream_family: Vec<String> = assignment
+            .after
+            .iter()
+            .map(|id| by_name[id].clone())
+            .collect();
+        assert_eq!(guide_family, stream_family, "guide and streams disagree");
+    }
+
+    #[test]
+    fn match_and_visibility_group_the_same_channels_together() {
+        // One grouping function serves both apps: the same inputs group the same
+        // channels together in `match` and in `visibility`.
+        let matching = matching_config();
+        let world = world(
+            &["ESPN", "ESPN HD", "CNN", "US: ESPN"],
+            &["ESPN", "ESPN HD", "CNN"],
+        );
+        let settings = crosstalk_streams::settings::StreamsSettings::default();
+        let options = crosstalk_streams::matching::MatchOptions::new(&settings, &matching);
+        let throughput = crosstalk_streams::quality::MemoryThroughputSource::new();
+        let outcome = crosstalk_streams::matching::plan(
+            &world,
+            &crosstalk_core::config::ScopeConfig::default(),
+            &settings,
+            &options,
+            &throughput,
+        )
+        .expect("plan");
+        let mut match_groups: Vec<Vec<i64>> = outcome
+            .gate_groups
+            .iter()
+            .map(|group| {
+                let mut members = group.member_ids.clone();
+                members.sort_unstable();
+                members
+            })
+            .collect();
+        match_groups.sort();
+        // Visibility groups through the same `build_groups`: rebuild it here over the
+        // same channels and compare member sets.
+        let engine = UnifiedEngine::new(&matching.engine_config());
+        let mut groups = crosstalk_streams::matching::build_groups(
+            &world.channels,
+            &options.database,
+            options.engine.normalizer(),
+            &[],
+            false,
+            &std::collections::HashMap::new(),
+            &engine,
+            None,
+        );
+        for group in &mut groups {
+            group.members.sort_unstable();
+        }
+        let mut members: Vec<Vec<i64>> = groups
+            .iter()
+            .map(|group| {
+                group
+                    .members
+                    .iter()
+                    .map(|position| world.channels[*position].id)
+                    .collect()
+            })
+            .collect();
+        for set in &mut members {
+            set.sort_unstable();
+        }
+        members.sort();
+        assert_eq!(match_groups, members, "match and visibility disagree");
     }
 }

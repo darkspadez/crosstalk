@@ -109,12 +109,9 @@ use crate::settings::StreamsSettings;
 use anyhow::{bail, Result};
 use crosstalk_core::channel_ops::{self, Field, Op, ReportSpec, Selection, SetValue};
 use crosstalk_core::csv_report;
-use crosstalk_core::dispatcharr::{
-    Channel, ChannelGroup, DispatcharrClient, World, WorldKind, WorldKinds,
-};
+use crosstalk_core::dispatcharr::{Channel, ChannelGroup, World, WorldKind, WorldKinds};
 use crosstalk_core::jobs::JobContext;
 use crosstalk_core::subapp::{JobOutcome, OutcomeBuilder, SubApp};
-use regex::Regex;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// The report's title, without the preview/applied suffix.
@@ -374,43 +371,11 @@ impl TriageOutcome {
 /// Why a channel the probe judged is not written: the run is held to `[scope]`.
 const OUT_OF_SCOPE: &str = "outside the scope this run may touch, so it is left exactly as it is";
 
-/// The bracket labels a rename format carries — the plugin's `_extract_format_tags` (3393).
-///
-/// `{name} [DEAD]` yields `["DEAD"]`, and `[X] {name} [DEAD]` yields `["X", "DEAD"]`. An
-/// unclosed bracket yields nothing, which is what the plugin's `findall` does too.
+/// The bracket labels a rename format carries — the plugin's `_extract_format_tags`
+/// (3393). Step 9 moved the parser beside `naming` so lineup's suffix rules read the
+/// same one; this delegates there.
 pub fn format_tags(format: &str) -> Vec<String> {
-    let mut tags = Vec::new();
-    let mut rest = format;
-    while let Some(open) = rest.find('[') {
-        let Some(close) = rest[open + 1..].find(']') else {
-            break;
-        };
-        let tag = &rest[open + 1..open + 1 + close];
-        if !tag.contains('[') {
-            tags.push(tag.to_string());
-        }
-        rest = &rest[open + 1 + close + 1..];
-    }
-    tags
-}
-
-/// Whether `name` already ends with the tag `label`, bracketed and case-insensitively — the
-/// plugin's trailing-tag regex for one label.
-///
-/// `ESPN [DEAD]` ends with `DEAD`; `ESPN [dead]` does too (the plugin compiles the tag regex
-/// with `re.IGNORECASE`); `[DEAD] ESPN` does not, because the plugin only ever strips and
-/// compares TRAILING tags.
-pub fn ends_with_tag(name: &str, label: &str) -> bool {
-    let trimmed = name.trim_end();
-    let Some(without_close) = trimmed.strip_suffix(']') else {
-        return false;
-    };
-    let Some(open) = without_close.rfind('[') else {
-        return false;
-    };
-    without_close[open + 1..]
-        .trim()
-        .eq_ignore_ascii_case(label.trim())
+    crosstalk_core::naming::format_tags(format)
 }
 
 /// The configured suffixes, lowercased, split on commas and stripped — the plugin's
@@ -428,89 +393,120 @@ pub fn configured_suffixes(settings: &StreamsSettings) -> Vec<String> {
 /// The tags a format suffix REPLACES: the configured ones plus the standard five, always —
 /// the plugin's `issue #18` rule (3705: narrowing `video_format_suffixes` must not stack a
 /// second tag onto a channel that carries one from before the narrowing).
+///
+/// Step 9: [`strip_format_tags`] strips exactly this set with the shared parser.
 pub fn known_format_tags(suffixes: &[String]) -> Vec<String> {
     let mut tags: Vec<String> = suffixes.to_vec();
-    for standard in ["uhd", "fhd", "hd", "sd", "unknown"] {
-        if !tags.iter().any(|tag| tag == standard) {
-            tags.push(standard.to_string());
+    for standard in crosstalk_core::quality::IC_FORMAT_LABELS {
+        let standard = standard.to_lowercase();
+        if !tags.contains(&standard) {
+            tags.push(standard);
         }
     }
     tags
 }
 
-/// The trailing-tag matcher, compiled once per run.
+/// Strip a trailing run of format tags off a name: the standard five plus the configured
+/// `video_format_suffixes` ([`known_format_tags`]) — `_derive` + `trailing_tag_re.sub` +
+/// `rstrip` (3705, 3712-3714), over the shared trailing-tag parser
+/// ([`tags::strip_with`]).
 ///
-/// The plugin compiles one `trailing_tag_re` and reuses it across every channel of the run
-/// (3705); at 20k channels a per-channel `re.compile` (or `Regex::new`) is the difference
-/// between one pass and 20 000 regex compilations. The tags are escaped, so the pattern cannot
-/// fail to compile; a hypothetical failure leaves the name alone rather than losing it.
-#[derive(Debug, Clone)]
-pub struct FormatTags {
-    tags: Vec<String>,
-    pattern: Option<Regex>,
+/// Step 9 output changes: parens strip (`ESPN (HD)` → `ESPN`; the regex only read
+/// `[...]`), and stacked mixed runs strip in one pass. The SET is the plugin's, not the
+/// vocabulary's whole quality kind: `[1080p]`, `[HEVC]`, `[RAW]` and the other provider
+/// tags triage never appends stay in the name. The plugin compiled one
+/// `trailing_tag_re` per run; the parser compiles nothing, so the one-pass shape costs
+/// nothing per channel either.
+pub fn strip_format_tags(name: &str, settings: &StreamsSettings) -> String {
+    crosstalk_matching::tags::strip_with(
+        name,
+        &[],
+        &known_format_tags(&configured_suffixes(settings)),
+    )
 }
 
-impl FormatTags {
-    /// The tags of this settings file: the configured suffixes plus the standard five.
-    pub fn of(settings: &StreamsSettings) -> Self {
-        Self::from_tags(known_format_tags(&configured_suffixes(settings)))
-    }
-
-    /// Explicit tags, lowercased or not: matching is case-insensitive either way.
-    pub fn from_tags(tags: Vec<String>) -> Self {
-        // Longest first, so `[unknown]` is preferred over a shorter tag that prefixes it — the
-        // plugin sorts the same way (3405). The bracketed shape makes the order harmless, but a
-        // stable order keeps two runs' reports identical.
-        let mut sorted: Vec<String> = tags;
-        sorted.sort_by(|left, right| right.len().cmp(&left.len()).then(left.cmp(right)));
-        sorted.dedup();
-        let alternation = sorted
-            .iter()
-            .map(|tag| regex::escape(tag))
-            .collect::<Vec<_>>()
-            .join("|");
-        let pattern = if alternation.is_empty() {
-            None
-        } else {
-            Regex::new(&format!(r"(?i)(?:\s*\[(?:{alternation})\])+\s*$")).ok()
-        };
-        Self {
-            tags: sorted,
-            pattern,
-        }
-    }
-
-    /// The tags themselves, longest first.
-    pub fn tags(&self) -> &[String] {
-        &self.tags
-    }
-
-    /// Strip a trailing run of format tags, then the space before it — `trailing_tag_re.sub`
-    /// plus `rstrip` (3712-3714).
-    pub fn strip(&self, name: &str) -> String {
-        match &self.pattern {
-            Some(pattern) => pattern.replace(name, "").trim_end().to_string(),
-            None => name.trim_end().to_string(),
-        }
-    }
-}
-
-/// [`FormatTags::strip`] for a one-off call (a test, or a harness).
-pub fn strip_format_tags(name: &str, tags: &[String]) -> String {
-    FormatTags::from_tags(tags.to_vec()).strip(name)
-}
-
-/// The new name a rename format produces, or `None` when it would be empty.
+/// The new name a rename format produces, or `None` when it would be blank.
 ///
-/// `format.replace('{name}', name)` (3508): every `{name}` becomes the base name, and any
-/// other brace token is left exactly as written — the plugin only ever replaces this one.
-pub fn render_format(format: &str, name: &str) -> Option<String> {
-    let rendered = format.trim().replace("{name}", name);
+/// Step 9: [`naming::render_channel`] (one template engine). Output changes for formats
+/// carrying `{group}`/`{number}`/`{epg}`/`{id}` (substituted with the channel's values
+/// now, literal before). The format is trimmed first, as the plugin's `.strip()` does
+/// (3508): surrounding whitespace in a settings value is never meant to land in a
+/// channel name. A format that renders blank is never written.
+pub fn render_format(
+    format: &str,
+    values: &crosstalk_core::naming::ChannelValues,
+) -> Option<String> {
+    let rendered = crosstalk_core::naming::render_channel(format.trim(), values);
     if rendered.trim().is_empty() {
         None
     } else {
         Some(rendered)
     }
+}
+
+/// What a rename format substitutes for one channel: the name the check saw, plus the
+/// channel's group, number, EPG name and id — the same values channel ops' templates read.
+/// `{epg}` reads the EPG listing, which a run loads only when a format names it
+/// ([`formats_name_epg`]); a channel with no EPG reads `No EPG`, as channel ops does.
+fn channel_values(
+    names: &NameLookup<'_>,
+    channel: &Channel,
+    name: &str,
+) -> crosstalk_core::naming::ChannelValues {
+    crosstalk_core::naming::ChannelValues {
+        name: name.to_string(),
+        group: channel
+            .channel_group_id
+            .and_then(|id| names.groups.get(&id))
+            .map_or_else(|| "No Group".to_string(), |name| (*name).to_string()),
+        number: channel
+            .display_number()
+            .map(|number| format!("{number}"))
+            .unwrap_or_default(),
+        epg: channel
+            .current_epg_id()
+            .and_then(|id| names.epg.get(&id))
+            .map_or_else(|| "No EPG".to_string(), |name| (*name).to_string()),
+        id: channel.id.to_string(),
+    }
+}
+
+/// The world's group and EPG entry names by id, built once per plan (E-S7): a rename
+/// format naming `{epg}` would otherwise walk the whole EPG listing per renamed channel.
+/// Reversed so a duplicated id keeps its first entry, as a `find` would.
+struct NameLookup<'a> {
+    groups: HashMap<i64, &'a str>,
+    epg: HashMap<i64, &'a str>,
+}
+
+impl<'a> NameLookup<'a> {
+    fn of(world: &'a World) -> Self {
+        Self {
+            groups: world
+                .groups
+                .iter()
+                .rev()
+                .map(|group| (group.id, group.name.as_str()))
+                .collect(),
+            epg: world
+                .entries
+                .iter()
+                .rev()
+                .map(|entry| (entry.id, entry.name.as_str()))
+                .collect(),
+        }
+    }
+}
+
+/// Whether any rename format substitutes `{epg}`, so the run must load the EPG listing.
+fn formats_name_epg(settings: &StreamsSettings) -> bool {
+    [
+        &settings.dead_rename_format,
+        &settings.low_framerate_rename_format,
+        &settings.black_screen_rename_format,
+    ]
+    .iter()
+    .any(|format| format.contains("{epg}"))
 }
 
 /// The switches this settings file has on, in words. Empty means triage would do nothing.
@@ -605,8 +601,8 @@ pub fn plan(
         .iter()
         .map(|channel| (channel.id, channel))
         .collect();
-    let tags = FormatTags::of(settings);
 
+    let names = NameLookup::of(world);
     let mut outcome = TriageOutcome {
         judged: verdicts.len(),
         switches,
@@ -619,9 +615,9 @@ pub fn plan(
             .or_insert(0) += 1;
         plan_channel(
             &mut outcome,
+            &names,
             settings,
             &suffixes,
-            &tags,
             channels.get(&verdict.channel_id).copied(),
             verdict,
         );
@@ -639,9 +635,9 @@ pub fn plan(
 /// Plan one channel's rename, suffix and move.
 fn plan_channel(
     outcome: &mut TriageOutcome,
+    names: &NameLookup<'_>,
     settings: &StreamsSettings,
     suffixes: &[String],
-    tags: &FormatTags,
     channel: Option<&Channel>,
     verdict: &RecordedVerdict,
 ) {
@@ -662,7 +658,12 @@ fn plan_channel(
             let format = class.rename_format(settings);
             let label_tags = format_tags(format);
             let base = verdict.channel_name.clone();
-            if let Some(label) = label_tags.iter().find(|label| ends_with_tag(&base, label)) {
+            // Step 9: the shared vocabulary's trailing-tag check (parens and literal
+            // affixes count now; the plugin's regex only read `[...]`).
+            if let Some(label) = label_tags
+                .iter()
+                .find(|label| crosstalk_matching::tags::has_trailing(&base, label))
+            {
                 // The one deliberate divergence: the plugin would append the tag again.
                 outcome.skipped.push(Skip {
                     channel_id: verdict.channel_id,
@@ -672,7 +673,7 @@ fn plan_channel(
                          (IPTV Checker would append a second one)"
                     ),
                 });
-            } else if let Some(to) = render_format(format, &base) {
+            } else if let Some(to) = render_format(format, &channel_values(names, channel, &base)) {
                 if to == base {
                     outcome.skipped.push(Skip {
                         channel_id: verdict.channel_id,
@@ -724,7 +725,7 @@ fn plan_channel(
         }
         // The plugin strips the applied format tags off the CURRENT name (it re-reads every
         // channel for this action), which in the same run is the name the rename above wrote.
-        let base = tags.strip(&current);
+        let base = strip_format_tags(&current, settings);
         let to = format!("{base} [{}]", format.to_uppercase());
         if to == current {
             outcome.skipped.push(Skip {
@@ -766,29 +767,25 @@ fn alive_rows(verdict: ChannelVerdict) -> bool {
 
 /// The groups a run's moves target, resolved to ids.
 ///
-/// A preview must not create anything, so an apply and a preview differ only here: an apply
-/// calls `POST /channels/groups/` (upstream `get_or_create`, 2666) for a missing group, while
-/// a preview plans against a NEGATIVE placeholder id that carries the real name, so the CSV
-/// says "Graveyard" rather than "No Group" and nothing is written. A placeholder id can never
-/// collide with a real one, and no write is ever attempted with one.
+/// Missing groups resolve to a NEGATIVE placeholder id that carries the real name, so the
+/// plan prints "Graveyard" rather than "No Group" and nothing is written yet. A placeholder
+/// id can never collide with a real one, and no write is ever attempted with one: on an
+/// apply the create stage replaces every placeholder with the created group's real id (or
+/// refuses the moves that lost their group) before the edit stage runs. Group creation
+/// itself lives on the create stage now — previewed, recorded as a row, owned by streams —
+/// instead of a direct `create_group` call.
 #[derive(Debug, Clone, Default)]
 pub struct GroupTargets {
-    /// Group name -> id (a real id on an apply, a placeholder on a preview).
+    /// Group name -> id (a real id, or a placeholder for a group the create stage makes).
     pub ids: HashMap<String, i64>,
     /// Groups that did not exist when the run started.
     pub missing: Vec<String>,
-    /// Groups this run created (apply only).
-    pub created: Vec<String>,
 }
 
 impl GroupTargets {
-    /// Resolve (and, unless `dry_run`, create) every group the moves name.
-    pub async fn resolve(
-        client: Option<&DispatcharrClient>,
-        world: &World,
-        moves: &[Move],
-        dry_run: bool,
-    ) -> Result<Self> {
+    /// Resolve every group the moves name, without creating anything: missing groups get a
+    /// placeholder id (see above), which the create stage replaces on an apply.
+    pub fn resolve(world: &World, moves: &[Move]) -> Self {
         let mut targets = GroupTargets::default();
         let mut wanted: Vec<String> = Vec::new();
         for movement in moves {
@@ -809,27 +806,15 @@ impl GroupTargets {
                 continue;
             }
             targets.missing.push(group.clone());
-            if dry_run {
-                loop {
-                    placeholder -= 1;
-                    if !world.groups.iter().any(|group| group.id == placeholder) {
-                        break;
-                    }
+            loop {
+                placeholder -= 1;
+                if !world.groups.iter().any(|group| group.id == placeholder) {
+                    break;
                 }
-                targets.ids.insert(group, placeholder);
-                continue;
             }
-            let Some(client) = client else {
-                bail!(
-                    "this run has no Dispatcharr session, so it cannot create the channel group \
-                     {group:?} the moves need"
-                );
-            };
-            let created = client.create_group(&group).await?;
-            targets.ids.insert(group.clone(), created.id);
-            targets.created.push(group);
+            targets.ids.insert(group, placeholder);
         }
-        Ok(targets)
+        targets
     }
 
     /// The world to PLAN against: the loaded one, plus a named entry for every group the run
@@ -856,6 +841,66 @@ impl GroupTargets {
     }
 }
 
+/// Replace placeholder group ids in an edit plan with the ids the create stage made.
+///
+/// A group the create stage failed (or never attempted, on a cancelled run) refuses the
+/// moves that needed it: the change is dropped and a skip names the lost group. Placeholders
+/// are negative by construction, so a non-negative id is never touched; a dry run never
+/// calls this, and its placeholders stay named by `plan_world`.
+fn remap_created_groups(
+    op_plan: &mut channel_ops::Plan,
+    targets: &GroupTargets,
+    report: &channel_ops::CreateReport,
+) {
+    use channel_ops::{CreatedOutcome, RowStatus};
+    let by_name: HashMap<&str, &CreatedOutcome> = report
+        .groups
+        .iter()
+        .map(|outcome| (outcome.name.as_str(), outcome))
+        .collect();
+    let mut kept = Vec::with_capacity(op_plan.changes.len());
+    for mut change in op_plan.changes.drain(..) {
+        let placeholder = match (&change.field, &change.after) {
+            (channel_ops::Field::Group, channel_ops::Value::Group(Some((id, _)))) if *id < 0 => *id,
+            _ => {
+                kept.push(change);
+                continue;
+            }
+        };
+        let name = targets
+            .ids
+            .iter()
+            .find_map(|(name, pid)| (*pid == placeholder).then_some(name));
+        let outcome = name.and_then(|name| by_name.get(name.as_str()).copied());
+        match outcome {
+            Some(outcome) if outcome.status == RowStatus::Ok && outcome.id.is_some() => {
+                let id = outcome.id.unwrap_or(0);
+                change.after = channel_ops::Value::Group(Some((id, outcome.name.clone())));
+                kept.push(change);
+            }
+            _ => {
+                let reason = match outcome {
+                    Some(outcome) if !outcome.reason.is_empty() => format!(
+                        "its group {:?} could not be created: {}",
+                        outcome.name, outcome.reason
+                    ),
+                    _ => "its group could not be created, so the move is refused".to_string(),
+                };
+                op_plan.skipped.push(channel_ops::Skip {
+                    channel_id: change.channel_id,
+                    channel_name: change.channel_name.clone(),
+                    channel_number: change.channel_number,
+                    channel_group: change.channel_group.clone(),
+                    op: Some(change.op),
+                    field: Some(change.field),
+                    reason,
+                });
+            }
+        }
+    }
+    op_plan.changes = kept;
+}
+
 /// The action: preview (a read and a CSV) or apply (the writes).
 pub async fn run(
     app: &dyn SubApp,
@@ -868,7 +913,6 @@ pub async fn run(
         "streams.triage_{}",
         if dry_run { "preview" } else { "apply" }
     );
-    let scope = context.config().scope.clone();
 
     // 1. The result set, before anything else: a mistyped action with no probe run costs no
     //    request, exactly as the plugin refuses without a results file (3505-3507).
@@ -876,10 +920,14 @@ pub async fn run(
     probe::announce(context, &action_id, &probe);
 
     // 2. Channels (names, groups) and the groups slice: the plan re-reads every channel it
-    //    writes, so a probe from any age is safe. Profiles only when the scope names them.
+    //    writes, so a probe from any age is safe. Profiles when the scope names them, or
+    //    when a step override is present (a named scope resolving to a table may name them).
     let mut kinds = WorldKinds::only(WorldKind::Channels) | WorldKind::Groups;
-    if !scope.profiles.trim().is_empty() {
+    if context.may_need_profiles() {
         kinds = kinds | WorldKind::Profiles;
+    }
+    if formats_name_epg(settings) {
+        kinds = kinds | WorldKind::EpgEntries;
     }
     context.progress(&crosstalk_core::jobs::ProgressEvent::new(
         "streams.triage",
@@ -889,21 +937,21 @@ pub async fn run(
     ));
     let world = client.load_world_with(kinds).await?;
 
-    // The scope is resolved once, up front: a scope that names both a group filter and an
-    // ignore filter is refused here rather than after a destination group has been created.
-    let scoped = crosstalk_core::scope::scope_channels(&world, &scope)?;
+    // The channel universe is resolved once, up front: a scope that names both a group
+    // filter and an ignore filter is refused here rather than after a destination group
+    // has been created. A step override replaces `[scope]` (see `JobContext::scoped_channels`).
+    let scoped = context.scoped_channels(&world)?;
     let mut outcome = plan(&world, settings, &probe.verdicts)?;
     // A probe from before a `[scope]` change may judge channels this run may not touch.
     let in_scope: HashSet<i64> = scoped.channels.iter().map(|channel| channel.id).collect();
     outcome.retain_in_scope(&in_scope);
 
-    // 3. The destination groups: created here on an apply, named by a placeholder on a
-    //    preview, so a preview writes nothing at all.
-    //    A run cancelled before this point creates no group either: its rows are all marked
-    //    cancelled by the apply, and an empty destination group would be its only trace.
-    let create_groups = !dry_run && !context.is_cancelled();
-    let targets =
-        GroupTargets::resolve(Some(client), &world, &outcome.moves, !create_groups).await?;
+    // 3. The destination groups: missing ones go through the channel-ops create stage, so a
+    //    preview plans (and records) them without writing anything, and an apply creates them
+    //    first and moves channels onto the real ids. A run cancelled before this point
+    //    creates no group: the create stage checks cancellation before every POST, so nothing
+    //    goes out and every row says why.
+    let targets = GroupTargets::resolve(&world, &outcome.moves);
     let plan_world = targets.plan_world(&world);
 
     // 4. One per-channel value map per field, through `channel_ops`: the same selection, scope
@@ -946,11 +994,62 @@ pub async fn run(
         });
     }
 
+    // The selection is the judged channels, held to the run's channel universe: a probe
+    // from before a `[scope]` change may judge channels this run may not touch, and a step
+    // override bounds them further to exactly its ids.
+    let base = context.base_selection(&world)?;
+    let mut target = outcome.target_ids();
+    if let Some(limit) = base.channel_ids.as_deref() {
+        target.retain(|id| limit.contains(id));
+    }
     let selection = Selection {
-        channel_ids: Some(outcome.target_ids()),
-        ..Selection::in_scope(&scope)
+        channel_ids: Some(target),
+        ..base
     };
-    let op_plan = channel_ops::plan(&plan_world, &selection, &operations)?;
+    let mut op_plan = channel_ops::plan(&plan_world, &selection, &operations)?;
+
+    // The missing groups go through the create stage: planned (and, on a preview, recorded)
+    // even when the run writes nothing else, created first on an apply so the moves below
+    // land on real ids. Owned by streams under `streams:triage:<group>`.
+    let create_request = channel_ops::CreateRequest {
+        app: "streams".to_string(),
+        groups: targets
+            .missing
+            .iter()
+            .map(|name| channel_ops::NewGroup {
+                name: name.clone(),
+                key: format!("streams:triage:{name}"),
+            })
+            .collect(),
+        logos: Vec::new(),
+        channels: Vec::new(),
+    };
+    // Groups dedup by exact name against the world; the owned state is still loaded on an
+    // apply, so a group an interrupted run posted (an unsettled intent) becomes streams'.
+    let owned = if dry_run {
+        channel_ops::OwnedState::default()
+    } else {
+        channel_ops::load_owned(context, &world, "streams", false).await?
+    };
+    let create_plan = channel_ops::plan_creates(
+        &world,
+        &owned.channels,
+        &create_request,
+        &channel_ops::PlanOptions::default(),
+    )?;
+    let create_applied = if dry_run || create_plan.is_empty() {
+        None
+    } else {
+        let creator: std::sync::Arc<dyn channel_ops::ChannelCreator> =
+            std::sync::Arc::new(channel_ops::RestChannelCreator::new(
+                client.clone(),
+                settings.write_concurrency.max(1) as usize,
+            ));
+        Some(channel_ops::apply_creates(creator, &create_plan, context, &action_id).await)
+    };
+    if let Some(report) = create_applied.as_ref() {
+        remap_created_groups(&mut op_plan, &targets, report);
+    }
 
     let applied = if dry_run || op_plan.changes.is_empty() {
         None
@@ -996,7 +1095,13 @@ pub async fn run(
         spec = spec.note("Left alone", skips);
     }
     let report = channel_ops::write_ops_report(context, &spec, &op_plan, applied.as_ref())?;
-    context.record_rows(&channel_ops::run_rows(&op_plan, applied.as_ref()))?;
+    // Create rows first (the groups were made before the moves), then the edit rows.
+    context.record_rows(&channel_ops::create_and_edit_run_rows(
+        &create_plan,
+        create_applied.as_ref(),
+        &op_plan,
+        applied.as_ref(),
+    ))?;
 
     let name = report
         .file_name()
@@ -1008,6 +1113,10 @@ pub async fn run(
         name.as_deref(),
     );
 
+    let groups_created = create_applied
+        .as_ref()
+        .map(|report| report.created())
+        .unwrap_or(0);
     let mut builder = OutcomeBuilder::new(if dry_run {
         format!(
             "Dry run complete. {} channel(s) would change: {} renamed, {} suffixed, {} moved.",
@@ -1030,7 +1139,7 @@ pub async fn run(
     .count("moved", outcome.moves.len() as i64)
     .count("skipped", outcome.skipped.len() as i64)
     .count("changes", op_plan.changes.len() as i64)
-    .count("groups_created", targets.created.len() as i64);
+    .count("groups_created", groups_created as i64);
     for (verdict, count) in &outcome.verdicts {
         builder = builder.count(format!("verdict_{verdict}"), *count as i64);
     }
@@ -1291,41 +1400,78 @@ mod tests {
             format_tags("{name} [DEAD").is_empty(),
             "an unclosed bracket"
         );
-        assert!(ends_with_tag("ESPN [DEAD]", "DEAD"));
-        assert!(ends_with_tag("ESPN [dead]", "DEAD"), "case-insensitive");
-        assert!(ends_with_tag("ESPN [DEAD] ", "DEAD"));
-        assert!(!ends_with_tag("[DEAD] ESPN", "DEAD"));
-        assert!(!ends_with_tag("ESPN [DEAD] News", "DEAD"));
+        // Step 9: the shared vocabulary's trailing-tag check (`tags::has_trailing`).
+        use crosstalk_matching::tags::has_trailing;
+        assert!(has_trailing("ESPN [DEAD]", "DEAD"));
+        assert!(has_trailing("ESPN [dead]", "DEAD"), "case-insensitive");
+        assert!(has_trailing("ESPN [DEAD] ", "DEAD"));
+        assert!(!has_trailing("[DEAD] ESPN", "DEAD"));
+        assert!(!has_trailing("ESPN [DEAD] News", "DEAD"));
+        // Output change: parens and literal affixes count now.
+        assert!(has_trailing("ESPN (DEAD)", "DEAD"));
     }
 
     #[test]
     fn the_format_suffix_strips_every_known_tag_before_appending() {
-        let tags = known_format_tags(&configured_suffixes(&StreamsSettings::default()));
-        assert_eq!(strip_format_tags("ESPN [HD] [SD]", &tags), "ESPN");
-        assert_eq!(strip_format_tags("ESPN [unknown]", &tags), "ESPN");
-        assert_eq!(strip_format_tags("ESPN", &tags), "ESPN");
+        // Step 9: the shared parser (`tags::strip_with`): parens strip, stacked mixed
+        // runs strip in one pass; the set stays the plugin's.
+        let settings = StreamsSettings::default();
+        assert_eq!(strip_format_tags("ESPN [HD] [SD]", &settings), "ESPN");
+        assert_eq!(strip_format_tags("ESPN [unknown]", &settings), "ESPN");
+        assert_eq!(strip_format_tags("ESPN", &settings), "ESPN");
+        assert_eq!(strip_format_tags("ESPN (HD)", &settings), "ESPN");
+        // A provider quality tag triage never appends is not a format tag.
+        assert_eq!(strip_format_tags("ESPN [1080p]", &settings), "ESPN [1080p]");
+        assert_eq!(
+            strip_format_tags("ESPN [HEVC] [HD]", &settings),
+            "ESPN [HEVC]"
+        );
         // A status tag is not a FORMAT tag: the suffix step does not touch it.
-        assert_eq!(strip_format_tags("ESPN [DEAD]", &tags), "ESPN [DEAD]");
-        // A tag in the middle is not trailing, so it stays (the plugin's regex is `$`-anchored).
-        assert_eq!(strip_format_tags("[HD] ESPN", &tags), "[HD] ESPN");
+        assert_eq!(strip_format_tags("ESPN [DEAD]", &settings), "ESPN [DEAD]");
+        // A tag in the middle is not trailing, so it stays.
+        assert_eq!(strip_format_tags("[HD] ESPN", &settings), "[HD] ESPN");
     }
 
     #[test]
-    fn a_formats_rendering_leaves_other_braces_alone() {
+    fn a_formats_rendering_substitutes_every_channel_token() {
+        // Step 9: one template engine (`naming::render_channel`): `{group}` and friends
+        // substitute the channel's own values now (literal before).
+        let world = World {
+            groups: vec![ChannelGroup {
+                id: 7,
+                name: "US: Sports".to_string(),
+            }],
+            ..World::default()
+        };
+        let channel = Channel {
+            id: 42,
+            name: "ESPN".to_string(),
+            channel_group_id: Some(7),
+            channel_number: Some(serde_json::json!(12)),
+            ..Channel::default()
+        };
+        let values = channel_values(&NameLookup::of(&world), &channel, "ESPN");
         assert_eq!(
-            render_format("{name} [DEAD] {group}", "ESPN").as_deref(),
-            Some("ESPN [DEAD] {group}")
+            render_format("{name} [DEAD] {group} #{number} {id} {epg}", &values).as_deref(),
+            Some("ESPN [DEAD] US: Sports #12 42 No EPG")
         );
-        assert_eq!(render_format("   ", "ESPN"), None);
-        assert_eq!(render_format("{name}", "ESPN").as_deref(), Some("ESPN"));
+        assert_eq!(render_format("{name}", &values).as_deref(), Some("ESPN"));
+        assert_eq!(
+            render_format("  {name} [DEAD]  ", &values).as_deref(),
+            Some("ESPN [DEAD]")
+        );
+        // A blank rendering is never written: no channel is renamed to whitespace.
+        assert_eq!(render_format("   ", &values), None);
+        assert_eq!(render_format("", &values), None);
+        assert!(!formats_name_epg(&StreamsSettings::default()));
     }
 
     // ---------------------------------------------------------------------------------
     // Group resolution
     // ---------------------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn an_apply_creates_a_missing_group_and_a_preview_does_not() {
+    #[test]
+    fn resolve_names_a_missing_group_with_a_placeholder_and_writes_nothing() {
         let world = world();
         let moves = vec![Move {
             channel_id: 1,
@@ -1333,27 +1479,75 @@ mod tests {
             group: "Parked".to_string(),
         }];
 
-        let preview = GroupTargets::resolve(None, &world, &moves, true)
-            .await
-            .expect("a preview resolves without a client");
-        assert_eq!(preview.missing, vec!["Parked".to_string()]);
-        assert!(preview.created.is_empty());
-        let placeholder = preview.ids["Parked"];
+        // Resolve is pure now: no client, no POSTs, just placeholders for the create stage.
+        let targets = GroupTargets::resolve(&world, &moves);
+        assert_eq!(targets.missing, vec!["Parked".to_string()]);
+        let placeholder = targets.ids["Parked"];
         assert!(placeholder < 0, "a placeholder id must not be a real id");
         // The plan prints the group's NAME for a placeholder, not "No Group".
-        let plan_world = preview.plan_world(&world);
+        let plan_world = targets.plan_world(&world);
         assert_eq!(plan_world.group_name(Some(placeholder)), "Parked");
+    }
+
+    #[tokio::test]
+    async fn the_create_stage_creates_a_missing_group_and_records_it() {
+        use crosstalk_core::channel_ops;
+        let world = world();
+        let moves = vec![Move {
+            channel_id: 1,
+            class: TriageClass::Dead,
+            group: "Parked".to_string(),
+        }];
+        let targets = GroupTargets::resolve(&world, &moves);
 
         let server = ServerFixture::start(&world).await;
         let client = server.client();
-        let applied = GroupTargets::resolve(Some(&client), &world, &moves, false)
-            .await
-            .expect("an apply creates it");
-        assert_eq!(applied.created, vec!["Parked".to_string()]);
-        assert_eq!(applied.ids["Parked"], 700);
+        let request = channel_ops::CreateRequest {
+            app: "streams".to_string(),
+            groups: targets
+                .missing
+                .iter()
+                .map(|name| channel_ops::NewGroup {
+                    name: name.clone(),
+                    key: format!("streams:triage:{name}"),
+                })
+                .collect(),
+            logos: Vec::new(),
+            channels: Vec::new(),
+        };
+        let plan = channel_ops::plan_creates(
+            &world,
+            &HashMap::new(),
+            &request,
+            &channel_ops::PlanOptions::default(),
+        )
+        .expect("plans");
+        assert_eq!(plan.groups.len(), 1);
+        assert!(plan.groups[0].existing_id.is_none());
+
+        let creator: std::sync::Arc<dyn channel_ops::ChannelCreator> =
+            std::sync::Arc::new(channel_ops::RestChannelCreator::new(client, 4));
+        let context = crosstalk_core::jobs::JobContext::for_tests(
+            crosstalk_core::config::CrosstalkConfig::default(),
+        );
+        let report =
+            channel_ops::apply_creates(creator, &plan, &context, "streams.triage_apply").await;
+        assert!(report.all_ok(), "{report:#?}");
+        assert_eq!(report.groups.len(), 1);
+        assert_eq!(report.groups[0].id, Some(700));
         let bodies = server.bodies("POST", "/api/channels/groups/").await;
         assert_eq!(bodies.len(), 1);
         assert_eq!(bodies[0]["name"], serde_json::json!("Parked"));
+        // One row per created object, with the new id and the owner key.
+        let rows = channel_ops::create_run_rows(&plan, Some(&report));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].subject, crosstalk_core::store::Subject::Group);
+        assert_eq!(rows[0].after_value.as_deref(), Some("700"));
+        assert_eq!(
+            rows[0].owner_key.as_deref(),
+            Some("streams:triage:Parked"),
+            "the create row carries the owner key"
+        );
     }
 
     #[tokio::test]
@@ -1365,10 +1559,7 @@ mod tests {
             group: "US: Cable".to_string(),
         }];
         let server = ServerFixture::start(&world).await;
-        let client = server.client();
-        let targets = GroupTargets::resolve(Some(&client), &world, &moves, false)
-            .await
-            .expect("resolve");
+        let targets = GroupTargets::resolve(&world, &moves);
         assert_eq!(targets.ids["US: Cable"], 100);
         assert!(targets.missing.is_empty());
         assert_eq!(
@@ -1626,15 +1817,16 @@ mod tests {
         assert_eq!(applied.counts.get("groups_created"), Some(&3));
 
         // The groups the moves named, then one edit/bulk payload carrying every rename and move.
-        let created: Vec<String> = server
+        let mut created: Vec<String> = server
             .bodies("POST", "/api/channels/groups/")
             .await
             .iter()
             .map(|body| body["name"].as_str().unwrap_or_default().to_string())
             .collect();
-        // In the order the moves name them (channel id), which is the order the groups are
-        // created in.
-        assert_eq!(created, vec!["Graveyard", "Black Screens", "Slow"]);
+        // The create stage posts groups concurrently, so their arrival order is not fixed;
+        // what matters is that each group the moves name is created exactly once.
+        created.sort();
+        assert_eq!(created, vec!["Black Screens", "Graveyard", "Slow"]);
 
         let bodies = server
             .bodies("PATCH", "/api/channels/channels/edit/bulk/")

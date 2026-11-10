@@ -6,14 +6,23 @@
 //! needing a reconnect path for a page an operator glances at.
 //!
 //! Authentication is a bearer token: the one in `crosstalk.toml` (or its environment variable),
-//! sent as a cookie by the login page or as an `Authorization: Bearer` header by a script.
+//! sent as an `Authorization: Bearer` header by a script, or presented once to the login page,
+//! which answers with a server-side session cookie.
+
+#![forbid(unsafe_code)]
 
 pub mod auth;
+pub mod client;
 pub mod csrf;
 pub mod host;
+pub mod limits;
 pub mod routes;
 pub mod security;
+pub mod session;
 pub mod state;
+
+/// SHA-256 lives in the host crate, which the bridge client signs with too.
+pub use crosstalk_core::sha256;
 
 pub use routes::router;
 pub use state::{AppState, UiApp, UiField};

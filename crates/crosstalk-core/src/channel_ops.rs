@@ -43,7 +43,8 @@
 //!     400 for the whole `edit/bulk` chunk. [`apply`] refuses those rows with that reason
 //!     instead of sending a payload that fails. The column is nullable and the model allows
 //!     it (deleting a group leaves its channels with none), so this is an API gap rather than
-//!     a crosstalk limitation, and a bridge-backed writer can close it later.
+//!     a crosstalk limitation: with the `crosstalk-bridge` plugin verified at start-up the
+//!     moves go through its [`GroupClearer`] instead (`docs/bridge.md`).
 //!
 //! Without [`PlanOptions::suffix_present_skips_rest`] the operations are independent: a
 //! rename that is a no-op is reported as a skip and the rest still run, which is what
@@ -85,11 +86,12 @@
 use crate::config::ScopeConfig;
 use crate::csv_report::{self, Report};
 use crate::dispatcharr::{
-    Channel, ChannelEdit, DispatcharrClient, EpgEntry, Set, Stream, World, WorldKind,
+    Channel, ChannelCreate, ChannelEdit, ChannelGroup, DispatcharrClient, EpgEntry, Logo, Set,
+    Stream, World, WorldKind,
 };
 use crate::jobs::JobContext;
 use crate::scope::{scope_channels, ScopedChannels};
-use crate::store::{RunRow, Subject};
+use crate::store::{CreateIntent, RunRow, Subject};
 use crate::subapp::{SettingsSchema, SettingsValues, SubApp};
 use crate::wildcard::parse_tokens;
 use anyhow::{bail, Context, Result};
@@ -97,6 +99,7 @@ use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// The columns a channel-ops report carries.
@@ -114,6 +117,9 @@ pub const COLUMNS: [&str; 9] = [
 
 /// The placeholders a [`RenameKind::Template`] understands. Anything else between braces is
 /// left exactly as written, so a template may also carry `{…}` meant for another tool.
+///
+/// Kept in sync with [`crate::naming::CHANNEL_PLACEHOLDERS`]: the template engine renders
+/// the value, this constant names the set for reports and settings help.
 pub const TEMPLATE_PLACEHOLDERS: [&str; 5] = ["{name}", "{group}", "{number}", "{epg}", "{id}"];
 
 /// Progress is published at most this often, like the plugin's own two-second flush.
@@ -276,7 +282,7 @@ impl Selection {
 /// What to do to every selected channel.
 ///
 /// There is no `Delete`: the plugins' permanent deletes are out of scope for crosstalk.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Op {
     Rename {
@@ -339,7 +345,7 @@ where
 ///
 /// Separate from [`Value`] because these are the values a caller ASKS for, while [`Value`] is
 /// what a plan reports (ids with the names they print as, so the report needs no world).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SetValue {
     /// A channel name.
@@ -352,6 +358,12 @@ pub enum SetValue {
     Flag(bool),
     /// An ordered stream list, replacing the channel's own.
     Streams(Vec<i64>),
+    /// A channel number (Dispatcharr's float; `None` clears it).
+    Number(Option<f64>),
+    /// A logo; `None` clears it. A logo created by the same plan is referenced through the
+    /// create stage's [`LogoRef`], not here: a `Set` value must name an object that already
+    /// exists, while a planned logo has no id until the create stage runs.
+    Logo(Option<i64>),
 }
 
 impl SetValue {
@@ -363,6 +375,8 @@ impl SetValue {
             Self::Epg(_) => "EPG entry",
             Self::Flag(_) => "flag",
             Self::Streams(_) => "stream list",
+            Self::Number(_) => "number",
+            Self::Logo(_) => "logo",
         }
     }
 
@@ -377,6 +391,8 @@ impl SetValue {
                 | (Field::HiddenFromOutput, Self::Flag(_))
                 | (Field::Membership(_), Self::Flag(_))
                 | (Field::Streams, Self::Streams(_))
+                | (Field::Number, Self::Number(_))
+                | (Field::Logo, Self::Logo(_))
         )
     }
 }
@@ -422,20 +438,30 @@ pub enum RenameKind {
 impl RenameKind {
     /// Whether the name already carries this rename, in which case the plugin skips the
     /// channel instead of adding it twice (2503, `current_name.endswith(bad_epg_suffix)`).
+    ///
+    /// Step 8 (migration list): the suffix check is the shared vocabulary rule
+    /// ([`has_trailing`](crosstalk_matching::tags::has_trailing): case-insensitive and
+    /// bracket-aware), not the plugin's exact `ends_with`. `CNN [badepg]` and
+    /// `CNN (BadEPG)` already count as tagged, which changes Janitor parity for those
+    /// case/bracket variants (oracle diff, not a gate). The append itself stays verbatim.
     fn already(&self, current: &str) -> bool {
         match self {
-            Self::Suffix(text) => current.ends_with(text.as_str()),
+            Self::Suffix(text) => crosstalk_matching::tags::has_trailing(current, text),
             Self::Prefix(text) => current.starts_with(text.as_str()),
             Self::Template(_) => false,
         }
     }
 
     /// The new name, or `None` when it would be empty (a blank name is not a rename).
-    fn produce(&self, current: &str, values: &Placeholders) -> Option<String> {
+    ///
+    /// Templates render through the shared engine ([`crate::naming::render_channel`]);
+    /// the suffix/prefix append stays verbatim. The presence check above is the shared
+    /// vocabulary rule, so a rename never double-appends.
+    fn produce(&self, current: &str, values: &crate::naming::ChannelValues) -> Option<String> {
         let name = match self {
             Self::Suffix(text) => format!("{current}{text}"),
             Self::Prefix(text) => format!("{text}{current}"),
-            Self::Template(template) => render_template(template, values),
+            Self::Template(template) => crate::naming::render_channel(template, values),
         };
         if name.trim().is_empty() {
             None
@@ -449,7 +475,8 @@ impl RenameKind {
 ///
 /// The label is both the API's own field name (it is what a CSV row and a run row carry, and
 /// what [`Self::from_label`] parses back) and the serialized form, so an [`Op::Set`] names its
-/// field the same way a restore reads it.
+/// field the same way a restore reads it. `Number` is Dispatcharr's float channel number
+/// (`channel_number`); `Logo` is the logo id (`logo_id`), `None` clearing each.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Field {
     Name,
@@ -460,6 +487,10 @@ pub enum Field {
     Membership(i64),
     /// The channel's ordered stream list.
     Streams,
+    /// The channel number.
+    Number,
+    /// The channel's logo.
+    Logo,
 }
 
 impl Field {
@@ -472,6 +503,8 @@ impl Field {
             Self::HiddenFromOutput => "hidden_from_output".to_string(),
             Self::Membership(profile_id) => format!("profile_membership:{profile_id}"),
             Self::Streams => "streams".to_string(),
+            Self::Number => "channel_number".to_string(),
+            Self::Logo => "logo_id".to_string(),
         }
     }
 
@@ -486,6 +519,8 @@ impl Field {
             "epg_data_id" => Some(Self::Epg),
             "hidden_from_output" => Some(Self::HiddenFromOutput),
             "streams" => Some(Self::Streams),
+            "channel_number" => Some(Self::Number),
+            "logo_id" => Some(Self::Logo),
             _ => label
                 .strip_prefix("profile_membership:")
                 .and_then(|id| id.parse().ok())
@@ -506,7 +541,7 @@ impl<'de> Deserialize<'de> for Field {
         Self::from_label(&label).ok_or_else(|| {
             serde::de::Error::custom(format!(
                 "unknown channel field {label:?}; use name, channel_group_id, epg_data_id, \
-                 hidden_from_output, streams or profile_membership:<id>"
+                 hidden_from_output, streams, channel_number, logo_id or profile_membership:<id>"
             ))
         })
     }
@@ -551,7 +586,7 @@ pub struct ListedStream {
 ///
 /// Ids are kept next to the names they print as: a report shows a guide or a group by NAME,
 /// while the write — and a later restore of it — needs the ID.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     /// A channel name.
     Name(String),
@@ -563,6 +598,10 @@ pub enum Value {
     Flag(bool),
     /// A channel's ordered stream list, in playback order.
     Streams(Vec<ListedStream>),
+    /// A channel number; `None` clears it.
+    Number(Option<f64>),
+    /// A logo; `None` clears it.
+    Logo(Option<(i64, String)>),
 }
 
 impl Value {
@@ -580,17 +619,25 @@ impl Value {
             Self::Epg(None) => "No EPG".to_string(),
             Self::Flag(flag) => if *flag { "yes" } else { "no" }.to_string(),
             Self::Streams(list) => display_streams(list),
+            Self::Number(Some(number)) => format!("{number}"),
+            Self::Number(None) => "No number".to_string(),
+            Self::Logo(Some((_, name))) => name.clone(),
+            Self::Logo(None) => "No logo".to_string(),
         }
     }
 
-    /// The machine value a restore reads back: an id, `none`, `true`/`false`, or the stream
-    /// ids of a list (comma-separated, `none` for an empty one).
+    /// The machine value a restore reads back: an id, `none`, `true`/`false`, the stream
+    /// ids of a list (comma-separated, `none` for an empty one), or the number itself.
     pub fn wire(&self) -> String {
         match self {
             Self::Name(name) => name.clone(),
-            Self::Group(Some((id, _))) | Self::Epg(Some((id, _))) => id.to_string(),
-            Self::Group(None) | Self::Epg(None) => "none".to_string(),
+            Self::Group(Some((id, _))) | Self::Epg(Some((id, _))) | Self::Logo(Some((id, _))) => {
+                id.to_string()
+            }
+            Self::Group(None) | Self::Epg(None) | Self::Logo(None) => "none".to_string(),
             Self::Flag(flag) => flag.to_string(),
+            Self::Number(Some(number)) => format!("{number}"),
+            Self::Number(None) => "none".to_string(),
             Self::Streams(list) if list.is_empty() => "none".to_string(),
             Self::Streams(list) => list
                 .iter()
@@ -738,6 +785,9 @@ pub struct Plan {
     pub skipped: Vec<Skip>,
     /// The scope and selection in words, for the report preamble and the log.
     pub description: String,
+    /// Scope settings that did not do what they say (an `ignore_groups` token matching no
+    /// group excludes nothing). A preview reports them; [`apply`] refuses a plan carrying any.
+    pub scope_warnings: Vec<String>,
 }
 
 /// What [`apply`] did, row by row.
@@ -775,6 +825,41 @@ pub struct PlanOptions {
     /// earlier operation that already planned a change has that change dropped (reported as
     /// a skip) when the guard fires.
     pub suffix_present_skips_rest: bool,
+    /// Resolve rename collisions through the shared engine
+    /// ([`crate::naming::resolve_collisions`], Name Cleaner's suffix/numeric/skip
+    /// strategies, against every channel name in the world) after all operations planned.
+    ///
+    /// Opt-in per plan: `None` (the default) plans exactly what the operations say, which
+    /// is what the guide's `tag_missing` preset relies on for its parity. Lineup's
+    /// clean/names set this; a `skip` reports the loser as a collision,
+    /// `suffix`/`numeric` rewrite the loser's planned name. Planned creates' names go
+    /// through the same pass (see [`plan_creates`]).
+    pub collision: Option<crate::naming::CollisionStrategy>,
+    /// The separator `suffix` collisions join with (`" "`, Name Cleaner's
+    /// `join_separator`). Ignored unless [`Self::collision`] is set.
+    pub collision_sep: String,
+    /// Per-channel removed quality tags for the `suffix` collision strategy: channel id
+    /// to the quality the cleaning stripped from that channel, uppercased (`["HD"]`).
+    ///
+    /// Name Cleaner's `suffix` strategy re-appends the FIRST removed segment
+    /// (`base + sep + rq[0]`, plugin.py:250-254) before falling back to a number; the
+    /// shared resolver ([`crate::naming::PlannedName::removed_tags`]) already takes one
+    /// list per planned name, and this is how a channel-ops plan supplies it — one map,
+    /// still one resolver. Channels absent here resolve with no removed tag (pure
+    /// numeric). Ignored unless [`Self::collision`] is set. Lineup's clean fills this
+    /// from the pipe segments its pipeline dropped.
+    pub collision_removed: HashMap<i64, Vec<String>>,
+    /// Refuse a number that is already used by any channel.
+    ///
+    /// Opt-in per plan, off by default. When on, a planned number that is already used by
+    /// another channel — in ANY group, because Dispatcharr's numbers are one global
+    /// namespace in practice (see [`drop_number_conflicts`]) — or claimed by an earlier
+    /// planned number in the same plan is dropped and reported as a skip, instead of landing
+    /// a duplicate through a REST or bulk write (neither runs `Channel.clean`). This covers
+    /// both a [`Field::Number`] change here and a [`NewChannel`] number in a create plan. A
+    /// channel cleared to no number never conflicts; a channel being renumbered away vacates
+    /// its old number for the rest of the plan (unless its own renumber is refused).
+    pub number_conflicts: bool,
 }
 
 /// Plan a selection and a list of operations against the world.
@@ -824,9 +909,10 @@ pub fn plan_with_options(
     };
     let scoped = scope_channels(world, &scope)?;
     // Built once: a guide or stream lookup per channel against ~55k rows would be quadratic.
-    // The stream index is only worth building when an operation writes a stream list.
+    // The stream and logo indexes are only worth building when an operation reads them.
     let needs_streams = ops.iter().any(|op| op.field() == Field::Streams);
-    let lookups = Lookups::of(world, needs_streams);
+    let needs_logos = ops.iter().any(|op| op.field() == Field::Logo);
+    let lookups = Lookups::of(world, needs_streams, needs_logos);
     let mut skipped: Vec<Skip> = Vec::new();
     let selected = narrow(
         world,
@@ -920,12 +1006,271 @@ pub fn plan_with_options(
         changes.extend(planned);
     }
 
+    if let Some(strategy) = options.collision {
+        resolve_plan_collisions(
+            world,
+            &mut changes,
+            &mut skipped,
+            strategy,
+            &options.collision_sep,
+            &options.collision_removed,
+        );
+    }
+
+    if options.number_conflicts {
+        drop_number_conflicts(world, &mut changes, &mut skipped);
+    }
+
+    let scope_warnings = if scoped.unmatched_ignore.is_empty() {
+        Vec::new()
+    } else {
+        vec![format!(
+            "[scope] ignore_groups names {} that match no channel group, so they exclude \
+             nothing: fix the names (they are case-sensitive) before applying",
+            quote_list(&scoped.unmatched_ignore)
+        )]
+    };
+
     Ok(Plan {
         description: selection.describe(&scoped.filter_description),
         selected: selected_rows,
         changes,
         skipped,
+        scope_warnings,
     })
+}
+
+/// Drop planned numbers that are already used, when [`PlanOptions::number_conflicts`] is on.
+///
+/// Numbers are checked GLOBALLY, not per group. Dispatcharr's only per-group check is
+/// `Channel.clean`, which REST and bulk writes never call; everything that hands out or
+/// reads a number treats it as one global namespace: `get_next_available_channel_number`
+/// reserves every channel's number (`compact_numbering.build_reserved_set`), the
+/// from-stream create refuses any reserved number (`channel_number_is_reserved`), the
+/// provider auto-sync seeds its `used_numbers` from every channel, and the outputs list
+/// channels flat by number (HDHomeRun `GuideNumber`, M3U `tvg-chno`, the default `tvg_id`).
+/// Two channels sharing a number in different groups are one channel to a player.
+///
+/// A [`Field::Number`] change whose number is held by another channel loses its change and
+/// gains a skip row naming the holder; an earlier planned number in the same plan holds the
+/// same way. A channel whose own number is being cleared or moved vacates it for the rest of
+/// the plan — unless its own change is refused, in which case it keeps the number, so the
+/// pass repeats until no refusal frees or re-takes a number (each round re-takes at least
+/// one, so it ends).
+fn drop_number_conflicts(world: &World, changes: &mut Vec<Change>, skipped: &mut Vec<Skip>) {
+    // Reversed so a duplicated id keeps its first channel, as a `find` would (E-N3).
+    let names: HashMap<i64, &str> = world
+        .channels
+        .iter()
+        .rev()
+        .map(|channel| (channel.id, channel.name.as_str()))
+        .collect();
+    let name_of = |id: i64| -> String {
+        names
+            .get(&id)
+            .map(|name| format!("channel {id} ({name})"))
+            .unwrap_or_else(|| format!("channel {id}"))
+    };
+    let planned_number = |change: &Change| match (&change.field, &change.after) {
+        (Field::Number, Value::Number(number)) => Some(*number),
+        _ => None,
+    };
+    // The channels whose number this plan moves: their old number is vacated, while their
+    // change stands.
+    let mut vacating: HashSet<i64> = changes
+        .iter()
+        .filter(|change| planned_number(change).is_some())
+        .map(|change| change.channel_id)
+        .collect();
+    loop {
+        let mut held: HashMap<u64, i64> = HashMap::new();
+        for channel in &world.channels {
+            if vacating.contains(&channel.id) {
+                continue;
+            }
+            if let Some(number) = channel_number_of(channel) {
+                held.entry(number_key(number)).or_insert(channel.id);
+            }
+        }
+        let mut refused: Vec<(usize, i64)> = Vec::new();
+        for (index, change) in changes.iter().enumerate() {
+            let Some(Some(number)) = planned_number(change) else {
+                // Not a number change, or a clear (which never conflicts).
+                continue;
+            };
+            match held.get(&number_key(number)) {
+                Some(holder) if *holder != change.channel_id => refused.push((index, *holder)),
+                _ => {
+                    held.insert(number_key(number), change.channel_id);
+                }
+            }
+        }
+        // A refused channel keeps its old number: if it was counted as vacated, take it back
+        // and plan again, because a later claim may have landed on it.
+        let retaken: Vec<i64> = refused
+            .iter()
+            .map(|(index, _)| changes[*index].channel_id)
+            .filter(|id| vacating.remove(id))
+            .collect();
+        if !retaken.is_empty() {
+            continue;
+        }
+        let refused: HashMap<usize, i64> = refused.into_iter().collect();
+        let mut kept: Vec<Change> = Vec::with_capacity(changes.len());
+        for (index, change) in changes.drain(..).enumerate() {
+            let Some(holder) = refused.get(&index) else {
+                kept.push(change);
+                continue;
+            };
+            let number = planned_number(&change).flatten().unwrap_or_default();
+            skipped.push(Skip {
+                channel_id: change.channel_id,
+                channel_name: change.channel_name.clone(),
+                channel_number: change.channel_number,
+                channel_group: change.channel_group.clone(),
+                op: Some(change.op),
+                field: Some(change.field),
+                reason: format!(
+                    "channel number {number} is already used by {} (numbers are global in \
+                     Dispatcharr's outputs), so this number is skipped",
+                    name_of(*holder),
+                ),
+            });
+        }
+        *changes = kept;
+        return;
+    }
+}
+
+/// The identity of a channel number for conflict checks: its bits, with `-0.0` folded onto
+/// `0.0` (they print and compare equal upstream).
+fn number_key(number: f64) -> u64 {
+    if number == 0.0 {
+        0.0f64.to_bits()
+    } else {
+        number.to_bits()
+    }
+}
+
+/// The next `n` free channel numbers, counting up from `start`.
+///
+/// Mirrors Dispatcharr's `get_next_available_channel_number` (`apps/channels/models.py`,
+/// over `_next_available_number` in `apps/m3u/tasks.py`): the smallest numbers `>= start`,
+/// one step at a time, that no channel holds in ANY group — upstream reserves numbers
+/// globally (see [`drop_number_conflicts`]), so a per-group pool would hand out numbers
+/// the server and the players already consider taken. `start` is a float because numbers
+/// are; a fractional start counts `1.5, 2.5, …`, like the endpoint's walk.
+///
+/// Only the raw `Channel.channel_number` values in the loaded world count. Dispatcharr also
+/// lets a `ChannelOverride` pin a different effective number per channel, but overrides are
+/// not exposed over REST — a caller that knows pins (a bridge-backed world) must merge them
+/// into the world's numbers first, or a handed-out number can still collide at apply time
+/// (which [`PlanOptions::number_conflicts`] then reports as a skip).
+pub fn next_free_numbers(world: &World, start: f64, n: usize) -> Vec<f64> {
+    let used: HashSet<u64> = world
+        .channels
+        .iter()
+        .filter_map(channel_number_of)
+        .map(number_key)
+        .collect();
+    let mut free = Vec::with_capacity(n);
+    let mut candidate = start;
+    while free.len() < n {
+        if !used.contains(&number_key(candidate)) {
+            free.push(candidate);
+        }
+        candidate += 1.0;
+    }
+    free
+}
+
+/// Apply the opt-in collision strategy to a plan's rename changes.
+///
+/// Only [`Field::Name`] changes participate, against EVERY channel name in the world
+/// (global, like Name Cleaner: see [`crate::naming`] for why not per group), minus the old
+/// names the renames free — a rename frees its own slot for a sibling, exactly like the
+/// engine's first pass. A resolved name rewrites the change's `after`; a `Skip` loser, and a
+/// change the resolver turns back into its own current name, loses its change and gains a
+/// `skipped` row. The per-channel removed quality comes from
+/// [`PlanOptions::collision_removed`] (lineup's clean fills it from the pipe segments its
+/// pipeline dropped); channels absent there resolve with no removed tag (pure numeric).
+fn resolve_plan_collisions(
+    world: &World,
+    changes: &mut Vec<Change>,
+    skipped: &mut Vec<Skip>,
+    strategy: crate::naming::CollisionStrategy,
+    sep: &str,
+    removed: &HashMap<i64, Vec<String>>,
+) {
+    use crate::naming::PlannedName;
+    let mut planned: Vec<PlannedName> = Vec::new();
+    for change in changes.iter() {
+        if change.field != Field::Name {
+            continue;
+        }
+        let (Value::Name(old_name), Value::Name(new_name)) = (&change.before, &change.after) else {
+            continue;
+        };
+        planned.push(PlannedName {
+            id: change.channel_id,
+            old_name: old_name.clone(),
+            new_name: new_name.clone(),
+            removed_tags: removed.get(&change.channel_id).cloned().unwrap_or_default(),
+        });
+    }
+    if planned.is_empty() {
+        return;
+    }
+    let existing: Vec<String> = world
+        .channels
+        .iter()
+        .map(|channel| channel.name.clone())
+        .collect();
+    let resolved = crate::naming::resolve_collisions(&planned, &existing, strategy, sep);
+    let resolved: HashMap<i64, crate::naming::ResolvedName> =
+        resolved.into_iter().map(|row| (row.id, row)).collect();
+    let mut kept: Vec<Change> = Vec::with_capacity(changes.len());
+    for mut change in changes.drain(..) {
+        let row = (change.field == Field::Name)
+            .then(|| resolved.get(&change.channel_id))
+            .flatten();
+        let Some(row) = row else {
+            kept.push(change);
+            continue;
+        };
+        let reason = if row.skipped {
+            Some(format!(
+                "the rename to {:?} collides with another channel's name and the plan's \
+                 collision strategy is skip, so the name is left as {:?}",
+                row.final_name,
+                change.before.display(),
+            ))
+        } else if Value::Name(row.final_name.clone()) == change.before {
+            Some(format!(
+                "the rename collides with another channel's name, and the collision \
+                 strategy resolves it back to the current name {:?}, so nothing changes",
+                change.before.display(),
+            ))
+        } else {
+            None
+        };
+        match reason {
+            Some(reason) => skipped.push(Skip {
+                channel_id: change.channel_id,
+                channel_name: change.channel_name.clone(),
+                channel_number: change.channel_number,
+                channel_group: change.channel_group.clone(),
+                op: Some(change.op),
+                field: Some(change.field),
+                reason,
+            }),
+            None => {
+                change.after = Value::Name(row.final_name.clone());
+                kept.push(change);
+            }
+        }
+    }
+    *changes = kept;
 }
 
 /// Writes many channels' ordered stream lists: the seam every stream-list write goes through.
@@ -979,6 +1324,15 @@ impl StreamListWriter for RestStreamListWriter {
     }
 }
 
+/// Moves channels to "No Group" (`channel_group` NULL): the one channel edit REST cannot
+/// express (see the module docs), so the only implementation is the bridge
+/// ([`crate::bridge::BridgeClient`]). Same contract as [`StreamListWriter`]: one answer per
+/// channel, in input order, `Ok` only when the write is confirmed.
+#[async_trait::async_trait]
+pub trait GroupClearer: Send + Sync {
+    async fn clear_many(&self, channel_ids: &[i64]) -> Vec<(i64, Result<()>)>;
+}
+
 /// Apply a plan, one request per endpoint, recording every row's outcome.
 ///
 /// The writes are batched the way the API wants them: a rename, a group move and a hide are
@@ -992,26 +1346,301 @@ impl StreamListWriter for RestStreamListWriter {
 /// how many rows before it were confirmed — the same partial-progress wording
 /// `batch_set_epg` and `edit_channels` already use. It does not stop the other endpoints: a
 /// failed profile update must not abandon the EPG clear the operator asked for too.
+///
+/// With the bridge verified at start-up ([`crate::bridge::for_config`]) the stream lists and
+/// the "No Group" moves go through it; without it the lists go over REST and the moves are
+/// refused per row, saying they need the bridge.
 pub async fn apply(
     client: &DispatcharrClient,
     plan: &Plan,
     context: &JobContext,
     action: &str,
 ) -> ApplyReport {
-    let writer = RestStreamListWriter::new(client.clone());
-    apply_with_writer(client, plan, context, action, &writer).await
+    let bridge = crate::bridge::for_config(context.config(), client);
+    let rest = RestStreamListWriter::new(client.clone());
+    let writer: &dyn StreamListWriter = match &bridge {
+        Some(bridge) => bridge,
+        None => &rest,
+    };
+    let clearer = bridge.as_ref().map(|bridge| bridge as &dyn GroupClearer);
+    apply_inner(client, plan, context, action, writer, clearer, false).await
 }
 
 /// [`apply`] with a caller-supplied [`StreamListWriter`].
 ///
 /// The hook a bridge-backed writer needs; everything except the stream-list stage is the same
-/// code [`apply`] runs.
+/// code [`apply`] runs, including the "No Group" moves going through the verified bridge when
+/// there is one.
 pub async fn apply_with_writer(
     client: &DispatcharrClient,
     plan: &Plan,
     context: &JobContext,
     action: &str,
     writer: &dyn StreamListWriter,
+) -> ApplyReport {
+    let bridge = crate::bridge::for_config(context.config(), client);
+    let clearer = bridge.as_ref().map(|bridge| bridge as &dyn GroupClearer);
+    apply_inner(client, plan, context, action, writer, clearer, false).await
+}
+
+/// [`apply`] with both writers chosen by the caller: `clearer` `None` refuses the "No Group"
+/// moves the way a run without the bridge does.
+pub async fn apply_with_writers(
+    client: &DispatcharrClient,
+    plan: &Plan,
+    context: &JobContext,
+    action: &str,
+    writer: &dyn StreamListWriter,
+    clearer: Option<&dyn GroupClearer>,
+) -> ApplyReport {
+    apply_inner(client, plan, context, action, writer, clearer, false).await
+}
+
+/// [`apply`] for a run whose rows are exactly [`run_rows`] of `plan`, keeping those rows in
+/// step with the writes.
+///
+/// The planned rows are recorded BEFORE the first write and re-recorded after every stage
+/// (same ordinals, so each replaces the last), so a run killed mid-apply still says what it
+/// was about to do and which stages landed: undo reads the `ok` rows, and without this a
+/// crash after the writes but before the end-of-run record would leave nothing to undo.
+pub async fn apply_recorded(
+    client: &DispatcharrClient,
+    plan: &Plan,
+    context: &JobContext,
+    action: &str,
+) -> Result<ApplyReport> {
+    context.record_rows(&run_rows(plan, None))?;
+    let bridge = crate::bridge::for_config(context.config(), client);
+    let rest = RestStreamListWriter::new(client.clone());
+    let writer: &dyn StreamListWriter = match &bridge {
+        Some(bridge) => bridge,
+        None => &rest,
+    };
+    let clearer = bridge.as_ref().map(|bridge| bridge as &dyn GroupClearer);
+    let report = apply_inner(client, plan, context, action, writer, clearer, true).await;
+    context.record_rows(&run_rows(plan, Some(&report)))?;
+    Ok(report)
+}
+
+async fn apply_inner(
+    client: &DispatcharrClient,
+    plan: &Plan,
+    context: &JobContext,
+    action: &str,
+    writer: &dyn StreamListWriter,
+    clearer: Option<&dyn GroupClearer>,
+    record: bool,
+) -> ApplyReport {
+    let mut changes = plan.changes.clone();
+    if !plan.scope_warnings.is_empty() {
+        // The scope does not mean what it says: write nothing rather than reach channels
+        // the operator meant to exclude.
+        let reason = format!("not applied: {}", plan.scope_warnings.join("; "));
+        return refuse_all_changes(changes, &reason);
+    }
+
+    // Plans are not re-checked by anything else between planning and writing, and several
+    // apps (and people) write the same fields, so the channels are listed once more right
+    // here: a change whose `before` no longer holds would revert somebody else's edit, so it
+    // is not sent. A cancelled run writes nothing anyway and skips the listing.
+    let stale = if context.is_cancelled() {
+        HashMap::new()
+    } else {
+        match changed_since_plan(client, &plan.changes).await {
+            Ok(stale) => stale,
+            Err(error) => {
+                return refuse_all_changes(changes, &format!("not applied: {error:#}"));
+            }
+        }
+    };
+    let mut fresh = Plan::default();
+    let mut origin: Vec<usize> = Vec::with_capacity(plan.changes.len());
+    for (index, change) in plan.changes.iter().enumerate() {
+        match stale.get(&index) {
+            Some(reason) => {
+                changes[index].status = RowStatus::Failed;
+                changes[index].reason = reason.clone();
+            }
+            None => {
+                fresh.changes.push(change.clone());
+                origin.push(index);
+            }
+        }
+    }
+    let checkpoint = Checkpoint {
+        plan,
+        base: changes,
+        origin,
+        record,
+    };
+    let report = apply_stages(
+        client,
+        &fresh,
+        context,
+        action,
+        writer,
+        clearer,
+        &checkpoint,
+    )
+    .await;
+    let changes = checkpoint.merged(&report.changes);
+    let ok = changes
+        .iter()
+        .filter(|change| change.status == RowStatus::Ok)
+        .count();
+    let failed = changes
+        .iter()
+        .filter(|change| change.status == RowStatus::Failed)
+        .count();
+    ApplyReport {
+        changes,
+        ok,
+        failed,
+    }
+}
+
+/// Every change failed with one reason, nothing sent.
+fn refuse_all_changes(mut changes: Vec<Change>, reason: &str) -> ApplyReport {
+    for change in &mut changes {
+        change.status = RowStatus::Failed;
+        change.reason = reason.to_string();
+    }
+    let failed = changes.len();
+    ApplyReport {
+        changes,
+        ok: 0,
+        failed,
+    }
+}
+
+/// Where [`apply_stages`] reports each finished stage: the full plan's rows (the ones not sent
+/// already carry their reason) and where each sent change sits in them.
+struct Checkpoint<'a> {
+    plan: &'a Plan,
+    base: Vec<Change>,
+    /// For each change [`apply_stages`] was given, its index in `base`.
+    origin: Vec<usize>,
+    /// Re-record the run rows after every stage ([`apply_recorded`]).
+    record: bool,
+}
+
+impl Checkpoint<'_> {
+    /// The full plan's changes with the sent ones' current outcomes.
+    fn merged(&self, sent: &[Change]) -> Vec<Change> {
+        let mut all = self.base.clone();
+        for (position, change) in sent.iter().enumerate() {
+            all[self.origin[position]] = change.clone();
+        }
+        all
+    }
+
+    /// Record the rows as they stand after a stage, when this apply records them.
+    fn stage(&self, context: &JobContext, sent: &[Change]) {
+        if !self.record {
+            return;
+        }
+        let report = ApplyReport {
+            changes: self.merged(sent),
+            ok: 0,
+            failed: 0,
+        };
+        if let Err(error) = context.record_rows(&run_rows(self.plan, Some(&report))) {
+            tracing::warn!("recording the run rows after a write stage failed: {error:#}");
+        }
+    }
+}
+
+/// The changes whose channel no longer holds the plan's `before`, by index, with the reason.
+///
+/// One channel listing. A channel missing from it is not judged here (the write itself says
+/// whether it is gone), and a profile membership is not either: memberships are not in the
+/// channel listing. A failed listing is an error, because writing unchecked is what this
+/// exists to prevent.
+async fn changed_since_plan(
+    client: &DispatcharrClient,
+    changes: &[Change],
+) -> Result<HashMap<usize, String>> {
+    if changes
+        .iter()
+        .all(|change| matches!(change.field, Field::Membership(_)))
+    {
+        return Ok(HashMap::new());
+    }
+    let live = client
+        .channels()
+        .await
+        .context("re-reading the channels right before writing")?;
+    let by_id: HashMap<i64, &Channel> = live.iter().map(|channel| (channel.id, channel)).collect();
+    let mut stale = HashMap::new();
+    for (index, change) in changes.iter().enumerate() {
+        let Some(channel) = by_id.get(&change.channel_id) else {
+            continue;
+        };
+        if let Some(now) = moved_since_plan(channel, change) {
+            stale.insert(
+                index,
+                format!(
+                    "not applied: changed since the plan ({} was {:?} when planned and is {now} \
+                     now), so writing it would revert someone else's edit",
+                    change.field.label(),
+                    change.before.display(),
+                ),
+            );
+        }
+    }
+    Ok(stale)
+}
+
+/// What the live channel holds for `change`'s field, when that is no longer its `before`.
+fn moved_since_plan(channel: &Channel, change: &Change) -> Option<String> {
+    let id_of = |value: &Option<(i64, String)>| value.as_ref().map(|(id, _)| *id);
+    let id_text = |id: Option<i64>| id.map_or_else(|| "none".to_string(), |id| format!("#{id}"));
+    let (holds, now) = match (&change.field, &change.before) {
+        (Field::Name, Value::Name(name)) => (channel.name == *name, format!("{:?}", channel.name)),
+        (Field::Group, Value::Group(group)) => (
+            channel.channel_group_id == id_of(group),
+            id_text(channel.channel_group_id),
+        ),
+        (Field::HiddenFromOutput, Value::Flag(flag)) => (
+            channel.hidden_from_output == *flag,
+            channel.hidden_from_output.to_string(),
+        ),
+        (Field::Number, Value::Number(number)) => {
+            let live = channel_number_of(channel);
+            (
+                live.map(number_key) == number.map(number_key),
+                live.map_or_else(|| "none".to_string(), |number| format!("{number}")),
+            )
+        }
+        (Field::Logo, Value::Logo(logo)) => {
+            (channel.logo_id == id_of(logo), id_text(channel.logo_id))
+        }
+        (Field::Epg, Value::Epg(epg)) => (
+            channel.current_epg_id() == id_of(epg),
+            id_text(channel.current_epg_id()),
+        ),
+        (Field::Streams, before) => {
+            let ids = before.stream_ids()?;
+            (
+                channel.streams == ids,
+                format!("a list of {} stream(s)", channel.streams.len()),
+            )
+        }
+        _ => return None,
+    };
+    (!holds).then_some(now)
+}
+
+/// The write stages of [`apply_with_writer`], over changes already checked against the live
+/// channels.
+async fn apply_stages(
+    client: &DispatcharrClient,
+    plan: &Plan,
+    context: &JobContext,
+    action: &str,
+    writer: &dyn StreamListWriter,
+    clearer: Option<&dyn GroupClearer>,
+    checkpoint: &Checkpoint<'_>,
 ) -> ApplyReport {
     let mut changes = plan.changes.clone();
     let total = changes.len() as u64;
@@ -1025,14 +1654,15 @@ pub async fn apply_with_writer(
     for (index, change) in plan.changes.iter().enumerate() {
         if !matches!(
             change.field,
-            Field::Name | Field::Group | Field::HiddenFromOutput
+            Field::Name | Field::Group | Field::HiddenFromOutput | Field::Number | Field::Logo
         ) {
             continue;
         }
         if change.field == Field::Group && matches!(&change.after, Value::Group(None)) {
             // The one channel edit the API cannot express, and one invalid row rejects its
-            // whole chunk — so it is reported here rather than sent. A channel that also has a
-            // rename in this plan keeps it: each field is its own row.
+            // whole chunk — so it never goes into `edit/bulk`: the bridge writes it, or it is
+            // reported. A channel that also has a rename in this plan keeps it: each field is
+            // its own row.
             no_group_rows.push(index);
             continue;
         }
@@ -1049,6 +1679,13 @@ pub async fn apply_with_writer(
             (Field::HiddenFromOutput, Value::Flag(hidden)) => {
                 edit.hidden_from_output = Some(*hidden);
             }
+            // Both are nullable upstream (`allow_null`), so a cleared value sends a null.
+            (Field::Number, Value::Number(number)) => {
+                edit.channel_number = number.map_or(Set::Null, Set::Value);
+            }
+            (Field::Logo, Value::Logo(logo)) => {
+                edit.logo_id = logo.as_ref().map_or(Set::Null, |(id, _)| Set::Value(*id));
+            }
             // A field this endpoint does not carry; the plan never produces one.
             _ => {}
         }
@@ -1059,27 +1696,49 @@ pub async fn apply_with_writer(
         } else {
             let payload: Vec<ChannelEdit> = edits.into_values().collect();
             progress.set(done, &format!("editing {} channel(s)", payload.len()));
-            match client.edit_channels(&payload).await {
-                Ok(_) => mark(&mut changes, &edit_rows, RowStatus::Ok, ""),
-                Err(error) => mark(
-                    &mut changes,
-                    &edit_rows,
-                    RowStatus::Failed,
-                    &format!("{error:#}"),
-                ),
-            }
+            // One answer per channel: a later chunk failing must not mark the landed chunks
+            // failed (undo would skip writes that are in effect), and the payload is one edit
+            // per channel while a channel can carry several rows, so rows map by channel id.
+            let cancelled = || context.is_cancelled();
+            let answers = client.edit_channels_each(&payload, &cancelled).await;
+            let by_channel: HashMap<i64, Option<Result<()>>> =
+                payload.iter().map(|edit| edit.id).zip(answers).collect();
+            mark_by_channel(&mut changes, &edit_rows, &by_channel);
         }
         done += edit_rows.len() as u64;
+        checkpoint.stage(context, &changes);
     }
     if !no_group_rows.is_empty() {
-        // A cancelled run says so, like every other batch it never reached; otherwise the
-        // reason is the API's own gap.
-        let reason = if context.is_cancelled() {
-            CANCELLED
-        } else {
-            NO_GROUP_UNSUPPORTED
-        };
-        mark(&mut changes, &no_group_rows, RowStatus::Failed, reason);
+        match clearer {
+            Some(clearer) if !context.is_cancelled() => {
+                let ids: Vec<i64> = no_group_rows
+                    .iter()
+                    .map(|index| plan.changes[*index].channel_id)
+                    .collect();
+                progress.set(
+                    done,
+                    &format!("moving {} channel(s) to No Group", ids.len()),
+                );
+                let by_channel: HashMap<i64, Option<Result<()>>> = clearer
+                    .clear_many(&ids)
+                    .await
+                    .into_iter()
+                    .map(|(channel_id, result)| (channel_id, Some(result)))
+                    .collect();
+                mark_by_channel(&mut changes, &no_group_rows, &by_channel);
+                checkpoint.stage(context, &changes);
+            }
+            _ => {
+                // A cancelled run says so, like every other batch it never reached; otherwise
+                // the reason is the API's own gap.
+                let reason = if context.is_cancelled() {
+                    CANCELLED
+                } else {
+                    NO_GROUP_UNSUPPORTED
+                };
+                mark(&mut changes, &no_group_rows, RowStatus::Failed, reason);
+            }
+        }
         done += no_group_rows.len() as u64;
     }
 
@@ -1104,21 +1763,26 @@ pub async fn apply_with_writer(
                 })
                 .collect();
             progress.set(done, &format!("updating profile {profile_id} membership"));
-            match client.set_profile_membership(profile_id, &payload).await {
-                Ok(_) => mark(&mut changes, &rows, RowStatus::Ok, ""),
-                Err(error) => mark(
-                    &mut changes,
-                    &rows,
-                    RowStatus::Failed,
-                    &format!("{error:#}"),
-                ),
-            }
+            let cancelled = || context.is_cancelled();
+            let answers = client
+                .set_profile_membership_each(profile_id, &payload, &cancelled)
+                .await;
+            let by_channel: HashMap<i64, Option<Result<()>>> = payload
+                .iter()
+                .map(|(channel_id, _)| *channel_id)
+                .zip(answers)
+                .collect();
+            mark_by_channel(&mut changes, &rows, &by_channel);
         }
         done += rows.len() as u64;
+        checkpoint.stage(context, &changes);
     }
 
     // 3. Guides: one `batch-set-epg` call, which chunks and retries internally. A clear and a
-    //    per-channel assignment are the same write, differing only in the id sent.
+    //    per-channel assignment are the same write, differing only in the id sent. The
+    //    chunks land in row order and the client stops at the first failure, so the rows
+    //    before the failing chunk are `ok` (they are in effect upstream, and undo must see
+    //    them) and only the rest fail with the chunk's message.
     let mut epg_rows: Vec<usize> = Vec::new();
     let mut associations: Vec<(i64, Option<i64>)> = Vec::new();
     for (index, change) in plan.changes.iter().enumerate() {
@@ -1135,17 +1799,16 @@ pub async fn apply_with_writer(
                 done,
                 &format!("writing {} guide assignment(s)", associations.len()),
             );
-            match client.batch_set_epg(&associations).await {
-                Ok(_) => mark(&mut changes, &epg_rows, RowStatus::Ok, ""),
-                Err(error) => mark(
-                    &mut changes,
-                    &epg_rows,
-                    RowStatus::Failed,
-                    &format!("{error:#}"),
-                ),
+            let outcome = client.batch_set_epg_outcome(&associations).await;
+            let (landed, rest) = epg_rows.split_at(outcome.confirmed.min(epg_rows.len()));
+            mark(&mut changes, landed, RowStatus::Ok, "");
+            match outcome.failure {
+                Some(failure) => mark(&mut changes, rest, RowStatus::Failed, &failure),
+                None => mark(&mut changes, rest, RowStatus::Ok, ""),
             }
         }
         done += epg_rows.len() as u64;
+        checkpoint.stage(context, &changes);
     }
 
     // 4. Stream lists: one batched write through the writer, which is the seam a
@@ -1226,6 +1889,30 @@ pub async fn apply_with_writer(
     }
 }
 
+/// Mark `rows` from per-channel answers: `Some(Ok)` landed, `Some(Err)` failed with its own
+/// message, `None` was never sent because the run was cancelled. A row whose channel has no
+/// answer at all fails loudly rather than sitting at `planned`.
+fn mark_by_channel(
+    changes: &mut [Change],
+    rows: &[usize],
+    answers: &HashMap<i64, Option<Result<()>>>,
+) {
+    for index in rows {
+        let change = &mut changes[*index];
+        let (status, reason) = match answers.get(&change.channel_id) {
+            Some(Some(Ok(()))) => (RowStatus::Ok, String::new()),
+            Some(Some(Err(error))) => (RowStatus::Failed, format!("{error:#}")),
+            Some(None) => (RowStatus::Failed, CANCELLED.to_string()),
+            None => (
+                RowStatus::Failed,
+                "the write returned no result for this channel".to_string(),
+            ),
+        };
+        change.status = status;
+        change.reason = reason;
+    }
+}
+
 /// What a batch of rows gets when the run was cancelled before it ran.
 const CANCELLED: &str = "not applied: the run was cancelled";
 
@@ -1233,7 +1920,8 @@ const CANCELLED: &str = "not applied: the run was cancelled";
 /// would fail the whole chunk it shares — and take the renames in that chunk down with it.
 const NO_GROUP_UNSUPPORTED: &str =
     "not applied: Dispatcharr's channel edit cannot clear a channel group (its serializer \
-     rejects a null channel_group_id), so this move has to be made in the Dispatcharr UI";
+     rejects a null channel_group_id); this move needs the crosstalk-bridge plugin ([bridge] \
+     in crosstalk.toml, see docs/bridge.md) or the Dispatcharr UI";
 
 /// What a channel-ops report needs from its caller: the app it belongs to and the settings
 /// the preamble names.
@@ -1301,6 +1989,10 @@ pub fn write_ops_report(
             },
         )
         .result("Skipped", plan.skipped.len());
+    let report = plan
+        .scope_warnings
+        .iter()
+        .fold(report, |report, warning| report.result("Warning", warning));
     let report = spec
         .notes
         .iter()
@@ -1410,6 +2102,7 @@ pub fn run_rows(plan: &Plan, applied: Option<&ApplyReport>) -> Vec<RunRow> {
             status: change.status.as_str().to_string(),
             reason: change.reason.clone(),
             ai_decision: None,
+            owner_key: None,
         });
     }
     for (offset, skip) in plan.skipped.iter().enumerate() {
@@ -1430,6 +2123,2002 @@ pub fn run_rows(plan: &Plan, applied: Option<&ApplyReport>) -> Vec<RunRow> {
     rows
 }
 
+// ---- Create stage ------------------------------------------------------------
+//
+// Edits change objects that already exist; creates make new ones. The two stay separate on
+// purpose: a create needs an id that does not exist until the POST answers, so it cannot
+// be one more [`Op`] over selected channels. Instead a [`CreateRequest`] names the groups,
+// logos and channels to make, [`plan_creates`] dedups it against the world (and against the
+// app's own earlier creates, through the ownership table), and [`apply_creates`] posts it
+// in dependency order — groups, then logos, then channels — through a [`ChannelCreator`].
+//
+// Scale shaped the split: thousands of channel POSTs go out concurrently (bounded by the
+// creator's concurrency), while planning stays pure and synchronous over the loaded world.
+// A preview therefore lists every object without touching the network, and an apply records
+// one run row per object with its new id ([`create_run_rows`]).
+//
+// Deduplication is get_or_create, per object kind:
+//
+// * a group whose exact name is already in the world reuses that id. Upstream names are
+//   unique and compared exactly (case-sensitive `TextField(unique=True)`), and the REST
+//   create answers 400 for an existing name (DRF's `UniqueValidator` runs before the
+//   serializer's get_or_create), so the client recovers a failed group create by looking
+//   the exact name up;
+// * a logo whose exact URL is already in the world reuses that id (`Logo.objects.get_or_create(url=…)`
+//   in `from-stream`);
+// * a channel is never created twice for one key: the key is app-defined
+//   (`lineup:<file>:<category>:<name>` for lineup) and the plan consults the objects the
+//   app already owns. A same-named channel the app does NOT own is left alone — adoption
+//   is an explicit [`Store::record_ownership`](crate::store::Store::record_ownership), not
+//   a side effect of planning.
+//
+// Crash safety: [`apply_creates`] records an intent (what it is about to post) before each
+// stage's POSTs and turns it into ownership when the answer lands. A process that dies in
+// between leaves the intent, and [`load_owned`] (what a caller runs before planning)
+// adopts the object that landed — matched by exactly what was posted, newer than anything
+// the plan's world held — or drops the intent when nothing did. It also forgets owned ids
+// that are gone from Dispatcharr (a user deleted them), so their keys are created again.
+// Hiding a channel (undo) keeps its ownership: a hidden channel is still in the world.
+//
+// [`PlanOptions::collision`] also guards planned create names (global scope, same engine
+// and strategies as renames; a create carries no removed quality tags, so `suffix` falls
+// back to numeric), and [`PlanOptions::number_conflicts`] also refuses a planned number
+// that is already used by any channel (numbers are global, see [`drop_number_conflicts`]).
+/// A group to create, by exact name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewGroup {
+    /// The group's name. Compared exactly (case-sensitive) against the world.
+    pub name: String,
+    /// The app-defined ownership key, recorded on the create row and in the ownership table.
+    pub key: String,
+}
+
+/// A logo to create, by URL (Dispatcharr's identity for a logo).
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewLogo {
+    pub name: String,
+    /// Compared exactly against the world's logo URLs.
+    pub url: String,
+    /// The app-defined ownership key, recorded on the create row and in the ownership table.
+    pub key: String,
+}
+
+/// Which group a new channel belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupRef {
+    /// An existing group by id.
+    Existing(i64),
+    /// A group from this request, by position in [`CreateRequest::groups`].
+    Planned(usize),
+}
+
+/// Which logo a new channel carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogoRef {
+    /// An existing logo by id.
+    Existing(i64),
+    /// A logo from this request, by position in [`CreateRequest::logos`].
+    Planned(usize),
+}
+
+/// A channel to create.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewChannel {
+    pub name: String,
+    /// Dispatcharr assigns the next free number when this is `None`. An auto-numbering
+    /// caller hands out [`next_free_numbers`] and sets one per channel instead.
+    pub number: Option<f64>,
+    /// `None` leaves the group to the server (which creates the "Default Group").
+    pub group: Option<GroupRef>,
+    pub logo: Option<LogoRef>,
+    /// Ordered stream ids, playback order first.
+    pub streams: Vec<i64>,
+    /// Dispatcharr's three-way meaning, spelled out because getting it wrong is silent:
+    /// omitted adds the channel to every profile, `[]` to none, `[0]` is the explicit
+    /// "all profiles" sentinel.
+    pub profile_ids: Option<Vec<i64>>,
+    pub tvg_id: Option<String>,
+    pub epg_data_id: Option<i64>,
+    /// The app-defined ownership key: the dedup identity of this channel. The plan refuses
+    /// to create a second channel for a key the app already owns.
+    pub key: String,
+}
+
+/// Everything one run wants to create, for one app.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CreateRequest {
+    /// Whose objects these are: the ownership rows' app.
+    pub app: String,
+    pub groups: Vec<NewGroup>,
+    pub logos: Vec<NewLogo>,
+    pub channels: Vec<NewChannel>,
+}
+
+/// What a create row is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreatedKind {
+    Group,
+    Logo,
+    Channel,
+}
+
+impl CreatedKind {
+    /// The ownership-table and subject form: `group`, `logo`, `channel`.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Group => "group",
+            Self::Logo => "logo",
+            Self::Channel => "channel",
+        }
+    }
+
+    /// The run-row subject carrying this kind's id.
+    pub fn subject(&self) -> Subject {
+        match self {
+            Self::Group => Subject::Group,
+            Self::Logo => Subject::Logo,
+            Self::Channel => Subject::Channel,
+        }
+    }
+}
+
+/// A group the plan will create (or reuse).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlannedGroup {
+    pub name: String,
+    pub key: String,
+    /// Set when the world already has this exact name: no POST, the id is reused.
+    pub existing_id: Option<i64>,
+}
+
+/// A logo the plan will create (or reuse).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlannedLogo {
+    pub name: String,
+    pub url: String,
+    pub key: String,
+    /// Set when the world already has this exact URL: no POST, the id is reused.
+    pub existing_id: Option<i64>,
+}
+
+/// A planned channel's resolved group: an existing id, or a group this plan creates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlannedGroupRef {
+    Existing(i64),
+    /// Position in [`CreatePlan::groups`].
+    New(usize),
+}
+
+/// A planned channel's resolved logo: an existing id, or a logo this plan creates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlannedLogoRef {
+    Existing(i64),
+    /// Position in [`CreatePlan::logos`].
+    New(usize),
+}
+
+/// A channel the plan will create, with its refs resolved to existing ids or to objects
+/// this same plan creates.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlannedChannel {
+    pub name: String,
+    pub number: Option<f64>,
+    pub group: Option<PlannedGroupRef>,
+    pub logo: Option<PlannedLogoRef>,
+    pub streams: Vec<i64>,
+    pub profile_ids: Option<Vec<i64>>,
+    pub tvg_id: Option<String>,
+    pub epg_data_id: Option<i64>,
+    pub key: String,
+    /// The group's name, for the report and the run row (the id may not exist yet).
+    pub group_name: String,
+}
+
+/// One requested object the plan refused, with the reason.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateSkip {
+    pub kind: CreatedKind,
+    /// The name it would have been created with.
+    pub name: String,
+    pub key: String,
+    pub reason: String,
+}
+
+/// What [`plan_creates`] produced: the objects to create, in dependency order, and the
+/// ones it refused.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CreatePlan {
+    /// Whose objects these are: the ownership rows' app.
+    pub app: String,
+    /// Groups to create (or reuse), in request order.
+    pub groups: Vec<PlannedGroup>,
+    /// Logos to create (or reuse), in request order.
+    pub logos: Vec<PlannedLogo>,
+    /// Channels to create, in request order, refs resolved.
+    pub channels: Vec<PlannedChannel>,
+    /// Requested objects the plan refused, with the reason each was left alone.
+    pub skipped: Vec<CreateSkip>,
+    /// The plan in words, for the report preamble and the log.
+    pub description: String,
+    /// The highest id of each kind in the world the plan was made from: an object that
+    /// lands from this plan's POSTs has a higher id, which is what lets a later reconcile
+    /// tell it from a user's own same-named object (see [`load_owned`]).
+    pub id_floor: IdFloor,
+}
+
+/// The highest group, logo and channel id a world held (`0` for none).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IdFloor {
+    pub group: i64,
+    pub logo: i64,
+    pub channel: i64,
+}
+
+impl IdFloor {
+    fn of(world: &World) -> Self {
+        Self {
+            group: world.groups.iter().map(|group| group.id).max().unwrap_or(0),
+            logo: world.logos.iter().map(|logo| logo.id).max().unwrap_or(0),
+            channel: world
+                .channels
+                .iter()
+                .map(|channel| channel.id)
+                .max()
+                .unwrap_or(0),
+        }
+    }
+
+    fn get(&self, kind: CreatedKind) -> i64 {
+        match kind {
+            CreatedKind::Group => self.group,
+            CreatedKind::Logo => self.logo,
+            CreatedKind::Channel => self.channel,
+        }
+    }
+}
+
+impl CreatePlan {
+    /// Whether the plan creates nothing at all (it may still carry skips worth reporting).
+    pub fn is_empty(&self) -> bool {
+        self.groups.is_empty() && self.logos.is_empty() && self.channels.is_empty()
+    }
+
+    /// How many POSTs an apply would send: groups and logos without an `existing_id`, plus
+    /// every channel.
+    pub fn planned_creates(&self) -> usize {
+        self.groups
+            .iter()
+            .filter(|group| group.existing_id.is_none())
+            .count()
+            + self
+                .logos
+                .iter()
+                .filter(|logo| logo.existing_id.is_none())
+                .count()
+            + self.channels.len()
+    }
+}
+
+/// Plan groups, logos and channels to create, deduped against the world and the app's own
+/// earlier creates.
+///
+/// Pure: nothing is written. `owned` maps the app's owner keys to the channel ids they
+/// already made ([`load_owned`]) — a key whose id is still in the world means an earlier
+/// run already created this channel, so the request is reported as a skip instead of a
+/// duplicate; a key whose id is gone (deleted upstream) is created again.
+///
+/// The world must carry every slice the dedup reads (groups for groups, logos for logos,
+/// channels for channels): planning against a slice that was not loaded would read "none"
+/// and post duplicates. Groups dedup by exact name and logos by exact URL against the
+/// world; a second request entry for the same name or URL is skipped as already planned.
+///
+/// A [`GroupRef::Planned`]/[`LogoRef::Planned`] that names no entry is a caller bug and
+/// fails the whole plan; a channel whose ref points at a skipped group or logo is skipped
+/// with the reason (its dependency is not being created), which is what lets a partial
+/// failure refuse exactly the channels that lost their group.
+///
+/// [`PlanOptions::number_conflicts`] refuses a planned number already used in its group
+/// (or claimed by an earlier planned create), and [`PlanOptions::collision`] resolves
+/// planned channel names through the shared engine (global scope, same as renames).
+pub fn plan_creates(
+    world: &World,
+    owned: &HashMap<String, i64>,
+    request: &CreateRequest,
+    options: &PlanOptions,
+) -> Result<CreatePlan> {
+    if !request.groups.is_empty() {
+        world.require(WorldKind::Groups)?;
+    }
+    if !request.logos.is_empty() {
+        world.require(WorldKind::Logos)?;
+    }
+    if !request.channels.is_empty() {
+        world.require(WorldKind::Channels)?;
+    }
+    for channel in &request.channels {
+        match channel.group {
+            Some(GroupRef::Planned(index)) if index >= request.groups.len() => bail!(
+                "channel {:?} (key {:?}) refers to planned group {index}, but the request \
+                 only names {} group(s)",
+                channel.name,
+                channel.key,
+                request.groups.len(),
+            ),
+            _ => {}
+        }
+        match channel.logo {
+            Some(LogoRef::Planned(index)) if index >= request.logos.len() => bail!(
+                "channel {:?} (key {:?}) refers to planned logo {index}, but the request \
+                 only names {} logo(s)",
+                channel.name,
+                channel.key,
+                request.logos.len(),
+            ),
+            _ => {}
+        }
+    }
+
+    let mut plan = CreatePlan {
+        app: request.app.clone(),
+        id_floor: IdFloor::of(world),
+        ..CreatePlan::default()
+    };
+    let live_channels: HashSet<i64> = world.channels.iter().map(|channel| channel.id).collect();
+
+    // Groups: exact names reuse the world's id; a repeated name is already planned.
+    let mut group_slot: Vec<GroupSlot> = Vec::with_capacity(request.groups.len());
+    let mut seen_groups: HashMap<&str, usize> = HashMap::new();
+    for group in &request.groups {
+        if group.name.trim().is_empty() {
+            plan.skipped.push(CreateSkip {
+                kind: CreatedKind::Group,
+                name: group.name.clone(),
+                key: group.key.clone(),
+                reason: "the group name is empty, which would be rejected".to_string(),
+            });
+            group_slot.push(GroupSlot::Skipped);
+            continue;
+        }
+        if let Some(existing) = world.groups.iter().find(|known| known.name == group.name) {
+            group_slot.push(GroupSlot::Existing(existing.id));
+            plan.groups.push(PlannedGroup {
+                name: group.name.clone(),
+                key: group.key.clone(),
+                existing_id: Some(existing.id),
+            });
+            continue;
+        }
+        if seen_groups.contains_key(group.name.as_str()) {
+            plan.skipped.push(CreateSkip {
+                kind: CreatedKind::Group,
+                name: group.name.clone(),
+                key: group.key.clone(),
+                reason: "a group with this name is already planned in this request".to_string(),
+            });
+            group_slot.push(GroupSlot::Skipped);
+            continue;
+        }
+        seen_groups.insert(group.name.as_str(), plan.groups.len());
+        group_slot.push(GroupSlot::New(plan.groups.len()));
+        plan.groups.push(PlannedGroup {
+            name: group.name.clone(),
+            key: group.key.clone(),
+            existing_id: None,
+        });
+    }
+
+    // Logos: exact URLs reuse the world's id; a repeated URL is already planned.
+    let mut logo_slot: Vec<LogoSlot> = Vec::with_capacity(request.logos.len());
+    let mut seen_logos: HashMap<&str, usize> = HashMap::new();
+    for logo in &request.logos {
+        if logo.url.trim().is_empty() {
+            plan.skipped.push(CreateSkip {
+                kind: CreatedKind::Logo,
+                name: logo.name.clone(),
+                key: logo.key.clone(),
+                reason: "the logo URL is empty, which would be rejected".to_string(),
+            });
+            logo_slot.push(LogoSlot::Skipped);
+            continue;
+        }
+        if let Some(existing) = world.logos.iter().find(|known| known.url == logo.url) {
+            logo_slot.push(LogoSlot::Existing(existing.id));
+            plan.logos.push(PlannedLogo {
+                name: logo.name.clone(),
+                url: logo.url.clone(),
+                key: logo.key.clone(),
+                existing_id: Some(existing.id),
+            });
+            continue;
+        }
+        if seen_logos.contains_key(logo.url.as_str()) {
+            plan.skipped.push(CreateSkip {
+                kind: CreatedKind::Logo,
+                name: logo.name.clone(),
+                key: logo.key.clone(),
+                reason: "a logo with this URL is already planned in this request".to_string(),
+            });
+            logo_slot.push(LogoSlot::Skipped);
+            continue;
+        }
+        seen_logos.insert(logo.url.as_str(), plan.logos.len());
+        logo_slot.push(LogoSlot::New(plan.logos.len()));
+        plan.logos.push(PlannedLogo {
+            name: logo.name.clone(),
+            url: logo.url.clone(),
+            key: logo.key.clone(),
+            existing_id: None,
+        });
+    }
+
+    // Channels: owned keys and repeated keys are already made; empty names are refused;
+    // refs resolve to existing ids or to this plan's own objects.
+    let mut seen_keys: HashSet<&str> = HashSet::new();
+    for channel in &request.channels {
+        let skip = |reason: String| CreateSkip {
+            kind: CreatedKind::Channel,
+            name: channel.name.clone(),
+            key: channel.key.clone(),
+            reason,
+        };
+        if channel.name.trim().is_empty() {
+            plan.skipped.push(skip(
+                "the channel name is empty, which would be rejected".to_string(),
+            ));
+            continue;
+        }
+        if let Some(id) = owned
+            .get(&channel.key)
+            .filter(|id| live_channels.contains(id))
+        {
+            plan.skipped.push(skip(format!(
+                "key {:?} was already created as channel {id}, so no duplicate is made",
+                channel.key,
+            )));
+            continue;
+        }
+        if !seen_keys.insert(channel.key.as_str()) {
+            plan.skipped.push(skip(format!(
+                "key {:?} is already planned in this request, so no duplicate is made",
+                channel.key,
+            )));
+            continue;
+        }
+        let group = match channel.group {
+            None => None,
+            Some(GroupRef::Existing(id)) => Some(PlannedGroupRef::Existing(id)),
+            Some(GroupRef::Planned(index)) => {
+                match resolve_group_slot(&request.groups, &group_slot, index) {
+                    Some(slot) => Some(slot),
+                    None => {
+                        plan.skipped.push(skip(format!(
+                            "its group {:?} is not being created, so the channel is refused",
+                            request.groups[index].name,
+                        )));
+                        continue;
+                    }
+                }
+            }
+        };
+        let logo = match channel.logo {
+            None => None,
+            Some(LogoRef::Existing(id)) => Some(PlannedLogoRef::Existing(id)),
+            Some(LogoRef::Planned(index)) => {
+                match resolve_logo_slot(&request.logos, &logo_slot, index) {
+                    Some(slot) => Some(slot),
+                    None => {
+                        plan.skipped.push(skip(format!(
+                            "its logo {:?} is not being created, so the channel is refused",
+                            request.logos[index].name,
+                        )));
+                        continue;
+                    }
+                }
+            }
+        };
+        let group_name = match group {
+            None => "No Group".to_string(),
+            Some(PlannedGroupRef::Existing(id)) => world.group_name(Some(id)),
+            Some(PlannedGroupRef::New(index)) => plan.groups[index].name.clone(),
+        };
+        plan.channels.push(PlannedChannel {
+            name: channel.name.clone(),
+            number: channel.number,
+            group,
+            logo,
+            streams: channel.streams.clone(),
+            profile_ids: channel.profile_ids.clone(),
+            tvg_id: channel.tvg_id.clone(),
+            epg_data_id: channel.epg_data_id,
+            key: channel.key.clone(),
+            group_name,
+        });
+    }
+
+    if options.number_conflicts {
+        drop_create_number_conflicts(world, &mut plan);
+    }
+
+    if let Some(strategy) = options.collision {
+        resolve_create_collisions(world, &mut plan, strategy, &options.collision_sep);
+    }
+
+    plan.description = format!(
+        "creates for {}: {} group(s), {} logo(s) and {} channel(s) to create, {} skipped",
+        request.app,
+        plan.groups
+            .iter()
+            .filter(|group| group.existing_id.is_none())
+            .count(),
+        plan.logos
+            .iter()
+            .filter(|logo| logo.existing_id.is_none())
+            .count(),
+        plan.channels.len(),
+        plan.skipped.len(),
+    );
+    Ok(plan)
+}
+
+/// Where one requested group ended up: an existing id, a slot in the plan, or skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupSlot {
+    Existing(i64),
+    New(usize),
+    Skipped,
+}
+
+/// Where one requested logo ended up: an existing id, a slot in the plan, or skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogoSlot {
+    Existing(i64),
+    New(usize),
+    Skipped,
+}
+
+/// Follow a planned group ref to what the channel actually gets: an existing id, or the
+/// plan slot to create. A ref to a skipped group follows the first request entry with the
+/// same name (a repeated name is the only way to be skipped), which is always plannable.
+fn resolve_group_slot(
+    groups: &[NewGroup],
+    slots: &[GroupSlot],
+    index: usize,
+) -> Option<PlannedGroupRef> {
+    match slots[index] {
+        GroupSlot::Existing(id) => Some(PlannedGroupRef::Existing(id)),
+        GroupSlot::New(slot) => Some(PlannedGroupRef::New(slot)),
+        GroupSlot::Skipped => {
+            let name = groups[index].name.as_str();
+            groups
+                .iter()
+                .zip(slots.iter())
+                .find(|(group, _)| group.name.as_str() == name)
+                .and_then(|(_, slot)| match slot {
+                    GroupSlot::Existing(id) => Some(PlannedGroupRef::Existing(*id)),
+                    GroupSlot::New(slot) => Some(PlannedGroupRef::New(*slot)),
+                    GroupSlot::Skipped => None,
+                })
+        }
+    }
+}
+
+/// Follow a planned logo ref to what the channel actually gets, like [`resolve_group_slot`]
+/// (a repeated URL is the only way to be skipped).
+fn resolve_logo_slot(
+    logos: &[NewLogo],
+    slots: &[LogoSlot],
+    index: usize,
+) -> Option<PlannedLogoRef> {
+    match slots[index] {
+        LogoSlot::Existing(id) => Some(PlannedLogoRef::Existing(id)),
+        LogoSlot::New(slot) => Some(PlannedLogoRef::New(slot)),
+        LogoSlot::Skipped => {
+            let url = logos[index].url.as_str();
+            logos
+                .iter()
+                .zip(slots.iter())
+                .find(|(logo, _)| logo.url.as_str() == url)
+                .and_then(|(_, slot)| match slot {
+                    LogoSlot::Existing(id) => Some(PlannedLogoRef::Existing(*id)),
+                    LogoSlot::New(slot) => Some(PlannedLogoRef::New(*slot)),
+                    LogoSlot::Skipped => None,
+                })
+        }
+    }
+}
+
+/// Drop planned creates whose number is already used.
+///
+/// The [`PlanOptions::number_conflicts`] pass for creates: same global rule as
+/// [`drop_number_conflicts`], over the world's numbers plus the plan's own earlier claims
+/// (a second planned create of one number loses, whichever group either lands in).
+fn drop_create_number_conflicts(world: &World, plan: &mut CreatePlan) {
+    let mut held: HashMap<u64, String> = HashMap::new();
+    for channel in &world.channels {
+        if let Some(number) = channel_number_of(channel) {
+            held.entry(number_key(number))
+                .or_insert_with(|| format!("channel {} ({})", channel.id, channel.name));
+        }
+    }
+    let mut kept: Vec<PlannedChannel> = Vec::with_capacity(plan.channels.len());
+    for channel in plan.channels.drain(..) {
+        let Some(number) = channel.number else {
+            kept.push(channel);
+            continue;
+        };
+        match held.get(&number_key(number)) {
+            Some(holder) => plan.skipped.push(CreateSkip {
+                kind: CreatedKind::Channel,
+                name: channel.name.clone(),
+                key: channel.key.clone(),
+                reason: format!(
+                    "channel number {number} is already used by {holder} (numbers are \
+                     global in Dispatcharr's outputs), so this create is skipped",
+                ),
+            }),
+            None => {
+                held.insert(
+                    number_key(number),
+                    format!("channel {:?} (planned in this run)", channel.name),
+                );
+                kept.push(channel);
+            }
+        }
+    }
+    plan.channels = kept;
+}
+
+/// Resolve planned create names through the opt-in collision strategy.
+///
+/// Same engine and global scope as renames ([`resolve_plan_collisions`]): single-claimant
+/// free names keep, the rest resolve per strategy in request order. A create carries no old
+/// name and no removed quality tags, so `suffix` falls back to numeric. A `skip` loser, and
+/// a name the resolver turns back into another planned name's slot... loses its create and
+/// gains a skip row; a resolved name rewrites the planned channel.
+fn resolve_create_collisions(
+    world: &World,
+    plan: &mut CreatePlan,
+    strategy: crate::naming::CollisionStrategy,
+    sep: &str,
+) {
+    use crate::naming::PlannedName;
+    if plan.channels.is_empty() {
+        return;
+    }
+    let planned: Vec<PlannedName> = plan
+        .channels
+        .iter()
+        .enumerate()
+        .map(|(index, channel)| PlannedName {
+            id: index as i64,
+            old_name: String::new(),
+            new_name: channel.name.clone(),
+            removed_tags: Vec::new(),
+        })
+        .collect();
+    let existing: Vec<String> = world
+        .channels
+        .iter()
+        .map(|channel| channel.name.clone())
+        .collect();
+    let resolved = crate::naming::resolve_collisions(&planned, &existing, strategy, sep);
+    let resolved: HashMap<i64, crate::naming::ResolvedName> =
+        resolved.into_iter().map(|row| (row.id, row)).collect();
+    let mut kept: Vec<PlannedChannel> = Vec::with_capacity(plan.channels.len());
+    for (index, mut channel) in plan.channels.drain(..).enumerate() {
+        let Some(row) = resolved.get(&(index as i64)) else {
+            kept.push(channel);
+            continue;
+        };
+        if row.skipped {
+            plan.skipped.push(CreateSkip {
+                kind: CreatedKind::Channel,
+                name: channel.name.clone(),
+                key: channel.key.clone(),
+                reason: format!(
+                    "the name {:?} collides with another channel's name and the plan's \
+                     collision strategy is skip, so the channel is not created",
+                    row.final_name,
+                ),
+            });
+            continue;
+        }
+        channel.name = row.final_name.clone();
+        kept.push(channel);
+    }
+    plan.channels = kept;
+}
+
+/// How a create plan reaches Dispatcharr: the seam a bridge-backed writer replaces.
+///
+/// The REST implementation ([`RestChannelCreator`]) posts one object per request, which is
+/// the only shape the API offers for creates; a Dispatcharr plugin (the bridge) can replace
+/// it behind the same trait. Every method returns the created object, with its new id.
+/// `concurrency` bounds how many POSTs fly at once (thousands of channels at sync scale).
+#[async_trait::async_trait]
+pub trait ChannelCreator: Send + Sync {
+    /// Create a group. An implementation answers the existing group when the exact name
+    /// already exists (the REST one recovers upstream's 400 by looking the name up).
+    async fn create_group(&self, name: &str) -> Result<ChannelGroup>;
+    /// Create a logo from a name and a URL (the URL is unique upstream).
+    async fn create_logo(&self, name: &str, url: &str) -> Result<Logo>;
+    /// Create a channel; Dispatcharr assigns the next free number when the payload names
+    /// none, and creates the "Default Group" when it names no group.
+    async fn create_channel(&self, channel: &ChannelCreate) -> Result<Channel>;
+    /// How many POSTs may fly at once.
+    fn concurrency(&self) -> usize;
+}
+
+/// The REST implementation: one POST per object, bounded concurrency, in dependency order.
+///
+/// Group and logo names/URLs are unique upstream: a failed group or logo POST is looked up
+/// by its exact name/URL and the landed object answered, so a lost response never fails a
+/// create that worked ([`DispatcharrClient::create_group`]). Channel POSTs are NOT retried:
+/// a re-sent create makes a second channel with the same name, so a lost response surfaces
+/// as a failure rather than repeating ([`DispatcharrClient::create_channel`] makes the same
+/// choice), and the intent recorded before the POST lets the next run's [`load_owned`]
+/// adopt the channel if it did land.
+pub struct RestChannelCreator {
+    client: DispatcharrClient,
+    concurrency: usize,
+}
+
+impl RestChannelCreator {
+    /// The creator [`apply_creates`] uses: this client, this concurrency bound.
+    pub fn new(client: DispatcharrClient, concurrency: usize) -> Self {
+        Self {
+            client,
+            concurrency,
+        }
+    }
+}
+
+impl std::fmt::Debug for RestChannelCreator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RestChannelCreator")
+            .field("concurrency", &self.concurrency)
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait::async_trait]
+impl ChannelCreator for RestChannelCreator {
+    async fn create_group(&self, name: &str) -> Result<ChannelGroup> {
+        self.client.create_group(name).await
+    }
+
+    async fn create_logo(&self, name: &str, url: &str) -> Result<Logo> {
+        self.client.create_logo(name, url).await
+    }
+
+    async fn create_channel(&self, channel: &ChannelCreate) -> Result<Channel> {
+        self.client.create_channel(channel).await
+    }
+
+    fn concurrency(&self) -> usize {
+        self.concurrency
+    }
+}
+
+/// One created (or refused) object.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreatedOutcome {
+    pub kind: CreatedKind,
+    pub name: String,
+    pub key: String,
+    /// The new id. `None` when the object was never created (refused or failed).
+    pub id: Option<i64>,
+    /// Whether this apply actually created the object (a reused group or logo is `Ok` but
+    /// not created).
+    pub created: bool,
+    /// The channel's group name (planned or resolved); a group's own name; `""` for a logo.
+    pub group: String,
+    pub status: RowStatus,
+    pub reason: String,
+}
+
+/// What [`apply_creates`] did, stage by stage, in plan order.
+#[derive(Debug, Clone, Default)]
+pub struct CreateReport {
+    pub groups: Vec<CreatedOutcome>,
+    pub logos: Vec<CreatedOutcome>,
+    pub channels: Vec<CreatedOutcome>,
+    pub ok: usize,
+    pub failed: usize,
+}
+
+impl CreateReport {
+    pub fn all_ok(&self) -> bool {
+        self.failed == 0
+    }
+
+    /// How many objects this apply actually created (reused groups/logos excluded).
+    pub fn created(&self) -> usize {
+        self.groups
+            .iter()
+            .chain(self.logos.iter())
+            .chain(self.channels.iter())
+            .filter(|outcome| outcome.created && outcome.status == RowStatus::Ok)
+            .count()
+    }
+}
+
+/// Apply a create plan: groups, then logos, then channels, through the creator.
+///
+/// Each stage posts concurrently (bounded by the creator's concurrency) and cancellation is
+/// checked between requests, so a cancelled run stops at the last object it finished rather
+/// than mid-request. A group or logo that fails refuses exactly the channels that ref it
+/// (their outcome says which dependency failed); every other object is still attempted.
+/// Successful creates are recorded in the ownership table (through the context's store and
+/// run, when the run has them) under the plan's app and each object's key; a stored row is
+/// what lets the next run's plan dedup instead of duplicating.
+///
+/// `action` is the id the progress events are published under.
+pub async fn apply_creates(
+    creator: Arc<dyn ChannelCreator>,
+    plan: &CreatePlan,
+    context: &JobContext,
+    action: &str,
+) -> CreateReport {
+    let mut report = CreateReport::default();
+    let total = (plan.groups.len() + plan.logos.len() + plan.channels.len()) as u64;
+    let mut progress = context.paced(action, total, PROGRESS_INTERVAL);
+    let mut done = 0u64;
+
+    // 1. Groups: reused ids need no POST; the rest go out concurrently.
+    let mut group_posts: Vec<(usize, String)> = Vec::new();
+    for (index, group) in plan.groups.iter().enumerate() {
+        match group.existing_id {
+            Some(id) => report.groups.push(CreatedOutcome {
+                kind: CreatedKind::Group,
+                name: group.name.clone(),
+                key: group.key.clone(),
+                id: Some(id),
+                created: false,
+                group: group.name.clone(),
+                status: RowStatus::Ok,
+                reason: format!("group {:?} already exists as id {id}", group.name),
+            }),
+            None => {
+                report.groups.push(CreatedOutcome {
+                    kind: CreatedKind::Group,
+                    name: group.name.clone(),
+                    key: group.key.clone(),
+                    id: None,
+                    created: false,
+                    group: group.name.clone(),
+                    status: RowStatus::Planned,
+                    reason: String::new(),
+                });
+                group_posts.push((index, group.name.clone()));
+            }
+        }
+    }
+    if !group_posts.is_empty() {
+        let phase = format!("creating {} group(s)", group_posts.len());
+        progress.set(done, &phase);
+        let intents = group_posts
+            .iter()
+            .map(|(index, name)| {
+                intent(
+                    plan,
+                    context,
+                    CreatedKind::Group,
+                    &plan.groups[*index].key,
+                    name,
+                )
+            })
+            .collect::<Vec<_>>();
+        let results = match record_intents(context, &intents) {
+            Ok(()) => {
+                run_concurrent(
+                    group_posts,
+                    creator.concurrency(),
+                    context,
+                    (&mut progress, done, &phase),
+                    |name| {
+                        let creator = Arc::clone(&creator);
+                        async move { creator.create_group(&name).await }
+                    },
+                )
+                .await
+            }
+            Err(reason) => refuse_all(&group_posts, &reason),
+        };
+        let mut landed: Vec<usize> = Vec::new();
+        for (index, outcome) in report.groups.iter_mut().enumerate() {
+            if outcome.status != RowStatus::Planned {
+                continue;
+            }
+            match results.get(&index) {
+                Some(Ok(created)) => {
+                    outcome.id = Some(created.id);
+                    outcome.created = true;
+                    outcome.status = RowStatus::Ok;
+                    landed.push(index);
+                }
+                Some(Err(error)) => {
+                    outcome.status = RowStatus::Failed;
+                    outcome.reason = format!("{error:#}");
+                }
+                None => {
+                    outcome.status = RowStatus::Failed;
+                    outcome.reason = unanswered(context);
+                }
+            }
+        }
+        record_ownership(
+            context,
+            plan,
+            &mut report.groups,
+            &landed,
+            CreatedKind::Group,
+        );
+    }
+    done += plan.groups.len() as u64;
+    // 2. Logos: same shape, after the groups (a logo never depends on a group, but the
+    //    order keeps the report and the progress reading the way the plan does).
+    let mut logo_posts: Vec<(usize, (String, String))> = Vec::new();
+    for (index, logo) in plan.logos.iter().enumerate() {
+        match logo.existing_id {
+            Some(id) => report.logos.push(CreatedOutcome {
+                kind: CreatedKind::Logo,
+                name: logo.name.clone(),
+                key: logo.key.clone(),
+                id: Some(id),
+                created: false,
+                group: String::new(),
+                status: RowStatus::Ok,
+                // The row keeps the logo's path, not a token in its query or userinfo; the
+                // exact URL lives in the ownership intent, which matches on it.
+                reason: format!(
+                    "logo URL {:?} already exists as id {id}",
+                    crate::redact::url_without_secrets(&logo.url)
+                ),
+            }),
+            None => {
+                report.logos.push(CreatedOutcome {
+                    kind: CreatedKind::Logo,
+                    name: logo.name.clone(),
+                    key: logo.key.clone(),
+                    id: None,
+                    created: false,
+                    group: String::new(),
+                    status: RowStatus::Planned,
+                    reason: String::new(),
+                });
+                logo_posts.push((index, (logo.name.clone(), logo.url.clone())));
+            }
+        }
+    }
+    if !logo_posts.is_empty() {
+        let phase = format!("creating {} logo(s)", logo_posts.len());
+        progress.set(done, &phase);
+        let intents = logo_posts
+            .iter()
+            .map(|(index, (name, url))| CreateIntent {
+                url: Some(url.clone()),
+                ..intent(
+                    plan,
+                    context,
+                    CreatedKind::Logo,
+                    &plan.logos[*index].key,
+                    name,
+                )
+            })
+            .collect::<Vec<_>>();
+        let results = match record_intents(context, &intents) {
+            Ok(()) => {
+                run_concurrent(
+                    logo_posts,
+                    creator.concurrency(),
+                    context,
+                    (&mut progress, done, &phase),
+                    |(name, url)| {
+                        let creator = Arc::clone(&creator);
+                        async move { creator.create_logo(&name, &url).await }
+                    },
+                )
+                .await
+            }
+            Err(reason) => refuse_all(&logo_posts, &reason),
+        };
+        let mut landed: Vec<usize> = Vec::new();
+        for (index, outcome) in report.logos.iter_mut().enumerate() {
+            if outcome.status != RowStatus::Planned {
+                continue;
+            }
+            match results.get(&index) {
+                Some(Ok(created)) => {
+                    outcome.id = Some(created.id);
+                    outcome.created = true;
+                    outcome.status = RowStatus::Ok;
+                    landed.push(index);
+                }
+                Some(Err(error)) => {
+                    outcome.status = RowStatus::Failed;
+                    outcome.reason = format!("{error:#}");
+                }
+                None => {
+                    outcome.status = RowStatus::Failed;
+                    outcome.reason = unanswered(context);
+                }
+            }
+        }
+        record_ownership(context, plan, &mut report.logos, &landed, CreatedKind::Logo);
+    }
+    done += plan.logos.len() as u64;
+    // 3. Channels: refs resolve against the two stages above; a failed dependency refuses
+    //    the channel with the reason instead of posting it.
+    let mut channel_posts: Vec<(usize, ChannelCreate)> = Vec::new();
+    for (index, channel) in plan.channels.iter().enumerate() {
+        let mut refused: Option<String> = None;
+        let group_id = match channel.group {
+            None => None,
+            Some(PlannedGroupRef::Existing(id)) => Some(id),
+            Some(PlannedGroupRef::New(group)) => match report.groups.get(group) {
+                Some(outcome) if outcome.status == RowStatus::Ok => outcome.id,
+                Some(outcome) => {
+                    refused = Some(format!(
+                        "group {:?} could not be created ({}), so the channel is refused",
+                        outcome.name,
+                        if outcome.reason.is_empty() {
+                            "it was not attempted".to_string()
+                        } else {
+                            outcome.reason.clone()
+                        },
+                    ));
+                    None
+                }
+                None => {
+                    refused = Some(
+                        "its group is not in this plan, so the channel is refused".to_string(),
+                    );
+                    None
+                }
+            },
+        };
+        let logo_id = match channel.logo {
+            None => None,
+            Some(PlannedLogoRef::Existing(id)) => Some(id),
+            Some(PlannedLogoRef::New(logo)) => match report.logos.get(logo) {
+                Some(outcome) if outcome.status == RowStatus::Ok => outcome.id,
+                Some(outcome) => {
+                    refused = Some(format!(
+                        "logo {:?} could not be created ({}), so the channel is refused",
+                        outcome.name,
+                        if outcome.reason.is_empty() {
+                            "it was not attempted".to_string()
+                        } else {
+                            outcome.reason.clone()
+                        },
+                    ));
+                    None
+                }
+                None => {
+                    refused =
+                        Some("its logo is not in this plan, so the channel is refused".to_string());
+                    None
+                }
+            },
+        };
+        match refused {
+            Some(reason) => report.channels.push(CreatedOutcome {
+                kind: CreatedKind::Channel,
+                name: channel.name.clone(),
+                key: channel.key.clone(),
+                id: None,
+                created: false,
+                group: channel.group_name.clone(),
+                status: RowStatus::Failed,
+                reason,
+            }),
+            None => {
+                let payload = ChannelCreate {
+                    name: channel.name.clone(),
+                    channel_number: channel.number,
+                    channel_group_id: group_id,
+                    tvg_id: channel.tvg_id.clone(),
+                    tvc_guide_stationid: None,
+                    epg_data_id: channel.epg_data_id,
+                    logo_id,
+                    streams: if channel.streams.is_empty() {
+                        None
+                    } else {
+                        Some(channel.streams.clone())
+                    },
+                    channel_profile_ids: channel.profile_ids.clone(),
+                };
+                report.channels.push(CreatedOutcome {
+                    kind: CreatedKind::Channel,
+                    name: channel.name.clone(),
+                    key: channel.key.clone(),
+                    id: None,
+                    created: false,
+                    group: channel.group_name.clone(),
+                    status: RowStatus::Planned,
+                    reason: String::new(),
+                });
+                channel_posts.push((index, payload));
+            }
+        }
+    }
+    if !channel_posts.is_empty() {
+        let phase = format!("creating {} channel(s)", channel_posts.len());
+        progress.set(done, &phase);
+        // The channel intents carry the resolved group id and the number as posted: what a
+        // reconcile matches a landed channel by.
+        let intents = channel_posts
+            .iter()
+            .map(|(index, payload)| CreateIntent {
+                group_id: payload.channel_group_id,
+                number: payload.channel_number,
+                ..intent(
+                    plan,
+                    context,
+                    CreatedKind::Channel,
+                    &plan.channels[*index].key,
+                    &payload.name,
+                )
+            })
+            .collect::<Vec<_>>();
+        let results = match record_intents(context, &intents) {
+            Ok(()) => {
+                run_concurrent(
+                    channel_posts,
+                    creator.concurrency(),
+                    context,
+                    (&mut progress, done, &phase),
+                    |payload| {
+                        let creator = Arc::clone(&creator);
+                        async move { creator.create_channel(&payload).await }
+                    },
+                )
+                .await
+            }
+            Err(reason) => refuse_all(&channel_posts, &reason),
+        };
+        let mut landed: Vec<usize> = Vec::new();
+        for (index, outcome) in report.channels.iter_mut().enumerate() {
+            if outcome.status != RowStatus::Planned {
+                continue;
+            }
+            match results.get(&index) {
+                Some(Ok(created)) => {
+                    outcome.id = Some(created.id);
+                    outcome.created = true;
+                    outcome.status = RowStatus::Ok;
+                    landed.push(index);
+                }
+                Some(Err(error)) => {
+                    outcome.status = RowStatus::Failed;
+                    outcome.reason = format!("{error:#}");
+                }
+                None => {
+                    outcome.status = RowStatus::Failed;
+                    outcome.reason = unanswered(context);
+                }
+            }
+        }
+        record_ownership(
+            context,
+            plan,
+            &mut report.channels,
+            &landed,
+            CreatedKind::Channel,
+        );
+    }
+
+    let ok = report
+        .groups
+        .iter()
+        .chain(report.logos.iter())
+        .chain(report.channels.iter())
+        .filter(|outcome| outcome.status == RowStatus::Ok)
+        .count();
+    let failed = report
+        .groups
+        .iter()
+        .chain(report.logos.iter())
+        .chain(report.channels.iter())
+        .filter(|outcome| outcome.status == RowStatus::Failed)
+        .count();
+    progress.finish(format!("{ok} created or reused, {failed} failed"));
+    CreateReport {
+        groups: report.groups,
+        logos: report.logos,
+        channels: report.channels,
+        ok,
+        failed,
+    }
+}
+
+/// The intent for one POST of `kind` under `key`: what a reconcile matches the landed
+/// object by. The caller fills the kind-specific columns (a logo's URL, a channel's group
+/// and number).
+fn intent(
+    plan: &CreatePlan,
+    context: &JobContext,
+    kind: CreatedKind,
+    key: &str,
+    name: &str,
+) -> CreateIntent {
+    CreateIntent {
+        kind: kind.label().to_string(),
+        app: plan.app.clone(),
+        owner_key: key.to_string(),
+        name: name.to_string(),
+        group_id: None,
+        number: None,
+        url: None,
+        after_id: plan.id_floor.get(kind),
+        run_id: context.run_id().unwrap_or(0),
+    }
+}
+
+/// Record a stage's intents before its POSTs go out, when the run has a store.
+///
+/// A store that cannot record them refuses the whole stage (the `Err` is the reason): a
+/// POST whose answer might be lost with no intent behind it is exactly the orphan the
+/// intent exists to prevent. A run without a store (unit tests, a caller outside the
+/// runner) has no ownership to keep and posts as is.
+fn record_intents(
+    context: &JobContext,
+    intents: &[CreateIntent],
+) -> std::result::Result<(), String> {
+    let (Some(store), Some(_)) = (context.store(), context.run_id()) else {
+        return Ok(());
+    };
+    store
+        .record_intents(intents)
+        .map_err(|error| format!("not sent: the create intent could not be recorded ({error:#})"))
+}
+
+/// Every post of a stage refused with one reason, in [`run_concurrent`]'s answer shape.
+fn refuse_all<T, R>(posts: &[(usize, T)], reason: &str) -> HashMap<usize, Result<R>> {
+    posts
+        .iter()
+        .map(|(index, _)| (*index, Err(anyhow::anyhow!("{reason}"))))
+        .collect()
+}
+
+/// Why a post has no answer: the run was cancelled before it went out, or its task ended
+/// without one (a panic in the creator).
+fn unanswered(context: &JobContext) -> String {
+    if context.is_cancelled() {
+        CANCELLED.to_string()
+    } else {
+        "failed: the request ended without an answer".to_string()
+    }
+}
+
+/// Record one successful create in the ownership table, when the run has a store.
+///
+/// Settles the intent recorded before the POST (ownership row in, intent out, one
+/// transaction). A run without a store (unit tests, and any caller outside the runner) skips
+/// this: the row is still recorded by [`create_run_rows`], only the cross-run dedup entry is
+/// missing. A store write that fails does NOT lose the object, and does not fail its row
+/// either: the object exists, so the row stays `ok` with its id (an undo of this run can still
+/// hide it once the ownership is in, and the rest of the plan may build on it) and the reason
+/// says it is not tracked yet. The intent stays, and the next [`load_owned`] adopts the
+/// object under this run.
+///
+/// A stage's creates (`landed`, positions in `outcomes`) settle together, in ONE store
+/// transaction (E-S1b): a 20k-channel create would otherwise pay a commit per object. A
+/// failed batch leaves every intent in place and marks each row, as one failure did.
+fn record_ownership(
+    context: &JobContext,
+    plan: &CreatePlan,
+    outcomes: &mut [CreatedOutcome],
+    landed: &[usize],
+    kind: CreatedKind,
+) {
+    let (Some(store), Some(run_id)) = (context.store(), context.run_id()) else {
+        return;
+    };
+    let settled: Vec<(i64, String)> = landed
+        .iter()
+        .filter_map(|&position| {
+            let outcome = outcomes.get(position)?;
+            outcome.id.map(|id| (id, outcome.key.clone()))
+        })
+        .collect();
+    if settled.is_empty() {
+        return;
+    }
+    if let Err(error) = store.settle_intents(kind.label(), &plan.app, run_id, &settled) {
+        for &position in landed {
+            let Some(outcome) = outcomes.get_mut(position) else {
+                continue;
+            };
+            let Some(id) = outcome.id else {
+                continue;
+            };
+            outcome.reason = format!(
+                "created as id {id} but ownership could not be recorded yet ({error:#}); the \
+                 next run adopts it"
+            );
+        }
+    }
+}
+
+/// What [`load_owned`] found and did before a create plan.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct OwnedState {
+    /// Owner key -> live channel id, the `owned` argument of [`plan_creates`].
+    pub channels: HashMap<String, i64>,
+    /// Objects an interrupted run posted but never recorded, adopted now:
+    /// `(kind, id, owner_key)`.
+    pub recovered: Vec<(String, i64, String)>,
+    /// Intents whose object never landed, dropped: `(kind, owner_key)`.
+    pub dropped: Vec<(String, String)>,
+    /// Owned ids gone from Dispatcharr (deleted by a user, confirmed by a 404), forgotten:
+    /// `(kind, id, key)`. On a dry run, the ones that WOULD be forgotten.
+    pub forgotten: Vec<(String, i64, String)>,
+    /// Owned ids missing from the listing that were NOT forgotten, because their own `GET`
+    /// still answered or failed: `(kind, id, key)`.
+    pub kept: Vec<(String, i64, String)>,
+}
+
+/// Reconcile and list what `app` owns, against a freshly loaded world, before planning
+/// creates.
+///
+/// 1. **Intents** an earlier run left unsettled (it died between a POST and its ownership
+///    row) are looked up in the world by exactly what was posted: a group by exact name, a
+///    logo by exact URL, a channel by exact name + group + number (when one was posted),
+///    always among objects with an id ABOVE the plan's floor (Dispatcharr's ids only grow,
+///    so a user's pre-existing same-named object can never match) and that nobody owns. The
+///    newest match is adopted under the intent's key and run; no match means the POST never
+///    landed, and the intent is dropped. An intent of a run that is still going is left to
+///    that run, and a kind the world did not load is left for a later reconcile.
+/// 2. **Stale ownership**: an owned id missing from a loaded slice MAY have been deleted
+///    upstream, or the listing was short (a proxy, a page cut, a scoped read). Only a 404
+///    from the object's own `GET` proves it gone; then its row is forgotten and its key can be
+///    created again. An id that answers, or whose check fails, stays owned. Hidden objects
+///    are still in the world, so undo's hide keeps ownership. Forgetting the ownership of a
+///    whole install would make the next create duplicate it, so the reconcile refuses when a
+///    loaded slice is empty while this app owns objects of that kind, or when more than
+///    [`max_forget`] ids of one kind are missing at once.
+/// 3. The owned channels' keys, for [`plan_creates`].
+///
+/// A `dry_run` (every preview) writes nothing: what would be adopted, dropped or forgotten is
+/// reported in the state and as a progress line, and an adopted channel's key is still
+/// returned so the preview plans exactly what the apply would.
+///
+/// A context without a store owns nothing and changes nothing.
+pub async fn load_owned(
+    context: &JobContext,
+    world: &World,
+    app: &str,
+    dry_run: bool,
+) -> Result<OwnedState> {
+    load_owned_bounded(context, world, app, dry_run, true).await
+}
+
+/// [`load_owned`] without the [`max_forget`] bound, for the operator's explicit
+/// `crosstalk ownership forget-deleted` after a deliberate mass deletion in Dispatcharr.
+///
+/// Every missing id is still confirmed by its own `GET`, and only a 404 forgets it; an empty
+/// listing is still refused. What goes is only the per-run cap, which exists to stop a run
+/// against the wrong instance (or a short listing nobody noticed) from forgetting a whole
+/// install in one go: here the operator is saying that the deletions were theirs. Never a
+/// dry run: a preview has nothing to force.
+pub async fn load_owned_unbounded(
+    context: &JobContext,
+    world: &World,
+    app: &str,
+) -> Result<OwnedState> {
+    load_owned_bounded(context, world, app, false, false).await
+}
+
+async fn load_owned_bounded(
+    context: &JobContext,
+    world: &World,
+    app: &str,
+    dry_run: bool,
+    bounded: bool,
+) -> Result<OwnedState> {
+    let mut state = OwnedState::default();
+    let Some(store) = context.store() else {
+        return Ok(state);
+    };
+    // Adopted by this (dry) reconcile, so two intents never claim the same object.
+    let mut adopted_now: HashSet<(String, i64)> = HashSet::new();
+    let loaded = |kind: &str| match kind {
+        "group" => world.has(WorldKind::Groups),
+        "logo" => world.has(WorldKind::Logos),
+        "channel" => world.has(WorldKind::Channels),
+        _ => false,
+    };
+    // What an intent is matched by, indexed once (E-S5): a crash in the middle of a big
+    // create leaves thousands of intents, and a walk over the world per intent is
+    // quadratic. The filters below are unchanged; only the walk is narrowed.
+    let mut groups_named: HashMap<&str, Vec<i64>> = HashMap::new();
+    for group in &world.groups {
+        groups_named
+            .entry(group.name.as_str())
+            .or_default()
+            .push(group.id);
+    }
+    let mut logos_at: HashMap<&str, Vec<i64>> = HashMap::new();
+    for logo in &world.logos {
+        logos_at.entry(logo.url.as_str()).or_default().push(logo.id);
+    }
+    let mut channels_named: HashMap<&str, Vec<&crate::dispatcharr::Channel>> = HashMap::new();
+    for channel in &world.channels {
+        channels_named
+            .entry(channel.name.as_str())
+            .or_default()
+            .push(channel);
+    }
+    for intent in store.pending_intents(app)? {
+        if !loaded(&intent.kind) {
+            continue;
+        }
+        if Some(intent.run_id) != context.run_id() {
+            let running = store
+                .run(intent.run_id)?
+                .is_some_and(|run| run.status.is_running());
+            if running {
+                continue;
+            }
+        }
+        let mut candidates: Vec<i64> = match intent.kind.as_str() {
+            "group" => groups_named
+                .get(intent.name.as_str())
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|id| *id > intent.after_id)
+                .collect(),
+            "logo" => intent
+                .url
+                .as_deref()
+                .and_then(|url| logos_at.get(url))
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|id| *id > intent.after_id)
+                .collect(),
+            _ => channels_named
+                .get(intent.name.as_str())
+                .into_iter()
+                .flatten()
+                .filter(|channel| {
+                    channel.id > intent.after_id
+                        && channel.name == intent.name
+                        && channel.channel_group_id == intent.group_id
+                        && intent.number.is_none_or(|number| {
+                            channel_number_of(channel).map(number_key) == Some(number_key(number))
+                        })
+                })
+                .map(|channel| channel.id)
+                .collect(),
+        };
+        candidates.sort_unstable_by(|a, b| b.cmp(a));
+        let mut adopted = None;
+        for id in candidates {
+            if adopted_now.contains(&(intent.kind.clone(), id)) {
+                continue;
+            }
+            if !store.is_owned(&intent.kind, id)? {
+                adopted = Some(id);
+                break;
+            }
+        }
+        match adopted {
+            Some(id) => {
+                if dry_run {
+                    // Nothing is recorded, so the owned-keys walk below will not see it:
+                    // hand the key to the plan here.
+                    if intent.kind == "channel" {
+                        state.channels.insert(intent.owner_key.clone(), id);
+                    }
+                } else {
+                    store.settle_intent(&intent.kind, id, app, &intent.owner_key, intent.run_id)?;
+                }
+                adopted_now.insert((intent.kind.clone(), id));
+                state.recovered.push((intent.kind, id, intent.owner_key));
+            }
+            None => {
+                if !dry_run {
+                    store.drop_intent(&intent.kind, app, &intent.owner_key)?;
+                }
+                state.dropped.push((intent.kind, intent.owner_key));
+            }
+        }
+    }
+    // Id sets, so the live check is one lookup per owned object rather than a walk over
+    // the world's listing (E-S5).
+    let live_groups: HashSet<i64> = world.groups.iter().map(|group| group.id).collect();
+    let live_logos: HashSet<i64> = world.logos.iter().map(|logo| logo.id).collect();
+    let live_channels: HashSet<i64> = world.channels.iter().map(|channel| channel.id).collect();
+    let live = |kind: &str, id: i64| match kind {
+        "group" => live_groups.contains(&id),
+        "logo" => live_logos.contains(&id),
+        _ => live_channels.contains(&id),
+    };
+    let slice_len = |kind: &str| match kind {
+        "group" => world.groups.len(),
+        "logo" => world.logos.len(),
+        _ => world.channels.len(),
+    };
+    let mut owned_per_kind: BTreeMap<String, usize> = BTreeMap::new();
+    let mut missing: Vec<(String, i64, String)> = Vec::new();
+    for (kind, id, key) in store.owned_keys(app)? {
+        *owned_per_kind.entry(kind.clone()).or_default() += 1;
+        if loaded(&kind) && !live(&kind, id) {
+            missing.push((kind, id, key));
+            continue;
+        }
+        if kind == "channel" {
+            state.channels.insert(key, id);
+        }
+    }
+
+    // A short or empty read must never look like a mass deletion.
+    for (kind, owned) in &owned_per_kind {
+        if !loaded(kind) {
+            continue;
+        }
+        let gone = missing.iter().filter(|(k, _, _)| k == kind).count();
+        if gone == 0 {
+            continue;
+        }
+        if slice_len(kind) == 0 {
+            bail!(
+                "Dispatcharr listed no {kind}s, yet {app} owns {owned} of them: refusing to \
+                 treat an empty listing as a deletion (the next create would duplicate them). \
+                 Check that Dispatcharr answers the {kind} listing, then run again."
+            );
+        }
+        let cap = max_forget(*owned);
+        if bounded && gone > cap {
+            bail!(
+                "{gone} of the {owned} {kind}s {app} owns are missing from Dispatcharr's \
+                 listing, more than the {cap} a run may forget at once: refusing, because a \
+                 short listing (or a run against the wrong Dispatcharr) would otherwise make \
+                 the next create duplicate them. Check the listing (a proxy, a scope or a page \
+                 limit) and run again. If you deleted them in Dispatcharr on purpose, run \
+                 `crosstalk ownership forget-deleted --app {app}` once: it confirms each one \
+                 with its own GET and forgets only those that answer 404."
+            );
+        }
+    }
+
+    // Each missing id is confirmed by its own GET: only a 404 proves it gone.
+    let client = context.dispatcharr().ok();
+    for (kind, id, key) in missing {
+        let exists = match (client, kind.as_str()) {
+            (Some(client), "group") => client.group_exists(id).await,
+            (Some(client), "logo") => client.logo_exists(id).await,
+            (Some(client), _) => client.channel_exists(id).await,
+            (None, _) => Err(anyhow::anyhow!("this run has no Dispatcharr session")),
+        };
+        match exists {
+            Ok(false) => {
+                if !dry_run {
+                    store.forget_ownership(&kind, id)?;
+                }
+                state.forgotten.push((kind, id, key));
+            }
+            // Still there (the listing was short) or unknown: keep it owned, so the plan
+            // never creates a second copy of an object that may well exist.
+            Ok(true) | Err(_) => {
+                if kind == "channel" {
+                    state.channels.insert(key.clone(), id);
+                }
+                state.kept.push((kind, id, key));
+            }
+        }
+    }
+    if let Some(line) = state.describe(dry_run) {
+        context.progress(&crate::jobs::ProgressEvent::new(
+            context.action().unwrap_or("ownership"),
+            0,
+            0,
+            line,
+        ));
+    }
+    Ok(state)
+}
+
+/// How many owned ids of one kind a reconcile may forget at once: 25, or 5% of what the app
+/// owns of that kind when that is more.
+pub fn max_forget(owned: usize) -> usize {
+    (owned / 20).max(25)
+}
+
+impl OwnedState {
+    /// One line saying what the reconcile did, or would do on a dry run; `None` when it had
+    /// nothing to do.
+    pub fn describe(&self, dry_run: bool) -> Option<String> {
+        if self.recovered.is_empty()
+            && self.dropped.is_empty()
+            && self.forgotten.is_empty()
+            && self.kept.is_empty()
+        {
+            return None;
+        }
+        let verb = if dry_run { "would " } else { "" };
+        let mut line = format!(
+            "ownership reconcile: {verb}adopt {}, {verb}drop {} intent(s), {verb}forget {} \
+             deleted object(s)",
+            self.recovered.len(),
+            self.dropped.len(),
+            self.forgotten.len(),
+        );
+        if !self.kept.is_empty() {
+            line.push_str(&format!(
+                "; {} owned object(s) missing from the listing are kept (they still answer, \
+                 or the check failed)",
+                self.kept.len()
+            ));
+        }
+        Some(line)
+    }
+}
+
+/// Post every item concurrently, bounded by `concurrency`, checking cancellation between
+/// requests and publishing progress as answers land.
+///
+/// The answer maps each item's index to its result. An index with NO answer was never
+/// started: the run was cancelled before its POST went out, and the caller fails it as
+/// cancelled. In-flight requests finish (cancelling a POST mid-flight cannot un-send it),
+/// which is what "cancel mid-create records landed rows" means. `progress` is the run's
+/// reporter, the count done before this stage and the stage's phase line.
+async fn run_concurrent<T, F, Fut, R>(
+    items: Vec<(usize, T)>,
+    concurrency: usize,
+    context: &JobContext,
+    progress: (&mut crate::jobs::PacedProgress, u64, &str),
+    f: F,
+) -> HashMap<usize, R>
+where
+    T: Send + 'static,
+    F: Fn(T) -> Fut,
+    Fut: std::future::Future<Output = R> + Send + 'static,
+    R: Send + 'static,
+{
+    use tokio::sync::Semaphore;
+    use tokio::task::JoinSet;
+    let (progress, done, phase) = progress;
+    let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
+    let mut set: JoinSet<(usize, R)> = JoinSet::new();
+    let mut results = HashMap::with_capacity(items.len());
+    // A task that panicked has no answer: its index stays out, like a never-started one.
+    let collect = |finished: std::result::Result<(usize, R), tokio::task::JoinError>,
+                   results: &mut HashMap<usize, R>| {
+        if let Ok((index, result)) = finished {
+            results.insert(index, result);
+        }
+    };
+    for (index, item) in items {
+        if context.is_cancelled() {
+            break;
+        }
+        // Drain finished answers while waiting for a permit, so progress moves with them.
+        let permit = loop {
+            if let Ok(permit) = semaphore.clone().try_acquire_owned() {
+                break Some(permit);
+            }
+            tokio::select! {
+                permit = semaphore.clone().acquire_owned() => break permit.ok(),
+                Some(finished) = set.join_next() => {
+                    collect(finished, &mut results);
+                    progress.set(done + results.len() as u64, phase);
+                }
+            }
+        };
+        let Some(permit) = permit else {
+            break;
+        };
+        // The future is built BEFORE spawning so `f` itself needs no `'static` bound: only
+        // the future it returns is sent to the task.
+        let future = f(item);
+        set.spawn(async move {
+            let _permit = permit;
+            (index, future.await)
+        });
+    }
+    while let Some(finished) = set.join_next().await {
+        collect(finished, &mut results);
+        progress.set(done + results.len() as u64, phase);
+    }
+    results
+}
+
+/// The create plan's rows in the store's shape, for `JobContext::record_rows`.
+///
+/// One row per created object — groups and logos first, then channels, then the plan's
+/// skips — with `subject` saying what the id belongs to, `field` always `created`, `before`
+/// empty and `after` the new id. The owner key rides along, so the next run's plan finds
+/// the object it already made. A preview (`applied` is `None`) records every planned object
+/// as `planned`; an apply records each outcome's own status.
+///
+/// Ordinals start at 0: a caller that also records edit rows uses
+/// [`create_and_edit_run_rows`], which shifts those after these, because `run_id` +
+/// `ordinal` is the row's key (an overlap silently replaces the create rows).
+pub fn create_run_rows(plan: &CreatePlan, applied: Option<&CreateReport>) -> Vec<RunRow> {
+    let mut rows = Vec::new();
+    let mut ordinal = 0i64;
+    // Groups, then logos, then channels: the dependency order the apply ran in.
+    for (index, group) in plan.groups.iter().enumerate() {
+        let outcome = applied.and_then(|report| report.groups.get(index));
+        rows.push(RunRow {
+            ordinal,
+            subject: Subject::Group,
+            channel_id: outcome.and_then(|outcome| outcome.id).unwrap_or(0),
+            channel_name: group.name.clone(),
+            channel_group: group.name.clone(),
+            channel_number: None,
+            method: "create".to_string(),
+            field: "created".to_string(),
+            before_value: None,
+            after_value: outcome
+                .and_then(|outcome| outcome.id)
+                .map(|id| id.to_string()),
+            status: outcome
+                .map(|outcome| outcome.status.as_str())
+                .unwrap_or(RowStatus::Planned.as_str())
+                .to_string(),
+            reason: outcome
+                .map(|outcome| outcome.reason.clone())
+                .unwrap_or_default(),
+            owner_key: Some(group.key.clone()),
+            ..RunRow::default()
+        });
+        ordinal += 1;
+    }
+    for (index, logo) in plan.logos.iter().enumerate() {
+        let outcome = applied.and_then(|report| report.logos.get(index));
+        rows.push(RunRow {
+            ordinal,
+            subject: Subject::Logo,
+            channel_id: outcome.and_then(|outcome| outcome.id).unwrap_or(0),
+            channel_name: logo.name.clone(),
+            channel_group: String::new(),
+            channel_number: None,
+            method: "create".to_string(),
+            field: "created".to_string(),
+            before_value: None,
+            after_value: outcome
+                .and_then(|outcome| outcome.id)
+                .map(|id| id.to_string()),
+            status: outcome
+                .map(|outcome| outcome.status.as_str())
+                .unwrap_or(RowStatus::Planned.as_str())
+                .to_string(),
+            reason: outcome
+                .map(|outcome| outcome.reason.clone())
+                .unwrap_or_default(),
+            owner_key: Some(logo.key.clone()),
+            ..RunRow::default()
+        });
+        ordinal += 1;
+    }
+    for (index, channel) in plan.channels.iter().enumerate() {
+        let outcome = applied.and_then(|report| report.channels.get(index));
+        rows.push(RunRow {
+            ordinal,
+            subject: Subject::Channel,
+            channel_id: outcome.and_then(|outcome| outcome.id).unwrap_or(0),
+            channel_name: channel.name.clone(),
+            channel_group: channel.group_name.clone(),
+            channel_number: channel.number,
+            method: "create".to_string(),
+            field: "created".to_string(),
+            before_value: None,
+            after_value: outcome
+                .and_then(|outcome| outcome.id)
+                .map(|id| id.to_string()),
+            status: outcome
+                .map(|outcome| outcome.status.as_str())
+                .unwrap_or(RowStatus::Planned.as_str())
+                .to_string(),
+            reason: outcome
+                .map(|outcome| outcome.reason.clone())
+                .unwrap_or_default(),
+            owner_key: Some(channel.key.clone()),
+            ..RunRow::default()
+        });
+        ordinal += 1;
+    }
+    for skip in &plan.skipped {
+        rows.push(RunRow {
+            ordinal,
+            subject: skip.kind.subject(),
+            channel_id: 0,
+            channel_name: skip.name.clone(),
+            channel_group: String::new(),
+            channel_number: None,
+            method: "create".to_string(),
+            field: skip.kind.label().to_string(),
+            status: "skipped".to_string(),
+            reason: skip.reason.clone(),
+            owner_key: Some(skip.key.clone()),
+            ..RunRow::default()
+        });
+        ordinal += 1;
+    }
+    rows
+}
+
+/// A create stage's rows followed by the edit plan's rows, as one run's rows.
+///
+/// The creates ran first, so their rows come first; the edit rows are shifted past them so
+/// no two rows share `run_id` + `ordinal` (the store's key, written with `INSERT OR
+/// REPLACE`: an overlap would drop the `created` rows the undo lists and ownership reads).
+pub fn create_and_edit_run_rows(
+    create_plan: &CreatePlan,
+    created: Option<&CreateReport>,
+    plan: &Plan,
+    applied: Option<&ApplyReport>,
+) -> Vec<RunRow> {
+    let mut rows = create_run_rows(create_plan, created);
+    let base = rows.len() as i64;
+    rows.extend(run_rows(plan, applied).into_iter().map(|mut row| {
+        row.ordinal += base;
+        row
+    }));
+    rows
+}
+
+/// Write the create plan (or what applying it did) as a CSV report.
+///
+/// The same [`COLUMNS`] as [`write_ops_report`]: one row per created object with the new id
+/// as `after`, then the plan's skips. `field` is always `created` for a created object.
+pub fn write_create_report(
+    context: &JobContext,
+    spec: &ReportSpec<'_>,
+    plan: &CreatePlan,
+    applied: Option<&CreateReport>,
+) -> Result<PathBuf> {
+    let exports_dir = context.exports_dir();
+    let planned = plan.planned_creates();
+    let report = Report::new(&exports_dir, spec.app, spec.stem, spec.title)
+        .channels_processed(plan.channels.len())
+        .result("Selection", &plan.description)
+        .result("Creates planned", planned)
+        .result(
+            "Creates written",
+            match applied {
+                Some(report) => report.created().to_string(),
+                None => "none, this was a preview".to_string(),
+            },
+        )
+        .result("Skipped", plan.skipped.len());
+    let report = spec
+        .notes
+        .iter()
+        .fold(report, |report, (label, value)| report.result(label, value));
+
+    report.write(
+        context.config(),
+        spec.schema,
+        spec.values,
+        &COLUMNS,
+        |writer| {
+            // (id, name, number, group, field, before, after, status, reason), owned: the
+            // ids only exist after an apply, the names always do.
+            let mut outcome_rows: Vec<CreateCsvRow> = Vec::new();
+            // Each section zips the plan with the report's outcomes in order; a missing
+            // outcome (a report from an older build) reads as not yet attempted.
+            let groups: Vec<Option<&CreatedOutcome>> = match applied {
+                Some(report) => report.groups.iter().map(Some).collect(),
+                None => vec![None; plan.groups.len()],
+            };
+            for (group, outcome) in plan.groups.iter().zip(groups.iter()) {
+                let (id, status, reason) = outcome_cells(outcome);
+                outcome_rows.push((
+                    id.clone(),
+                    group.name.clone(),
+                    None,
+                    group.name.clone(),
+                    "created".to_string(),
+                    String::new(),
+                    id.clone(),
+                    status,
+                    reason,
+                ));
+            }
+            let logos: Vec<Option<&CreatedOutcome>> = match applied {
+                Some(report) => report.logos.iter().map(Some).collect(),
+                None => vec![None; plan.logos.len()],
+            };
+            for (logo, outcome) in plan.logos.iter().zip(logos.iter()) {
+                let (id, status, reason) = outcome_cells(outcome);
+                outcome_rows.push((
+                    id.clone(),
+                    logo.name.clone(),
+                    None,
+                    String::new(),
+                    "created".to_string(),
+                    String::new(),
+                    id.clone(),
+                    status,
+                    reason,
+                ));
+            }
+            let channels: Vec<Option<&CreatedOutcome>> = match applied {
+                Some(report) => report.channels.iter().map(Some).collect(),
+                None => vec![None; plan.channels.len()],
+            };
+            for (channel, outcome) in plan.channels.iter().zip(channels.iter()) {
+                let (id, status, reason) = outcome_cells(outcome);
+                outcome_rows.push((
+                    id.clone(),
+                    channel.name.clone(),
+                    channel.number,
+                    channel.group_name.clone(),
+                    "created".to_string(),
+                    String::new(),
+                    id.clone(),
+                    status,
+                    reason,
+                ));
+            }
+            for (id, name, number, group, field, before, after, status, reason) in &outcome_rows {
+                writer.write_record([
+                    id.clone(),
+                    csv_report::safe_cell(name),
+                    number_cell(*number),
+                    csv_report::safe_cell(group),
+                    field.clone(),
+                    csv_report::safe_cell(before),
+                    csv_report::safe_cell(after),
+                    status.clone(),
+                    csv_report::safe_cell(reason),
+                ])?;
+            }
+            for skip in &plan.skipped {
+                writer.write_record([
+                    "0".to_string(),
+                    csv_report::safe_cell(&skip.name),
+                    String::new(),
+                    String::new(),
+                    skip.kind.label().to_string(),
+                    String::new(),
+                    String::new(),
+                    "skipped".to_string(),
+                    csv_report::safe_cell(&skip.reason),
+                ])?;
+            }
+            Ok(())
+        },
+    )
+}
+
+/// One create row for the CSV: (id, name, number, group, field, before, after, status,
+/// reason). All owned strings: the ids only exist after an apply, the names always do.
+type CreateCsvRow = (
+    String,
+    String,
+    Option<f64>,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
+
+/// One outcome's CSV cells: the id (empty before it exists), the status and the reason.
+fn outcome_cells(outcome: &Option<&CreatedOutcome>) -> (String, String, String) {
+    match outcome {
+        Some(outcome) => (
+            outcome.id.map(|id| id.to_string()).unwrap_or_default(),
+            outcome.status.as_str().to_string(),
+            outcome.reason.clone(),
+        ),
+        None => (
+            String::new(),
+            RowStatus::Planned.as_str().to_string(),
+            String::new(),
+        ),
+    }
+}
+
 /// Compile an EPG-name pattern, refusing the Python-only syntax with an explanation.
 ///
 /// The plugin calls `re.compile(pattern)` with no flags and `.search(epg_name)`, so the
@@ -1447,42 +4136,11 @@ pub fn compile_pattern(pattern: &str) -> Result<Regex> {
     })
 }
 
-/// Fill a [`RenameKind::Template`].
-///
-/// One pass, so a channel literally named `{group}` is not substituted twice. Unknown
-/// `{…}` tokens are copied through unchanged.
-fn render_template(template: &str, values: &Placeholders) -> String {
-    let mut out = String::with_capacity(template.len());
-    let mut rest = template;
-    while let Some(open) = rest.find('{') {
-        out.push_str(&rest[..open]);
-        let Some(close) = rest[open..].find('}') else {
-            out.push_str(&rest[open..]);
-            return out;
-        };
-        let token = &rest[open..open + close + 1];
-        match token {
-            "{name}" => out.push_str(&values.name),
-            "{group}" => out.push_str(&values.group),
-            "{number}" => out.push_str(&values.number),
-            "{epg}" => out.push_str(&values.epg),
-            "{id}" => out.push_str(&values.id),
-            other => out.push_str(other),
-        }
-        rest = &rest[open + close + 1..];
-    }
-    out.push_str(rest);
-    out
-}
-
-/// What a template can substitute.
-struct Placeholders {
-    name: String,
-    group: String,
-    number: String,
-    epg: String,
-    id: String,
-}
+/// What a per-channel template substitutes: the shared engine's
+/// [`crate::naming::ChannelValues`], kept here under its old name so the call
+/// sites read unchanged. The rendering itself moved to
+/// [`crate::naming::render_channel`] (byte-identical output).
+type Placeholders = crate::naming::ChannelValues;
 
 /// A channel's mutable state while its operations are evaluated.
 struct Working {
@@ -1491,6 +4149,8 @@ struct Working {
     epg: Option<i64>,
     hidden: bool,
     streams: Vec<i64>,
+    number: Option<f64>,
+    logo: Option<i64>,
 }
 
 impl Working {
@@ -1501,6 +4161,8 @@ impl Working {
             epg: channel.current_epg_id(),
             hidden: channel.hidden_from_output,
             streams: channel.streams.clone(),
+            number: channel_number_of(channel),
+            logo: channel.logo_id,
         }
     }
 }
@@ -1659,6 +4321,14 @@ fn apply_op(
                 (Field::Streams, SetValue::Streams(ids)) => {
                     plan_streams(
                         channel, group, kind, ids, lookups, current, planned, skipped,
+                    );
+                }
+                (Field::Number, SetValue::Number(number)) => {
+                    plan_number(channel, group, kind, *number, current, planned, skipped);
+                }
+                (Field::Logo, SetValue::Logo(logo)) => {
+                    plan_logo(
+                        channel, group, kind, *logo, lookups, current, planned, skipped,
                     );
                 }
                 // `require_world` refuses a value that does not fit its field before a plan
@@ -1857,6 +4527,79 @@ fn plan_hidden(
     current.hidden = hidden;
 }
 
+/// Plan a channel number, from a per-channel value.
+///
+/// Dispatcharr stores the number as a float; the comparison is exact, because `5` and `5.5`
+/// are different numbers and the API echoes back what it was given. A channel already on the
+/// number is a no-op skip, like every other field.
+fn plan_number(
+    channel: &Channel,
+    group: &str,
+    kind: OpKind,
+    number: Option<f64>,
+    current: &mut Working,
+    planned: &mut Vec<Change>,
+    skipped: &mut Vec<Skip>,
+) {
+    if current.number == number {
+        let reason = match number {
+            Some(number) => format!("the channel already has number {number}"),
+            None => "the channel already has no number".to_string(),
+        };
+        skipped.push(Skip::of(channel, group, reason).with_op(kind, Field::Number));
+        return;
+    }
+    record(
+        planned,
+        Change::planned(
+            channel,
+            group,
+            kind,
+            Field::Number,
+            Value::Number(current.number),
+            Value::Number(number),
+        ),
+    );
+    current.number = number;
+}
+
+/// Plan a logo, from a per-channel value: an id, or `None` to clear it.
+///
+/// The names are cosmetic (a world loaded without the logos slice plans and applies the same
+/// change, it just prints the id), exactly like stream lists.
+#[allow(clippy::too_many_arguments)]
+fn plan_logo(
+    channel: &Channel,
+    group: &str,
+    kind: OpKind,
+    logo: Option<i64>,
+    lookups: &Lookups<'_>,
+    current: &mut Working,
+    planned: &mut Vec<Change>,
+    skipped: &mut Vec<Skip>,
+) {
+    if current.logo == logo {
+        let reason = match logo {
+            Some(_) => "the channel already has this logo".to_string(),
+            None => "the channel already has no logo".to_string(),
+        };
+        skipped.push(Skip::of(channel, group, reason).with_op(kind, Field::Logo));
+        return;
+    }
+    record(
+        planned,
+        Change::planned(
+            channel,
+            group,
+            kind,
+            Field::Logo,
+            Value::Logo(logo_values(lookups, current.logo)),
+            Value::Logo(logo_values(lookups, logo)),
+        ),
+    );
+    current.logo = logo;
+}
+
 /// Plan the guide: [`Op::ClearEpg`] is a `None` target, a per-channel value may assign one.
 #[allow(clippy::too_many_arguments)]
 fn plan_epg(
@@ -1964,6 +4707,31 @@ fn display_streams(list: &[ListedStream]) -> String {
     text
 }
 
+/// Parse a `channel_number` wire value back into a number, for a restore.
+///
+/// `none` (and an empty string) is the CLEARED number: a channel with no number is a real
+/// value a restore may have to put back, which is not the same as "no value was recorded".
+/// `None` is a value that parses as neither, which the caller skips and reports.
+pub fn parse_number_wire(wire: &str) -> Option<Option<f64>> {
+    let wire = wire.trim();
+    if wire.is_empty() || wire.eq_ignore_ascii_case("none") {
+        return Some(None);
+    }
+    wire.parse::<f64>().ok().map(Some)
+}
+
+/// Parse a `logo_id` wire value back into a logo id, for a restore.
+///
+/// `none` (and an empty string) is the CLEARED logo, like [`parse_number_wire`]; `None` is
+/// unparseable.
+pub fn parse_logo_wire(wire: &str) -> Option<Option<i64>> {
+    let wire = wire.trim();
+    if wire.is_empty() || wire.eq_ignore_ascii_case("none") {
+        return Some(None);
+    }
+    wire.parse::<i64>().ok().map(Some)
+}
+
 /// Parse a `streams` wire value back into ids, for a restore.
 ///
 /// `none` (and an empty string) is the EMPTY list: a channel with no streams is a real value a
@@ -2008,19 +4776,21 @@ fn record(planned: &mut Vec<Change>, change: Change) {
     }
 }
 
-/// Guide entries and streams by id, for the per-channel lookups of one plan.
+/// Guide entries, streams and logos by id, for the per-channel lookups of one plan.
 ///
-/// Both are optional detail rather than state: a guide name is printed in the report, and a
-/// stream name in a stream list. A world loaded without one of those slices plans and applies
-/// the same changes, it just prints the id instead of the name.
+/// All three are optional detail rather than state: a guide name is printed in the report,
+/// a stream name in a stream list, a logo name in a logo change. A world loaded without one
+/// of those slices plans and applies the same changes, it just prints the id instead of the
+/// name.
 struct Lookups<'a> {
     entries: HashMap<i64, &'a EpgEntry>,
     streams: HashMap<i64, &'a Stream>,
+    logos: HashMap<i64, &'a Logo>,
 }
 
 impl<'a> Lookups<'a> {
-    /// Index the world's guide entries, and its streams when the plan needs them.
-    fn of(world: &'a World, with_streams: bool) -> Self {
+    /// Index the world's guide entries, and its streams and logos when the plan needs them.
+    fn of(world: &'a World, with_streams: bool, with_logos: bool) -> Self {
         Self {
             entries: world
                 .entries
@@ -2033,6 +4803,11 @@ impl<'a> Lookups<'a> {
                     .iter()
                     .map(|stream| (stream.id, stream))
                     .collect()
+            } else {
+                HashMap::new()
+            },
+            logos: if with_logos {
+                world.logos.iter().map(|logo| (logo.id, logo)).collect()
             } else {
                 HashMap::new()
             },
@@ -2057,6 +4832,29 @@ impl<'a> Lookups<'a> {
 /// The group value for a group id, name included so the report needs no world.
 fn group_values(world: &World, group: Option<i64>) -> Option<(i64, String)> {
     group.map(|id| (id, world.group_name(Some(id))))
+}
+
+/// The logo value for a logo id, name included so the report needs no world.
+fn logo_values(lookups: &Lookups<'_>, logo: Option<i64>) -> Option<(i64, String)> {
+    let id = logo?;
+    let name = lookups
+        .logos
+        .get(&id)
+        .map(|logo| logo.name.clone())
+        .unwrap_or_else(|| format!("Logo {id}"));
+    Some((id, name))
+}
+
+/// The channel number as an f64, for the working state a number plan compares against.
+///
+/// Dispatcharr answers the number as a JSON number or, on some builds, a string; anything
+/// else (including null) is no number.
+fn channel_number_of(channel: &Channel) -> Option<f64> {
+    match channel.channel_number.as_ref()? {
+        serde_json::Value::Number(number) => number.as_f64(),
+        serde_json::Value::String(text) => text.trim().parse().ok(),
+        _ => None,
+    }
 }
 
 /// The EPG entry value for an entry id, name included for the same reason.
@@ -2327,6 +5125,13 @@ fn narrow<'a>(
 /// The lookup is an EXACT match, like the plugin's `ChannelProfile.objects.get(name=pname)`:
 /// `sports` does not find `Sports`. (The scope's own `profiles` filter IS case-insensitive,
 /// like the plugin's scope filter at 1724-1727; the two actions genuinely differ here.)
+///
+/// That inference WRITES MORE than the plugin: a channel with no membership row at all (a
+/// profile created "start empty", or channels added after it) is not in the plugin's set but
+/// is here, because REST cannot tell "disabled" from "no row". So a profile whose derived
+/// hidden set is larger than both [`HIDDEN_GUARD_FLOOR`] and its own enabled list is refused:
+/// that shape is a sparse profile, where clearing "everything not enabled" would unassign
+/// nearly every guide in the install.
 fn hidden_channels(world: &World, profiles: &str) -> Result<HashSet<i64>> {
     let mut hidden: HashSet<i64> = HashSet::new();
     for name in parse_tokens(profiles) {
@@ -2336,16 +5141,32 @@ fn hidden_channels(world: &World, profiles: &str) -> Result<HashSet<i64>> {
             .find(|profile| profile.name == name)
             .with_context(|| format!("Channel profile '{name}' not found"))?;
         let enabled: HashSet<i64> = profile.channels.iter().copied().collect();
-        hidden.extend(
-            world
-                .channels
-                .iter()
-                .map(|channel| channel.id)
-                .filter(|id| !enabled.contains(id)),
-        );
+        let disabled: Vec<i64> = world
+            .channels
+            .iter()
+            .map(|channel| channel.id)
+            .filter(|id| !enabled.contains(id))
+            .collect();
+        if disabled.len() > HIDDEN_GUARD_FLOOR.max(enabled.len()) {
+            bail!(
+                "Channel profile '{name}' enables {} channel(s) and leaves {} not enabled: \
+                 refusing to clear the guides of all of them. Dispatcharr's REST API lists only \
+                 a profile's ENABLED channels, so a channel with no membership row (a profile \
+                 created empty, or channels added after it) looks the same as one disabled on \
+                 purpose. Clear these guides from the Dispatcharr UI, or use a profile that \
+                 enables most channels and disables a few.",
+                enabled.len(),
+                disabled.len()
+            );
+        }
+        hidden.extend(disabled);
     }
     Ok(hidden)
 }
+
+/// The most not-enabled channels `clear_hidden` accepts from a profile that enables fewer than
+/// that, before it reads the profile as sparse rather than curated (see [`hidden_channels`]).
+const HIDDEN_GUARD_FLOOR: usize = 25;
 
 /// Mark rows with an outcome.
 fn mark(changes: &mut [Change], rows: &[usize], status: RowStatus, reason: &str) {
@@ -2517,6 +5338,49 @@ mod tests {
         // CNN has a guide, PPV 1 and Local do not.
         assert_eq!(plan.changes.len(), 1);
         assert_eq!(plan.changes[0].channel_id, 2);
+    }
+
+    #[test]
+    fn a_sparse_profile_refuses_clear_hidden() {
+        // B4: REST lists only a profile's enabled channels, so a profile created empty (or
+        // a short listing) would make "not enabled" mean nearly every channel. A profile
+        // that leaves more channels out than max(25, enabled) is refused.
+        let world = World {
+            channels: (1..=100)
+                .map(|id| channel(id, &format!("Channel {id}"), None, Some(1000 + id)))
+                .collect(),
+            profiles: vec![
+                ChannelProfile {
+                    id: 2,
+                    name: "Favorites".to_string(),
+                    channels: vec![1, 2, 3],
+                },
+                ChannelProfile {
+                    id: 3,
+                    name: "Curated".to_string(),
+                    channels: (1..=80).collect(),
+                },
+            ],
+            ..World::default()
+        };
+        let error = plan_ops(
+            &world,
+            &Selection::hidden_in("Favorites", &scope()),
+            &[Op::ClearEpg],
+        )
+        .expect_err("refused");
+        let message = format!("{error:#}");
+        assert!(message.contains("lists only"), "{message}");
+        assert!(message.contains("leaves 97 not enabled"), "{message}");
+
+        // A curated profile (most enabled, 20 disabled) still plans.
+        let plan = plan_ops(
+            &world,
+            &Selection::hidden_in("Curated", &scope()),
+            &[Op::ClearEpg],
+        )
+        .expect("plans");
+        assert_eq!(plan.changes.len(), 20);
     }
 
     #[test]
@@ -2817,11 +5681,46 @@ mod tests {
     }
 
     #[test]
+    fn a_suffix_check_is_case_insensitive_and_bracket_aware() {
+        // Step 8 (migration list): the shared rule is `tags::has_trailing`, not the
+        // plugin's exact `ends_with`. `CNN [badepg]` (case) and `CNN (BadEPG)` (brackets)
+        // already count as tagged — a Janitor-parity change for those variants (oracle
+        // diff, not a gate). The append itself stays verbatim.
+        let mut tagged = world();
+        tagged.channels[0].name = "CNN [badepg]".to_string();
+        tagged.channels[2].name = "CNN (BadEPG)".to_string();
+        let plan = plan_ops(
+            &tagged,
+            &Selection::default(),
+            &[Op::Rename {
+                kind: RenameKind::Suffix(" [BadEPG]".to_string()),
+            }],
+        )
+        .expect("plans");
+        for id in [1, 3] {
+            assert!(
+                plan.skipped
+                    .iter()
+                    .any(|skip| skip.channel_id == id && skip.reason.contains("already ends with")),
+                "channel {id} is skipped as tagged: {:#?}",
+                plan.skipped
+            );
+        }
+        assert!(
+            plan.changes.iter().all(|change| change.field != Field::Name
+                || (change.channel_id != 1 && change.channel_id != 3)),
+            "{:#?}",
+            plan.changes
+        );
+    }
+
+    #[test]
     fn a_coupled_suffix_and_clear_skips_an_already_tagged_channel_entirely() {
         // `add_bad_epg_suffix` with `remove_epg_with_suffix` (2508-2514): a channel that
         // already carries the suffix is skipped ENTIRELY, keeping its guide.
         let options = PlanOptions {
             suffix_present_skips_rest: true,
+            ..PlanOptions::default()
         };
         let plan = plan_with_options(
             &world(),
@@ -2906,6 +5805,7 @@ mod tests {
         // after the move already planned, and neither change survives.
         let options = PlanOptions {
             suffix_present_skips_rest: true,
+            ..PlanOptions::default()
         };
         let plan = plan_with_options(
             &world(),
@@ -2931,6 +5831,69 @@ mod tests {
                 .any(|skip| skip.reason.contains("already tagged")),
             "{:#?}",
             plan.skipped
+        );
+    }
+
+    #[test]
+    fn collisions_are_opt_in_and_global() {
+        let ops = [Op::Rename {
+            kind: RenameKind::Template("Same".to_string()),
+        }];
+        let selection = Selection {
+            channel_ids: Some(vec![1, 3]),
+            ..Selection::default()
+        };
+        // Default: no collision strategy, both renames planned verbatim (guide
+        // parity: `tag_missing` never opts in).
+        let plain = plan_ops(&world(), &selection, &ops).expect("plans");
+        assert_eq!(plain.changes.len(), 2);
+        assert!(plain
+            .changes
+            .iter()
+            .all(|change| change.after == Value::Name("Same".to_string())));
+        // Opt-in numeric: different groups (Sports vs PPV Live) collide too, because
+        // Dispatcharr's outputs list channels flat.
+        let options = PlanOptions {
+            collision: Some(crate::naming::CollisionStrategy::Numeric),
+            collision_sep: " ".to_string(),
+            ..PlanOptions::default()
+        };
+        let plan = plan_with_options(&world(), &selection, &ops, &options).expect("plans");
+        let mut afters: Vec<String> = plan
+            .changes
+            .iter()
+            .map(|change| change.after.display())
+            .collect();
+        afters.sort();
+        assert_eq!(afters, vec!["Same (2)".to_string(), "Same (3)".to_string()]);
+        // Same group as well: channels 1 and 2 both land on "Same".
+        let selection = Selection {
+            channel_ids: Some(vec![1, 2]),
+            ..Selection::default()
+        };
+        let plan = plan_with_options(&world(), &selection, &ops, &options).expect("plans");
+        let mut afters: Vec<String> = plan
+            .changes
+            .iter()
+            .map(|change| change.after.display())
+            .collect();
+        afters.sort();
+        // Both deferred the unique pass (two claimants), so id order goes numeric.
+        assert_eq!(afters, vec!["Same (2)".to_string(), "Same (3)".to_string()]);
+        // Skip reports the loser instead of renaming it.
+        let options = PlanOptions {
+            collision: Some(crate::naming::CollisionStrategy::Skip),
+            ..PlanOptions::default()
+        };
+        let plan = plan_with_options(&world(), &selection, &ops, &options).expect("plans");
+        // Both rows claimed one name, so both deferred and both report a collision.
+        assert!(plan.changes.is_empty(), "{:#?}", plan.changes);
+        assert_eq!(
+            plan.skipped
+                .iter()
+                .filter(|skip| skip.reason.contains("collision"))
+                .count(),
+            2
         );
     }
 
@@ -3390,7 +6353,7 @@ mod tests {
     #[test]
     fn an_unknown_field_label_is_refused() {
         let error = serde_json::from_value::<Op>(serde_json::json!({
-            "op": "set", "field": "logo_id", "values": {}
+            "op": "set", "field": "tvg_id", "values": {}
         }))
         .expect_err("rejects");
         assert!(
@@ -3590,6 +6553,29 @@ mod tests {
         }
     }
 
+    /// Serve `world`'s channels as the live listing [`apply`] re-reads before writing.
+    async fn serve_channels(server: &MockServer, world: &World) {
+        Mock::given(method("GET"))
+            .and(path("/api/channels/channels/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::to_value(&world.channels).expect("channels")),
+            )
+            .mount(server)
+            .await;
+    }
+
+    /// How many write requests (anything but a GET) the server received.
+    async fn writes(server: &MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|request| request.method.as_str() != "GET")
+            .count()
+    }
+
     #[tokio::test]
     async fn applying_batches_one_request_per_endpoint() {
         let server = MockServer::start().await;
@@ -3657,6 +6643,7 @@ mod tests {
         .expect("plans");
         assert_eq!(plan.changes.len(), 7);
 
+        serve_channels(&server, &world()).await;
         let report = apply(&client, &plan, &context, "guide.tag_missing_apply").await;
         assert!(report.all_ok(), "{:#?}", report.changes);
         assert_eq!(report.ok, 7);
@@ -3715,6 +6702,7 @@ mod tests {
         )
         .expect("plans");
 
+        serve_channels(&server, &world()).await;
         let report = apply(&client, &plan, &context, "guide.tag_missing_apply").await;
         assert!(!report.all_ok());
         assert_eq!(report.failed, 1);
@@ -3731,6 +6719,364 @@ mod tests {
             .iter()
             .filter(|change| change.field != Field::Membership(2))
             .all(|change| change.status == RowStatus::Ok));
+    }
+
+    #[tokio::test]
+    async fn a_later_failing_epg_chunk_keeps_the_landed_rows_ok() {
+        // Phase 3 review: `batch-set-epg` posts 500 rows per chunk and stops at the first
+        // failure. The rows of the chunks that landed are in effect upstream, so they must
+        // be `ok` (undo re-checks them); only the rows from the failing chunk on fail.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/channels/channels/batch-set-epg/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"success": true, "channels_updated": 500})),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/channels/channels/batch-set-epg/"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let world = World {
+            channels: (1..=600)
+                .map(|id| channel(id, &format!("Channel {id}"), None, Some(1000 + id)))
+                .collect(),
+            ..World::default()
+        };
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        let context = JobContext::for_tests(crate::config::CrosstalkConfig::default());
+        let plan = plan_ops(&world, &Selection::default(), &[Op::ClearEpg]).expect("plans");
+        assert_eq!(plan.changes.len(), 600);
+
+        serve_channels(&server, &world).await;
+        let report = apply(&client, &plan, &context, "guide.clear_groups_apply").await;
+        assert_eq!(report.ok, 500, "{:?}", report.changes.last());
+        assert_eq!(report.failed, 100);
+        for change in &plan.changes[..500].iter().collect::<Vec<_>>() {
+            let written = report
+                .changes
+                .iter()
+                .find(|c| c.channel_id == change.channel_id)
+                .expect("row");
+            assert_eq!(written.status, RowStatus::Ok, "{written:?}");
+        }
+        let failed: Vec<&Change> = report
+            .changes
+            .iter()
+            .filter(|c| c.status == RowStatus::Failed)
+            .collect();
+        assert_eq!(failed.len(), 100);
+        assert!(
+            failed.iter().all(|c| c.reason.contains("chunk 2/2")),
+            "{:?}",
+            failed[0].reason
+        );
+        assert!(failed.iter().all(|c| c.channel_id > 500));
+    }
+
+    /// 501 channels, each with a rename (and on the first one a hide as well, so one channel
+    /// carries two rows of the same `edit/bulk` edit).
+    fn edit_world() -> World {
+        World {
+            channels: (1..=501)
+                .map(|id| channel(id, &format!("Channel {id}"), None, None))
+                .collect(),
+            profiles: vec![ChannelProfile {
+                id: 2,
+                name: "Favorites".to_string(),
+                channels: (1..=501).collect(),
+            }],
+            ..World::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_later_failing_edit_chunk_keeps_the_landed_rows_ok() {
+        // B3: chunk 1 (500 channels) lands, chunk 2 (1 channel) is rejected. The landed
+        // rows are in effect upstream, so they are `ok` and undo sees them.
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/channels/channels/edit/bulk/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"message": "ok", "channels": []})),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/channels/channels/edit/bulk/"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("{\"detail\":\"bad row\"}"))
+            .mount(&server)
+            .await;
+
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        let context = JobContext::for_tests(crate::config::CrosstalkConfig::default());
+        let plan = plan_ops(
+            &edit_world(),
+            &Selection::default(),
+            &[
+                Op::Rename {
+                    kind: RenameKind::Suffix(" [X]".to_string()),
+                },
+                Op::SetHiddenFromOutput { hidden: true },
+            ],
+        )
+        .expect("plans");
+        assert_eq!(plan.changes.len(), 1002);
+
+        serve_channels(&server, &edit_world()).await;
+        let report = apply(&client, &plan, &context, "lineup.names_apply").await;
+        assert_eq!(report.ok, 1000, "{:?}", report.changes.last());
+        assert_eq!(report.failed, 2);
+        let failed: Vec<&Change> = report
+            .changes
+            .iter()
+            .filter(|change| change.status == RowStatus::Failed)
+            .collect();
+        // Both rows of the one channel in the rejected chunk, and only those.
+        assert!(failed.iter().all(|change| change.channel_id == 501));
+        assert!(failed[0].reason.contains("bad row"), "{}", failed[0].reason);
+        // What undo plans from: the ok rows.
+        let undoable: HashSet<i64> = report
+            .changes
+            .iter()
+            .filter(|change| change.status == RowStatus::Ok)
+            .map(|change| change.channel_id)
+            .collect();
+        assert_eq!(undoable.len(), 500);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_edit_chunk_is_retried_one_channel_at_a_time() {
+        // B3: one bad row (400) rejects the whole chunk before anything lands; the chunk is
+        // retried per channel so only the bad one fails.
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/channels/channels/edit/bulk/"))
+            .respond_with(|request: &wiremock::Request| {
+                let edits: Vec<serde_json::Value> =
+                    serde_json::from_slice(&request.body).expect("json");
+                if edits.len() > 1 || edits[0]["id"] == 2 {
+                    return ResponseTemplate::new(400)
+                        .set_body_string("{\"errors\":[{\"channel_id\":2}]}");
+                }
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"message": "ok", "channels": edits}))
+            })
+            .mount(&server)
+            .await;
+
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        let context = JobContext::for_tests(crate::config::CrosstalkConfig::default());
+        let plan = plan_ops(
+            &world(),
+            &Selection {
+                channel_ids: Some(vec![1, 2, 4]),
+                ..Selection::default()
+            },
+            &[Op::Rename {
+                kind: RenameKind::Suffix(" [X]".to_string()),
+            }],
+        )
+        .expect("plans");
+        assert_eq!(plan.changes.len(), 3);
+
+        serve_channels(&server, &world()).await;
+        let report = apply(&client, &plan, &context, "lineup.names_apply").await;
+        assert_eq!(report.ok, 2);
+        assert_eq!(report.failed, 1);
+        let failed = report
+            .changes
+            .iter()
+            .find(|change| change.status == RowStatus::Failed)
+            .expect("one failure");
+        assert_eq!(failed.channel_id, 2);
+        assert!(failed.reason.contains("channel 2"), "{}", failed.reason);
+    }
+
+    #[tokio::test]
+    async fn a_later_failing_membership_chunk_keeps_the_landed_rows_ok() {
+        // B3, memberships: the same per-chunk truth as the edit stage.
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/channels/profiles/2/channels/bulk-update/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"status": "success", "updated": 500, "created": 0}),
+            ))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/channels/profiles/2/channels/bulk-update/"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("{\"detail\":\"nope\"}"))
+            .mount(&server)
+            .await;
+
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        let context = JobContext::for_tests(crate::config::CrosstalkConfig::default());
+        let plan = plan_ops(
+            &edit_world(),
+            &Selection::default(),
+            &[Op::SetMembership {
+                profile_id: 2,
+                enabled: false,
+            }],
+        )
+        .expect("plans");
+        assert_eq!(plan.changes.len(), 501);
+
+        let report = apply(&client, &plan, &context, "lineup.tidy_apply").await;
+        assert_eq!(report.ok, 500);
+        assert_eq!(report.failed, 1);
+        let failed = report
+            .changes
+            .iter()
+            .find(|change| change.status == RowStatus::Failed)
+            .expect("one failure");
+        assert_eq!(failed.channel_id, 501);
+    }
+
+    #[tokio::test]
+    async fn a_cancel_between_edit_chunks_stops_the_rest() {
+        // B3/S3: cancellation is checked between chunks, and an unsent chunk says so.
+        let server = MockServer::start().await;
+        let context = JobContext::for_tests(crate::config::CrosstalkConfig::default());
+        let cancel = context.clone();
+        Mock::given(method("PATCH"))
+            .and(path("/api/channels/channels/edit/bulk/"))
+            .respond_with(move |_: &wiremock::Request| {
+                // The first chunk lands and the operator cancels while it is in flight.
+                cancel.cancel();
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"message": "ok", "channels": []}))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        let plan = plan_ops(
+            &edit_world(),
+            &Selection::default(),
+            &[Op::Rename {
+                kind: RenameKind::Suffix(" [X]".to_string()),
+            }],
+        )
+        .expect("plans");
+        serve_channels(&server, &edit_world()).await;
+        let report = apply(&client, &plan, &context, "lineup.names_apply").await;
+        assert_eq!(report.ok, 500);
+        assert_eq!(report.failed, 1);
+        let failed = report
+            .changes
+            .iter()
+            .find(|change| change.status == RowStatus::Failed)
+            .expect("the unsent row");
+        assert_eq!(failed.reason, CANCELLED);
+    }
+
+    #[tokio::test]
+    async fn a_channel_changed_between_plan_and_apply_is_not_written() {
+        // S5: somebody renamed channel 1 after the plan was made. Writing the planned rename
+        // would revert that edit, so it is not sent; channel 4 still is.
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/channels/channels/edit/bulk/"))
+            .and(body_json(serde_json::json!([
+                {"id": 4, "name": "Télé-Québec [X]"}
+            ])))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"message": "ok", "channels": [{"id": 4}]})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut live = world();
+        live.channels[0].name = "ESPN 2".to_string();
+        serve_channels(&server, &live).await;
+
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        let context = JobContext::for_tests(crate::config::CrosstalkConfig::default());
+        let plan = plan_ops(
+            &world(),
+            &Selection {
+                channel_ids: Some(vec![1, 4]),
+                ..Selection::default()
+            },
+            &[Op::Rename {
+                kind: RenameKind::Suffix(" [X]".to_string()),
+            }],
+        )
+        .expect("plans");
+        assert_eq!(plan.changes.len(), 2);
+
+        let report = apply(&client, &plan, &context, "lineup.names_apply").await;
+        assert_eq!(report.ok, 1);
+        assert_eq!(report.failed, 1);
+        let stale = report
+            .changes
+            .iter()
+            .find(|change| change.channel_id == 1)
+            .expect("channel 1");
+        assert_eq!(stale.status, RowStatus::Failed);
+        assert!(
+            stale.reason.contains("changed since the plan"),
+            "{}",
+            stale.reason
+        );
+        assert!(stale.reason.contains("ESPN 2"), "{}", stale.reason);
+    }
+
+    #[tokio::test]
+    async fn a_failed_listing_before_writing_writes_nothing() {
+        // S5: the re-read is what keeps a stale plan from reverting edits, so without it
+        // nothing is written.
+        let server = MockServer::start().await;
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        let context = JobContext::for_tests(crate::config::CrosstalkConfig::default());
+        let plan = plan_ops(&world(), &Selection::default(), &[Op::ClearEpg]).expect("plans");
+        let report = apply(&client, &plan, &context, "guide.clear_groups_apply").await;
+        assert_eq!(report.ok, 0);
+        assert_eq!(report.failed, plan.changes.len());
+        assert!(report.changes[0].reason.contains("re-reading the channels"));
+        assert_eq!(writes(&server).await, 0);
+    }
+
+    #[tokio::test]
+    async fn an_ignore_token_that_matches_nothing_refuses_the_apply() {
+        // S6: `ignore_groups = "PPV Lve"` (a typo) excludes nothing. A preview says so; an
+        // apply writes nothing rather than reach the channels the operator meant to exclude.
+        let server = MockServer::start().await;
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        let context = JobContext::for_tests(crate::config::CrosstalkConfig::default());
+        let mut scoped = scope();
+        scoped.ignore_groups = "PPV Lve".to_string();
+        let plan =
+            plan_ops(&world(), &Selection::in_scope(&scoped), &[Op::ClearEpg]).expect("plans");
+        assert_eq!(plan.scope_warnings.len(), 1);
+        assert!(
+            plan.scope_warnings[0].contains("'PPV Lve'"),
+            "{:?}",
+            plan.scope_warnings
+        );
+        assert!(!plan.changes.is_empty());
+
+        let report = apply(&client, &plan, &context, "guide.clear_groups_apply").await;
+        assert_eq!(report.ok, 0);
+        assert_eq!(report.failed, plan.changes.len());
+        assert!(report.changes[0].reason.contains("ignore_groups"));
+        assert!(server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -3897,6 +7243,7 @@ mod tests {
         assert_eq!(plan.changes.len(), 2);
 
         let writer = RecordingWriter::new();
+        serve_channels(&server, &stream_world()).await;
         let report =
             apply_with_writer(&client, &plan, &context, "streams.sort_apply", &writer).await;
         assert!(report.all_ok(), "{:#?}", report.changes);
@@ -3904,11 +7251,8 @@ mod tests {
             writer.batches(),
             vec![vec![(1, vec![101, 100]), (3, vec![102, 100])]]
         );
-        // Nothing was sent to the API: the writer owns that decision.
-        assert_eq!(
-            server.received_requests().await.unwrap_or_default().len(),
-            0
-        );
+        // Nothing was written through the API: the writer owns that decision.
+        assert_eq!(writes(&server).await, 0);
     }
 
     #[tokio::test]
@@ -3933,6 +7277,7 @@ mod tests {
             ..RecordingWriter::new()
         };
 
+        serve_channels(&server, &stream_world()).await;
         let report =
             apply_with_writer(&client, &plan, &context, "streams.sort_apply", &writer).await;
         assert_eq!(report.ok, 1);
@@ -3997,6 +7342,7 @@ mod tests {
             ..RecordingWriter::new()
         };
 
+        serve_channels(&server, &stream_world()).await;
         let report =
             apply_with_writer(&client, &plan, &context, "streams.sort_apply", &writer).await;
         assert_eq!(report.ok, 1);
@@ -4042,12 +7388,10 @@ mod tests {
         )
         .expect("plans");
 
+        serve_channels(&server, &stream_world()).await;
         let report = apply(&client, &plan, &context, "streams.sort_apply").await;
         assert!(report.all_ok(), "{:#?}", report.changes);
-        assert_eq!(
-            server.received_requests().await.unwrap_or_default().len(),
-            1
-        );
+        assert_eq!(writes(&server).await, 1);
     }
 
     #[tokio::test]
@@ -4085,6 +7429,7 @@ mod tests {
         .expect("plans");
 
         let writer = RecordingWriter::new();
+        serve_channels(&server, &world()).await;
         let report =
             apply_with_writer(&client, &plan, &context, "guide.restore_apply", &writer).await;
         assert!(report.all_ok(), "{:#?}", report.changes);
@@ -4138,6 +7483,7 @@ mod tests {
             .any(|change| change.field == Field::Group && change.after.wire() == "none"));
 
         let writer = RecordingWriter::new();
+        serve_channels(&server, &world()).await;
         let report =
             apply_with_writer(&client, &plan, &context, "guide.restore_apply", &writer).await;
         assert_eq!(report.ok, 1);
@@ -4163,6 +7509,92 @@ mod tests {
                 .status,
             RowStatus::Ok
         );
+        // And the reason names the way out.
+        assert!(
+            moved.reason.contains("crosstalk-bridge"),
+            "{}",
+            moved.reason
+        );
+    }
+
+    /// A [`GroupClearer`] that records what it was asked and fails the ids it is told to.
+    struct RecordingClearer {
+        asked: std::sync::Mutex<Vec<i64>>,
+        failing: Vec<i64>,
+    }
+
+    #[async_trait::async_trait]
+    impl GroupClearer for RecordingClearer {
+        async fn clear_many(&self, channel_ids: &[i64]) -> Vec<(i64, Result<()>)> {
+            self.asked
+                .lock()
+                .expect("lock")
+                .extend_from_slice(channel_ids);
+            channel_ids
+                .iter()
+                .map(|id| {
+                    let result = if self.failing.contains(id) {
+                        Err(anyhow::anyhow!("not_found: no such channel"))
+                    } else {
+                        Ok(())
+                    };
+                    (*id, result)
+                })
+                .collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_move_to_no_group_goes_through_the_group_clearer_when_there_is_one() {
+        let server = MockServer::start().await;
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        let context = JobContext::for_tests(crate::config::CrosstalkConfig::default());
+        let plan = plan_ops(
+            &world(),
+            &Selection {
+                channel_ids: Some(vec![1, 2]),
+                ..Selection::default()
+            },
+            &[Op::MoveGroup { group_id: None }],
+        )
+        .expect("plans");
+        let grouped: Vec<i64> = plan
+            .changes
+            .iter()
+            .filter(|change| change.field == Field::Group)
+            .map(|change| change.channel_id)
+            .collect();
+        assert!(!grouped.is_empty());
+
+        let clearer = RecordingClearer {
+            asked: std::sync::Mutex::new(Vec::new()),
+            failing: vec![grouped[0]],
+        };
+        let writer = RecordingWriter::new();
+        serve_channels(&server, &world()).await;
+        let report = apply_with_writers(
+            &client,
+            &plan,
+            &context,
+            "guide.restore_apply",
+            &writer,
+            Some(&clearer),
+        )
+        .await;
+        assert_eq!(*clearer.asked.lock().expect("lock"), grouped);
+        for change in &report.changes {
+            if change.channel_id == grouped[0] {
+                assert_eq!(change.status, RowStatus::Failed);
+                assert!(change.reason.contains("not_found"), "{}", change.reason);
+            } else {
+                assert_eq!(change.status, RowStatus::Ok, "{}", change.reason);
+            }
+        }
+        // Nothing went to `edit/bulk`: a null group there fails the whole chunk.
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert!(requests
+            .iter()
+            .all(|request| request.url.path() != "/api/channels/channels/edit/bulk/"));
     }
 
     // ---- rows --------------------------------------------------------------
@@ -4348,5 +7780,1411 @@ mod tests {
             plan.description
         );
         assert!(plan.description.contains("\"US\""), "{}", plan.description);
+    }
+
+    // ---- Field::Number / Field::Logo -------------------------------------------
+
+    fn numbered(id: i64, number: f64, logo: Option<i64>) -> Channel {
+        Channel {
+            id,
+            name: format!("Channel {id}"),
+            channel_number: Some(serde_json::json!(number)),
+            channel_group_id: Some(10),
+            logo_id: logo,
+            ..Channel::default()
+        }
+    }
+
+    fn numbered_world() -> World {
+        World {
+            channels: vec![numbered(1, 5.0, Some(70)), numbered(2, 6.0, None)],
+            groups: vec![crate::dispatcharr::ChannelGroup {
+                id: 10,
+                name: "Sports".to_string(),
+            }],
+            // Logo 70 exists for the name the report prints; 71 does not (the plan still
+            // works, printing the id).
+            logos: vec![crate::dispatcharr::Logo {
+                id: 70,
+                name: "ESPN".to_string(),
+                url: "http://logos/espn.png".to_string(),
+                ..crate::dispatcharr::Logo::default()
+            }],
+            ..World::default()
+        }
+    }
+
+    #[test]
+    fn number_and_logo_set_plan_noop_report_and_restore_round_trip() {
+        let mut values = HashMap::new();
+        values.insert(1, SetValue::Number(Some(7.0)));
+        values.insert(2, SetValue::Number(Some(6.0)));
+        let plan = plan_ops(
+            &numbered_world(),
+            &Selection::default(),
+            &[Op::Set {
+                field: Field::Number,
+                values,
+            }],
+        )
+        .expect("plans");
+        // Channel 2 already has 6: a no-op skip, not a write.
+        assert_eq!(plan.changes.len(), 1);
+        assert_eq!(plan.changes[0].channel_id, 1);
+        assert_eq!(plan.changes[0].field, Field::Number);
+        assert_eq!(
+            plan.changes[0].before,
+            Value::Number(Some(5.0)),
+            "the before value is the world's number"
+        );
+        assert_eq!(plan.changes[0].after, Value::Number(Some(7.0)));
+        assert_eq!(plan.skipped.len(), 1);
+        assert_eq!(plan.skipped[0].channel_id, 2);
+
+        let mut values = HashMap::new();
+        values.insert(1, SetValue::Logo(Some(71)));
+        values.insert(2, SetValue::Logo(None));
+        let plan = plan_ops(
+            &numbered_world(),
+            &Selection::default(),
+            &[Op::Set {
+                field: Field::Logo,
+                values,
+            }],
+        )
+        .expect("plans");
+        assert_eq!(plan.changes.len(), 1);
+        assert_eq!(
+            plan.changes[0].after,
+            Value::Logo(Some((71, "Logo 71".to_string()))),
+            "an unknown logo prints its id"
+        );
+        assert_eq!(plan.skipped.len(), 1, "clearing an empty logo is a no-op");
+
+        // Wire round-trips the way a restore parses them back.
+        assert_eq!(Value::Number(Some(7.0)).wire(), "7");
+        assert_eq!(Value::Number(None).wire(), "none");
+        assert_eq!(Value::Logo(Some((71, "X".to_string()))).wire(), "71");
+        assert_eq!(Value::Logo(None).wire(), "none");
+        assert_eq!(parse_number_wire("7"), Some(Some(7.0)));
+        assert_eq!(parse_number_wire("none"), Some(None));
+        assert_eq!(parse_number_wire("abc"), None);
+        assert_eq!(parse_logo_wire("71"), Some(Some(71)));
+        assert_eq!(parse_logo_wire("none"), Some(None));
+        assert_eq!(parse_logo_wire(""), Some(None));
+        assert_eq!(parse_logo_wire("abc"), None);
+        // Field labels round-trip for the restore reader.
+        assert_eq!(Field::from_label("channel_number"), Some(Field::Number));
+        assert_eq!(Field::from_label("logo_id"), Some(Field::Logo));
+        assert_eq!(Field::Number.label(), "channel_number");
+        assert_eq!(Field::Logo.label(), "logo_id");
+    }
+
+    #[tokio::test]
+    async fn number_and_logo_apply_through_the_bulk_edit() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/channels/channels/edit/bulk/"))
+            .and(body_json(serde_json::json!([
+                {"id": 1, "channel_number": 7.0, "logo_id": 71},
+                {"id": 2, "channel_number": null}
+            ])))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"message": "ok", "channels": [{"id": 1}, {"id": 2}]}),
+            ))
+            .mount(&server)
+            .await;
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        let context = JobContext::for_tests(crate::config::CrosstalkConfig::default());
+        let mut values = HashMap::new();
+        values.insert(1, SetValue::Number(Some(7.0)));
+        values.insert(2, SetValue::Number(None));
+        let mut logos = HashMap::new();
+        logos.insert(1, SetValue::Logo(Some(71)));
+        let plan = plan_ops(
+            &numbered_world(),
+            &Selection::default(),
+            &[
+                Op::Set {
+                    field: Field::Number,
+                    values,
+                },
+                Op::Set {
+                    field: Field::Logo,
+                    values: logos,
+                },
+            ],
+        )
+        .expect("plans");
+        // Two number changes and one logo change fold into one edit row per channel.
+        assert_eq!(plan.changes.len(), 3);
+        serve_channels(&server, &numbered_world()).await;
+        let report = apply(&client, &plan, &context, "test.numbers").await;
+        assert!(report.all_ok(), "{:#?}", report.changes);
+        // A cleared logo sends an explicit null, like a cleared guide.
+        let mut clears = HashMap::new();
+        clears.insert(1, SetValue::Logo(None));
+        let plan = plan_ops(
+            &numbered_world(),
+            &Selection::default(),
+            &[Op::Set {
+                field: Field::Logo,
+                values: clears,
+            }],
+        )
+        .expect("plans");
+        assert_eq!(plan.changes.len(), 1);
+    }
+
+    // ---- Create stage ----------------------------------------------------------
+
+    fn create_world() -> World {
+        World {
+            channels: vec![
+                numbered(1, 5.0, Some(70)),
+                numbered(2, 9.0, None),
+                Channel {
+                    id: 3,
+                    name: "ESPN".to_string(),
+                    channel_group_id: None,
+                    ..Channel::default()
+                },
+            ],
+            groups: vec![crate::dispatcharr::ChannelGroup {
+                id: 10,
+                name: "Sports".to_string(),
+            }],
+            logos: vec![crate::dispatcharr::Logo {
+                id: 70,
+                name: "ESPN".to_string(),
+                url: "http://logos/espn.png".to_string(),
+                ..crate::dispatcharr::Logo::default()
+            }],
+            ..World::default()
+        }
+    }
+
+    fn group_ref(index: usize) -> Option<GroupRef> {
+        Some(GroupRef::Planned(index))
+    }
+
+    /// An in-memory [`ChannelCreator`]: ids count up from `next`, names in `fail` fail.
+    struct FakeCreator {
+        next: std::sync::Mutex<i64>,
+        fail_groups: std::collections::HashSet<String>,
+        created_channels: std::sync::Mutex<Vec<String>>,
+        concurrency: usize,
+    }
+
+    impl FakeCreator {
+        fn new(next: i64) -> Self {
+            Self {
+                next: std::sync::Mutex::new(next),
+                fail_groups: std::collections::HashSet::new(),
+                created_channels: std::sync::Mutex::new(Vec::new()),
+                concurrency: 8,
+            }
+        }
+
+        fn failing_group(name: &str) -> Self {
+            let mut creator = Self::new(100);
+            creator.fail_groups.insert(name.to_string());
+            creator
+        }
+
+        fn id(&self) -> i64 {
+            let mut next = self.next.lock().expect("lock");
+            let id = *next;
+            *next += 1;
+            id
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChannelCreator for FakeCreator {
+        async fn create_group(&self, name: &str) -> Result<ChannelGroup> {
+            if self.fail_groups.contains(name) {
+                anyhow::bail!("group {name:?} failed");
+            }
+            Ok(ChannelGroup {
+                id: self.id(),
+                name: name.to_string(),
+            })
+        }
+
+        async fn create_logo(&self, name: &str, url: &str) -> Result<Logo> {
+            Ok(Logo {
+                id: self.id(),
+                name: name.to_string(),
+                url: url.to_string(),
+                ..crate::dispatcharr::Logo::default()
+            })
+        }
+
+        async fn create_channel(&self, channel: &ChannelCreate) -> Result<Channel> {
+            self.created_channels
+                .lock()
+                .expect("lock")
+                .push(channel.name.clone());
+            Ok(Channel {
+                id: self.id(),
+                name: channel.name.clone(),
+                channel_group_id: channel.channel_group_id,
+                logo_id: channel.logo_id,
+                ..Channel::default()
+            })
+        }
+
+        fn concurrency(&self) -> usize {
+            self.concurrency
+        }
+    }
+
+    fn request(channels: Vec<NewChannel>) -> CreateRequest {
+        CreateRequest {
+            app: "lineup".to_string(),
+            groups: vec![NewGroup {
+                name: "News".to_string(),
+                key: "lineup:file:cat:group".to_string(),
+            }],
+            logos: vec![NewLogo {
+                name: "CNN".to_string(),
+                url: "http://logos/cnn.png".to_string(),
+                key: "lineup:logo:cnn".to_string(),
+            }],
+            channels,
+        }
+    }
+
+    fn cnn(number: Option<f64>) -> NewChannel {
+        NewChannel {
+            name: "CNN".to_string(),
+            number,
+            group: group_ref(0),
+            logo: Some(LogoRef::Planned(0)),
+            streams: vec![11, 12],
+            profile_ids: Some(vec![1]),
+            tvg_id: Some("cnn.us".to_string()),
+            epg_data_id: Some(44),
+            key: "lineup:file:news:cnn".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn creates_plan_dedup_resolve_and_apply_with_ownership() {
+        // The world already has group Sports and logo espn.png: both dedup to existing ids.
+        let mut existing = request(vec![cnn(Some(7.0))]);
+        existing.groups.push(NewGroup {
+            name: "Sports".to_string(),
+            key: "lineup:file:cat:sports".to_string(),
+        });
+        existing.logos.push(NewLogo {
+            name: "ESPN copy".to_string(),
+            url: "http://logos/espn.png".to_string(),
+            key: "lineup:logo:espn".to_string(),
+        });
+        let plan = plan_creates(
+            &create_world(),
+            &HashMap::new(),
+            &existing,
+            &PlanOptions::default(),
+        )
+        .expect("plans");
+        assert_eq!(plan.groups.len(), 2);
+        assert_eq!(plan.groups[0].existing_id, None, "News is new");
+        assert_eq!(
+            plan.groups[1].existing_id,
+            Some(10),
+            "Sports reuses the world's id"
+        );
+        assert_eq!(plan.logos[1].existing_id, Some(70), "logo dedups by URL");
+        assert_eq!(plan.channels.len(), 1);
+        // Refs resolve: the new group is index 0 in the plan, the logo too.
+        assert_eq!(
+            plan.channels[0].group,
+            Some(PlannedGroupRef::New(0)),
+            "a ref to the new group"
+        );
+        assert_eq!(plan.channels[0].logo, Some(PlannedLogoRef::New(0)));
+        assert_eq!(plan.channels[0].group_name, "News");
+
+        let store = crate::store::Store::in_memory().expect("store");
+        let run_id = store
+            .start_run("lineup", "create_apply", false)
+            .expect("start");
+        let context = JobContext::for_tests(crate::config::CrosstalkConfig::default()).for_run(
+            "lineup",
+            "create_apply",
+            run_id,
+            store.clone(),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let creator: std::sync::Arc<dyn ChannelCreator> =
+            std::sync::Arc::new(FakeCreator::new(100));
+        let report = apply_creates(creator, &plan, &context, "lineup.create_apply").await;
+        assert!(report.all_ok(), "{report:#?}");
+        // Groups: News created as 100, Sports reused as 10. Logos: cnn as 101, espn reused
+        // as 70. The channel takes the created group and logo ids.
+        assert_eq!(report.groups[0].id, Some(100));
+        assert!(report.groups[0].created);
+        assert!(!report.groups[1].created);
+        assert_eq!(report.channels[0].id, Some(102));
+        // Ownership: every created object is recorded under the app and its key.
+        assert!(store.is_owned("group", 100).expect("query"));
+        assert!(store.is_owned("logo", 101).expect("query"));
+        assert!(store.is_owned("channel", 102).expect("query"));
+        assert_eq!(
+            store.owner_of("channel", 102).expect("query"),
+            Some((
+                "lineup".to_string(),
+                "lineup:file:news:cnn".to_string(),
+                run_id
+            )),
+        );
+        // Reused objects are NOT adopted: only what this run made is owned.
+        assert!(!store.is_owned("group", 10).expect("query"));
+        // Run rows: one per created object with the new id and the owner key.
+        let rows = create_run_rows(&plan, Some(&report));
+        assert_eq!(rows.len(), 5, "2 groups + 2 logos + 1 channel");
+        let channel_row = rows
+            .iter()
+            .find(|row| row.subject == Subject::Channel)
+            .expect("channel row");
+        assert_eq!(channel_row.after_value.as_deref(), Some("102"));
+        assert_eq!(channel_row.field, "created");
+        assert_eq!(
+            channel_row.owner_key.as_deref(),
+            Some("lineup:file:news:cnn")
+        );
+        store.append_rows(run_id, &rows).expect("append");
+        assert_eq!(store.rows(run_id).expect("rows").len(), 5);
+
+        // Create rows plus edit rows in one run: the edit rows are shifted past the create
+        // rows, so none replaces a `created` row (`run_id` + `ordinal` is the key).
+        let edits = Plan {
+            changes: vec![Change {
+                channel_id: 7,
+                channel_name: "CNN".to_string(),
+                channel_number: None,
+                channel_group: "Test".to_string(),
+                op: OpKind::Set,
+                field: Field::Group,
+                before: Value::Group(Some((1, "Test".to_string()))),
+                after: Value::Group(Some((100, "News".to_string()))),
+                status: RowStatus::Ok,
+                reason: String::new(),
+            }],
+            ..Plan::default()
+        };
+        let both = create_and_edit_run_rows(&plan, Some(&report), &edits, None);
+        assert_eq!(both.len(), 6);
+        let ordinals: std::collections::HashSet<i64> = both.iter().map(|row| row.ordinal).collect();
+        assert_eq!(ordinals.len(), 6, "every row keeps its own ordinal");
+        let other_run = store
+            .start_run("streams", "triage_apply", false)
+            .expect("start");
+        store.append_rows(other_run, &both).expect("append");
+        let stored = store.rows(other_run).expect("rows");
+        assert_eq!(stored.len(), 6);
+        assert_eq!(
+            stored.iter().filter(|row| row.field == "created").count(),
+            5,
+            "the created rows survive the edit rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_group_refuses_its_channels_but_not_its_siblings() {
+        let other = NewChannel {
+            name: "BBC".to_string(),
+            number: None,
+            group: Some(GroupRef::Existing(10)),
+            logo: None,
+            streams: Vec::new(),
+            profile_ids: None,
+            tvg_id: None,
+            epg_data_id: None,
+            key: "lineup:file:news:bbc".to_string(),
+        };
+        let plan = plan_creates(
+            &create_world(),
+            &HashMap::new(),
+            &request(vec![cnn(None), other]),
+            &PlanOptions::default(),
+        )
+        .expect("plans");
+        assert_eq!(plan.channels.len(), 2);
+
+        let context = JobContext::for_tests(crate::config::CrosstalkConfig::default());
+        let creator: std::sync::Arc<dyn ChannelCreator> =
+            std::sync::Arc::new(FakeCreator::failing_group("News"));
+        let report = apply_creates(creator, &plan, &context, "lineup.create_apply").await;
+        assert!(!report.all_ok());
+        assert_eq!(report.failed, 2, "the group and its channel");
+        assert_eq!(report.groups[0].status, RowStatus::Failed);
+        let refused = &report.channels[0];
+        assert_eq!(refused.status, RowStatus::Failed);
+        assert!(
+            refused.reason.contains("News") && refused.reason.contains("could not be created"),
+            "the refusal names the lost group: {}",
+            refused.reason
+        );
+        // The sibling in the existing group still lands.
+        assert_eq!(report.channels[1].status, RowStatus::Ok);
+        assert_eq!(report.channels[1].id, Some(101));
+    }
+
+    #[tokio::test]
+    async fn an_owned_key_is_never_created_twice() {
+        let mut owned = HashMap::new();
+        owned.insert("lineup:file:news:cnn".to_string(), 1);
+        let plan = plan_creates(
+            &create_world(),
+            &owned,
+            &request(vec![cnn(Some(7.0))]),
+            &PlanOptions::default(),
+        )
+        .expect("plans");
+        assert!(
+            plan.channels.is_empty(),
+            "the owned channel is not re-created"
+        );
+        assert_eq!(plan.skipped.len(), 1);
+        assert!(plan.skipped[0]
+            .reason
+            .contains("already created as channel 1"));
+
+        // A cancelled run sends no POSTs and fails every row as cancelled.
+        let plan = plan_creates(
+            &create_world(),
+            &HashMap::new(),
+            &request(vec![cnn(Some(7.0))]),
+            &PlanOptions::default(),
+        )
+        .expect("plans");
+        let context = JobContext::for_tests(crate::config::CrosstalkConfig::default());
+        context.cancel();
+        let creator: std::sync::Arc<dyn ChannelCreator> =
+            std::sync::Arc::new(FakeCreator::new(100));
+        let report = apply_creates(creator, &plan, &context, "lineup.create_apply").await;
+        assert_eq!(report.ok, 0);
+        assert_eq!(
+            report.failed, 3,
+            "the group, the logo and the refused channel"
+        );
+        assert!(
+            report
+                .groups
+                .iter()
+                .all(|outcome| outcome.reason == CANCELLED),
+            "nothing was started: {report:#?}"
+        );
+    }
+
+    /// A creator that cancels the run from inside the first POST: the group lands, the
+    /// stages after it do not start.
+    struct CancelOnGroup {
+        flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        next: std::sync::Mutex<i64>,
+    }
+
+    #[async_trait::async_trait]
+    impl ChannelCreator for CancelOnGroup {
+        async fn create_group(&self, name: &str) -> Result<ChannelGroup> {
+            self.flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(ChannelGroup {
+                id: {
+                    let mut next = self.next.lock().expect("lock");
+                    let id = *next;
+                    *next += 1;
+                    id
+                },
+                name: name.to_string(),
+            })
+        }
+
+        async fn create_logo(&self, name: &str, url: &str) -> Result<Logo> {
+            Ok(Logo {
+                id: 999,
+                name: name.to_string(),
+                url: url.to_string(),
+                ..crate::dispatcharr::Logo::default()
+            })
+        }
+
+        async fn create_channel(&self, channel: &ChannelCreate) -> Result<Channel> {
+            Ok(Channel {
+                id: 998,
+                name: channel.name.clone(),
+                ..Channel::default()
+            })
+        }
+
+        fn concurrency(&self) -> usize {
+            1
+        }
+    }
+
+    #[test]
+    fn number_conflicts_skip_used_numbers_in_edits_and_creates() {
+        // The world holds 5 and 9 in group 10; 9 sits on channel 2.
+        let options = PlanOptions {
+            number_conflicts: true,
+            ..PlanOptions::default()
+        };
+        let mut values = HashMap::new();
+        values.insert(1, SetValue::Number(Some(9.0)));
+        let plan = plan_with_options(
+            &create_world(),
+            &Selection::default(),
+            &[Op::Set {
+                field: Field::Number,
+                values,
+            }],
+            &options,
+        );
+        let plan = plan.expect("plans");
+        assert!(
+            plan.changes.is_empty(),
+            "9 is held by channel 2 in group 10"
+        );
+        assert_eq!(plan.skipped.len(), 1);
+        assert!(plan.skipped[0].reason.contains("already used by channel 2"));
+
+        // Off by default: the same plan writes.
+        let mut values = HashMap::new();
+        values.insert(1, SetValue::Number(Some(9.0)));
+        let plan = plan_ops(
+            &create_world(),
+            &Selection::default(),
+            &[Op::Set {
+                field: Field::Number,
+                values,
+            }],
+        )
+        .expect("plans");
+        assert_eq!(plan.changes.len(), 1);
+
+        // Creates: 9 is taken (whatever the group), 10 in the NEW group is free once, and
+        // clearing never conflicts.
+        let taken = NewChannel {
+            name: "Taken".to_string(),
+            number: Some(9.0),
+            group: Some(GroupRef::Existing(10)),
+            logo: None,
+            streams: Vec::new(),
+            profile_ids: None,
+            tvg_id: None,
+            epg_data_id: None,
+            key: "lineup:k:taken".to_string(),
+        };
+        let mut free = taken.clone();
+        free.name = "Free".to_string();
+        free.key = "lineup:k:free".to_string();
+        free.group = group_ref(0);
+        free.number = Some(10.0);
+        let mut second = free.clone();
+        second.name = "Second".to_string();
+        second.key = "lineup:k:second".to_string();
+        let mut clearing = taken.clone();
+        clearing.name = "Clearing".to_string();
+        clearing.key = "lineup:k:clearing".to_string();
+        clearing.number = None;
+        let plan = plan_creates(
+            &create_world(),
+            &HashMap::new(),
+            &CreateRequest {
+                app: "lineup".to_string(),
+                groups: vec![NewGroup {
+                    name: "News".to_string(),
+                    key: "lineup:k:g".to_string(),
+                }],
+                logos: Vec::new(),
+                channels: vec![taken, free, second, clearing],
+            },
+            &options,
+        )
+        .expect("plans");
+        assert_eq!(
+            plan.channels
+                .iter()
+                .map(|channel| channel.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Free", "Clearing"],
+            "the taken number and the second claim of it are skipped"
+        );
+        assert_eq!(plan.skipped.len(), 2);
+        assert!(plan.skipped[0].reason.contains("already used by channel 2"));
+    }
+
+    #[test]
+    fn collision_strategies_guard_planned_create_names() {
+        // The world already has ESPN (id 3, no group): global scope, like renames.
+        let named = |name: &str, key: &str| NewChannel {
+            name: name.to_string(),
+            number: None,
+            group: None,
+            logo: None,
+            streams: Vec::new(),
+            profile_ids: None,
+            tvg_id: None,
+            epg_data_id: None,
+            key: key.to_string(),
+        };
+        let requested = || CreateRequest {
+            app: "lineup".to_string(),
+            groups: Vec::new(),
+            logos: Vec::new(),
+            channels: vec![named("espn", "k:1"), named("BBC", "k:2")],
+        };
+        let numeric = PlanOptions {
+            collision: Some(crate::naming::CollisionStrategy::Numeric),
+            collision_sep: " ".to_string(),
+            ..PlanOptions::default()
+        };
+        let plan =
+            plan_creates(&create_world(), &HashMap::new(), &requested(), &numeric).expect("plans");
+        // Case-insensitive: "espn" collides with the world's "ESPN" and counts up.
+        assert_eq!(plan.channels[0].name, "espn (2)");
+        assert_eq!(plan.channels[1].name, "BBC");
+
+        let skip = PlanOptions {
+            collision: Some(crate::naming::CollisionStrategy::Skip),
+            collision_sep: " ".to_string(),
+            ..PlanOptions::default()
+        };
+        let plan =
+            plan_creates(&create_world(), &HashMap::new(), &requested(), &skip).expect("plans");
+        assert_eq!(plan.channels.len(), 1);
+        assert_eq!(plan.channels[0].name, "BBC");
+        assert_eq!(plan.skipped.len(), 1);
+        assert!(plan.skipped[0]
+            .reason
+            .contains("collision strategy is skip"));
+
+        // Off by default: the colliding name plans as-is.
+        let plan = plan_creates(
+            &create_world(),
+            &HashMap::new(),
+            &requested(),
+            &PlanOptions::default(),
+        )
+        .expect("plans");
+        assert_eq!(plan.channels.len(), 2);
+    }
+
+    #[test]
+    fn invalid_refs_fail_the_create_plan() {
+        let mut channel = cnn(None);
+        channel.group = Some(GroupRef::Planned(7));
+        let error = plan_creates(
+            &create_world(),
+            &HashMap::new(),
+            &request(vec![channel]),
+            &PlanOptions::default(),
+        )
+        .expect_err("a dangling group ref is a caller bug");
+        assert!(
+            format!("{error:#}").contains("planned group 7"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn next_free_numbers_skips_used_and_counts_up() {
+        // The world holds 5 and 9 (group 10); numbers are global, so every group shares them.
+        assert_eq!(
+            next_free_numbers(&create_world(), 1.0, 4),
+            vec![1.0, 2.0, 3.0, 4.0]
+        );
+        assert_eq!(
+            next_free_numbers(&create_world(), 5.0, 3),
+            vec![6.0, 7.0, 8.0],
+            "5 is held, so counting starts past it"
+        );
+        assert_eq!(
+            next_free_numbers(&create_world(), 8.0, 2),
+            vec![8.0, 10.0],
+            "9 is held in group 10, which an ungrouped create cannot reuse either"
+        );
+        // Fractional starts step by whole numbers, mirroring the endpoint's walk.
+        assert_eq!(next_free_numbers(&create_world(), 4.5, 2), vec![4.5, 5.5]);
+    }
+
+    #[test]
+    fn number_conflicts_are_global_and_a_refused_renumber_keeps_its_number() {
+        let options = PlanOptions {
+            number_conflicts: true,
+            ..PlanOptions::default()
+        };
+        let mut world = create_world();
+        // Channel 3 (ESPN) is ungrouped; 9 is held by channel 2 in group 10.
+        let mut values = HashMap::new();
+        values.insert(3, SetValue::Number(Some(9.0)));
+        let plan = plan_with_options(
+            &world,
+            &Selection::default(),
+            &[Op::Set {
+                field: Field::Number,
+                values,
+            }],
+            &options,
+        )
+        .expect("plans");
+        assert!(plan.changes.is_empty(), "9 is taken in ANOTHER group too");
+        assert!(plan.skipped[0].reason.contains("already used by channel 2"));
+
+        // Channel 1 (5) asks for 9 (refused: held by 2), channel 3 asks for 5. Channel 1
+        // keeps 5 because its own move was refused, so channel 3's claim must lose too.
+        world.channels[2].channel_number = None;
+        let mut values = HashMap::new();
+        values.insert(1, SetValue::Number(Some(9.0)));
+        values.insert(3, SetValue::Number(Some(5.0)));
+        let plan = plan_with_options(
+            &world,
+            &Selection::default(),
+            &[Op::Set {
+                field: Field::Number,
+                values,
+            }],
+            &options,
+        )
+        .expect("plans");
+        assert!(
+            plan.changes.is_empty(),
+            "neither renumber may land: {:?}",
+            plan.changes
+        );
+        assert_eq!(plan.skipped.len(), 2);
+
+        // A swap stays legal: both vacate, both claim the other's old number.
+        let mut values = HashMap::new();
+        values.insert(1, SetValue::Number(Some(9.0)));
+        values.insert(2, SetValue::Number(Some(5.0)));
+        let plan = plan_with_options(
+            &world,
+            &Selection::default(),
+            &[Op::Set {
+                field: Field::Number,
+                values,
+            }],
+            &options,
+        )
+        .expect("plans");
+        assert_eq!(plan.changes.len(), 2, "{:?}", plan.skipped);
+    }
+
+    /// A store-backed context for one run of `app`.
+    fn run_context(store: &crate::store::Store, app: &str) -> (JobContext, i64) {
+        let run_id = store.start_run(app, "create_apply", false).expect("start");
+        let context = JobContext::for_tests(crate::config::CrosstalkConfig::default()).for_run(
+            app,
+            "create_apply",
+            run_id,
+            store.clone(),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        (context, run_id)
+    }
+
+    #[tokio::test]
+    async fn a_recorded_apply_writes_its_rows_before_the_first_write() {
+        // S3: the planned rows are in the store before anything is sent, and every stage's
+        // outcome is recorded as it lands, so a run killed mid-apply leaves a record undo
+        // can use.
+        let store = crate::store::Store::in_memory().expect("store");
+        let (context, run_id) = run_context(&store, "lineup");
+        let server = MockServer::start().await;
+        serve_channels(&server, &world()).await;
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (seen_in, store_in) = (Arc::clone(&seen), store.clone());
+        Mock::given(method("PATCH"))
+            .and(path("/api/channels/channels/edit/bulk/"))
+            .respond_with(move |_: &wiremock::Request| {
+                let rows = store_in.rows(run_id).unwrap_or_default();
+                let planned = rows.iter().filter(|row| row.status == "planned").count();
+                seen_in.store(planned, std::sync::atomic::Ordering::SeqCst);
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"message": "ok", "channels": []}))
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/channels/channels/batch-set-epg/"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        let plan = plan_ops(
+            &world(),
+            &Selection {
+                channel_ids: Some(vec![1, 4]),
+                ..Selection::default()
+            },
+            &[
+                Op::Rename {
+                    kind: RenameKind::Suffix(" [X]".to_string()),
+                },
+                Op::ClearEpg,
+            ],
+        )
+        .expect("plans");
+        assert_eq!(plan.changes.len(), 4);
+
+        let report = apply_recorded(&client, &plan, &context, "lineup.names_apply")
+            .await
+            .expect("records");
+        assert_eq!(report.ok, 2);
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "every row was recorded as planned before the first write"
+        );
+        let rows = store.rows(run_id).expect("rows");
+        assert_eq!(rows.len(), 4);
+        let count = |field: &str, status: &str| {
+            rows.iter()
+                .filter(|row| row.field == field && row.status == status)
+                .count()
+        };
+        assert_eq!(count("name", "ok"), 2);
+        assert_eq!(count("epg_data_id", "failed"), 2);
+    }
+
+    #[tokio::test]
+    async fn a_crash_between_post_and_ownership_is_adopted_not_duplicated() {
+        let store = crate::store::Store::in_memory().expect("store");
+        let world = create_world();
+        let plan = plan_creates(
+            &world,
+            &HashMap::new(),
+            &request(vec![cnn(Some(7.0))]),
+            &PlanOptions::default(),
+        )
+        .expect("plans");
+        assert_eq!(plan.id_floor.channel, 3);
+        // The run posts, then dies before any answer is recorded: its intents remain.
+        let (context, run_id) = run_context(&store, "lineup");
+        let intents = vec![
+            intent(
+                &plan,
+                &context,
+                CreatedKind::Group,
+                "lineup:file:cat:group",
+                "News",
+            ),
+            CreateIntent {
+                group_id: Some(100),
+                number: Some(7.0),
+                ..intent(
+                    &plan,
+                    &context,
+                    CreatedKind::Channel,
+                    "lineup:file:news:cnn",
+                    "CNN",
+                )
+            },
+            intent(&plan, &context, CreatedKind::Logo, "lineup:logo:cnn", "CNN"),
+        ];
+        store.record_intents(&intents).expect("intents");
+        store
+            .finish_run(
+                run_id,
+                crate::store::RunStatus::Failed,
+                None,
+                &serde_json::json!({}),
+                None,
+            )
+            .expect("finish");
+
+        // What landed upstream: group 100 and channel 102 (the logo never did). A user's
+        // own same-named channel 2 predates the plan and must not be adopted.
+        let mut after = world.clone();
+        after.groups.push(ChannelGroup {
+            id: 100,
+            name: "News".to_string(),
+        });
+        after.channels[1].name = "CNN".to_string();
+        after.channels[1].channel_group_id = Some(100);
+        after.channels.push(Channel {
+            id: 102,
+            name: "CNN".to_string(),
+            channel_group_id: Some(100),
+            channel_number: Some(serde_json::json!(7.0)),
+            ..Channel::default()
+        });
+        let (next, _) = run_context(&store, "lineup");
+        // A preview of the reconcile writes nothing, but plans with the adopted key.
+        let preview = load_owned(&next, &after, "lineup", true)
+            .await
+            .expect("previews");
+        assert_eq!(preview.channels.get("lineup:file:news:cnn"), Some(&102));
+        assert_eq!(preview.dropped.len(), 1);
+        assert_eq!(store.pending_intents("lineup").expect("query").len(), 3);
+        assert!(!store.is_owned("channel", 102).expect("query"));
+
+        let owned = load_owned(&next, &after, "lineup", false)
+            .await
+            .expect("reconciles");
+        let mut recovered = owned.recovered.clone();
+        recovered.sort();
+        assert_eq!(
+            recovered,
+            vec![
+                (
+                    "channel".to_string(),
+                    102,
+                    "lineup:file:news:cnn".to_string()
+                ),
+                (
+                    "group".to_string(),
+                    100,
+                    "lineup:file:cat:group".to_string()
+                ),
+            ]
+        );
+        assert_eq!(
+            owned.dropped,
+            vec![("logo".to_string(), "lineup:logo:cnn".to_string())]
+        );
+        assert!(store.pending_intents("lineup").expect("query").is_empty());
+        assert_eq!(owned.channels.get("lineup:file:news:cnn"), Some(&102));
+        // The rerun's plan finds the adopted channel instead of posting a second one.
+        let plan = plan_creates(
+            &after,
+            &owned.channels,
+            &request(vec![cnn(Some(7.0))]),
+            &PlanOptions::default(),
+        )
+        .expect("plans");
+        assert!(plan.channels.is_empty(), "no duplicate: {plan:#?}");
+        assert!(!store.is_owned("channel", 2).expect("query"));
+    }
+
+    /// [`run_context`] with a session on `server`, so a reconcile can confirm a deletion.
+    fn connected_run_context(
+        store: &crate::store::Store,
+        app: &str,
+        server: &MockServer,
+    ) -> (JobContext, i64) {
+        let (context, run_id) = run_context(store, app);
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        (context.with_dispatcharr(client), run_id)
+    }
+
+    #[tokio::test]
+    async fn a_deleted_owned_channel_is_forgotten_and_created_again() {
+        let store = crate::store::Store::in_memory().expect("store");
+        // Nothing mounted: `GET /channels/channels/55/` answers 404, the proof it is gone.
+        let server = MockServer::start().await;
+        let (context, run_id) = connected_run_context(&store, "lineup", &server);
+        store
+            .record_ownership("channel", 55, "lineup", "lineup:file:news:cnn", run_id)
+            .expect("record");
+        // 55 is not in the world: a user deleted it.
+        let preview = load_owned(&context, &create_world(), "lineup", true)
+            .await
+            .expect("previews");
+        assert_eq!(preview.forgotten.len(), 1);
+        assert!(
+            store.is_owned("channel", 55).expect("query"),
+            "a preview forgets nothing"
+        );
+        let owned = load_owned(&context, &create_world(), "lineup", false)
+            .await
+            .expect("loads");
+        assert_eq!(
+            owned.forgotten,
+            vec![(
+                "channel".to_string(),
+                55,
+                "lineup:file:news:cnn".to_string()
+            )]
+        );
+        assert!(owned.channels.is_empty());
+        assert!(!store.is_owned("channel", 55).expect("query"));
+        // A stale id handed straight to the plan does not block the create either.
+        let mut stale = HashMap::new();
+        stale.insert("lineup:file:news:cnn".to_string(), 55);
+        let plan = plan_creates(
+            &create_world(),
+            &stale,
+            &request(vec![cnn(Some(7.0))]),
+            &PlanOptions::default(),
+        )
+        .expect("plans");
+        assert_eq!(plan.channels.len(), 1);
+        // A HIDDEN owned channel (undo hides) is still in the world and stays owned.
+        let mut world = create_world();
+        world.channels[0].hidden_from_output = true;
+        store
+            .record_ownership("channel", 1, "lineup", "lineup:k:one", run_id)
+            .expect("record");
+        let owned = load_owned(&context, &world, "lineup", false)
+            .await
+            .expect("loads");
+        assert_eq!(owned.channels.get("lineup:k:one"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn an_owned_channel_that_still_answers_is_kept_though_the_listing_missed_it() {
+        // B2: a short listing is not a deletion. 55 is missing from the world but its own
+        // GET answers, so it stays owned and its key still dedupes the plan.
+        let store = crate::store::Store::in_memory().expect("store");
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/channels/channels/55/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": 55, "name": "CNN"})),
+            )
+            .mount(&server)
+            .await;
+        let (context, run_id) = connected_run_context(&store, "lineup", &server);
+        store
+            .record_ownership("channel", 55, "lineup", "lineup:file:news:cnn", run_id)
+            .expect("record");
+        let owned = load_owned(&context, &create_world(), "lineup", false)
+            .await
+            .expect("loads");
+        assert!(owned.forgotten.is_empty());
+        assert_eq!(owned.kept.len(), 1);
+        assert_eq!(owned.channels.get("lineup:file:news:cnn"), Some(&55));
+        assert!(store.is_owned("channel", 55).expect("query"));
+    }
+
+    #[tokio::test]
+    async fn an_empty_channel_listing_never_forgets_ownership() {
+        // B2: an empty read while the app owns channels is refused, not a mass forget.
+        let store = crate::store::Store::in_memory().expect("store");
+        let server = MockServer::start().await;
+        let (context, run_id) = connected_run_context(&store, "lineup", &server);
+        for id in 1..=3 {
+            store
+                .record_ownership("channel", id, "lineup", &format!("lineup:k:{id}"), run_id)
+                .expect("record");
+        }
+        let mut world = create_world();
+        world.channels.clear();
+        let error = load_owned(&context, &world, "lineup", false)
+            .await
+            .expect_err("refused");
+        assert!(
+            format!("{error:#}").contains("listed no channels"),
+            "{error:#}"
+        );
+        assert_eq!(store.owned_keys("lineup").expect("query").len(), 3);
+    }
+
+    #[tokio::test]
+    async fn too_many_missing_owned_channels_are_refused() {
+        // B2: more than max(25, 5%) missing at once reads as a short listing.
+        let store = crate::store::Store::in_memory().expect("store");
+        let server = MockServer::start().await;
+        let (context, run_id) = connected_run_context(&store, "lineup", &server);
+        for id in 1_000..1_026 {
+            store
+                .record_ownership("channel", id, "lineup", &format!("lineup:k:{id}"), run_id)
+                .expect("record");
+        }
+        let error = load_owned(&context, &create_world(), "lineup", false)
+            .await
+            .expect_err("refused");
+        let message = format!("{error:#}");
+        assert!(message.contains("26 of the 26"), "{message}");
+        // The way out is named: the refusal would otherwise block every run of the app for
+        // good after a deliberate mass deletion.
+        assert!(
+            message.contains("ownership forget-deleted --app lineup"),
+            "{message}"
+        );
+        assert_eq!(store.owned_keys("lineup").expect("query").len(), 26);
+        assert_eq!(max_forget(100), 25);
+        assert_eq!(max_forget(1_000), 50);
+
+        // The operator's explicit reconcile forgets them, each still confirmed by its own GET
+        // (nothing is mounted, so every one answers 404).
+        let owned = load_owned_unbounded(&context, &create_world(), "lineup")
+            .await
+            .expect("forgets");
+        assert_eq!(owned.forgotten.len(), 26);
+        assert!(owned.kept.is_empty());
+        assert!(store.owned_keys("lineup").expect("query").is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_unbounded_reconcile_still_keeps_what_answers_and_refuses_an_empty_listing() {
+        // The cap is the only thing `forget-deleted` drops: an id whose GET still answers stays
+        // owned, and an empty listing is still no deletion.
+        let store = crate::store::Store::in_memory().expect("store");
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/channels/channels/1000/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": 1000, "name": "Still here"})),
+            )
+            .mount(&server)
+            .await;
+        let (context, run_id) = connected_run_context(&store, "lineup", &server);
+        for id in 1_000..1_030 {
+            store
+                .record_ownership("channel", id, "lineup", &format!("lineup:k:{id}"), run_id)
+                .expect("record");
+        }
+        let owned = load_owned_unbounded(&context, &create_world(), "lineup")
+            .await
+            .expect("reconciles");
+        assert_eq!(owned.forgotten.len(), 29);
+        assert_eq!(owned.kept.len(), 1);
+        assert!(store.is_owned("channel", 1000).expect("query"));
+        assert_eq!(store.owned_keys("lineup").expect("query").len(), 1);
+
+        let mut world = create_world();
+        world.channels.clear();
+        let error = load_owned_unbounded(&context, &world, "lineup")
+            .await
+            .expect_err("refused");
+        assert!(
+            format!("{error:#}").contains("listed no channels"),
+            "{error:#}"
+        );
+        assert!(store.is_owned("channel", 1000).expect("query"));
+    }
+
+    #[tokio::test]
+    async fn an_apply_settles_its_intents_into_ownership() {
+        let store = crate::store::Store::in_memory().expect("store");
+        let (context, _) = run_context(&store, "lineup");
+        let plan = plan_creates(
+            &create_world(),
+            &HashMap::new(),
+            &request(vec![cnn(Some(7.0))]),
+            &PlanOptions::default(),
+        )
+        .expect("plans");
+        let creator: std::sync::Arc<dyn ChannelCreator> =
+            std::sync::Arc::new(FakeCreator::new(100));
+        let report = apply_creates(creator, &plan, &context, "lineup.create_apply").await;
+        assert!(report.all_ok(), "{report:#?}");
+        assert!(store.pending_intents("lineup").expect("query").is_empty());
+        assert_eq!(store.owned_keys("lineup").expect("query").len(), 3);
+    }
+
+    #[test]
+    fn a_create_plan_needs_the_slices_it_dedups_against() {
+        let mut world = create_world();
+        world.loaded = crate::dispatcharr::WorldKinds::ALL.without(WorldKind::Logos);
+        let error = plan_creates(
+            &world,
+            &HashMap::new(),
+            &request(vec![cnn(None)]),
+            &PlanOptions::default(),
+        )
+        .expect_err("logos were not loaded");
+        assert!(
+            format!("{error:#}").to_lowercase().contains("logo"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_rest_creator_posts_one_object_per_endpoint() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/channels/groups/"))
+            .and(body_json(serde_json::json!({"name": "News"})))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(serde_json::json!({"id": 21, "name": "News"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/channels/logos/"))
+            .and(body_json(
+                serde_json::json!({"name": "CNN", "url": "http://logos/cnn.png"}),
+            ))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "id": 71,
+                "name": "CNN",
+                "url": "http://logos/cnn.png",
+            })))
+            .mount(&server)
+            .await;
+        // `channel_profile_ids` keeps Dispatcharr's three-way meaning: omitted is all
+        // profiles, `[]` is none, `[0]` the explicit all-profiles sentinel.
+        Mock::given(method("POST"))
+            .and(path("/api/channels/channels/"))
+            .and(body_json(serde_json::json!({
+                "name": "CNN",
+                "channel_number": 7.0,
+                "channel_group_id": 21,
+                "tvg_id": "cnn.us",
+                "epg_data_id": 44,
+                "logo_id": 71,
+                "streams": [11, 12],
+                "channel_profile_ids": [1],
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "id": 102,
+                "name": "CNN",
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DispatcharrClient::new(&config(&server.uri())).expect("client");
+        let creator = RestChannelCreator::new(client, 4);
+        assert_eq!(creator.concurrency(), 4);
+        let group = creator.create_group("News").await.expect("group");
+        assert_eq!(group.id, 21);
+        let logo = creator
+            .create_logo("CNN", "http://logos/cnn.png")
+            .await
+            .expect("logo");
+        assert_eq!(logo.id, 71);
+        // A channel POST carries the resolved ids, the ordered streams and the profile
+        // semantics verbatim.
+        let channel = creator
+            .create_channel(&ChannelCreate {
+                name: "CNN".to_string(),
+                channel_number: Some(7.0),
+                channel_group_id: Some(21),
+                tvg_id: Some("cnn.us".to_string()),
+                tvc_guide_stationid: None,
+                epg_data_id: Some(44),
+                logo_id: Some(71),
+                streams: Some(vec![11, 12]),
+                channel_profile_ids: Some(vec![1]),
+            })
+            .await
+            .expect("channel");
+        assert_eq!(channel.id, 102);
+    }
+
+    #[test]
+    fn ownership_is_idempotent_and_queried_by_app_and_key() {
+        use crate::store::Subject;
+        let store = crate::store::Store::in_memory().expect("store");
+        assert!(!store.is_owned("channel", 102).expect("query"));
+        store
+            .record_ownership("channel", 102, "lineup", "lineup:f:news:cnn", 7)
+            .expect("record");
+        assert!(store.is_owned("channel", 102).expect("query"));
+        // A repeat records nothing new: the first owner wins, and the loser is told.
+        assert!(!store
+            .record_ownership("channel", 102, "streams", "other", 8)
+            .expect("repeat"));
+        assert_eq!(
+            store.owner_of("channel", 102).expect("query"),
+            Some(("lineup".to_string(), "lineup:f:news:cnn".to_string(), 7)),
+        );
+        assert_eq!(
+            store
+                .owned_ids("lineup", "lineup:f:news:cnn")
+                .expect("query"),
+            vec![("channel".to_string(), 102)],
+        );
+        store
+            .record_ownership("group", 100, "lineup", "lineup:g:news", 7)
+            .expect("record");
+        assert_eq!(
+            store.owned_keys("lineup").expect("query"),
+            vec![
+                ("channel".to_string(), 102, "lineup:f:news:cnn".to_string()),
+                ("group".to_string(), 100, "lineup:g:news".to_string()),
+            ],
+        );
+        // The subject wire forms match the ownership kinds, so a create row and its
+        // ownership entry name the object the same way.
+        assert_eq!(Subject::Group.as_str(), CreatedKind::Group.label());
+        assert_eq!(Subject::Logo.as_str(), CreatedKind::Logo.label());
+        assert_eq!(Subject::Channel.as_str(), CreatedKind::Channel.label());
+    }
+
+    #[tokio::test]
+    async fn cancel_mid_create_records_landed_rows() {
+        let plan = plan_creates(
+            &create_world(),
+            &HashMap::new(),
+            &request(vec![cnn(Some(7.0))]),
+            &PlanOptions::default(),
+        )
+        .expect("plans");
+        let context = JobContext::for_tests(crate::config::CrosstalkConfig::default());
+        let creator: std::sync::Arc<dyn ChannelCreator> = std::sync::Arc::new(CancelOnGroup {
+            flag: context.cancel_flag(),
+            next: std::sync::Mutex::new(100),
+        });
+        let report = apply_creates(creator, &plan, &context, "lineup.create_apply").await;
+        assert_eq!(report.groups[0].status, RowStatus::Ok, "the group landed");
+        assert_eq!(report.groups[0].id, Some(100));
+        assert_eq!(
+            report.logos[0].status,
+            RowStatus::Failed,
+            "the logo stage never started"
+        );
+        assert_eq!(report.logos[0].reason, CANCELLED);
+        assert_eq!(
+            report.channels[0].status,
+            RowStatus::Failed,
+            "the channel lost its logo"
+        );
+        assert!(report.channels[0].reason.contains("could not be created"));
+        // The landed row keeps its id; the rest say why they did not land.
+        let rows = create_run_rows(&plan, Some(&report));
+        assert_eq!(rows[0].status, "ok");
+        assert_eq!(rows[0].after_value.as_deref(), Some("100"));
+        assert_eq!(rows[1].status, "failed");
+    }
+
+    #[test]
+    fn the_create_csv_lists_every_object_and_the_skips() {
+        use crate::subapp::{SettingsSchema, SettingsValues};
+        use crate::test_app::StubApp;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = crate::config::CrosstalkConfig {
+            config_dir: dir.path().to_path_buf(),
+            ..crate::config::CrosstalkConfig::default()
+        };
+        let context = JobContext::for_tests(config);
+        let app = StubApp::new();
+        let values = SettingsValues::default();
+        let schema = SettingsSchema::default();
+        let mut plan = plan_creates(
+            &create_world(),
+            &HashMap::new(),
+            &request(vec![cnn(Some(7.0))]),
+            &PlanOptions::default(),
+        )
+        .expect("plans");
+        plan.skipped.push(CreateSkip {
+            kind: CreatedKind::Channel,
+            name: "Dupe".to_string(),
+            key: "k:dupe".to_string(),
+            reason: "already created".to_string(),
+        });
+        let spec = ReportSpec::new(
+            &app,
+            &schema,
+            &values,
+            "create_preview",
+            "Create Preview Report",
+        );
+        let path = write_create_report(&context, &spec, &plan, None).expect("writes");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            text.contains(
+                "channel_id,channel_name,channel_number,group,field,before,after,status,reason"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("CNN"), "{text}");
+        assert!(text.contains("created"), "{text}");
+        assert!(text.contains("planned"), "{text}");
+        assert!(text.contains("Dupe"), "the skip is listed: {text}");
+        assert!(text.contains("Creates planned: 3"), "{text}");
     }
 }

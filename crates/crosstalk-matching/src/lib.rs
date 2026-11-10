@@ -10,17 +10,25 @@
 //! flags on [`NormalizeFlags`], [`MatchOptions`], [`profile::MatchProfile`] and the alias
 //! tables — see [`profile`] for the function-by-function diff.
 
+#![forbid(unsafe_code)]
+
 pub mod alias;
 pub mod callsign;
 pub mod country;
 pub mod data;
+pub mod engine;
+pub mod identity;
+pub mod market;
 pub mod normalize;
 pub mod pipeline;
 pub mod profile;
 pub mod pyre;
 pub mod similarity;
+pub mod tags;
 pub mod tokens;
 
+pub use engine::{EngineConfig, UnifiedEngine, DEFAULT_THRESHOLD, ENGINE_VERSION};
+pub use identity::{Identity, IdentityCache, ResolveContext};
 pub use normalize::{NormalizeFlags, Normalizer};
 pub use profile::{MatchProfile, MatcherConfig};
 

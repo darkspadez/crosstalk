@@ -1,10 +1,14 @@
 //! The HTTP routes: pages, the JSON API, and the actions that start runs.
 
-use crate::auth::{self, COOKIE};
-use crate::state::{self, AppState, UiApp, UiField, UiHooks, UiRow, UiSettings, UiWorkflow};
+use crate::auth;
+use crate::client::ClientInfo;
+use crate::limits;
+use crate::state::{
+    self, AppState, CsrfToken, UiApp, UiField, UiHooks, UiRow, UiSettings, UiWorkflow,
+};
 use askama::Template;
 use axum::body::Bytes;
-use axum::extract::{Form, Path, State};
+use axum::extract::{DefaultBodyLimit, Form, Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
@@ -12,13 +16,28 @@ use axum::{Json, Router};
 use crosstalk_core::store::{RunRecord, RunStatus};
 use crosstalk_core::subapp::Registry;
 use std::collections::HashMap;
+use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
+/// The longest free-text action input the server accepts, in characters. The form says the
+/// same; this is what a hand-made POST meets.
+pub const MAX_ACTION_INPUT: usize = 256;
+
 /// Build the router.
+///
+/// The layers, outermost first: security headers (and the `[server]` settings read once for the
+/// request), tracing, the 30 s timeout, the in-flight bound, the auth gate, the Host/Origin
+/// check, CSRF, then each route with its own body bound. Auth runs before anything reads a body
+/// or answers about CSRF, so an unauthenticated request learns nothing and costs nothing.
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
-        .route("/login", get(login_page).post(login))
+        .route(
+            "/login",
+            get(login_page)
+                .post(login)
+                .layer(DefaultBodyLimit::max(limits::LOGIN_BODY)),
+        )
         .route("/logout", post(logout))
         .route("/", get(dashboard))
         .route("/apps/:app", get(app_page))
@@ -29,13 +48,23 @@ pub fn router(state: AppState) -> Router {
         .route("/runs/:id/rows", get(run_rows))
         .route("/runs/:id/csv", get(run_csv))
         .route("/runs/:id/cancel", post(cancel_run))
+        .route("/runs/:id/undo", post(start_undo))
         .route("/exports/clear", post(clear_exports))
         .route("/settings", get(settings_page))
-        .route("/settings/host", post(save_host_settings))
-        .route("/settings/:app", post(save_app_settings))
-        // Dispatcharr Connect posts here. Bearer-only (`auth::require`), CSRF-exempt because of
+        .route(
+            "/settings/host",
+            post(save_host_settings).layer(DefaultBodyLimit::max(limits::SETTINGS_BODY)),
+        )
+        .route(
+            "/settings/:app",
+            post(save_app_settings).layer(DefaultBodyLimit::max(limits::SETTINGS_BODY)),
+        )
+        // Dispatcharr Connect posts here. Bearer-only (`auth::gate`), CSRF-exempt because of
         // that (`csrf::check`), and it answers 202 before any work starts.
-        .route(crosstalk_core::hooks::ROUTE, post(dispatcharr_hook))
+        .route(
+            crosstalk_core::hooks::ROUTE,
+            post(dispatcharr_hook).layer(DefaultBodyLimit::max(limits::HOOK_BODY)),
+        )
         // A workflow's Run button on the dashboard. It writes, so it confirms like an apply.
         .route("/workflows/:name/run", post(start_workflow))
         .route("/api/v1/apps", get(api_apps))
@@ -47,11 +76,9 @@ pub fn router(state: AppState) -> Router {
         .route("/static/app.css", get(stylesheet))
         .route("/static/htmx.min.js", get(htmx))
         .route("/static/confirm.js", get(confirm_script))
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            auth::require,
-        ))
-        // Outside auth, so a forged cross-site POST fails closed even with no token set.
+        // Every other route's body bound; the routes above that need another set their own.
+        .layer(DefaultBodyLimit::max(limits::DEFAULT_BODY))
+        // Innermost check: a forged cross-site POST fails closed even with no token set.
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::csrf::check,
@@ -61,14 +88,56 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             crate::host::check,
         ))
+        // Outside both: the sender is known (and counted) before anything else looks at the
+        // request, so a wrong token is a 401/429 and never a CSRF 403.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::gate,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            limits::concurrency,
+        ))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            limits::REQUEST_TIMEOUT,
+        ))
         .layer(TraceLayer::new_for_http())
         // Outside everything, so even a rejection from an inner layer (a 403 from the
-        // Host or CSRF checks, a 401, a redirect) carries the browser security headers.
-        .layer(axum::middleware::from_fn(crate::security::headers))
+        // Host or CSRF checks, a 401, a 429, a redirect) carries the browser security headers.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::security::headers,
+        ))
         .with_state(state)
 }
 
 // --- templates ---------------------------------------------------------------------
+
+/// Renders an askama template as an HTML response.
+///
+/// askama 0.16 dropped its axum integration (the `askama_axum` crate, which pulled in the
+/// unmaintained `basic-toml`), so every page type gets this blanket shim instead. A render
+/// failure is a bug in a template, not in the request: it is logged and answered with 500.
+trait RenderPage {
+    fn into_response(self) -> Response;
+}
+
+impl<T: Template> RenderPage for T {
+    fn into_response(self) -> Response {
+        match self.render() {
+            Ok(body) => axum::response::Html(body).into_response(),
+            Err(error) => {
+                tracing::error!("rendering a page failed: {error}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "the page could not be rendered\n",
+                )
+                    .into_response()
+            }
+        }
+    }
+}
 
 #[derive(Template)]
 #[template(path = "login.html")]
@@ -126,10 +195,22 @@ struct RunTemplate {
     report_available: bool,
     /// The steps of a workflow run, in the order they ran. Empty for an ordinary run.
     steps: Vec<RunRecord>,
+    /// The workflow's planned steps, with each step's scope override and failure policy.
+    /// Empty for an ordinary run.
+    planned: Vec<crate::state::UiStep>,
     /// Whether this run is a workflow's, whose results live on its steps' pages.
     is_workflow: bool,
     /// The workflow run this run is a step of, when it is one.
     parent: Option<RunRecord>,
+    /// Whether the page offers "Undo this run": a finished, non-preview run with `ok`
+    /// channel rows left to reverse.
+    undo_eligible: bool,
+    /// The undo runs that reversed this run, newest first. An undone run lists them so an
+    /// operator can follow the chain in either direction.
+    undo_runs: Vec<RunRecord>,
+    /// Whether this run is an undo PREVIEW whose target can still be undone, so the page
+    /// offers "Apply undo".
+    apply_undo_offered: bool,
 }
 
 #[derive(Template)]
@@ -191,8 +272,8 @@ async fn confirm_script() -> Response {
         .into_response()
 }
 
-async fn login_page() -> LoginTemplate {
-    LoginTemplate { error: None }
+async fn login_page() -> Response {
+    LoginTemplate { error: None }.into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -202,7 +283,7 @@ struct LoginForm {
 
 async fn login(
     State(state): State<AppState>,
-    connect: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    client: ClientInfo,
     Form(form): Form<LoginForm>,
 ) -> Response {
     let Some(expected) = state.token() else {
@@ -210,64 +291,59 @@ async fn login(
         return Redirect::to("/").into_response();
     };
 
-    // Per-IP failure counting: ten wrong tokens in five minutes locks the address out
-    // with a 429, so the single all-powerful token cannot be guessed at line rate.
-    // Without connection info (tests, some proxies) every attempt shares one bucket,
-    // which only makes the limit stricter.
-    let ip = connect
-        .map(|info| info.0.ip())
-        .unwrap_or_else(|| std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
-    if !state.login_limiter().allowed(ip) {
-        let mut response = (
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many failed sign-in attempts: wait a few minutes and try again\n",
+    // Per-client failure counting, checked and counted in one step: ten wrong tokens in five
+    // minutes locks the client out with a 429, so the single all-powerful token cannot be
+    // guessed at line rate. Wrong Bearer tokens on any other route count toward the same limit.
+    if let Err(retry) = state.login_limiter().try_attempt(client.key) {
+        return auth::too_many(retry);
+    }
+
+    if !auth::tokens_match(&expected, form.token.trim()) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            LoginTemplate {
+                error: Some("That token does not match the configured one.".to_string()),
+            }
+            .into_response(),
         )
             .into_response();
-        if let Ok(value) = header::HeaderValue::from_str(
-            &state
-                .login_limiter()
-                .retry_after_secs(ip)
-                .max(1)
-                .to_string(),
-        ) {
-            response.headers_mut().insert(header::RETRY_AFTER, value);
-        }
-        return response;
     }
+    state.login_limiter().record_success(client.key);
 
-    if !crate::auth::tokens_match(&expected, form.token.trim()) {
-        state.login_limiter().record_failure(ip);
-        return LoginTemplate {
-            error: Some("That token does not match the configured one.".to_string()),
-        }
-        .into_response();
-    }
-    state.login_limiter().record_success(ip);
-
-    let cookie = format!(
-        "{COOKIE}={}; Path=/; HttpOnly; SameSite=Strict",
-        form.token.trim()
-    );
+    // The browser gets a session id, never the token itself.
+    let session = state.sessions().create(&expected);
+    let secure = state.server_view().secure_cookies || client.https;
     let mut response = Redirect::to("/").into_response();
-    response.headers_mut().insert(
-        header::SET_COOKIE,
-        header::HeaderValue::from_str(&cookie)
-            .unwrap_or_else(|_| header::HeaderValue::from_static("crosstalk_token=; Path=/")),
-    );
+    if let Ok(value) =
+        header::HeaderValue::from_str(&crate::session::set_cookie(&session.id, secure))
+    {
+        response.headers_mut().append(header::SET_COOKIE, value);
+    }
+    // A cookie an older version set to the raw token is cleared on the way in.
+    let [_, legacy] = crate::session::clear_cookies(secure);
+    if let Ok(value) = header::HeaderValue::from_str(&legacy) {
+        response.headers_mut().append(header::SET_COOKIE, value);
+    }
     response
 }
 
-async fn logout() -> Response {
+async fn logout(State(state): State<AppState>, client: ClientInfo, headers: HeaderMap) -> Response {
+    if let Some(id) = crate::session::session_id(&headers) {
+        state.sessions().remove(&id);
+    }
+    let secure = state.server_view().secure_cookies || client.https;
     let mut response = Redirect::to("/login").into_response();
-    response.headers_mut().insert(
-        header::SET_COOKIE,
-        header::HeaderValue::from_static("crosstalk_token=; Path=/; Max-Age=0"),
-    );
+    for cookie in crate::session::clear_cookies(secure) {
+        if let Ok(value) = header::HeaderValue::from_str(&cookie) {
+            response.headers_mut().append(header::SET_COOKIE, value);
+        }
+    }
     response
 }
 
 async fn dashboard(
     State(state): State<AppState>,
+    CsrfToken(csrf_token): CsrfToken,
     axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>,
 ) -> Response {
     let runs = state.store.recent_runs(20).unwrap_or_default();
@@ -275,7 +351,7 @@ async fn dashboard(
     let warnings = snapshot.validate().warnings;
     DashboardTemplate {
         version: crosstalk_core::HOST_VERSION,
-        csrf_token: state.csrf_token().to_string(),
+        csrf_token,
         apps: state::apps(&state.registry, &state.store),
         schedules: state::schedules(&snapshot),
         workflows: state::workflows(&state.runner, &snapshot, &state.store),
@@ -368,14 +444,18 @@ async fn clear_exports(
     .into_response()
 }
 
-async fn app_page(State(state): State<AppState>, Path(app_id): Path<String>) -> Response {
+async fn app_page(
+    State(state): State<AppState>,
+    CsrfToken(csrf_token): CsrfToken,
+    Path(app_id): Path<String>,
+) -> Response {
     let Some(app) = state.registry.get(&app_id) else {
         return (StatusCode::NOT_FOUND, "no such app\n").into_response();
     };
 
     AppTemplate {
         version: crosstalk_core::HOST_VERSION,
-        csrf_token: state.csrf_token().to_string(),
+        csrf_token,
         app: UiApp {
             id: app.id().to_string(),
             name: app.name().to_string(),
@@ -413,6 +493,10 @@ struct StartForm {
     /// operator asks for the backlog from the beginning.
     #[serde(default)]
     fresh: Option<String>,
+    /// The action's single free-text input, when it declares one. Ignored for actions
+    /// without an input (the form only renders the field then).
+    #[serde(default)]
+    input: Option<String>,
 }
 
 async fn start_action(
@@ -444,6 +528,25 @@ async fn start_action(
         options.fresh()
     } else {
         options
+    };
+    // The form's field is short; a hand-made POST is held to the same bound before the text is
+    // recorded anywhere.
+    if form
+        .input
+        .as_deref()
+        .is_some_and(|text| text.chars().count() > MAX_ACTION_INPUT)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("the input is longer than {MAX_ACTION_INPUT} characters\n"),
+        )
+            .into_response();
+    }
+    // An input for an action that declares none is a forged field: drop it rather than
+    // record text no action reads. An empty input is no input (the context trims it).
+    let options = match (action.input, form.input.clone()) {
+        (Some(_), Some(text)) if !text.trim().is_empty() => options.with_input(Some(text)),
+        _ => options,
     };
     match state
         .runner
@@ -516,31 +619,29 @@ async fn start_workflow(
 /// failed delivery for anything else, and "I do not act on this event" is not a delivery failure.
 async fn dispatcharr_hook(
     State(state): State<AppState>,
-    connect: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    client: ClientInfo,
     axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>,
     body: Bytes,
 ) -> Response {
     let snapshot = state.snapshot();
-    let ip = connect
-        .map(|info| info.0.ip())
-        .unwrap_or_else(|| std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
 
-    // A delivery starts real work, so the route counts them per address. The bound comes from
-    // the live configuration, so raising it needs no restart.
+    // A delivery starts real work, so the route counts them per client. The bound comes from
+    // the live configuration, so raising it needs no restart; checking and counting are one
+    // step, so a burst of concurrent deliveries cannot all slip under it.
     let limit = snapshot.hooks.rate_per_minute;
-    if limit > 0 && state.hook_limiter().hits(ip) >= limit {
-        let retry = state.hook_limiter().retry_after_secs(ip).max(1);
-        let mut response = (
-            StatusCode::TOO_MANY_REQUESTS,
-            format!("too many hook deliveries: retry in {retry}s\n"),
-        )
-            .into_response();
-        if let Ok(value) = header::HeaderValue::from_str(&retry.to_string()) {
-            response.headers_mut().insert(header::RETRY_AFTER, value);
+    if limit > 0 {
+        if let Err(retry) = state.hook_limiter().try_attempt_within(client.key, limit) {
+            let mut response = (
+                StatusCode::TOO_MANY_REQUESTS,
+                format!("too many hook deliveries: retry in {retry}s\n"),
+            )
+                .into_response();
+            if let Ok(value) = header::HeaderValue::from_str(&retry.to_string()) {
+                response.headers_mut().insert(header::RETRY_AFTER, value);
+            }
+            return response;
         }
-        return response;
     }
-    state.hook_limiter().record_hit(ip);
 
     let fields = crosstalk_core::hooks::read_fields(&body);
     let configured: std::collections::BTreeSet<String> =
@@ -551,9 +652,12 @@ async fn dispatcharr_hook(
         &configured,
     );
     let Some(event) = resolved else {
+        // The count and a few names, not every key: a body is the sender's to fill, and the log
+        // is not the place for all of it.
         tracing::info!(
             bytes = body.len(),
-            fields = ?fields.keys().collect::<Vec<_>>(),
+            field_count = fields.len(),
+            fields = ?log_keys(&fields),
             "hook delivery names no event this configuration knows; ignored"
         );
         return (
@@ -570,33 +674,89 @@ async fn dispatcharr_hook(
         from = event.source.as_str(),
         account = fields
             .get("account_name")
-            .map(String::as_str)
+            .map(|value| truncate(value, LOG_FIELD_BYTES))
             .unwrap_or("-"),
-        source = fields.get("source_name").map(String::as_str).unwrap_or("-"),
+        source = fields
+            .get("source_name")
+            .map(|value| truncate(value, LOG_FIELD_BYTES))
+            .unwrap_or("-"),
+        field_count = fields.len(),
         "hook delivery received"
     );
     let delivered = state.hooks().deliver(&event.name);
     let body = match &delivered {
         crosstalk_core::hooks::Delivered::Unknown => {
-            format!("accepted: {} is not a configured event\n", event.name)
+            format!(
+                "accepted: {} is not a configured event\n",
+                echo(&event.name)
+            )
         }
         crosstalk_core::hooks::Delivered::Unconfigured => {
-            format!("accepted: {} has no targets configured\n", event.name)
+            format!(
+                "accepted: {} has no targets configured\n",
+                echo(&event.name)
+            )
         }
         crosstalk_core::hooks::Delivered::Coalesced { event } => {
-            format!("accepted: joined the settling {event} burst\n")
+            format!("accepted: joined the settling {} burst\n", echo(event))
         }
         crosstalk_core::hooks::Delivered::Scheduled { event, targets } => {
-            format!("accepted: {event} runs {targets} target(s) once the burst settles\n")
+            format!(
+                "accepted: {} runs {targets} target(s) once the burst settles\n",
+                echo(event)
+            )
         }
     };
     (StatusCode::ACCEPTED, body).into_response()
 }
 
-async fn runs_page(State(state): State<AppState>) -> Response {
+/// How many of a delivery's field names the log line lists.
+const LOG_KEYS: usize = 10;
+/// The longest field name or value the log line carries, in bytes.
+const LOG_FIELD_BYTES: usize = 64;
+
+/// The first [`LOG_KEYS`] field names of a delivery, each cut to [`LOG_FIELD_BYTES`].
+fn log_keys(fields: &std::collections::BTreeMap<String, String>) -> Vec<&str> {
+    fields
+        .keys()
+        .take(LOG_KEYS)
+        .map(|key| truncate(key, LOG_FIELD_BYTES))
+        .collect()
+}
+
+/// `text` cut to at most `max` bytes, on a character boundary.
+fn truncate(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// An event name as the 202 answer may echo it: the characters an event name is made of, and
+/// `?` for anything else, at most 64 of them. Already free of control characters
+/// (`hooks::read_event` refuses those), but the answer is the sender's to read, so it says only
+/// what it needs to.
+fn echo(name: &str) -> String {
+    name.chars()
+        .take(LOG_FIELD_BYTES)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':') {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect()
+}
+
+async fn runs_page(State(state): State<AppState>, CsrfToken(csrf_token): CsrfToken) -> Response {
     RunsTemplate {
         version: crosstalk_core::HOST_VERSION,
-        csrf_token: state.csrf_token().to_string(),
+        csrf_token,
         runs: state.store.recent_runs(100).unwrap_or_default(),
     }
     .into_response()
@@ -606,11 +766,15 @@ async fn load_run(state: &AppState, run_id: i64) -> Option<RunRecord> {
     state.store.run(run_id).ok().flatten()
 }
 
-async fn run_page(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+async fn run_page(
+    State(state): State<AppState>,
+    CsrfToken(csrf_token): CsrfToken,
+    Path(id): Path<i64>,
+) -> Response {
     match load_run(&state, id).await {
         Some(run) => RunTemplate {
             version: crosstalk_core::HOST_VERSION,
-            csrf_token: state.csrf_token().to_string(),
+            csrf_token,
             counts: state::counts(&run),
             active: state
                 .runner
@@ -620,8 +784,17 @@ async fn run_page(State(state): State<AppState>, Path(id): Path<i64>) -> Respons
             rows: state::rows(&state.store, id),
             report_available: state::report_available(&run),
             steps: state::steps_of(&state.store, &run),
+            planned: state::planned_steps(&state.snapshot(), &run),
             is_workflow: run.app == crosstalk_core::workflow::APP_ID,
             parent: state::parent_of(&state.store, &run),
+            undo_eligible: state::undo_eligible(&state.registry, &state.store, &run),
+            undo_runs: state::undo_runs(&state.store, &run),
+            apply_undo_offered: state::is_undo_run(&run)
+                && run.dry_run
+                && run.parent_run_id.is_some_and(|target| {
+                    crosstalk_core::undo::check_target(&state.store, &state.registry, target)
+                        .is_ok()
+                }),
             run,
         }
         .into_response(),
@@ -629,7 +802,11 @@ async fn run_page(State(state): State<AppState>, Path(id): Path<i64>) -> Respons
     }
 }
 
-async fn run_status(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+async fn run_status(
+    State(state): State<AppState>,
+    CsrfToken(csrf_token): CsrfToken,
+    Path(id): Path<i64>,
+) -> Response {
     let Some(run) = load_run(&state, id).await else {
         return (StatusCode::NOT_FOUND, "no such run\n").into_response();
     };
@@ -639,7 +816,7 @@ async fn run_status(State(state): State<AppState>, Path(id): Path<i64>) -> Respo
         .into_iter()
         .find(|entry| entry.run_id == id);
     RunStatusTemplate {
-        csrf_token: state.csrf_token().to_string(),
+        csrf_token,
         counts: state::counts(&run),
         report_available: state::report_available(&run),
         run,
@@ -715,8 +892,57 @@ async fn cancel_run(State(state): State<AppState>, Path(id): Path<i64>) -> Respo
     Redirect::to(&format!("/runs/{id}")).into_response()
 }
 
+#[derive(serde::Deserialize)]
+struct UndoForm {
+    /// Server-side confirmation for the APPLY half, mirroring the CLI's `--yes`: without it
+    /// the request starts a preview instead. The browser's confirm dialog is convenience,
+    /// not protection.
+    #[serde(default)]
+    confirm: Option<String>,
+}
+
+/// `POST /runs/:id/undo`: start undoing one run.
+///
+/// Without `confirm=true` this starts a PREVIEW (a dry run that changes nothing) and the
+/// undo button's page says so; the preview run's page offers "Apply undo", which posts
+/// back here with `confirm=true`. The undo is recorded under the target run's app with
+/// `parent_run_id` set to the undone run, so undoing an undo restores the applied state.
+async fn start_undo(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Form(form): Form<UndoForm>,
+) -> Response {
+    let Some(target) = load_run(&state, id).await else {
+        return (StatusCode::NOT_FOUND, "no such run\n").into_response();
+    };
+    let dry_run = form.confirm.as_deref() != Some("true");
+    // Preview and apply alike: a refused target starts no run, and the answer says why.
+    if let Err(error) = crosstalk_core::undo::check_target(&state.store, &state.registry, target.id)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("this run cannot be undone: {error:#}\n"),
+        )
+            .into_response();
+    }
+    match state.runner.start_undo_with(
+        &target.app,
+        id,
+        dry_run,
+        crosstalk_core::runner::RunOptions::default(),
+    ) {
+        Ok(started) => Redirect::to(&format!("/runs/{}", started.run_id)).into_response(),
+        Err(error) => (
+            StatusCode::CONFLICT,
+            format!("could not start the undo: {error:#}\n"),
+        )
+            .into_response(),
+    }
+}
+
 async fn settings_page(
     State(state): State<AppState>,
+    CsrfToken(csrf_token): CsrfToken,
     axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>,
 ) -> Response {
     let saved = query.get("saved").is_some_and(|value| value == "1");
@@ -724,7 +950,7 @@ async fn settings_page(
     let snapshot = state.snapshot();
     SettingsTemplate {
         version: crosstalk_core::HOST_VERSION,
-        csrf_token: state.csrf_token().to_string(),
+        csrf_token,
         saved,
         host_error: None,
         host_notice: env_overrides.then(|| {
@@ -761,11 +987,11 @@ fn app_forms(state: &AppState, error: Option<String>) -> Vec<UiSettings> {
 }
 
 /// Render the settings page with a host-level error, keeping the just-submitted values.
-fn settings_with_host_error(state: &AppState, error: String) -> Response {
+fn settings_with_host_error(state: &AppState, csrf_token: String, error: String) -> Response {
     let snapshot = state.snapshot();
     SettingsTemplate {
         version: crosstalk_core::HOST_VERSION,
-        csrf_token: state.csrf_token().to_string(),
+        csrf_token,
         saved: false,
         host_error: Some(error),
         host_notice: None,
@@ -780,6 +1006,7 @@ fn settings_with_host_error(state: &AppState, error: String) -> Response {
 
 async fn save_host_settings(
     State(state): State<AppState>,
+    CsrfToken(csrf_token): CsrfToken,
     Form(form): Form<HashMap<String, String>>,
 ) -> Response {
     let config_dir = state.config.config_dir();
@@ -858,6 +1085,7 @@ async fn save_host_settings(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 settings_with_host_error(
                     &state,
+                    csrf_token.clone(),
                     format!(
                         "Saved to {path}, but the daemon could not reload it and still runs the \
                          old values: {error:#}",
@@ -872,6 +1100,30 @@ async fn save_host_settings(
     // with no token is a configuration the daemon refuses to start with, so it must not be
     // swapped in at runtime either. The file IS saved at this point, so say so: a restart
     // would refuse to start until a token is restored.
+    // The same listener rules the daemon starts under: a too-short token on a reachable bind,
+    // trusted proxies without a token, a bad CIDR or public URL. The file is saved; the daemon
+    // keeps running the old values.
+    let security = fresh.server.security_errors();
+    if !security.is_empty() {
+        tracing::warn!(
+            problems = security.join("; ").as_str(),
+            "host settings saved but NOT applied: the reloaded [server] settings are unsafe"
+        );
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            settings_with_host_error(
+                &state,
+                csrf_token.clone(),
+                format!(
+                    "Saved to {path}, but NOT applied: {}. A restart with this file would \
+                     refuse to start.",
+                    security.join("; "),
+                    path = path.display(),
+                ),
+            ),
+        )
+            .into_response();
+    }
     if crate::auth::requires_token(&fresh.server.bind, fresh.server.resolved_token().as_deref()) {
         tracing::warn!(
             bind = fresh.server.bind.as_str(),
@@ -881,6 +1133,7 @@ async fn save_host_settings(
             StatusCode::INTERNAL_SERVER_ERROR,
             settings_with_host_error(
                 &state,
+                csrf_token.clone(),
                 format!(
                     "Saved to {path}, but NOT applied: the reloaded configuration binds \
                      {bind} with no token, which would leave the daemon unauthenticated. A \
@@ -925,6 +1178,7 @@ async fn save_host_settings(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     settings_with_host_error(
                         &state,
+                        csrf_token.clone(),
                         format!("Settings applied, but the schedules would not re-arm: {error:#}"),
                     ),
                 )
@@ -968,6 +1222,7 @@ fn env_override_fields(
 
 async fn save_app_settings(
     State(state): State<AppState>,
+    CsrfToken(csrf_token): CsrfToken,
     Path(app_id): Path<String>,
     Form(form): Form<HashMap<String, String>>,
 ) -> Response {
@@ -981,7 +1236,7 @@ async fn save_app_settings(
             let snapshot = state.snapshot();
             return SettingsTemplate {
                 version: crosstalk_core::HOST_VERSION,
-                csrf_token: state.csrf_token().to_string(),
+                csrf_token: csrf_token.clone(),
                 saved: false,
                 host_error: None,
                 host_notice: None,
@@ -1000,7 +1255,7 @@ async fn save_app_settings(
         let snapshot = state.snapshot();
         return SettingsTemplate {
             version: crosstalk_core::HOST_VERSION,
-            csrf_token: state.csrf_token().to_string(),
+            csrf_token: csrf_token.clone(),
             saved: false,
             host_error: None,
             host_notice: None,
@@ -1103,8 +1358,29 @@ pub fn describe_registry(registry: &Registry) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::env_override_fields;
+    use super::{echo, env_override_fields, log_keys, truncate};
     use crosstalk_core::config::CrosstalkConfig;
+
+    #[test]
+    fn the_hook_log_names_a_few_short_keys() {
+        let fields: std::collections::BTreeMap<String, String> = (0..25)
+            .map(|n| (format!("{n:02}{}", "k".repeat(100)), String::new()))
+            .collect();
+        let keys = log_keys(&fields);
+        assert_eq!(keys.len(), 10);
+        assert!(keys.iter().all(|key| key.len() == 64), "{keys:?}");
+        // A multi-byte character straddling the cut is dropped whole, not split.
+        let text = format!("{}é", "a".repeat(63));
+        assert_eq!(truncate(&text, 64), "a".repeat(63));
+        assert_eq!(truncate("short", 64), "short");
+    }
+
+    #[test]
+    fn an_echoed_event_name_is_tame() {
+        assert_eq!(echo("m3u_refresh"), "m3u_refresh");
+        assert_eq!(echo("a b<c>"), "a?b?c?");
+        assert_eq!(echo(&"e".repeat(200)).len(), 64);
+    }
 
     #[test]
     fn identical_configs_have_no_overrides() {

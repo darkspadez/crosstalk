@@ -1,0 +1,60 @@
+# cargo-deny policy, run by the `audit` job in .github/workflows/ci.yml:
+#
+#   cargo deny --locked check licenses advisories bans
+#
+# Licences: an allow-list. Everything compiled into the binary must be under one of these
+# (an `OR` expression passes when any branch does). Adding a licence is a deliberate,
+# reviewed change; about.toml's `accepted` list is the same set, so THIRD_PARTY_LICENSES and
+# this check never disagree.
+
+[graph]
+# Only what ships: the two release targets (build.yml), no dev-only crates.
+targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
+exclude-dev = true
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    # unicode_names2's Unicode data tables.
+    "Unicode-DFS-2016",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+    # webpki-roots: Mozilla's CA bundle, as data.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+# The list above is a policy, not an inventory: an allowed licence nobody uses today is fine.
+unused-allowed-license = "allow"
+
+[advisories]
+# cargo audit (audit.toml) is the primary advisory gate; this repeats it through cargo-deny
+# so licences, bans and advisories share one policy file.
+yanked = "deny"
+unmaintained = "all"
+ignore = [
+    # basic-toml is unmaintained; askama_derive 0.16.1 (a proc-macro, build time only) still
+    # reads askama's config file through it. Remove this entry when `cargo tree -i basic-toml`
+    # comes back empty (docs/audit/F-supply.md, F-S8).
+    { id = "RUSTSEC-2026-0374", reason = "basic-toml via askama_derive 0.16.1: build-time config parsing of this repository's own askama.toml, never runtime input" },
+]
+
+[bans]
+# Duplicate versions are reported, not failed: they come from upstream crates' own
+# dependency ranges and are cleared by lockfile maintenance (renovate.json), not by hand.
+multiple-versions = "warn"
+# The workspace's own path dependencies carry no version requirement (the crates are not
+# published), which cargo-deny counts as a wildcard; registry dependencies are pinned by
+# Cargo.lock and `--locked` either way.
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

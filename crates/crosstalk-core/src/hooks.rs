@@ -39,8 +39,10 @@
 //! A refresh of twenty M3U accounts fires twenty `m3u_refresh` events within a few seconds; that
 //! is one logical "the playlists changed", so one match. Every delivery of the same event
 //! restarts a timer, and the targets run once the burst has been quiet for
-//! `hooks.debounce_secs`. An event that arrives while the target is busy queues **one** follow-up
-//! run for when it frees — Stream-Mapparr's dirty-flag behaviour, which is what keeps a late
+//! `hooks.debounce_secs`, but never later than `hooks.max_settle_secs` after the burst's first
+//! delivery (five debounce windows by default, at most fifteen minutes), so deliveries that never
+//! pause still run their targets. An event that arrives while the target is busy queues **one**
+//! follow-up run for when it frees — Stream-Mapparr's dirty-flag behaviour, which is what keeps a late
 //! account from being dropped and a busy app from being started twenty times.
 
 use crate::config::HooksConfig;
@@ -104,10 +106,11 @@ pub struct ResolvedEvent {
 /// from the scheduler or the CLI; only webhook deliveries are capped.
 const MAX_EVENT_NAME_LEN: usize = 128;
 
-/// Whether a name from a delivery is usable as an event: present after trimming, and short.
+/// Whether a name from a delivery is usable as an event: present after trimming, short, and
+/// free of control characters (a newline in a name would forge a log line).
 fn valid_name(value: &str) -> Option<String> {
     let value = value.trim();
-    if value.is_empty() || value.len() > MAX_EVENT_NAME_LEN {
+    if value.is_empty() || value.len() > MAX_EVENT_NAME_LEN || value.chars().any(char::is_control) {
         return None;
     }
     Some(value.to_string())
@@ -298,14 +301,18 @@ pub struct Hooks {
 /// One settling burst.
 #[derive(Debug)]
 struct Pending {
+    /// When the burst's first delivery arrived: the bound on how long it may keep settling.
+    first: tokio::time::Instant,
     /// When the last delivery of this event arrived.
     last: Mutex<tokio::time::Instant>,
 }
 
 impl Pending {
     fn new() -> Self {
+        let now = tokio::time::Instant::now();
         Self {
-            last: Mutex::new(tokio::time::Instant::now()),
+            first: now,
+            last: Mutex::new(now),
         }
     }
 
@@ -317,13 +324,16 @@ impl Pending {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = tokio::time::Instant::now();
     }
 
-    /// When the burst will have been quiet for `debounce`.
-    fn fire_at(&self, debounce: Duration) -> tokio::time::Instant {
-        *self
+    /// When the burst will have been quiet for `debounce`, or has settled for `max_settle` since
+    /// its first delivery, whichever comes first: deliveries that never stop arriving still run
+    /// their targets.
+    fn fire_at(&self, debounce: Duration, max_settle: Duration) -> tokio::time::Instant {
+        let quiet = *self
             .last
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            + debounce
+            + debounce;
+        quiet.min(self.first + max_settle)
     }
 }
 
@@ -397,6 +407,7 @@ impl Hooks {
         }
 
         let debounce = config.hooks.debounce();
+        let max_settle = config.hooks.max_settle();
         let pending = {
             let mut map = self
                 .pending
@@ -422,7 +433,9 @@ impl Hooks {
         let hooks = Arc::clone(self);
         let event_name = event.to_string();
         tokio::spawn(async move {
-            hooks.settle(&event_name, &pending, debounce).await;
+            hooks
+                .settle(&event_name, &pending, debounce, max_settle)
+                .await;
         });
         Delivered::Scheduled {
             event: event.to_string(),
@@ -431,13 +444,21 @@ impl Hooks {
     }
 
     /// Wait out the burst, then run the event's targets.
-    async fn settle(self: Arc<Self>, event: &str, pending: &Arc<Pending>, debounce: Duration) {
+    async fn settle(
+        self: Arc<Self>,
+        event: &str,
+        pending: &Arc<Pending>,
+        debounce: Duration,
+        max_settle: Duration,
+    ) {
         loop {
-            let fire_at = pending.fire_at(debounce);
+            let fire_at = pending.fire_at(debounce, max_settle);
             tokio::time::sleep_until(fire_at).await;
             // Another delivery may have restarted the timer while this task slept: if it did,
-            // the new deadline is later than the one just reached, so wait again.
-            if pending.fire_at(debounce) <= fire_at {
+            // the new deadline is later than the one just reached, so wait again. The
+            // `max_settle` bound stops the deadline moving past the burst's first delivery
+            // plus that bound.
+            if pending.fire_at(debounce, max_settle) <= fire_at {
                 break;
             }
         }

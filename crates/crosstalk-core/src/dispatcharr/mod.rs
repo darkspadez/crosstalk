@@ -38,7 +38,7 @@ mod types;
 
 pub use types::*;
 
-pub use channels::CHANNEL_EDIT_CHUNK_SIZE;
+pub use channels::{BatchEpgOutcome, CHANNEL_EDIT_CHUNK_SIZE};
 
 use crate::config::DispatcharrConfig;
 use anyhow::{bail, Context, Result};
@@ -118,7 +118,13 @@ impl Credentials {
 #[derive(Clone)]
 pub struct DispatcharrClient {
     http: reqwest::Client,
+    /// The API root, with any `user:pass@` from `base_url` taken out (see `proxy_auth`), so
+    /// a URL built from it can be quoted in an error.
     base: String,
+    /// The `user:pass@` the configured `base_url` carried, sent as HTTP basic auth on every
+    /// request (for a reverse proxy in front of Dispatcharr), exactly as reqwest would have
+    /// sent it from the URL, without the URL ever holding it.
+    proxy_auth: Option<(String, Option<String>)>,
     credentials: Arc<Credentials>,
     /// Memoised programme checks, keyed by `(tvg_id, source, window start, window end)`.
     program_cache: Arc<dashmap::DashMap<(String, i64, String, String), HasPrograms>>,
@@ -155,6 +161,10 @@ impl DispatcharrClient {
             // large instance is a few megabytes, not a hang.
             .timeout(Duration::from_secs(config.timeout_secs.max(1)))
             .user_agent(concat!("crosstalk/", env!("CARGO_PKG_VERSION")))
+            // Never follow a redirect: a 301/302 on a PATCH or POST is re-sent as a GET, and
+            // that GET's 200 would read as a confirmed write. Any 3xx is an error instead
+            // (see [`redirect_error`]).
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .context("building the HTTP client")?;
 
@@ -168,6 +178,7 @@ impl DispatcharrClient {
         Ok(Self {
             http,
             base: config.api_root(),
+            proxy_auth: config.base_url_userinfo(),
             credentials: Arc::new(Credentials {
                 api_key,
                 username: config.username.trim().to_string(),
@@ -184,6 +195,15 @@ impl DispatcharrClient {
     /// The API root every request is built from.
     pub fn base(&self) -> &str {
         &self.base
+    }
+
+    /// A request to `url`, carrying the base URL's basic-auth credentials when it had any.
+    fn request(&self, method: reqwest::Method, url: &str) -> reqwest::RequestBuilder {
+        let request = self.http.request(method, url);
+        match &self.proxy_auth {
+            Some((user, password)) => request.basic_auth(user, password.as_deref()),
+            None => request,
+        }
     }
 
     /// Obtain a token up front when logging in, so a bad password fails immediately rather
@@ -222,14 +242,14 @@ impl DispatcharrClient {
             .context("no password configured")?;
         let url = format!("{}/accounts/token/", self.base);
         let response = self
-            .http
-            .post(&url)
+            .request(reqwest::Method::POST, &url)
             .json(&Body {
                 username: &self.credentials.username,
                 password: &password,
             })
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .with_context(|| format!("POST {url}"))?;
 
         let status = response.status();
@@ -239,7 +259,7 @@ impl DispatcharrClient {
                 "Dispatcharr login failed for user {:?} ({status}). Check \
                  dispatcharr.username and dispatcharr.password. Response: {}",
                 self.credentials.username,
-                truncate(&body, 300)
+                safe_body(&body, 300)
             );
         }
         let tokens: Tokens = serde_json::from_str(&body)
@@ -267,11 +287,11 @@ impl DispatcharrClient {
             .context("no refresh token")?;
         let url = format!("{}/accounts/token/refresh/", self.base);
         let response = self
-            .http
-            .post(&url)
+            .request(reqwest::Method::POST, &url)
             .json(&serde_json::json!({ "refresh": refresh }))
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .with_context(|| format!("POST {url}"))?;
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
@@ -309,7 +329,7 @@ impl DispatcharrClient {
         loop {
             attempt += 1;
             let authorization = self.authorization().await?;
-            let mut request = self.http.get(&url).query(query);
+            let mut request = self.request(reqwest::Method::GET, &url).query(query);
             if let Some(value) = authorization.as_deref() {
                 request = request.header(reqwest::header::AUTHORIZATION, value);
                 // The API key goes in its own header; `ApiKey`/`Bearer` in Authorization is
@@ -336,6 +356,9 @@ impl DispatcharrClient {
                         continue;
                     }
 
+                    if status.is_redirection() {
+                        return Err(redirect_error("GET", &url, status, response.headers()));
+                    }
                     if status == reqwest::StatusCode::UNAUTHORIZED
                         || status == reqwest::StatusCode::FORBIDDEN
                     {
@@ -344,16 +367,21 @@ impl DispatcharrClient {
                             "Dispatcharr rejected the credentials for {url} ({status}). Check \
                              dispatcharr.api_key, or the username and password, and that the \
                              account is an administrator. Response: {}",
-                            truncate(&body, 300)
+                            safe_body(&body, 300)
                         );
                     }
                     if !status.is_success() {
                         let body = response.text().await.unwrap_or_default();
-                        bail!("GET {url} failed with {status}: {}", truncate(&body, 300));
+                        return Err(StatusError::new(
+                            status,
+                            format!("GET {url} failed with {status}: {}", safe_body(&body, 300)),
+                        )
+                        .into());
                     }
                     return response
                         .json::<T>()
                         .await
+                        .map_err(reqwest::Error::without_url)
                         .with_context(|| format!("GET {url} returned an unexpected body"));
                 }
                 Err(error) => {
@@ -362,7 +390,7 @@ impl DispatcharrClient {
                         tokio::time::sleep(RETRY_BASE * 2u32.pow(attempt - 1)).await;
                         continue;
                     }
-                    return Err(error).with_context(|| format!("GET {url}"));
+                    return Err(error.without_url()).with_context(|| format!("GET {url}"));
                 }
             }
         }
@@ -387,7 +415,7 @@ impl DispatcharrClient {
         loop {
             attempt += 1;
             let authorization = self.authorization().await?;
-            let mut request = self.http.request(method.clone(), &url);
+            let mut request = self.request(method.clone(), &url);
             if let Some(payload) = body {
                 request = request.json(payload);
             }
@@ -414,6 +442,14 @@ impl DispatcharrClient {
                         continue;
                     }
 
+                    if status.is_redirection() {
+                        return Err(redirect_error(
+                            method.as_str(),
+                            &url,
+                            status,
+                            response.headers(),
+                        ));
+                    }
                     if status == reqwest::StatusCode::UNAUTHORIZED
                         || status == reqwest::StatusCode::FORBIDDEN
                     {
@@ -422,19 +458,24 @@ impl DispatcharrClient {
                             "Dispatcharr rejected the credentials for {method} {url} ({status}). \
                              Check dispatcharr.api_key, or the username and password, and that \
                              the account is an administrator. Response: {}",
-                            truncate(&body, 300)
+                            safe_body(&body, 300)
                         );
                     }
                     if !status.is_success() {
                         let body = response.text().await.unwrap_or_default();
-                        bail!(
-                            "{method} {url} failed with {status}: {}",
-                            truncate(&body, 300)
-                        );
+                        return Err(StatusError::new(
+                            status,
+                            format!(
+                                "{method} {url} failed with {status}: {}",
+                                safe_body(&body, 300)
+                            ),
+                        )
+                        .into());
                     }
                     return response
                         .text()
                         .await
+                        .map_err(reqwest::Error::without_url)
                         .with_context(|| format!("{method} {url}: reading the response body"));
                 }
                 Err(error) => {
@@ -442,7 +483,7 @@ impl DispatcharrClient {
                         tokio::time::sleep(RETRY_BASE * 2u32.pow(attempt - 1)).await;
                         continue;
                     }
-                    return Err(error).with_context(|| format!("{method} {url}"));
+                    return Err(error.without_url()).with_context(|| format!("{method} {url}"));
                 }
             }
         }
@@ -460,7 +501,7 @@ impl DispatcharrClient {
         serde_json::from_str(&text).with_context(|| {
             format!(
                 "{method} {path} returned an unexpected body: {}",
-                truncate(&text, 200)
+                safe_body(&text, 200)
             )
         })
     }
@@ -475,6 +516,16 @@ impl DispatcharrClient {
         retry: Retry,
     ) -> Result<()> {
         self.send_write(method, path, None, retry).await.map(|_| ())
+    }
+
+    /// Whether `GET path` finds the object: `Ok(false)` only for a 404, which is the one
+    /// answer that proves it is gone. Any other failure is an error, never "gone".
+    async fn exists(&self, path: &str) -> Result<bool> {
+        match self.get_json::<serde_json::Value>(path, &[]).await {
+            Ok(_) => Ok(true),
+            Err(error) if http_status(&error) == Some(reqwest::StatusCode::NOT_FOUND) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     /// The signed-in user's level, `10` being administrator.
@@ -680,6 +731,84 @@ async fn fetch_if<T>(
     } else {
         Ok(Vec::new())
     }
+}
+
+/// A non-success HTTP answer, kept typed so a caller can tell a 404 (gone) or a 400 (one
+/// rejected row) from the rest. Displays as the plain `METHOD url failed with STATUS: body`.
+#[derive(Debug)]
+pub struct StatusError {
+    pub status: reqwest::StatusCode,
+    message: String,
+}
+
+impl StatusError {
+    fn new(status: reqwest::StatusCode, message: String) -> Self {
+        Self { status, message }
+    }
+}
+
+impl std::fmt::Display for StatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for StatusError {}
+
+/// The HTTP status behind a client error, when the server answered one.
+pub fn http_status(error: &anyhow::Error) -> Option<reqwest::StatusCode> {
+    error
+        .downcast_ref::<StatusError>()
+        .map(|status| status.status)
+}
+
+/// The error for a 3xx answer. Redirects are never followed (a re-sent PATCH would arrive as a
+/// GET), so the fix is on the operator's side: point `dispatcharr.base_url` at the final URL.
+fn redirect_error(
+    method: &str,
+    url: &str,
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+) -> anyhow::Error {
+    let location = headers
+        .get(reqwest::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("(no Location header)");
+    anyhow::anyhow!(
+        "{method} {url} answered {status}, redirecting to {}: dispatcharr.base_url redirects; \
+         use the final URL (redirects are not followed, so a write is never re-sent as a GET)",
+        // The path is what the operator needs to fix `base_url`; the userinfo and query are
+        // where a credential would ride, so they go.
+        truncate(&crate::redact::url_without_secrets(location), 200)
+    )
+}
+
+/// A Dispatcharr response body made fit for an error message, a run summary and a log line.
+///
+/// Bodies echo objects back, and a stream or M3U account object carries the provider URL
+/// (`/live/<user>/<pass>/<id>.ts`) and credentials. So, before the cut: every JSON string
+/// value under a key naming a URL or a credential is blanked, then every URL left anywhere
+/// is shortened to its host ([`crate::redact::urls_to_hosts`]).
+fn safe_body(text: &str, limit: usize) -> String {
+    truncate(
+        &crate::redact::urls_to_hosts(&blank_sensitive_values(text)),
+        limit,
+    )
+}
+
+/// `"url": "..."`, `"password": "..."` and the like with their string values emptied.
+///
+/// Pattern-based rather than a JSON round trip, so it also works on an HTML error page or a
+/// body that is not valid JSON, and keeps the rest of the body as the server wrote it.
+fn blank_sensitive_values(text: &str) -> String {
+    static SENSITIVE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let pattern = SENSITIVE.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?i)("(?:url|[a-z_]*_url|password|username|token|api_key|access|refresh|secret)"\s*:\s*)"(?:[^"\\]|\\.)*""#,
+        )
+        .expect("valid sensitive-key pattern")
+    });
+    pattern.replace_all(text, r#"${1}"""#).into_owned()
 }
 
 fn truncate(text: &str, limit: usize) -> String {

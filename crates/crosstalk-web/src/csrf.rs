@@ -3,19 +3,23 @@
 //! The threat is a cross-origin form POST: with no token configured on a loopback listener,
 //! any web page the operator visits could otherwise submit a form to the daemon (starting an
 //! apply action, rewriting settings) as a CORS "simple request" with no preflight. The fix is
-//! a synchroniser token: a random secret generated once at daemon startup, embedded as a hidden
-//! field in every server-rendered POST form, and checked on every POST.
+//! a synchroniser token embedded as a hidden field in every server-rendered POST form, and
+//! checked on every request that is not a GET, HEAD or OPTIONS.
+//!
+//! Which token: a signed-in browser's session carries its own, random per session (see
+//! [`crate::session`]); a daemon with no auth token (loopback only) has no sessions and uses one
+//! random secret generated at startup.
 //!
 //! The token is accepted two ways: the `csrf_token` form field (what the templates send) or
 //! the `x-csrf-token` header (what scripts and the test suite send). `/login` is exempt: it is
 //! the endpoint that establishes trust, and it carries the auth token itself. Requiring CSRF
 //! on login would also deadlock a fresh browser with no cookie yet.
 //!
-//! A request that presents a valid `Authorization: Bearer <token>` header matching the
-//! configured server token is also exempt: a cross-site page cannot forge that header (it
-//! would need a CORS preflight the daemon never answers), so such a request is a script, not
-//! a browser form. Browsers use the cookie plus `csrf_token`; scripts use Bearer and skip
-//! CSRF.
+//! A request the auth gate admitted on a correct `Authorization: Bearer <token>` header is also
+//! exempt: a cross-site page cannot forge that header (it would need a CORS preflight the daemon
+//! never answers), so such a request is a script, not a browser form. Browsers use the session
+//! cookie plus `csrf_token`; scripts use Bearer and skip CSRF. A WRONG Bearer token never gets
+//! here: the gate runs first and answers 401.
 //!
 //! No new dependencies: randomness comes from the operating system (`/dev/urandom` on unix,
 //! OS-seeded `RandomState` hashing elsewhere), comparison is constant-time.
@@ -153,71 +157,70 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-/// Reject POSTs without the daemon's CSRF token.
+/// Reject state-changing requests without the right CSRF token.
 ///
-/// Runs outside the auth check, so a forged cross-site POST fails closed with 403 even when
-/// no auth token is configured at all (the tokenless-loopback default).
+/// Runs inside the auth gate, so it only ever sees requests whose sender is known, and it reads a
+/// form body (for the hidden field) only up to that route's body bound.
 pub async fn check(
     State(state): State<crate::state::AppState>,
     request: Request,
     next: Next,
 ) -> Response {
-    if request.method() == Method::GET {
+    if matches!(
+        *request.method(),
+        Method::GET | Method::HEAD | Method::OPTIONS
+    ) {
         return next.run(request).await;
     }
 
-    if request.method() != Method::POST {
+    let path = request.uri().path().to_string();
+    // The token-issuing endpoint carries the auth token itself; the Dispatcharr webhook is
+    // Bearer-only and the gate admitted it on exactly that.
+    if path == "/login" || path == crosstalk_core::hooks::ROUTE {
         return next.run(request).await;
     }
 
-    // The token-issuing endpoint: it carries the auth token itself.
-    if request.uri().path() == "/login" {
-        return next.run(request).await;
-    }
+    let authenticated = request
+        .extensions()
+        .get::<crate::auth::Authenticated>()
+        .cloned();
+    let expected = match authenticated {
+        // A script: a forged browser form cannot set the Authorization header.
+        Some(crate::auth::Authenticated::Bearer) => return next.run(request).await,
+        Some(crate::auth::Authenticated::Session(session)) => session.csrf,
+        Some(crate::auth::Authenticated::Open) => state.csrf_token().to_string(),
+        // Not through the gate's protected path (a public route): only a tokenless daemon has a
+        // token such a request could carry.
+        None if state.token().is_none() => state.csrf_token().to_string(),
+        None => return forbidden(),
+    };
 
-    // The Dispatcharr webhook: bearer-only, and it says so itself (`auth::require` refuses the
-    // session cookie there). A cross-site form cannot set an Authorization header, so a request
-    // that reaches that route authenticated cannot be a forged browser POST — and a request that
-    // does not is refused with a 401 before the handler runs.
-    if request.uri().path() == crosstalk_core::hooks::ROUTE {
-        return next.run(request).await;
-    }
-
-    // A script presenting the configured server token cannot be a forged browser form:
-    // cross-site pages cannot set the Authorization header. Only when a token is
-    // configured, and only on an exact constant-time match.
-    // Only the header counts, never the cookie: the login cookie is sent automatically and a
-    // cross-site page could ride it, while `Authorization` needs an explicit, preflighted header
-    // a forged form cannot set.
-    if let Some(expected) = state.token() {
-        if let Some(presented) = crate::auth::bearer_token(&request) {
-            if crate::auth::tokens_match(&expected, &presented) {
-                return next.run(request).await;
-            }
-        }
-    }
-
-    if is_valid(state.csrf_token(), &request) {
+    if is_valid(&expected, &request) {
         return next.run(request).await;
     }
 
     // Fall back to the form field, which means consuming the body and rebuilding it.
+    let limit = crate::limits::body_limit(&path);
     let (parts, body) = request.into_parts();
-    let bytes = match axum::body::to_bytes(body, 1 << 20).await {
+    let bytes = match axum::body::to_bytes(body, limit).await {
         Ok(bytes) => bytes,
         Err(_) => {
             return (StatusCode::PAYLOAD_TOO_LARGE, "the form was too large\n").into_response()
         }
     };
-    if !body_has_token(state.csrf_token(), &bytes) {
-        return (
-            StatusCode::FORBIDDEN,
-            "missing or invalid CSRF token: reload the page and resubmit the form\n",
-        )
-            .into_response();
+    if !body_has_token(&expected, &bytes) {
+        return forbidden();
     }
     next.run(Request::from_parts(parts, Body::from(bytes)))
         .await
+}
+
+fn forbidden() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        "missing or invalid CSRF token: reload the page and resubmit the form\n",
+    )
+        .into_response()
 }
 
 #[cfg(test)]

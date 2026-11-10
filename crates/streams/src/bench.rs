@@ -51,7 +51,7 @@ use crosstalk_core::dispatcharr::{
     Channel, ChannelGroup, ChannelProfile, DispatcharrClient, M3uAccount, Stream, World, WorldKind,
     WorldKinds, CHANNEL_EDIT_CHUNK_SIZE,
 };
-use crosstalk_core::store::Store;
+use crosstalk_core::store::{RunStatus, Store};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -63,6 +63,10 @@ pub const WRITE_CHUNK: usize = CHANNEL_EDIT_CHUNK_SIZE;
 /// The budget the bridge decision is measured against: a 20,000-channel apply that fits in
 /// this is "REST is enough", and one that does not is what a bridge would buy.
 pub const APPLY_BUDGET: Duration = Duration::from_secs(120);
+
+/// The audit's hard SLA (plans/security-audit.md): every action's plan, setup included,
+/// under this at 20k channels. Every bench report ends with a line saying whether it held.
+pub const PLAN_SLA: Duration = Duration::from_secs(10);
 
 /// The world size a synthetic run builds by default: the plan's own numbers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,9 +162,9 @@ const STREAMS_PER_CHANNEL: usize = 10;
 fn family_name(index: usize) -> String {
     let network = NETWORKS[index % NETWORKS.len()];
     let slot = index / NETWORKS.len();
-    let zone = if index > 0 && index % 13 == 0 {
+    let zone = if index > 0 && index.is_multiple_of(13) {
         " West"
-    } else if index > 0 && index % 17 == 0 {
+    } else if index > 0 && index.is_multiple_of(17) {
         " East"
     } else {
         ""
@@ -360,6 +364,29 @@ impl BenchPhase {
         }
     }
 
+    /// What the SLA counts: setup, plan and write plan together.
+    pub fn total(&self) -> Duration {
+        self.setup_time.unwrap_or_default()
+            + self.plan_time.unwrap_or_default()
+            + self.write_plan_time.unwrap_or_default()
+    }
+
+    /// The phase as JSON, for `--json`: seconds as numbers, `null` when not measured.
+    pub fn to_json(&self) -> serde_json::Value {
+        let secs = |elapsed: Option<Duration>| elapsed.map(|elapsed| elapsed.as_secs_f64());
+        serde_json::json!({
+            "action": self.action,
+            "setup_s": secs(self.setup_time),
+            "plan_s": secs(self.plan_time),
+            "write_plan_s": secs(self.write_plan_time),
+            "total_s": self.error.is_none().then(|| self.total().as_secs_f64()),
+            "writes": self.writes,
+            "requests": self.requests,
+            "detail": self.detail,
+            "error": self.error,
+        })
+    }
+
     /// One report line.
     pub fn line(&self) -> String {
         if let Some(error) = &self.error {
@@ -504,6 +531,7 @@ impl BenchReport {
         for phase in &self.phases {
             lines.push(format!("  {}", phase.line()));
         }
+        lines.push(format!("  {}", self.sla_line()));
         if let Some(timing) = &self.write_timing {
             lines.extend(timing.lines());
         }
@@ -517,6 +545,79 @@ impl BenchReport {
         for line in self.lines() {
             println!("{line}");
         }
+    }
+
+    /// The measured phases over [`PLAN_SLA`], slowest first.
+    pub fn over_sla(&self) -> Vec<&BenchPhase> {
+        let mut over: Vec<&BenchPhase> = self
+            .phases
+            .iter()
+            .filter(|phase| phase.error.is_none() && phase.total() >= PLAN_SLA)
+            .collect();
+        over.sort_by_key(|phase| std::cmp::Reverse(phase.total()));
+        over
+    }
+
+    /// Whether every measured phase held [`PLAN_SLA`].
+    pub fn sla_passed(&self) -> bool {
+        self.over_sla().is_empty()
+    }
+
+    /// The SLA verdict in one line: pass with the slowest phase, or fail naming every phase
+    /// over the limit.
+    pub fn sla_line(&self) -> String {
+        let limit = seconds(Some(PLAN_SLA));
+        if self.sla_passed() {
+            let slowest = self
+                .phases
+                .iter()
+                .filter(|phase| phase.error.is_none())
+                .max_by_key(|phase| phase.total());
+            return match slowest {
+                Some(phase) => format!(
+                    "SLA: PASS, every plan under {limit} (slowest: {} {}, setup included)",
+                    phase.action,
+                    seconds(Some(phase.total()))
+                ),
+                None => format!("SLA: PASS, nothing measured against {limit}"),
+            };
+        }
+        let over: Vec<String> = self
+            .over_sla()
+            .iter()
+            .map(|phase| format!("{} {}", phase.action, seconds(Some(phase.total()))))
+            .collect();
+        format!(
+            "SLA: FAIL, over {limit} (setup included): {}",
+            over.join(", ")
+        )
+    }
+
+    /// The whole report as JSON, for `--json`.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "title": self.title,
+            "setup": self
+                .setup
+                .iter()
+                .map(|(label, elapsed)| serde_json::json!({
+                    "label": label,
+                    "seconds": elapsed.as_secs_f64(),
+                }))
+                .collect::<Vec<_>>(),
+            "phases": self.phases.iter().map(BenchPhase::to_json).collect::<Vec<_>>(),
+            "sla": {
+                "limit_s": PLAN_SLA.as_secs_f64(),
+                "passed": self.sla_passed(),
+                "over": self
+                    .over_sla()
+                    .iter()
+                    .map(|phase| phase.action.clone())
+                    .collect::<Vec<_>>(),
+                "line": self.sla_line(),
+            },
+            "notes": self.notes,
+        })
     }
 }
 
@@ -690,7 +791,7 @@ fn visibility_phase(
     let options = MatchOptions::with_database(settings, matching_config, Some(database.clone()));
     let setup_time = started.elapsed();
     let started = Instant::now();
-    let planned = visibility::plan_with_options(world, scope, &options);
+    let planned = visibility::plan_with_options(world, scope, &options, None);
     let plan_time = started.elapsed();
     let outcome = match planned {
         Ok(outcome) => outcome,
@@ -749,7 +850,7 @@ fn phases(
 
 /// The notes every report carries: the build profile, and the settings that decide what a
 /// plan writes.
-fn common_notes(settings: &StreamsSettings) -> Vec<String> {
+fn common_notes(settings: &StreamsSettings, matching_config: &MatchingConfig) -> Vec<String> {
     let mut notes = Vec::new();
     if cfg!(debug_assertions) {
         notes.push(
@@ -761,11 +862,11 @@ fn common_notes(settings: &StreamsSettings) -> Vec<String> {
     }
     notes.push(format!(
         "settings: overwrite_streams={}, keep_custom_streams={}, visible_channel_limit={}, \
-         match threshold {}, throughput sorting {}",
+         [matching] cut {}, throughput sorting {}",
         settings.overwrite_streams,
         settings.keep_custom_streams,
         settings.visible_channel_limit,
-        settings.match_threshold(),
+        matching_config.threshold(),
         if settings.enable_throughput_sorting {
             "on"
         } else {
@@ -804,7 +905,7 @@ pub fn synthetic(
     let throughput = MemoryThroughputSource::new();
     let phases = phases(&world, &scope, settings, matching_config, &throughput);
 
-    let mut notes = common_notes(settings);
+    let mut notes = common_notes(settings, matching_config);
     notes.push(
         "scope: every channel, in the synthetic world's only profile (\"All\"); [scope] in \
          crosstalk.toml is not applied to a synthetic world"
@@ -874,15 +975,11 @@ pub async fn live(
     );
 
     let write_timing = match write_ids {
-        Some(ids) => Some(
-            time_writes(&client, &world, ids)
-                .await
-                .context("timing stream-list writes")?,
-        ),
+        Some(ids) => Some(timed_writes_in_a_run(&client, &world, ids, &store_path).await?),
         None => None,
     };
 
-    let mut notes = common_notes(settings);
+    let mut notes = common_notes(settings, &config.matching);
     notes.push(format!(
         "read-only: nothing was written by the plans; measured against {}",
         config.dispatcharr.api_root()
@@ -907,6 +1004,45 @@ pub async fn live(
         write_timing,
         notes,
     })
+}
+
+/// The action id a `--write-timing` run is recorded under.
+pub const ACTION_WRITE_TIMING: &str = "bench_write_timing";
+
+/// [`time_writes`] inside a recorded streams run.
+///
+/// The timing WRITES stream lists, so it takes the streams app's one-live-run slot like any
+/// other writer: a streams run in progress (here or in the daemon) refuses it instead of
+/// racing it, and the run page records that it happened and how it went.
+async fn timed_writes_in_a_run(
+    client: &DispatcharrClient,
+    world: &World,
+    ids: &[i64],
+    store_path: &std::path::Path,
+) -> Result<WriteTiming> {
+    let store = Store::open_shared(store_path)
+        .with_context(|| format!("opening {}", store_path.display()))?;
+    let run_id = store
+        .start_run(crate::APP_ID, ACTION_WRITE_TIMING, false)
+        .context(
+            "--write-timing rewrites stream lists, so it needs the streams app's run slot, and \
+             a streams run is already in progress (here or in another process): wait for it to \
+             finish",
+        )?;
+    let timed = time_writes(client, world, ids).await;
+    let (status, summary) = match &timed {
+        Ok(timing) => (
+            RunStatus::Succeeded,
+            format!(
+                "write timing over {} channel(s): {} failed write(s), each list rewritten to the \
+                 value read back just before",
+                timing.sample, timing.failed
+            ),
+        ),
+        Err(error) => (RunStatus::Failed, format!("{error:#}")),
+    };
+    store.finish_run(run_id, status, Some(&summary), &serde_json::json!({}), None)?;
+    timed.context("timing stream-list writes")
 }
 
 /// `--write-timing`: the two request patterns, measured on the same lists.
@@ -941,16 +1077,18 @@ async fn time_writes(
     // The lists are read back AFTER the four plans ran, one GET per channel, immediately
     // before the writes — never from the world above. That world was loaded before the
     // plans, so its lists are minutes stale on a busy box; rewriting them would revert a
-    // concurrent edit instead of being the no-op this timing promises.
+    // concurrent edit instead of being the no-op this timing promises. They come from the
+    // channel's own row (its `streams` ids, exactly the list the write replaces), not from a
+    // stream listing, whose filters could leave a stream out and so unlink it.
     let mut lists: Vec<(i64, Vec<i64>)> = Vec::with_capacity(ids.len());
     for id in ids {
-        let streams = client.channel_streams(*id).await.with_context(|| {
+        let streams = client.channel_stream_ids(*id).await.with_context(|| {
             format!(
                 "reading the current stream list of channel {id} immediately before the \
                  write timing"
             )
         })?;
-        lists.push((*id, streams.iter().map(|stream| stream.id).collect()));
+        lists.push((*id, streams));
     }
 
     let mut failed = 0usize;
@@ -982,7 +1120,7 @@ async fn time_writes(
 // Formatting
 // =======================================================================================
 
-fn seconds(elapsed: Option<Duration>) -> String {
+pub fn seconds(elapsed: Option<Duration>) -> String {
     match elapsed {
         Some(elapsed) => format!("{:.3}s", elapsed.as_secs_f64()),
         None => "-".to_string(),
@@ -991,11 +1129,11 @@ fn seconds(elapsed: Option<Duration>) -> String {
 
 /// `20000` as `20,000`: a six-figure count with no separator is one digit away from a
 /// misreading, and these numbers are quoted.
-fn thousands(count: usize) -> String {
+pub fn thousands(count: usize) -> String {
     let digits = count.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, ch) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index) % 3 == 0 {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
             out.push(',');
         }
         out.push(ch);
@@ -1256,10 +1394,10 @@ mod tests {
             .mount(&fixture.server)
             .await;
         // `--write-timing` reads each sampled channel's list back immediately before the
-        // writes (never from the loaded world), so the mock serves those reads from the
-        // same world the load saw.
+        // writes (never from the loaded world), from the channel's own row, so the mock
+        // serves those reads from the same world the load saw.
         Mock::given(method("GET"))
-            .and(path_regex(r"^/api/channels/channels/\d+/streams/$"))
+            .and(path_regex(r"^/api/channels/channels/\d+/$"))
             .respond_with(move |request: &wiremock::Request| {
                 let id: i64 = request
                     .url
@@ -1268,20 +1406,11 @@ mod tests {
                     .nth(4)
                     .and_then(|id| id.parse().ok())
                     .unwrap_or(-1);
-                let streams: Vec<serde_json::Value> = world
-                    .channels
-                    .iter()
-                    .find(|channel| channel.id == id)
-                    .map(|channel| {
-                        channel
-                            .streams
-                            .iter()
-                            .filter_map(|id| world.streams.iter().find(|stream| stream.id == *id))
-                            .map(|stream| serde_json::to_value(stream).expect("stream"))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                ResponseTemplate::new(200).set_body_json(streams)
+                match world.channels.iter().find(|channel| channel.id == id) {
+                    Some(channel) => ResponseTemplate::new(200)
+                        .set_body_json(serde_json::to_value(channel).expect("channel")),
+                    None => ResponseTemplate::new(404),
+                }
             })
             .mount(&fixture.server)
             .await;
@@ -1324,10 +1453,13 @@ mod tests {
         let timing = report.write_timing.expect("write timing");
         assert_eq!(timing.sample, sampled.len());
         assert_eq!(timing.failed, 0, "{}", timing.recommendation());
+        // The verdict depends on wall-clock timings extrapolated to 20k channels, so a busy
+        // machine can tip it either way; the budget rule itself has its own pure test. Here it
+        // only has to reach one of the two verdicts.
+        let verdict = timing.recommendation();
         assert!(
-            timing.recommendation().contains("REST is enough"),
-            "{}",
-            timing.recommendation()
+            verdict.contains("REST is enough") || verdict.contains("bridge"),
+            "{verdict}"
         );
         let per_channel = fixture
             .server
@@ -1360,15 +1492,51 @@ mod tests {
             .unwrap_or_default()
             .into_iter()
             .filter(|request| {
+                let path = request.url.path();
                 request.method.as_str() == "GET"
-                    && request.url.path().ends_with("/streams/")
-                    && request.url.path().starts_with("/api/channels/channels/")
+                    && path.starts_with("/api/channels/channels/")
+                    && path != "/api/channels/channels/"
             })
             .count();
         assert_eq!(
             rereads,
             sampled.len(),
             "one fresh list read per sampled channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_timing_waits_for_the_streams_slot() {
+        // S10: the timing writes stream lists, so a streams run in progress (here, or a
+        // daemon's) refuses it instead of racing it.
+        use crate::test_support::{sort_world, ServerFixture, CHANNEL_SORTED};
+
+        let fixture = ServerFixture::start(&sort_world()).await;
+        let store =
+            Store::open_shared(fixture.config.data_dir().join("crosstalk.db")).expect("store");
+        let running = store
+            .start_run(crate::APP_ID, "sort_apply", false)
+            .expect("a live streams run");
+        let error = live(
+            &fixture.config,
+            &StreamsSettings::default(),
+            Some(&[CHANNEL_SORTED]),
+        )
+        .await
+        .expect_err("refused");
+        assert!(format!("{error:#}").contains("run slot"), "{error:#}");
+        let writes = fixture
+            .server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|request| request.method.as_str() != "GET")
+            .count();
+        assert_eq!(writes, 0, "nothing was written");
+        assert_eq!(
+            store.run(running).expect("run").expect("present").status,
+            RunStatus::Running
         );
     }
 

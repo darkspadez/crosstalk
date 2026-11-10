@@ -19,10 +19,28 @@
 # authenticates requests.
 bind = "127.0.0.1"
 port = 8730
-# Bearer token required on every request. Leave empty only while `bind` is loopback.
+# Bearer token required on every request. Leave empty only while `bind` is loopback and
+# no proxy is in front. At least 32 bytes once the daemon is reachable from elsewhere (a
+# non-loopback bind, or trusted_proxies set): `openssl rand -hex 32`.
 # Prefer the environment variable named by `token_env` so the secret stays out of the file.
+# When both are set the variable wins (and `validate` warns). A file holding an inline secret
+# should be `chmod 600`: `validate` and `serve` warn when it is readable by others.
 token = ""
 token_env = "CROSSTALK_TOKEN"
+# Reverse proxies allowed to name the client (addresses or CIDR ranges, IPv4 or IPv6).
+# Only a request whose socket peer is listed has its X-Forwarded-For / X-Real-IP /
+# X-Forwarded-Proto / X-Forwarded-Host believed; the per-client sign-in limit keys on
+# the address they name. Setting this requires a token.
+# trusted_proxies = ["127.0.0.1", "172.16.0.0/12"]
+trusted_proxies = []
+# The URL browsers use, when a proxy rewrites the Host header. A form POST's Origin must
+# match it (scheme, host and port).
+# public_url = "https://crosstalk.example.com"
+public_url = ""
+# Mark the session cookie Secure, and send Strict-Transport-Security, even when no
+# trusted proxy says the request came over https (both happen automatically when one does).
+secure_cookies = false
+hsts = false
 
 [dispatcharr]
 # Dispatcharr's base URL, without the /api suffix.
@@ -38,8 +56,23 @@ password_env = "CROSSTALK_DISPATCHARR_PASSWORD"
 # Per-request timeout in seconds.
 timeout_secs = 30
 # Cap on concurrent requests. The public TypeSafe endpoint rate-limits around eight
-# concurrent requests; Dispatcharr itself is usually fine with more.
+# concurrent requests; Dispatcharr itself is usually fine with more. Lineup's channel,
+# group and logo writes are paced by this cap too (it replaces Lineuparr's rate_limiting).
 concurrency = 8
+
+# The crosstalk-bridge Dispatcharr plugin (docs/bridge.md): the four writes REST cannot do
+# (bulk stream lists, bulk stream stats, moving a channel to No Group, generated guide entries).
+# Off by default. `crosstalk bridge secret` fills in `secret` and prints it once to paste into
+# the plugin; `crosstalk bridge ping` checks the install. When enabled, `serve` pings the plugin
+# at start-up and uses it only if it answers a signed ping at min_version or later.
+[bridge]
+enabled = false
+secret = ""
+# When this variable is set and not blank it wins over `secret`.
+secret_env = "CROSSTALK_BRIDGE_SECRET"
+# The zip import installs the plugin as crosstalk_bridge; the other spelling is tried too.
+plugin_key = "crosstalk_bridge"
+min_version = "0.1.0"
 
 # AI providers. The endpoint, the key and the concurrency cap live here, so several
 # sub-apps share one provider entry rather than each holding a copy. Which provider and
@@ -62,8 +95,8 @@ concurrency = 8
 
 # The AI matching policy. The heuristics decide first and the model only promotes: it is
 # asked about results in the band below, or about candidates for a channel the heuristics
-# could not match at all. A heuristic result at or above a sub-app's own confidence
-# threshold is never re-checked or vetoed by the model. An AI-accepted pick is still
+# could not match at all. A heuristic result at or above the one [matching] cut is never
+# re-checked or vetoed by the model. An AI-accepted pick is still
 # validated for programme data: when every same-name copy is empty the channel is left
 # unmatched with a reason saying so. The guide app's heal never consults the model.
 #
@@ -74,6 +107,11 @@ provider = "typesafe"
 # Model name as the provider spells it. TypeSafe's aliases are jev-latest and jev-preview;
 # pinning a version (jev-1.14.0) keeps answers stable when a new release ships.
 model = "jev-latest"
+# Escalation chain: asked in order, each link handling what the earlier ones could not
+# decide (a Jev decision model handing off to an LLM fallback). Empty means the
+# provider/model pair above, as one link. Setting both the pair (non-default) and the
+# chain is an error `crosstalk validate` reports and the settings form refuses to save.
+# chain = [{ provider = "typesafe", model = "jev-latest" }, { provider = "llm", model = "kimi-k3" }]
 # Inclusive score band treated as uncertain.
 verify_band_low = 80
 verify_band_high = 94
@@ -111,6 +149,10 @@ ignore_groups = ""
 retention_days = 0
 
 [matching]
+# The ONE decision cut every app matches at (guide assigns, streams attaches, lineup
+# names): a sensitivity preset -- strict/high/medium/low (95/90/80/70) -- or a bare
+# number. Guide's old per-action thresholds are retired in favour of this.
+sensitivity = "strict"
 # These four toggles live here rather than in a sub-app file, because every sub-app that
 # compares channel names must agree on them: two apps disagreeing about whether "[HD]" is
 # stripped would give two different answers for the same channel.
@@ -119,7 +161,8 @@ ignore_regional_tags = true
 ignore_geographic_tags = true
 ignore_misc_tags = true
 
-# Which shipped channel databases the matcher may draw reference names from. Empty means
+# Which merged channel databases the matcher may draw reference names from (AU, BR, CA,
+# DE, DO, ES, FR, IN, MX, NL, NO, PE, PL, PT, UK, US; `data/merged/channels/`). Empty means
 # the plugin's rule: every database when only one ships, otherwise the United States one.
 # Enabling a country you do not carry costs accuracy rather than gaining coverage.
 enabled_databases = ["US"]
@@ -153,7 +196,8 @@ run_history_days = 15
 
 # Named workflows: a sequence of `<app>.<action>` steps the host runs in order, each as an
 # ordinary run of its own (own run page, own CSV, own checkpoint), plus one run record for the
-# workflow itself that links them. It stops at the first step that fails or is cancelled; a step
+# workflow itself that links them. It stops at the first step that fails (unless that step sets
+# continue_on_failure, below) or is cancelled; a step
 # that pauses at its window's end pauses the workflow, and the next firing resumes that step.
 # Schedule one as "workflow.<name>", like an action.
 # [workflows.nightly]
@@ -161,6 +205,55 @@ run_history_days = 15
 # A new pass discards each step's saved progress. Off by default, which resumes instead: what
 # an operator turns on after widening the scope.
 # fresh = false
+#
+# A step can also be a table: `scope` REPLACES [scope] for that step (a table, or the name of
+# a scope an app provides, like "lineup" — which may reach channels [scope] excludes), and
+# `continue_on_failure` carries on past that step's failure (the workflow still ends failed).
+# A step's scope only ever comes from this file: hooks and the UI cannot pass one. TOML does
+# not allow a line break inside `{ ... }`, so keep each table on one line, or use
+# [[workflows.<name>.steps]] tables instead.
+#
+# `full_sync` is Lineuparr's `full_sync`, as a workflow: sync the channel list from the
+# configured lineup file, match streams and guide entries over exactly those channels,
+# assign their logos, then hide the owned channels left with no streams.
+# `scope = "lineup"` is lineup's owned channels for its configured lineup file (the
+# named scope replaces [scope] for that step); streams' lineup mode additionally
+# restricts those steps to the lineup file's country. `continue_on_failure` carries
+# the sequence past a failed guide/logo step, and the workflow itself ends failed, with
+# each step listed. A failed sync or stream match stops it: tidy hides the owned channels
+# left with no streams, so it must never run after a stream match that did not happen.
+# [workflows.full_sync]
+# [[workflows.full_sync.steps]]
+# action = "lineup.sync_apply"
+# [[workflows.full_sync.steps]]
+# action = "streams.match_apply"
+# scope = "lineup"
+# [[workflows.full_sync.steps]]
+# action = "guide.match_apply"
+# scope = "lineup"
+# continue_on_failure = true
+# [[workflows.full_sync.steps]]
+# action = "lineup.logos_apply"
+# scope = "lineup"
+# continue_on_failure = true
+# [[workflows.full_sync.steps]]
+# action = "lineup.tidy_apply"
+#
+# Optional steps, commented out because `sync` already names channels after the lineup:
+# `names_apply` would rename every channel to the unified identity's canonical name
+# (the OTA template or the merged database leader) and tag what nothing recognises —
+# display names from every app then agree, but the lineup's own provider spellings are
+# gone. `categorize_apply` would move channels into groups named after their database
+# category instead of the lineup's categories. Either (or both) goes between
+# `lineup.sync_apply` and the match steps when wanted, with the same lineup scope:
+# [[workflows.full_sync.steps]]
+# action = "lineup.names_apply"
+# scope = "lineup"
+# continue_on_failure = true
+# [[workflows.full_sync.steps]]
+# action = "lineup.categorize_apply"
+# scope = "lineup"
+# continue_on_failure = true
 
 # Dispatcharr Connect events, and what they trigger. A target is an `<app>.<action>` or a
 # `workflow.<name>`; the event names are whatever you subscribe to in Dispatcharr
@@ -178,6 +271,9 @@ run_history_days = 15
 # is queued for when it frees.
 # [hooks]
 # debounce_secs = 60
+# # A burst that never goes quiet still runs this long after its first delivery
+# # (default 5 x debounce_secs, at most 900).
+# max_settle_secs = 300
 # rate_per_minute = 60
 # m3u_refresh = ["streams.match_apply"]
 # epg_refresh = ["workflow.nightly"]

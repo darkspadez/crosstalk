@@ -79,10 +79,12 @@ impl DispatcharrClient {
         if !response.success {
             bail!(
                 "the plugin {key:?} refused {action:?}: {}",
-                response
-                    .error
-                    .unwrap_or_else(|| "no reason given".to_string())
-                    .trim()
+                crate::redact::urls_to_hosts(
+                    response
+                        .error
+                        .unwrap_or_else(|| "no reason given".to_string())
+                        .trim()
+                )
             );
         }
         Ok(response.result)

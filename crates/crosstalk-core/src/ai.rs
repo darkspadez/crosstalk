@@ -102,6 +102,11 @@ pub struct DecisionRequest {
     pub state: serde_json::Value,
     /// Question id -> question. The id is not sent to the model; it names the answer.
     pub questions: BTreeMap<String, Question>,
+    /// What the question is about, e.g. `"epg"`, `"streams"` or `"names"`. A chat-shaped
+    /// backend turns it into a task prefix for its prompt; a decision-shaped backend ignores
+    /// it. `None` asks the generic "same channel?" question. Stored with the audit row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
 }
 
 impl DecisionRequest {
@@ -115,11 +120,24 @@ impl DecisionRequest {
             model: model.into(),
             state,
             questions: BTreeMap::new(),
+            task: None,
         }
     }
 
     pub fn ask(mut self, id: impl Into<String>, question: Question) -> Self {
         self.questions.insert(id.into(), question);
+        self
+    }
+
+    /// Name what the question is about, so a chat-shaped backend can tailor its prompt
+    /// without new plumbing: `"epg"`, `"streams"`, `"names"`, or a sentence.
+    pub fn with_task(mut self, task: impl Into<String>) -> Self {
+        let task = task.into();
+        self.task = if task.trim().is_empty() {
+            None
+        } else {
+            Some(task)
+        };
         self
     }
 }
@@ -212,6 +230,118 @@ impl Verdict {
     }
 }
 
+/// One link's turn at the question: what it answered, or why it could not.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChainAttempt {
+    /// The chain link's provider, as named in `[ai.providers]`.
+    pub provider: String,
+    /// The chain link's model.
+    pub model: String,
+    /// The answer, when the call worked. `None` when it failed.
+    pub response: Option<DecisionResponse>,
+    /// Why the call failed, when it did.
+    pub error: Option<String>,
+}
+
+impl ChainAttempt {
+    /// Whether this attempt settled anything: an answer arrived, failed or not.
+    /// (Every recorded attempt arrived at an answer or an error; the helper exists so
+    /// audit rendering reads plainly.)
+    pub fn failed(&self) -> bool {
+        self.response.is_none()
+    }
+}
+
+/// What the chain did with one question: every link asked, in order.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ChainOutcome {
+    /// One entry per link asked, in chain order. The last entry with a response decided.
+    pub attempts: Vec<ChainAttempt>,
+    /// True when cancellation stopped the chain before a link settled the question.
+    pub cancelled: bool,
+}
+
+impl ChainOutcome {
+    /// The attempt that decided, if any: the last one that got a response.
+    pub fn deciding(&self) -> Option<&ChainAttempt> {
+        self.attempts
+            .iter()
+            .rev()
+            .find(|attempt| attempt.response.is_some())
+    }
+
+    /// The deciding response, if any.
+    pub fn response(&self) -> Option<&DecisionResponse> {
+        self.deciding()
+            .and_then(|attempt| attempt.response.as_ref())
+    }
+
+    /// Who decided: the deciding link's provider and model.
+    pub fn decided_by(&self) -> Option<(&str, &str)> {
+        self.deciding()
+            .map(|attempt| (attempt.provider.as_str(), attempt.model.as_str()))
+    }
+
+    /// The yes-probability of one noul question in the deciding response.
+    pub fn noul(&self, id: &str) -> Option<f64> {
+        self.response().and_then(|response| response.noul(id))
+    }
+
+    /// Whether the chain escalated: more than one link was asked.
+    pub fn escalated(&self) -> bool {
+        self.attempts.len() > 1
+    }
+}
+
+/// The chain's answer to one yes/no question: the probability and who decided it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct YesNoOutcome {
+    /// The yes-probability from the deciding link, if it answered the question.
+    pub probability: Option<f64>,
+    /// The deciding link's provider. Empty when nothing answered.
+    pub provider: String,
+    /// The deciding link's model. Empty when nothing answered.
+    pub model: String,
+    /// Every link asked, in chain order.
+    pub attempts: Vec<ChainAttempt>,
+    /// True when cancellation stopped the chain before a link settled the question.
+    pub cancelled: bool,
+}
+
+/// Build the "are these the same channel?" request the corpus labeller asks.
+///
+/// One noul question, id `"same"`, over the two names: the smallest question the chain
+/// can answer, and the one [`AiService::decide_yes_no`] reads back.
+///
+/// `entry` addresses the request at the chain's first link; `decide_yes_no` re-addresses
+/// it per link, so any link of `chain` works here. `task` names the naming domain (the
+/// labeller passes `"names"`); it only tunes a chat-shaped backend's prompt.
+pub fn yes_no_request(
+    entry: &crate::config::AiChainEntry,
+    first: &str,
+    second: &str,
+    task: &str,
+) -> DecisionRequest {
+    DecisionRequest::new(
+        entry.provider.clone(),
+        entry.model.clone(),
+        serde_json::json!({
+            "first": first,
+            "second": second,
+        }),
+    )
+    .ask(
+        "same",
+        Question::noul_with(
+            format!("Do {first:?} and {second:?} refer to the same television channel?"),
+            "The same channel, ignoring only quality and language tags",
+            "A different channel: a numbered sibling, a time-shifted feed, a regional \
+             variant, or a different network",
+        ),
+    )
+    .with_task(task)
+}
+
 /// Answers questions.
 #[async_trait::async_trait]
 pub trait Decider: Send + Sync {
@@ -267,9 +397,14 @@ impl AiService {
 
     /// A service with one decider, for tests.
     pub fn with_decider(name: impl Into<String>, decider: std::sync::Arc<dyn Decider>) -> Self {
-        let mut deciders = BTreeMap::new();
-        deciders.insert(name.into(), decider);
-        Self { deciders }
+        Self::with_deciders(vec![(name.into(), decider)])
+    }
+
+    /// A service with several deciders, for chain tests: one per chain link.
+    pub fn with_deciders(deciders: Vec<(String, std::sync::Arc<dyn Decider>)>) -> Self {
+        Self {
+            deciders: deciders.into_iter().collect(),
+        }
     }
 
     pub fn has(&self, provider: &str) -> bool {
@@ -295,6 +430,139 @@ impl AiService {
         })?;
         decider.decide(request).await
     }
+
+    /// Ask each chain link in order until one settles the question.
+    ///
+    /// The same [`DecisionRequest`] goes to every link, with only the provider and model
+    /// rewritten to the link's own: an escalation is a second opinion on the same question,
+    /// not a new question. A link that errors hands the question on; a link whose answer
+    /// `settled` calls undecided does too. A confident answer is final and later links are
+    /// never asked, so the first link that can decide is the only one that spends anything.
+    ///
+    /// `settled` answers whether a response decides the question — accept or confident
+    /// reject — because "undecided" depends on the caller's thresholds, which this layer
+    /// does not know. `cancelled` is checked between links, never during one: an in-flight
+    /// request runs to its answer, and the chain stops after it.
+    pub async fn decide_chain(
+        &self,
+        chain: &[crate::config::AiChainEntry],
+        request: &DecisionRequest,
+        mut settled: impl FnMut(&DecisionResponse) -> bool,
+        cancelled: impl Fn() -> bool,
+    ) -> ChainOutcome {
+        let mut outcome = ChainOutcome {
+            attempts: Vec::new(),
+            cancelled: false,
+        };
+        for (position, entry) in chain.iter().enumerate() {
+            if position > 0 && cancelled() {
+                outcome.cancelled = true;
+                break;
+            }
+            let mut addressed = request.clone();
+            addressed.provider = entry.provider.clone();
+            addressed.model = entry.model.clone();
+            match self.decide(&addressed).await {
+                Ok(response) => {
+                    let done = settled(&response);
+                    outcome.attempts.push(ChainAttempt {
+                        provider: entry.provider.clone(),
+                        model: entry.model.clone(),
+                        response: Some(response),
+                        error: None,
+                    });
+                    if done {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    outcome.attempts.push(ChainAttempt {
+                        provider: entry.provider.clone(),
+                        model: entry.model.clone(),
+                        response: None,
+                        error: Some(redact_error(&format!("{error:#}"))),
+                    });
+                }
+            }
+        }
+        outcome
+    }
+
+    /// Ask the chain one yes/no question and read the answer with the gate's own rule.
+    ///
+    /// This is the labeller's entry point: given two names, build the request with
+    /// [`yes_no_request`], ask, and read the yes-probability and the model that decided it
+    /// off the outcome. `question` is the noul question id to read.
+    ///
+    /// One call is one pair; a labeller with thousands of pairs fans out itself, bounded by
+    /// [`crate::ai_gate::fanout_bound_for`]. Each provider's client still holds its own
+    /// `max_concurrency` permits and retries rate limits and 5xx, so a wide fan-out cannot
+    /// overrun a slow link, and only the pairs the cheap first link cannot settle reach the
+    /// later ones. Cancellation is checked between links; the caller stops issuing pairs.
+    pub async fn decide_yes_no(
+        &self,
+        chain: &[crate::config::AiChainEntry],
+        request: &DecisionRequest,
+        question: &str,
+        accept_at: f64,
+        reject_at: f64,
+        cancelled: impl Fn() -> bool,
+    ) -> YesNoOutcome {
+        let outcome = self
+            .decide_chain(
+                chain,
+                request,
+                |response| {
+                    // A noul answer carries no confidence, and `Verdict::accept` treats a
+                    // missing confidence as "no evidence against": the probability alone
+                    // decides, exactly as the gate reads a yes-probability.
+                    match response.noul(question) {
+                        Some(probability) => {
+                            let verdict = Verdict {
+                                probability,
+                                confidence: None,
+                            };
+                            verdict.accept(accept_at, 0.0) || verdict.reject(reject_at)
+                        }
+                        // A missing answer is not evidence either way: escalate.
+                        None => false,
+                    }
+                },
+                cancelled,
+            )
+            .await;
+        let deciding = outcome.deciding();
+        YesNoOutcome {
+            probability: deciding.and_then(|attempt| {
+                attempt
+                    .response
+                    .as_ref()
+                    .and_then(|response| response.noul(question))
+            }),
+            provider: deciding
+                .map(|attempt| attempt.provider.clone())
+                .unwrap_or_default(),
+            model: deciding
+                .map(|attempt| attempt.model.clone())
+                .unwrap_or_default(),
+            attempts: outcome.attempts,
+            cancelled: outcome.cancelled,
+        }
+    }
+}
+
+/// Scrub an error message before it reaches the audit trail: URLs shrink to
+/// `scheme://host[:port]` (their userinfo, path and query are where proxies and providers
+/// carry tokens; see [`crate::redact::urls_to_hosts`]) and bearer tokens are masked. The
+/// bearer key itself is sent as a header and never formatted into an error, but a
+/// provider's echoed body or an operator's `base_url` can still carry one.
+pub fn redact_error(text: &str) -> String {
+    static BEARER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let bearer = BEARER.get_or_init(|| {
+        regex::Regex::new(r#"(?i)\bbearer\s+[^\s"',}]+"#).expect("valid bearer pattern")
+    });
+    let text = crate::redact::urls_to_hosts(text);
+    bearer.replace_all(&text, "Bearer [redacted]").into_owned()
 }
 
 fn build_typesafe(name: &str, provider: &AiProviderConfig) -> Result<std::sync::Arc<dyn Decider>> {
@@ -589,8 +857,24 @@ pub mod openai {
     }
 
     /// Build the instruction sent as the system message.
-    fn system_prompt(request: &DecisionRequest) -> String {
-        let mut lines = vec![
+    ///
+    /// The request's task, when set, becomes the first line: a chat model told "you are
+    /// matching a channel to a guide listing" answers a different question than one told
+    /// it is comparing two names, and the generic wording below covers neither precisely.
+    /// Unknown tasks are passed through verbatim rather than rejected, so a new caller does
+    /// not need a prompt change to be understood.
+    pub(super) fn system_prompt(request: &DecisionRequest) -> String {
+        let mut lines = Vec::new();
+        if let Some(task) = request
+            .task
+            .as_deref()
+            .map(str::trim)
+            .filter(|task| !task.is_empty())
+        {
+            lines.push(task_prefix(task).to_string());
+            lines.push(String::new());
+        }
+        lines.push(
             "You answer questions about whether two channel names refer to the same television \
              channel. Reply with a JSON object and nothing else: {\"answers\": {<id>: <value>}, \
              \"confidences\": {<id>: <number 0-1>}}. For a yes/no question the value is the \
@@ -598,9 +882,9 @@ pub mod openai {
              is the exact option name. Treat numbered siblings (ESPN and ESPN2), time-shifted \
              feeds (+1) and regional feeds (East, West, Pacific) as DIFFERENT channels."
                 .to_string(),
-            String::new(),
-            "Questions:".to_string(),
-        ];
+        );
+        lines.push(String::new());
+        lines.push("Questions:".to_string());
         for (id, question) in &request.questions {
             match question {
                 Question::Noul {
@@ -640,6 +924,23 @@ pub mod openai {
         lines.join("\n")
     }
 
+    /// The per-task instruction prefix for the system prompt: what the question is about,
+    /// in the words a chat model needs first. Unknown tasks pass through verbatim.
+    pub(super) fn task_prefix(task: &str) -> std::borrow::Cow<'_, str> {
+        match task {
+            "epg" => std::borrow::Cow::Borrowed(
+                "You are matching a Dispatcharr channel to a guide (EPG) listing entry.",
+            ),
+            "streams" => std::borrow::Cow::Borrowed(
+                "You are matching a Dispatcharr channel to an IPTV stream.",
+            ),
+            "names" => std::borrow::Cow::Borrowed(
+                "You are deciding whether two channel names refer to the same television channel.",
+            ),
+            other => std::borrow::Cow::Owned(format!("Task: {other}.")),
+        }
+    }
+
     #[async_trait::async_trait]
     impl Decider for OpenAiCompatClient {
         fn provider(&self) -> &str {
@@ -673,11 +974,45 @@ pub mod openai {
             });
 
             let started = std::time::Instant::now();
-            let mut sent = self.http.post(&url).json(&body);
-            if !self.api_key.is_empty() {
-                sent = sent.bearer_auth(&self.api_key);
-            }
-            let response = sent.send().await.with_context(|| format!("POST {url}"))?;
+            // The same back-off as the TypeSafe client: a corpus labeller asking thousands
+            // of questions should ride out a hosted endpoint's rate limit, not fail the pair.
+            let mut attempt = 0u32;
+            let response = loop {
+                attempt += 1;
+                let mut sent = self.http.post(&url).json(&body);
+                if !self.api_key.is_empty() {
+                    sent = sent.bearer_auth(&self.api_key);
+                }
+                match sent.send().await {
+                    Ok(response) => {
+                        let status = response.status();
+                        let retryable = status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                            || status.as_u16() == 529
+                            || status.is_server_error();
+                        if retryable && attempt < 3 {
+                            let wait = response
+                                .headers()
+                                .get(reqwest::header::RETRY_AFTER)
+                                .and_then(|value| value.to_str().ok())
+                                .and_then(|value| value.parse::<u64>().ok())
+                                .map(Duration::from_secs)
+                                .unwrap_or(Duration::from_millis(250 * 2u64.pow(attempt - 1)))
+                                .min(Duration::from_secs(30));
+                            tokio::time::sleep(wait).await;
+                            continue;
+                        }
+                        break response;
+                    }
+                    Err(error) => {
+                        if attempt < 3 && (error.is_connect() || error.is_timeout()) {
+                            tokio::time::sleep(Duration::from_millis(250 * 2u64.pow(attempt - 1)))
+                                .await;
+                            continue;
+                        }
+                        return Err(error).with_context(|| format!("POST {url}"));
+                    }
+                }
+            };
 
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
@@ -992,6 +1327,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn openai_compat_retries_a_rate_limit() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "gpt-local",
+                "choices": [{"message": {"content": "{\"answers\": {\"same\": 0.7}}"}}],
+            })))
+            .mount(&server)
+            .await;
+
+        let service = AiService::from_config(&CrosstalkConfig {
+            ai: crate::config::AiConfig {
+                providers: BTreeMap::from([(
+                    "local".to_string(),
+                    openai_provider(&format!("{}/v1", server.uri())),
+                )]),
+                ..crate::config::AiConfig::default()
+            },
+            ..CrosstalkConfig::default()
+        });
+        let response = service.decide(&request("local")).await.expect("retried");
+        assert_eq!(response.noul("same"), Some(0.7));
+    }
+
+    #[tokio::test]
     async fn openai_compat_defaults_a_missing_confidence_to_zero() {
         // No "confidences" map at all: the choice must not report certainty it was
         // never given. 0.0 fails the `min_confidence` floor instead of auto-passing
@@ -1271,5 +1638,443 @@ mod tests {
         })
         .expect("client");
         assert_eq!(client.base(), "https://api.typesafe.ai/v1");
+    }
+
+    /// A decider scripted per link: answers the `same` question with a fixed probability —
+    /// or omits it, or fails — and counts its calls so escalation is observable.
+    struct ScriptDecider {
+        probability: Option<f64>,
+        fail: bool,
+        model: String,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Decider for ScriptDecider {
+        fn provider(&self) -> &str {
+            "script"
+        }
+
+        fn calibrated(&self) -> bool {
+            true
+        }
+
+        async fn decide(&self, _request: &DecisionRequest) -> Result<DecisionResponse> {
+            use std::sync::atomic::Ordering;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                anyhow::bail!("the endpoint is down");
+            }
+            let mut answers = BTreeMap::new();
+            if let Some(probability) = self.probability {
+                answers.insert("same".to_string(), Answer::Noul { noul: probability });
+            }
+            Ok(DecisionResponse {
+                model: self.model.clone(),
+                answers,
+                input_tokens: 1,
+                output_tokens: 1,
+                latency_ms: 1,
+                calibrated: true,
+            })
+        }
+    }
+
+    fn script(
+        probability: Option<f64>,
+        fail: bool,
+        model: &str,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> std::sync::Arc<dyn Decider> {
+        std::sync::Arc::new(ScriptDecider {
+            probability,
+            fail,
+            model: model.to_string(),
+            calls,
+        })
+    }
+
+    fn chain() -> Vec<crate::config::AiChainEntry> {
+        vec![
+            crate::config::AiChainEntry::new("first", "jev-latest"),
+            crate::config::AiChainEntry::new("second", "kimi-k3"),
+        ]
+    }
+
+    fn same_request() -> DecisionRequest {
+        DecisionRequest::new("first", "jev-latest", serde_json::json!({"a": "ESPN"}))
+            .ask("same", Question::noul("Same channel?"))
+    }
+
+    /// The gate's rule for one yes/no answer: accept or confident reject settles.
+    fn settled_yes_no(accept_at: f64, reject_at: f64) -> impl FnMut(&DecisionResponse) -> bool {
+        move |response: &DecisionResponse| match response.noul("same") {
+            Some(probability) => probability >= accept_at || probability <= reject_at,
+            None => false,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_confident_first_answer_stops_the_chain() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let first_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let second_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let service = AiService::with_deciders(vec![
+            (
+                "first".to_string(),
+                script(
+                    Some(0.95),
+                    false,
+                    "jev-1",
+                    std::sync::Arc::clone(&first_calls),
+                ),
+            ),
+            (
+                "second".to_string(),
+                script(
+                    Some(0.95),
+                    false,
+                    "kimi",
+                    std::sync::Arc::clone(&second_calls),
+                ),
+            ),
+        ]);
+        let outcome = service
+            .decide_chain(&chain(), &same_request(), settled_yes_no(0.8, 0.3), || {
+                false
+            })
+            .await;
+        assert_eq!(outcome.attempts.len(), 1);
+        assert!(!outcome.cancelled);
+        assert!(!outcome.escalated());
+        assert_eq!(outcome.decided_by(), Some(("first", "jev-latest")));
+        assert_eq!(outcome.noul("same"), Some(0.95));
+        assert_eq!(first_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second_calls.load(Ordering::SeqCst), 0, "never asked");
+    }
+
+    #[tokio::test]
+    async fn an_undecided_first_answer_escalates() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let first_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let second_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let service = AiService::with_deciders(vec![
+            (
+                "first".to_string(),
+                script(
+                    Some(0.5),
+                    false,
+                    "jev-1",
+                    std::sync::Arc::clone(&first_calls),
+                ),
+            ),
+            (
+                "second".to_string(),
+                script(
+                    Some(0.95),
+                    false,
+                    "kimi",
+                    std::sync::Arc::clone(&second_calls),
+                ),
+            ),
+        ]);
+        let outcome = service
+            .decide_chain(&chain(), &same_request(), settled_yes_no(0.8, 0.3), || {
+                false
+            })
+            .await;
+        assert_eq!(outcome.attempts.len(), 2);
+        assert!(outcome.escalated());
+        assert_eq!(outcome.decided_by(), Some(("second", "kimi-k3")));
+        assert_eq!(outcome.noul("same"), Some(0.95));
+        assert_eq!(first_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_confident_reject_is_final() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let second_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let service = AiService::with_deciders(vec![
+            (
+                "first".to_string(),
+                script(Some(0.1), false, "jev-1", Default::default()),
+            ),
+            (
+                "second".to_string(),
+                script(
+                    Some(0.95),
+                    false,
+                    "kimi",
+                    std::sync::Arc::clone(&second_calls),
+                ),
+            ),
+        ]);
+        let outcome = service
+            .decide_chain(&chain(), &same_request(), settled_yes_no(0.8, 0.3), || {
+                false
+            })
+            .await;
+        assert_eq!(outcome.attempts.len(), 1);
+        assert_eq!(outcome.decided_by(), Some(("first", "jev-latest")));
+        assert_eq!(second_calls.load(Ordering::SeqCst), 0, "a reject is final");
+    }
+
+    #[tokio::test]
+    async fn a_missing_answer_escalates() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let second_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let service = AiService::with_deciders(vec![
+            (
+                "first".to_string(),
+                script(None, false, "jev-1", Default::default()),
+            ),
+            (
+                "second".to_string(),
+                script(
+                    Some(0.2),
+                    false,
+                    "kimi",
+                    std::sync::Arc::clone(&second_calls),
+                ),
+            ),
+        ]);
+        let outcome = service
+            .decide_chain(&chain(), &same_request(), settled_yes_no(0.8, 0.3), || {
+                false
+            })
+            .await;
+        assert_eq!(
+            outcome.attempts.len(),
+            2,
+            "a missing answer is not evidence"
+        );
+        assert_eq!(outcome.decided_by(), Some(("second", "kimi-k3")));
+        assert_eq!(second_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_call_escalates() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let second_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let service = AiService::with_deciders(vec![
+            (
+                "first".to_string(),
+                script(Some(0.95), true, "jev-1", Default::default()),
+            ),
+            (
+                "second".to_string(),
+                script(
+                    Some(0.9),
+                    false,
+                    "kimi",
+                    std::sync::Arc::clone(&second_calls),
+                ),
+            ),
+        ]);
+        let outcome = service
+            .decide_chain(&chain(), &same_request(), settled_yes_no(0.8, 0.3), || {
+                false
+            })
+            .await;
+        assert_eq!(outcome.attempts.len(), 2);
+        assert!(outcome.attempts[0].failed());
+        assert!(outcome.attempts[0]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("down"));
+        assert_eq!(outcome.decided_by(), Some(("second", "kimi-k3")));
+        assert_eq!(second_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn all_undecided_records_every_attempt() {
+        let service = AiService::with_deciders(vec![
+            (
+                "first".to_string(),
+                script(Some(0.5), false, "jev-1", Default::default()),
+            ),
+            (
+                "second".to_string(),
+                script(Some(0.6), false, "kimi", Default::default()),
+            ),
+        ]);
+        let outcome = service
+            .decide_chain(&chain(), &same_request(), settled_yes_no(0.8, 0.3), || {
+                false
+            })
+            .await;
+        assert_eq!(outcome.attempts.len(), 2);
+        assert!(!outcome.cancelled);
+        // The last answer stands, even undecided: the caller reads the probability and
+        // applies its own thresholds.
+        assert_eq!(outcome.decided_by(), Some(("second", "kimi-k3")));
+        assert_eq!(outcome.noul("same"), Some(0.6));
+    }
+
+    #[tokio::test]
+    async fn all_failed_leaves_nothing_decided() {
+        let service = AiService::with_deciders(vec![
+            (
+                "first".to_string(),
+                script(None, true, "jev-1", Default::default()),
+            ),
+            (
+                "second".to_string(),
+                script(None, true, "kimi", Default::default()),
+            ),
+        ]);
+        let outcome = service
+            .decide_chain(&chain(), &same_request(), settled_yes_no(0.8, 0.3), || {
+                false
+            })
+            .await;
+        assert_eq!(outcome.attempts.len(), 2);
+        assert!(outcome.deciding().is_none());
+        assert!(outcome.decided_by().is_none());
+        assert!(outcome.attempts.iter().all(|attempt| attempt.failed()));
+    }
+
+    #[tokio::test]
+    async fn cancellation_stops_the_chain_between_links() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let second_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let service = AiService::with_deciders(vec![
+            (
+                "first".to_string(),
+                script(Some(0.5), false, "jev-1", Default::default()),
+            ),
+            (
+                "second".to_string(),
+                script(
+                    Some(0.95),
+                    false,
+                    "kimi",
+                    std::sync::Arc::clone(&second_calls),
+                ),
+            ),
+        ]);
+        // The first link leaves the question undecided and the operator cancels while its
+        // answer lands: the second link is never asked.
+        let stop = std::sync::Arc::clone(&cancel);
+        let outcome = service
+            .decide_chain(
+                &chain(),
+                &same_request(),
+                |response: &DecisionResponse| {
+                    stop.store(true, Ordering::SeqCst);
+                    settled_yes_no(0.8, 0.3)(response)
+                },
+                || cancel.load(Ordering::SeqCst),
+            )
+            .await;
+        assert!(outcome.cancelled);
+        assert_eq!(outcome.attempts.len(), 1);
+        assert_eq!(second_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn an_empty_chain_asks_nothing() {
+        let service = AiService::with_deciders(vec![]);
+        let outcome = service
+            .decide_chain(&[], &same_request(), settled_yes_no(0.8, 0.3), || false)
+            .await;
+        assert!(outcome.attempts.is_empty());
+        assert!(!outcome.cancelled);
+        assert!(outcome.deciding().is_none());
+    }
+
+    #[tokio::test]
+    async fn the_labeller_gets_a_probability_and_the_deciding_model() {
+        // `yes_no_request` + `decide_yes_no`: given two names, ask the chain "same
+        // channel?" and read back the yes-probability and who decided it.
+        let service = AiService::with_deciders(vec![
+            (
+                "first".to_string(),
+                script(Some(0.5), false, "jev-1", Default::default()),
+            ),
+            (
+                "second".to_string(),
+                script(Some(0.91), false, "kimi", Default::default()),
+            ),
+        ]);
+        let request = super::yes_no_request(&chain()[0], "ESPN HD", "ESPN", "names");
+        assert_eq!(request.task.as_deref(), Some("names"));
+        assert!(request.questions.contains_key("same"));
+        let answered = service
+            .decide_yes_no(&chain(), &request, "same", 0.8, 0.3, || false)
+            .await;
+        assert_eq!(answered.probability, Some(0.91));
+        assert_eq!(answered.provider, "second");
+        assert_eq!(answered.model, "kimi-k3");
+        assert_eq!(answered.attempts.len(), 2);
+        assert!(!answered.cancelled);
+    }
+
+    #[test]
+    fn the_task_becomes_the_chat_prompts_first_line() {
+        let base = same_request();
+        let plain = super::openai::system_prompt(&base);
+        assert!(
+            !plain
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .starts_with("You are matching"),
+            "no task, no prefix"
+        );
+        for (task, expected) in [
+            (
+                "epg",
+                "You are matching a Dispatcharr channel to a guide (EPG) listing entry.",
+            ),
+            (
+                "streams",
+                "You are matching a Dispatcharr channel to an IPTV stream.",
+            ),
+            (
+                "names",
+                "You are deciding whether two channel names refer to the same television channel.",
+            ),
+        ] {
+            let tasked = same_request().with_task(task);
+            let prompt = super::openai::system_prompt(&tasked);
+            assert_eq!(prompt.lines().next().unwrap_or_default(), expected);
+            assert!(
+                prompt.contains("You answer questions about"),
+                "{task}: the generic wording stays"
+            );
+        }
+        let custom = same_request().with_task("logos");
+        assert_eq!(
+            super::openai::system_prompt(&custom)
+                .lines()
+                .next()
+                .unwrap_or_default(),
+            "Task: logos."
+        );
+        assert_eq!(same_request().with_task("  ").task, None, "blank is unset");
+    }
+
+    #[test]
+    fn audit_errors_lose_url_tokens_and_bearer_keys() {
+        let raw = "POST https://user:pa55@proxy.example/v1/chat/completions?api_key=sk-123&x=1: \
+                   401 {\"error\": \"bad header Bearer sk-live-abc\"}";
+        let clean = super::redact_error(raw);
+        assert!(!clean.contains("sk-123"), "{clean}");
+        assert!(!clean.contains("pa55"), "{clean}");
+        assert!(!clean.contains("sk-live-abc"), "{clean}");
+        assert!(clean.contains("https://proxy.example"), "{clean}");
+        assert!(
+            !clean.contains("/v1/chat"),
+            "the path is dropped too: {clean}"
+        );
+        assert_eq!(
+            super::redact_error("the endpoint is down"),
+            "the endpoint is down",
+            "plain errors pass through untouched"
+        );
     }
 }

@@ -228,7 +228,7 @@ mod tests {
         config.workflows.insert(
             "nightly".to_string(),
             crate::config::WorkflowConfig {
-                steps: vec!["streams.probe".to_string()],
+                steps: vec!["streams.probe".into()],
                 fresh: false,
             },
         );

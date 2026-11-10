@@ -84,7 +84,6 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use crosstalk_core::config::MatchingConfig;
 use crosstalk_core::store::{Store, StreamHealth};
 use crosstalk_matching::normalize::{NormalizeFlags, Normalizer};
-use crosstalk_matching::MatchProfile;
 use regex::Regex;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
@@ -636,6 +635,15 @@ impl ThroughputSource for StoreThroughputSource {
     }
 }
 
+/// The throughput evidence a run reads: the store's `stream_health`, or nothing when the
+/// context has no store (every stream "unknown", like the plugin with an empty cache).
+pub fn throughput_source(store: Option<&Store>) -> anyhow::Result<Box<dyn ThroughputSource>> {
+    Ok(match store {
+        Some(store) => Box::new(StoreThroughputSource::load(store)?),
+        None => Box::new(MemoryThroughputSource::new()),
+    })
+}
+
 // ---------------------------------------------------------------------------------------
 // The model
 // ---------------------------------------------------------------------------------------
@@ -982,12 +990,19 @@ pub fn tier_label(
 /// The normaliser zone routing uses for a channel name.
 ///
 /// `_clean_channel_name` (4382-4400) normalises with the plugin's ignore flags, which here are
-/// the host's `[matching]` toggles plus Stream-Mapparr's own structural switches — the same
-/// pair the matcher itself runs, so the base name zone routing groups siblings by is the name
-/// the matcher would compare.
+/// the host's `[matching]` toggles plus the unified engine's decided structural flags —
+/// the same normalizer the engine itself runs (step 9: one normalizer), so the base name
+/// zone routing groups siblings by is the name the matcher compares.
 pub fn zone_normalizer(matching: &MatchingConfig) -> Normalizer {
-    let flags: NormalizeFlags =
-        MatchProfile::StreamMapparr.normalize_flags(matching.normalize_flags());
+    // The decided flags are the engine's (`UnifiedEngine::new` forces them): the core
+    // pipeline (N01), designator rejoin (N08), `&`-split (N05), letter-only dots (N06)
+    // and the suffix floor (N07). No profile switch survives beside them.
+    let mut flags: NormalizeFlags = matching.normalize_flags();
+    flags.core_pipeline = true;
+    flags.rejoin_designators = true;
+    flags.split_ampersand = true;
+    flags.dots_letters_only = true;
+    flags.suffix_floor = true;
     Normalizer::new(flags)
 }
 

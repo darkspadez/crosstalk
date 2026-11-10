@@ -142,18 +142,21 @@ mod tests {
                     name: "ESPN".to_string(),
                     tvg_id: "espn.us".to_string(),
                     epg_source: Some(101),
+                    icon_url: None,
                 },
                 EpgEntry {
                     id: 2,
                     name: "ESPN HD".to_string(),
                     tvg_id: "espn.hd".to_string(),
                     epg_source: Some(100),
+                    icon_url: None,
                 },
                 EpgEntry {
                     id: 3,
                     name: "Gone".to_string(),
                     tvg_id: "gone".to_string(),
                     epg_source: Some(102),
+                    icon_url: None,
                 },
             ],
             ..World::default()

@@ -7,12 +7,12 @@ license.workspace = true
 description = "Pure, IO-free channel-name matcher ported from EPG Janitor"
 
 [dependencies]
+serde.workspace = true
 regex.workspace = true
 fancy-regex.workspace = true
 unicode-normalization.workspace = true
 unicode-general-category.workspace = true
 unicode_names2.workspace = true
 serde_json.workspace = true
-
-[dev-dependencies]
+# The candidate index prepares its per-name views in parallel (audit E-S3).
 rayon.workspace = true

@@ -5,18 +5,25 @@
 # directory is bind-mounted and the daemon must be able to write the SQLite database, the CSV
 # exports and any settings saved from the UI into it.
 
-FROM rust:1-alpine AS builder
+# Both bases are pinned by digest (Renovate's docker manager bumps tag and digest together).
+# The builder tag names a Rust release so a rebuild is reproducible. rust-toolchain.toml
+# (channel `stable`) is deliberately NOT copied in: rustup would honour it and download
+# whatever stable is today, bypassing the pinned compiler. CI's toolchain follows `stable`
+# and may run ahead of the image until Renovate bumps this tag.
+FROM rust:1.99.1-alpine3.22@sha256:9a744dc47d1ac2a7d17fc3cedfc8b4928b1696dfcba3274ab25bfb40988a9ff0 AS builder
 RUN apk add --no-cache musl-dev
 WORKDIR /src
 
 # Dependencies first, so a source change does not re-download the world.
-COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY data ./data
 COPY config ./config
 RUN cargo build --release --locked --bin crosstalk
 
-FROM alpine:3.20 AS runtime
+# Alpine 3.22 (supported to 2027-05): the ffmpeg below decodes untrusted provider streams, so
+# the base must be a release that still gets security fixes.
+FROM alpine:3.22@sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f AS runtime
 
 # Match the host user that owns the bind-mounted ./config. Override at build time:
 #   docker build --build-arg PUID=$(id -u) --build-arg PGID=$(id -g) .
@@ -29,6 +36,8 @@ ARG PGID=1000
 # `config/streams.example.toml` defaults `ffprobe_path` / `ffmpeg_path` there (IPTV Checker's
 # own default, /usr/local/bin, is where its own Dockerfile put a static build).
 # One layer, and the apk index is dropped in the same RUN so it costs no image space.
+# The package version is deliberately unpinned: Alpine's repositories drop superseded
+# versions, so a pin would break the build on the next security update instead of taking it.
 RUN apk add --no-cache ffmpeg \
     && addgroup -g "${PGID}" -S crosstalk \
     && adduser -u "${PUID}" -S -G crosstalk crosstalk \
@@ -38,10 +47,19 @@ RUN apk add --no-cache ffmpeg \
 COPY --from=builder /src/target/release/crosstalk /usr/local/bin/crosstalk
 
 # The licence and the notices for the ported plugin travel with the image, as MIT requires.
-COPY LICENSE THIRD_PARTY_NOTICES.md /usr/share/doc/crosstalk/
+# THIRD_PARTY_LICENSES (every Rust crate compiled in, from `cargo about generate`) is
+# written into the build context by build.yml before the image build; the trailing `*`
+# keeps a local `docker build` without it working.
+COPY LICENSE THIRD_PARTY_NOTICES.md THIRD_PARTY_LICENSES* /usr/share/doc/crosstalk/
 
 VOLUME ["/config"]
-WORKDIR /config
+# The daemon writes only /config (database, exports, saved settings) and /tmp, so the
+# container can run with a read-only root filesystem (see docker-compose.example.yml).
+# The working directory is /tmp, not /config: anything a child process drops in its cwd
+# (an ffprobe/ffmpeg side file) lands on the tmpfs, never in the persisted config. The
+# CLI's `--config` default is relative, hence CROSSTALK_CONFIG_DIR for `docker exec`.
+ENV CROSSTALK_CONFIG_DIR=/config
+WORKDIR /tmp
 USER crosstalk
 EXPOSE 8730
 
