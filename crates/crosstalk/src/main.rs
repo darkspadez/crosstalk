@@ -439,10 +439,10 @@ fn serve(args: ServeArgs) -> Result<()> {
         // The listener rules the configuration report calls errors: a token too short for a
         // reachable daemon, trusted proxies without a token, a range or public URL that does
         // not parse. Each would leave the daemon weaker than the operator thinks it is.
-        let security = snapshot.server.security_errors();
+        let security = snapshot.security_errors();
         if !security.is_empty() {
             anyhow::bail!(
-                "refusing to start with an unsafe [server] configuration:\n  - {}",
+                "refusing to start with an unsafe listener configuration:\n  - {}",
                 security.join("\n  - ")
             );
         }

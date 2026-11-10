@@ -1,9 +1,15 @@
 //! Token authentication for the daemon's HTTP surface.
 //!
-//! One token, from `server.token` or the environment variable it names. A script (and the
-//! Dispatcharr webhook) sends it as `Authorization: Bearer <token>` on every request; a browser
-//! presents it once to the login page and gets a server-side session (see [`crate::session`]),
-//! so the token itself never lives in a cookie.
+//! One master token, from `server.token` or the environment variable it names. A script sends it
+//! as `Authorization: Bearer <token>` on every request; a browser presents it once to the login
+//! page and gets a session (see [`crate::session`]), so the token itself never lives in a
+//! cookie.
+//!
+//! The Dispatcharr webhook can have its own: `[hooks] token`, accepted as a Bearer on
+//! `POST /hooks/dispatcharr` only and refused (401) everywhere else, so the credential Connect
+//! stores can trigger a configured refresh and nothing more. While one is set, the master token
+//! still works on the hook route for this release and logs a once-per-process warning; that
+//! fallback goes in 0.2.0. Without one, the route takes the master token as before.
 //!
 //! [`gate`] is the one place that decides, and it runs before the Host and CSRF checks so that
 //! nothing about a request is examined (or its body read) before its sender is known:
@@ -44,7 +50,8 @@ const MAX_HITS_PER_CLIENT: usize = 4096;
 pub enum Authenticated {
     /// No token is configured (a loopback-only daemon): the daemon-wide CSRF token applies.
     Open,
-    /// A correct `Authorization: Bearer` token: a script, exempt from CSRF.
+    /// A correct `Authorization: Bearer` token (the master token, or the hook token on the hook
+    /// route): a script, exempt from CSRF.
     Bearer,
     /// A browser session, whose own CSRF token its forms carry.
     Session(SessionRef),
@@ -327,6 +334,62 @@ pub fn digests_match(a: &[u8; 32], b: &[u8; 32]) -> bool {
     crate::sha256::digests_match(a, b)
 }
 
+/// What a presented Bearer token is, for the route it was presented on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Credential {
+    /// The master token.
+    Master,
+    /// The hook token, on the hook route.
+    Hook,
+    /// Neither: a wrong token, or the hook token anywhere but the hook route.
+    Wrong,
+}
+
+/// Judge a Bearer token. Both comparisons always run, each in constant time, so the answer's
+/// timing says nothing about which token came close.
+fn bearer_credential(
+    view: &crate::state::ServerView,
+    is_hook: bool,
+    presented: &str,
+) -> Credential {
+    let master = view
+        .token
+        .as_deref()
+        .is_some_and(|expected| tokens_match(expected, presented));
+    let hook = view
+        .hook_token
+        .as_deref()
+        .is_some_and(|expected| tokens_match(expected, presented));
+    if is_hook && hook {
+        Credential::Hook
+    } else if master {
+        Credential::Master
+    } else {
+        Credential::Wrong
+    }
+}
+
+/// Whether the master-token-on-the-hook-route warning has been logged by this process.
+static MASTER_ON_HOOK_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Log, once per process, that a delivery used the master token although a hook token is set.
+fn warn_master_on_hook() {
+    if !MASTER_ON_HOOK_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            "a webhook delivery used the master token although [hooks] token is set: give \
+             Dispatcharr Connect the hook token instead. The master token is accepted on \
+             {} until crosstalk 0.2.0, then refused",
+            crosstalk_core::hooks::ROUTE
+        );
+    }
+}
+
+/// Whether this process has logged the master-token-on-the-hook-route warning.
+pub fn master_on_hook_warned() -> bool {
+    MASTER_ON_HOOK_WARNED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Whether a request is reachable without a credential.
 ///
 /// The login page (to GET; posting to it is an attempt and goes through the limiter), the
@@ -375,7 +438,7 @@ pub async fn gate(
     let path = request.uri().path().to_string();
     let is_hook = path == crosstalk_core::hooks::ROUTE;
 
-    let Some(expected) = view.token.clone() else {
+    if view.token.is_none() {
         // Tokenless is only safe while nothing but this host can reach the daemon. A request
         // that came through a proxy came from somewhere else, whatever its socket says.
         if crate::client::has_forwarding_headers(request.headers()) {
@@ -386,18 +449,21 @@ pub async fn gate(
             );
             return unauthorized();
         }
-        // A route that starts real work needs a credential to check.
-        if is_hook {
+        if !is_hook {
+            request.extensions_mut().insert(Authenticated::Open);
+            return next.run(request).await;
+        }
+        // A route that starts real work needs a credential to check: the hook token, when one
+        // is configured, goes through the limiter below like any Bearer.
+        if view.hook_token.is_none() {
             tracing::warn!(
-                "refused a webhook delivery: the route needs a configured server token (set \
-                 server.token or server.token_env and give Dispatcharr the same value as a \
-                 Bearer token)"
+                "refused a webhook delivery: the route needs a configured token (set \
+                 hooks.token or server.token and give Dispatcharr the same value as a Bearer \
+                 token)"
             );
             return unauthorized();
         }
-        request.extensions_mut().insert(Authenticated::Open);
-        return next.run(request).await;
-    };
+    }
 
     if is_public(request.method(), &path) {
         return next.run(request).await;
@@ -417,13 +483,21 @@ pub async fn gate(
         if let Err(retry) = limiter.try_attempt(client.key) {
             return too_many(retry);
         }
-        if !tokens_match(&expected, &presented) {
-            tracing::warn!(
-                client = %client.ip,
-                path = path.as_str(),
-                "refused a wrong Bearer token"
-            );
-            return unauthorized();
+        match bearer_credential(&view, is_hook, &presented) {
+            Credential::Hook => {}
+            Credential::Master => {
+                if is_hook && view.hook_token.is_some() {
+                    warn_master_on_hook();
+                }
+            }
+            Credential::Wrong => {
+                tracing::warn!(
+                    client = %client.ip,
+                    path = path.as_str(),
+                    "refused a wrong Bearer token"
+                );
+                return unauthorized();
+            }
         }
         limiter.forgive(client.key);
         request.extensions_mut().insert(Authenticated::Bearer);
@@ -432,9 +506,9 @@ pub async fn gate(
 
     // The webhook starts real work, so a browser session cannot trigger it by visiting a URL:
     // only the Bearer header counts there.
-    if !is_hook {
+    if let (false, Some(expected)) = (is_hook, view.token.as_deref()) {
         if let Some(id) = crate::session::session_id(request.headers()) {
-            if let Some(session) = state.sessions().touch(&id, &expected) {
+            if let Some(session) = state.sessions().touch(&id, expected) {
                 request
                     .extensions_mut()
                     .insert(Authenticated::Session(session));

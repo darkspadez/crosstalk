@@ -40,14 +40,18 @@ where
     D: serde::Deserializer<'de>,
 {
     use serde::Deserialize;
-    let value = serde_json::Value::deserialize(deserializer)?;
-    Ok(match value {
+    Ok(scalar_text(serde_json::Value::deserialize(deserializer)?))
+}
+
+/// A scalar as the text [`string_or_scalar`] reads it as.
+fn scalar_text(value: serde_json::Value) -> String {
+    match value {
         serde_json::Value::String(text) => text,
         serde_json::Value::Null => String::new(),
         serde_json::Value::Bool(flag) => flag.to_string(),
         serde_json::Value::Number(number) => number.to_string(),
         other => other.to_string(),
-    })
+    }
 }
 
 /// What a secret field prints as in `Debug` output: whether it is set, never its value.
@@ -1364,8 +1368,8 @@ pub struct WorkflowConfig {
 /// The event names are open-ended (`m3u_refresh`, `epg_refresh`, `m3u_error`, … — whatever the
 /// operator subscribes to in Dispatcharr), so they are the table's unknown keys rather than a
 /// fixed list. A target is an `<app>.<action>` or a `workflow.<name>`, validated at load like a
-/// schedule key.
-#[derive(Debug, Clone, PartialEq)]
+/// schedule key. `token` and `token_env` are settings, so neither can be an event name.
+#[derive(Clone, PartialEq)]
 pub struct HooksConfig {
     /// How long one event must be quiet before its targets run.
     ///
@@ -1385,8 +1389,28 @@ pub struct HooksConfig {
     /// A hook delivery starts real work, so an unauthenticated flood (or a Connect integration
     /// configured twice) must not start a run per request. Zero disables the limit.
     pub rate_per_minute: u32,
+    /// A Bearer token accepted ONLY on the webhook route, so the credential Dispatcharr Connect
+    /// stores and sends with every delivery can trigger a configured refresh and nothing else.
+    /// Empty means the route takes the master `server.token`, as before.
+    pub token: String,
+    /// Read the hook token from this environment variable. When set and not blank it wins over
+    /// `token`.
+    pub token_env: String,
     /// Event name to what it triggers, in the order the hook fires them.
     pub events: BTreeMap<String, Vec<String>>,
+}
+
+impl std::fmt::Debug for HooksConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HooksConfig")
+            .field("debounce_secs", &self.debounce_secs)
+            .field("max_settle_secs", &self.max_settle_secs)
+            .field("rate_per_minute", &self.rate_per_minute)
+            .field("token", &redacted(&self.token))
+            .field("token_env", &self.token_env)
+            .field("events", &self.events)
+            .finish()
+    }
 }
 
 impl Default for HooksConfig {
@@ -1397,6 +1421,8 @@ impl Default for HooksConfig {
             debounce_secs: 60.0,
             max_settle_secs: None,
             rate_per_minute: 60,
+            token: String::new(),
+            token_env: "CROSSTALK_HOOK_TOKEN".to_string(),
             events: BTreeMap::new(),
         }
     }
@@ -1405,6 +1431,42 @@ impl Default for HooksConfig {
 impl HooksConfig {
     /// The ceiling on `max_settle_secs`: a quarter of an hour.
     pub const MAX_SETTLE_CAP_SECS: f64 = 900.0;
+
+    /// The hook-only token, resolved from the environment first.
+    pub fn resolved_token(&self) -> Option<String> {
+        resolve_secret(&self.token, &self.token_env)
+    }
+
+    /// What the settings form shows in place of the hook token: where it comes from, never
+    /// what it is.
+    pub fn token_status(&self) -> String {
+        if secret_from_env(&self.token_env).is_some() {
+            format!("set (from ${})", self.token_env.trim())
+        } else if self.token.trim().is_empty() {
+            "not set: the webhook takes the master token".to_string()
+        } else {
+            "set in crosstalk.toml".to_string()
+        }
+    }
+
+    /// The hook token's listener rule, the master token's own: on a daemon reachable from
+    /// outside this host (a non-loopback bind, or `trusted_proxies`) it is at least
+    /// [`MIN_TOKEN_BYTES`] long.
+    pub fn security_errors(&self, server: &ServerConfig) -> Vec<String> {
+        let mut errors = Vec::new();
+        if let Some(token) = self.resolved_token() {
+            let reachable = !server.trusted_proxies.is_empty() || !server.is_loopback();
+            if token.len() < MIN_TOKEN_BYTES && reachable {
+                errors.push(format!(
+                    "hooks.token is {} bytes; a daemon reachable from outside this host (a \
+                     non-loopback bind or trusted_proxies) needs at least {MIN_TOKEN_BYTES}. \
+                     Generate one with `openssl rand -hex 32`.",
+                    token.len()
+                ));
+            }
+        }
+        errors
+    }
 
     /// How long after a burst's FIRST delivery its targets run at the latest: `max_settle_secs`,
     /// or five debounce windows when unset, capped at fifteen minutes.
@@ -1469,6 +1531,8 @@ impl<'de> Deserialize<'de> for HooksConfig {
                         "debounce_secs" => config.debounce_secs = map.next_value()?,
                         "max_settle_secs" => config.max_settle_secs = Some(map.next_value()?),
                         "rate_per_minute" => config.rate_per_minute = map.next_value()?,
+                        "token" => config.token = scalar_text(map.next_value()?),
+                        "token_env" => config.token_env = scalar_text(map.next_value()?),
                         _ => {
                             let targets: Vec<String> = map.next_value().map_err(|error| {
                                 serde::de::Error::custom(format!(
@@ -1495,12 +1559,14 @@ impl Serialize for HooksConfig {
         use serde::ser::SerializeMap;
 
         let settle = usize::from(self.max_settle_secs.is_some());
-        let mut map = serializer.serialize_map(Some(2 + settle + self.events.len()))?;
+        let mut map = serializer.serialize_map(Some(4 + settle + self.events.len()))?;
         map.serialize_entry("debounce_secs", &self.debounce_secs)?;
         if let Some(secs) = self.max_settle_secs {
             map.serialize_entry("max_settle_secs", &secs)?;
         }
         map.serialize_entry("rate_per_minute", &self.rate_per_minute)?;
+        map.serialize_entry("token", &self.token)?;
+        map.serialize_entry("token_env", &self.token_env)?;
         for (event, targets) in &self.events {
             map.serialize_entry(event, targets)?;
         }
@@ -1754,6 +1820,15 @@ impl CrosstalkConfig {
         }
     }
 
+    /// The listener rules the daemon refuses to start (or to reload) without: the `[server]`
+    /// ones ([`ServerConfig::security_errors`]) and the hook token's length
+    /// ([`HooksConfig::security_errors`]).
+    pub fn security_errors(&self) -> Vec<String> {
+        let mut errors = self.server.security_errors();
+        errors.extend(self.hooks.security_errors(&self.server));
+        errors
+    }
+
     /// Problems an operator needs to fix, as human-readable strings.
     ///
     /// Warnings are separated from errors so the UI can show "this will not work" and
@@ -1812,11 +1887,12 @@ impl CrosstalkConfig {
                     &self.bridge.secret,
                     &self.bridge.secret_env,
                 ),
+                shadowed_secret_warning("hooks.token", &self.hooks.token, &self.hooks.token_env),
             ]
             .into_iter()
             .flatten(),
         );
-        report.errors.extend(self.server.security_errors());
+        report.errors.extend(self.security_errors());
         report.errors.extend(self.bridge.errors());
         if !self.server.is_loopback() && self.server.resolved_token().is_none() {
             report.warnings.push(format!(
@@ -2207,7 +2283,13 @@ impl From<CrosstalkConfig> for SharedConfig {
 /// nothing to render and the CSV preamble cannot report them under the names operators know.
 pub fn host_schema() -> crate::subapp::SettingsSchema {
     crate::subapp::SettingsSchema::new(
-        [shared_fields(), matching_fields(), bridge_fields()].concat(),
+        [
+            shared_fields(),
+            matching_fields(),
+            bridge_fields(),
+            hooks_fields(),
+        ]
+        .concat(),
     )
 }
 
@@ -2588,6 +2670,34 @@ fn bridge_fields() -> Vec<crate::subapp::FieldSpec> {
     ]
 }
 
+/// `[hooks]`, as form fields: only the hook token's status line. The token is a
+/// [`FieldKind::Secret`](crate::subapp::FieldKind), set in the file or the environment, never
+/// from the form.
+fn hooks_fields() -> Vec<crate::subapp::FieldSpec> {
+    use crate::subapp::{FieldKind, FieldSpec, FieldValue};
+
+    vec![
+        FieldSpec::section(
+            "_section_hooks",
+            "Webhook",
+            "The Dispatcharr Connect webhook (POST /hooks/dispatcharr). With a hook token set, \
+             give Dispatcharr that token instead of the master one: it starts the configured \
+             hook targets and is refused everywhere else.",
+        ),
+        FieldSpec::new(
+            "hooks.token",
+            "_section_hooks",
+            "Hook Token",
+            FieldKind::Secret,
+            FieldValue::Text(String::new()),
+        )
+        .with_help(
+            "Never shown here. Set [hooks] token in crosstalk.toml or $CROSSTALK_HOOK_TOKEN \
+             (at least 32 bytes: `openssl rand -hex 32`).",
+        ),
+    ]
+}
+
 /// The chain as the settings form holds it: empty when unset (so the preamble prints
 /// "(not set)"), otherwise the compact JSON the form parses back verbatim.
 fn chain_form_value(chain: &[AiChainEntry]) -> String {
@@ -2658,6 +2768,11 @@ pub fn host_values(config: &CrosstalkConfig) -> crate::subapp::SettingsValues {
     values.insert(
         "bridge.min_version",
         crate::subapp::FieldValue::Text(config.bridge.min_version.clone()),
+    );
+    // The status line, never the token.
+    values.insert(
+        "hooks.token",
+        crate::subapp::FieldValue::Text(config.hooks.token_status()),
     );
     values
 }
@@ -2815,7 +2930,7 @@ pub fn apply_host_values(
         config.matching.custom_aliases = map.clone();
     }
 
-    // `bridge.secret` is deliberately absent: a form never sets a secret.
+    // `bridge.secret` and `hooks.token` are deliberately absent: a form never sets a secret.
     if let Some(value) = values.bool("bridge.enabled") {
         config.bridge.enabled = value;
     }
@@ -4335,6 +4450,7 @@ m3u_refresh = ["streams.match_apply"]
         config.dispatcharr.api_key = "KEY-SECRET".to_string();
         config.dispatcharr.password = "PASSWORD-SECRET".to_string();
         config.bridge.secret = "BRIDGE-SECRET".to_string();
+        config.hooks.token = "HOOK-SECRET".to_string();
         config.ai.providers.insert(
             "llm".to_string(),
             AiProviderConfig {
@@ -4353,11 +4469,129 @@ m3u_refresh = ["streams.match_apply"]
             "AI-QUERY-SECRET",
             "AI-KEY-SECRET",
             "BRIDGE-SECRET",
+            "HOOK-SECRET",
         ] {
             assert!(!printed.contains(secret), "{secret} in {printed}");
         }
         assert!(printed.contains("<redacted>"), "{printed}");
         assert!(printed.contains("dispatcharr.test"), "{printed}");
+    }
+
+    #[test]
+    fn the_hook_token_is_read_checked_and_never_printed() {
+        let defaults = HooksConfig::default();
+        assert_eq!(defaults.token_env, "CROSSTALK_HOOK_TOKEN");
+        assert!(defaults.token.is_empty());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            "[server]\nbind = \"0.0.0.0\"\ntoken = \"0123456789abcdef0123456789abcdef\"\n\
+             token_env = \"\"\n\n[hooks]\ntoken = \"HOOKSHORT\"\ntoken_env = \"\"\n\
+             m3u_refresh = [\"streams.match_apply\"]\n",
+        );
+        let mut config = CrosstalkConfig::load_file(dir.path()).expect("load");
+        config.dispatcharr.api_key = "k".to_string();
+        assert_eq!(config.hooks.resolved_token().as_deref(), Some("HOOKSHORT"));
+        assert!(
+            !config.hooks.events.contains_key("token"),
+            "a setting, not an event"
+        );
+        assert_eq!(config.hooks.targets("m3u_refresh").len(), 1);
+        // Too short for a reachable daemon: an error for validate, serve and a reload alike.
+        let errors = config.validate().errors;
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("hooks.token is 9 bytes")),
+            "{errors:?}"
+        );
+        assert!(errors.iter().all(|error| !error.contains("HOOKSHORT")));
+        assert_eq!(config.security_errors().len(), 1);
+        // On a loopback-only daemon it is fine, as the master token is.
+        config.server.bind = "127.0.0.1".to_string();
+        assert!(config.security_errors().is_empty());
+        config.server.trusted_proxies = vec!["10.0.0.0/8".to_string()];
+        assert_eq!(config.security_errors().len(), 1);
+        config.hooks.token = "h".repeat(MIN_TOKEN_BYTES);
+        assert!(config.security_errors().is_empty());
+
+        let printed = format!("{:?}", config.hooks);
+        assert!(!printed.contains(&"h".repeat(MIN_TOKEN_BYTES)), "{printed}");
+        assert!(printed.contains("<redacted>"), "{printed}");
+    }
+
+    #[test]
+    fn the_hook_token_from_the_environment_wins_and_is_never_saved() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "crosstalk.toml",
+            "[hooks]\ntoken = \"FILE-HOOK-0123456789abcdef0123456789\"\n\
+             token_env = \"CROSSTALK_TESTHOOK_TOKEN\"\n",
+        );
+        std::env::set_var(
+            "CROSSTALK_TESTHOOK_TOKEN",
+            "ENV-HOOK-0123456789abcdef0123456789",
+        );
+        let config =
+            CrosstalkConfig::load_prefixed(dir.path(), "CROSSTALK_TESTHOOK_PREFIX_").expect("load");
+        let resolved = config.hooks.resolved_token();
+        let status = config.hooks.token_status();
+        let warnings = config.validate().warnings;
+        let mut file = CrosstalkConfig::load_file(dir.path()).expect("load file");
+        file.hooks.rate_per_minute = 30;
+        file.save(dir.path().join("crosstalk.toml")).expect("save");
+        std::env::remove_var("CROSSTALK_TESTHOOK_TOKEN");
+
+        assert_eq!(
+            resolved.as_deref(),
+            Some("ENV-HOOK-0123456789abcdef0123456789")
+        );
+        assert_eq!(status, "set (from $CROSSTALK_TESTHOOK_TOKEN)");
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("hooks.token is set in the file and in")));
+        let saved = std::fs::read_to_string(dir.path().join("crosstalk.toml")).expect("read");
+        assert!(!saved.contains("ENV-HOOK"), "{saved}");
+        assert!(saved.contains("FILE-HOOK"), "{saved}");
+        let reloaded = CrosstalkConfig::load_file(dir.path()).expect("reload");
+        assert_eq!(reloaded.hooks.rate_per_minute, 30);
+        assert!(reloaded.hooks.events.is_empty(), "{saved}");
+    }
+
+    #[test]
+    fn the_settings_form_shows_the_hook_token_as_a_status_line() {
+        use crate::subapp::{FieldKind, FieldValue};
+        let mut config = CrosstalkConfig::default();
+        config.hooks.token_env = String::new();
+        let field_kind = host_schema()
+            .editable()
+            .find(|field| field.id == "hooks.token")
+            .map(|field| field.kind.clone());
+        assert_eq!(field_kind, Some(FieldKind::Secret));
+        assert_eq!(
+            host_values(&config).get("hooks.token"),
+            Some(&FieldValue::Text(
+                "not set: the webhook takes the master token".to_string()
+            ))
+        );
+        config.hooks.token = "FORM-HOOK-0123456789abcdef0123456789".to_string();
+        let values = host_values(&config);
+        assert_eq!(
+            values.get("hooks.token"),
+            Some(&FieldValue::Text("set in crosstalk.toml".to_string()))
+        );
+        assert!(!format!("{values:?}").contains("FORM-HOOK"));
+        let mut submitted = values.clone();
+        submitted.insert("hooks.token", FieldValue::Text("typed-in".to_string()));
+        let mut applied = config.clone();
+        apply_host_values(&mut applied, &submitted).expect("apply");
+        assert_eq!(
+            applied.hooks.token, config.hooks.token,
+            "never set by a form"
+        );
     }
 
     #[test]

@@ -328,8 +328,9 @@ accident.
   that the file's value is shadowed. A blank variable falls back to the file. The
   `CROSSTALK_<SECTION>__<KEY>` overrides of `token`, `api_key`, `password`, `secret`,
   `username`, `base_url` and `public_url` are taken verbatim: `CROSSTALK_SERVER__TOKEN=0123456`
-  stays `0123456`. The bridge secret works the same way (`[bridge] secret` /
-  `secret_env = "CROSSTALK_BRIDGE_SECRET"`); the settings page shows only whether it is set and
+  stays `0123456`. The bridge secret and the webhook's own token work the same way
+  (`[bridge] secret` / `secret_env = "CROSSTALK_BRIDGE_SECRET"`, `[hooks] token` /
+  `token_env = "CROSSTALK_HOOK_TOKEN"`); the settings page shows only whether each is set and
   where from, and never changes it.
 - **`base_url` credentials.** A `user:pass@` in `dispatcharr.base_url` (for a proxy in front of
   Dispatcharr) is sent as HTTP basic auth and never printed: `validate`, errors and logs show
@@ -944,9 +945,10 @@ Setting it up, in Dispatcharr's own UI:
    event you are subscribing) if you do not use a payload template, because Dispatcharr's own
    payload carries no event name. The URL is *exact*: keep the path, and note the port is
    `server.port`.
-3. Header: `Authorization: Bearer <server.token>`. The route accepts **only** this: a session
+3. Header: `Authorization: Bearer <hooks.token>` — a **hook-only token** (below), or
+   `<server.token>` when none is set. The route accepts **only** a Bearer header: a session
    cookie is refused (a browser session must not be able to trigger an apply by visiting a
-   URL), and a daemon with no `server.token` refuses every delivery rather than accept
+   URL), and a daemon with neither token refuses every delivery rather than accept
    unauthenticated work.
 4. Add `Content-Type: application/json` and a per-event **payload template** such as
    `{"event": "m3u_refresh", "account": "{{ account_name }}"}` if you want a JSON body; without
@@ -956,9 +958,9 @@ Setting it up, in Dispatcharr's own UI:
 
 How a delivery is handled:
 
-- **Auth**: `Authorization: Bearer <server.token>`, never a cookie; the route is exempt from
-  CSRF only for that reason. A wrong token counts toward the same per-client lockout as a
-  wrong sign-in (ten in five minutes, then `429`). Deliveries are rate limited per client
+- **Auth**: `Authorization: Bearer <hooks.token>` (or `<server.token>`), never a cookie; the
+  route is exempt from CSRF only for that reason. A wrong token counts toward the same
+  per-client lockout as a wrong sign-in (ten in five minutes, then `429`). Deliveries are rate limited per client
   (`hooks.rate_per_minute` over a minute, `429` with `Retry-After`); bodies over 64 KiB are
   refused with `413`.
 - **Which event**: an `?event=` query parameter, then an `event` or `type` field in the body,
@@ -981,9 +983,35 @@ How a delivery is handled:
   the work runs in the background. An event the configuration does not name is logged and
   answered `202` too — "I do not act on this" is not a delivery failure.
 
+### The hook-only token
+
+Dispatcharr stores the Bearer token you give Connect in its own database and sends it with every
+delivery, so whatever you give it is only as safe as that database. Give it a token that can do
+nothing but trigger the configured hooks:
+
+```toml
+[hooks]
+token_env = "CROSSTALK_HOOK_TOKEN"   # the default; or token = "..." in the file (chmod 600)
+```
+
+- Accepted **only** on `POST /hooks/dispatcharr`, through the same auth gate and lockout as
+  every other credential. Anywhere else it is a wrong token: `401`, and it counts toward the
+  client's ten-in-five-minutes lockout.
+- Resolved like every secret: the variable `token_env` names wins over `token`, a blank
+  variable falls back to the file, it is never written back from the environment, debug output
+  prints `<redacted>`, and the settings page shows only whether it is set and where from.
+- At least 32 bytes when the daemon is reachable from elsewhere (a non-loopback bind or
+  `trusted_proxies`), exactly like `server.token`: `validate` reports a shorter one, `serve`
+  refuses to start and a settings save refuses to apply it.
+- **Migration**: while a hook token is set, the master token is still accepted on the hook
+  route for this release, and the first such delivery logs a warning naming the change. Put
+  the hook token in Dispatcharr's Connect header. **crosstalk 0.2.0 removes the fallback**:
+  with a hook token set, the master token will be refused on the hook route.
+- With no hook token configured nothing changes: the route takes `server.token`.
+
 ```bash
 curl -X POST http://127.0.0.1:8730/hooks/dispatcharr \
-  -H "Authorization: Bearer $CROSSTALK_SERVER_TOKEN" \
+  -H "Authorization: Bearer $CROSSTALK_HOOK_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"event": "m3u_refresh", "account_name": "test"}'
 ```
@@ -1103,9 +1131,10 @@ server {
 }
 ```
 
-The webhook goes through the same proxy and the same token: point Dispatcharr at
-`https://crosstalk.example.com/hooks/dispatcharr` with the `Authorization: Bearer` header. There
-is no separate webhook token (a deliberate choice: one token, hardened).
+The webhook goes through the same proxy and the same gate: point Dispatcharr at
+`https://crosstalk.example.com/hooks/dispatcharr` with an `Authorization: Bearer` header carrying
+the [hook-only token](#the-hook-only-token) (`[hooks] token`), so the credential Dispatcharr
+stores cannot sign in or run anything else.
 
 ## How matching works
 

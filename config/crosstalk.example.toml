@@ -261,8 +261,8 @@ run_history_days = 15
 #
 # Setup, in Dispatcharr: Settings → Connect → Add Connection, type Webhook, URL
 # `http://<crosstalk host>:8730/hooks/dispatcharr` (crosstalk's own `server.port`, which
-# defaults to 8730 — not Dispatcharr's port), header `Authorization: Bearer <server.token>`
-# (and `Content-Type: application/json` if you use a payload template), then subscribe the
+# defaults to 8730 — not Dispatcharr's port), header `Authorization: Bearer <hooks.token>`
+# (or `<server.token>` when no hook token is set) (and `Content-Type: application/json` if you use a payload template), then subscribe the
 # events below. Dispatcharr's own payload carries no event name, so either add `?event=<name>`
 # to the URL or give the subscription a payload template like {"event": "m3u_refresh"}.
 #
@@ -275,5 +275,16 @@ run_history_days = 15
 # # (default 5 x debounce_secs, at most 900).
 # max_settle_secs = 300
 # rate_per_minute = 60
+# # A token for the webhook ONLY: accepted on POST /hooks/dispatcharr, refused (401)
+# # everywhere else, through the same lockout as every other credential. Dispatcharr stores
+# # whatever you give it and sends it on every delivery, so give it this rather than the
+# # master token: a leak there can then only trigger the targets below. At least 32 bytes
+# # once the daemon is reachable from elsewhere (`openssl rand -hex 32`); the variable named
+# # by token_env wins over the file, and the settings page only says whether it is set.
+# # While it is set, the master token still works on the hook route in this release (with a
+# # one-time warning in the log); crosstalk 0.2.0 refuses it there. `token` and `token_env`
+# # are settings, so they cannot be event names.
+# token = ""
+# token_env = "CROSSTALK_HOOK_TOKEN"
 # m3u_refresh = ["streams.match_apply"]
 # epg_refresh = ["workflow.nightly"]

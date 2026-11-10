@@ -100,6 +100,7 @@ fn state_with(
     let mut config = CrosstalkConfig::load(dir.path()).expect("config");
     config.server.token = token.unwrap_or_default().to_string();
     config.server.token_env = String::new();
+    config.hooks.token_env = String::new();
     config.jobs.exports_dir = dir.path().join("exports").display().to_string();
     tweak(&mut config);
 
@@ -2897,4 +2898,133 @@ async fn the_hook_answer_echoes_only_a_tame_event_name() {
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
     assert!(!body.contains('<'), "{body}");
     assert!(body.contains("?script?alert?1???script?"), "{body}");
+}
+
+// --- the hook-only token -------------------------------------------------------------
+
+/// A hook token, distinct from [`LONG`] (the master token in these tests).
+const HOOK_TOKEN: &str = "hook-0123456789abcdef0123456789ab";
+
+fn with_hook_token(config: &mut CrosstalkConfig) {
+    with_hooks(config);
+    config.hooks.token = HOOK_TOKEN.to_string();
+}
+
+#[tokio::test]
+async fn the_hook_token_works_on_the_hook_route_only() {
+    let (state, store, _dir) = state_with(Some(LONG), with_hook_token);
+    let bearer = format!("Bearer {HOOK_TOKEN}");
+    let (status, _headers, body) = post_hook(
+        &state,
+        r#"{"event": "m3u_refresh"}"#,
+        Some(("authorization", bearer.clone())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    wait_for_runs(&store, "echo", 1).await;
+
+    // Anywhere else it is a wrong token: a read, and a form POST.
+    let form = ("content-type", "application/x-www-form-urlencoded");
+    for (method, uri) in [("GET", "/api/v1/runs"), ("POST", "/exports/clear")] {
+        let (status, _headers, body) = send(
+            &state,
+            method,
+            uri,
+            Some("192.0.2.7:4000"),
+            &[("authorization", bearer.as_str()), form],
+            b"confirm=true".to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}: {body}");
+    }
+    // ...and each refusal counted toward the client's lockout.
+    let client: std::net::IpAddr = "192.0.2.7".parse().expect("ip");
+    assert_eq!(state.login_limiter().hits(client), 2);
+}
+
+#[tokio::test]
+async fn a_wrong_hook_token_counts_toward_the_lockout() {
+    let (state, _store, _dir) = state_with(Some(LONG), with_hook_token);
+    for attempt in 0..10 {
+        let (status, _headers, body) = post_hook(
+            &state,
+            r#"{"event": "m3u_refresh"}"#,
+            Some(("authorization", "Bearer hook-wrong".to_string())),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "attempt {attempt}: {body}"
+        );
+    }
+    // Locked out, even with the right hook token.
+    let (status, headers, _body) = post_hook(
+        &state,
+        r#"{"event": "m3u_refresh"}"#,
+        Some(("authorization", format!("Bearer {HOOK_TOKEN}"))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(headers.contains_key("retry-after"));
+}
+
+#[tokio::test]
+async fn the_master_token_still_works_on_the_hook_route_with_a_warning() {
+    let (state, store, _dir) = state_with(Some(LONG), with_hook_token);
+    let (status, _headers, body) = post_hook(
+        &state,
+        r#"{"event": "m3u_refresh"}"#,
+        Some(("authorization", format!("Bearer {LONG}"))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    wait_for_runs(&store, "echo", 1).await;
+    assert!(
+        crate::auth::master_on_hook_warned(),
+        "the migration warning was logged"
+    );
+}
+
+#[tokio::test]
+async fn the_dashboard_names_the_hook_token_when_one_is_set() {
+    let (state, _store, _dir) = state_with(Some(LONG), with_hook_token);
+    let bearer = format!("Bearer {LONG}");
+    let (status, _headers, body) = send(
+        &state,
+        "GET",
+        "/",
+        None,
+        &[("authorization", bearer.as_str())],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Bearer &lt;hooks.token&gt;"), "{body}");
+    assert!(!body.contains(HOOK_TOKEN), "{body}");
+}
+
+#[tokio::test]
+async fn saving_host_settings_refuses_a_short_hook_token_on_a_reachable_bind() {
+    let (state, _store, dir) = state(Some(LONG));
+    std::fs::write(
+        dir.path().join("crosstalk.toml"),
+        format!(
+            "[server]\nbind = \"0.0.0.0\"\ntoken = \"{LONG}\"\ntoken_env = \"\"\n\n\
+             [hooks]\ntoken = \"short\"\ntoken_env = \"\"\n"
+        ),
+    )
+    .expect("seed");
+    let bearer = format!("Bearer {LONG}");
+    let (status, body) = post_page(
+        &state,
+        "/settings/host",
+        "matching.enabled_databases=US",
+        &[("authorization", bearer.as_str())],
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(body.contains("NOT applied"), "{body}");
+    assert!(body.contains("hooks.token is 5 bytes"), "{body}");
+    assert_eq!(state.snapshot().server.bind, "127.0.0.1", "not swapped in");
 }

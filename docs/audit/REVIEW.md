@@ -166,7 +166,9 @@ runner labels (no `actionlint.yaml` lists them), as before the series. Nothing w
 
 ## Decisions I would revisit
 
-- **A9, the one-token rule for the webhook.** Decided and respected. The webhook now goes
+- **A9, the one-token rule for the webhook.** ADOPTED afterwards: `[hooks] token` is a
+  hook-only credential (see `docs/audit/A-web.md`, A9). The original note: Decided and
+  respected. The webhook now goes
   through the same gate and limiter and refuses sessions, which is the strongest shape one
   token allows. But Dispatcharr Connect stores that token in its own database and sends it on
   every delivery; a leak there is the master token. A second, hook-only credential with the
