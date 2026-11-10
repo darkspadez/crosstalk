@@ -173,7 +173,7 @@ runner labels (no `actionlint.yaml` lists them), as before the series. Nothing w
   every delivery; a leak there is the master token. A second, hook-only credential with the
   same limiter would confine that leak to "trigger a configured refresh". Worth revisiting once
   the first real install is behind a proxy.
-- **Sessions in memory.** ADOPTED afterwards in the commit after `3753591` on
+- **Sessions in memory.** ADOPTED afterwards in `d00a1ec` on
   `fix/web-sessions-hook` ("web: signed session cookies that survive a restart"): signed
   cookies under `<data_dir>/session.key`, sign-outs persisted in SQLite, `crosstalk sessions
   revoke-all` (see `docs/audit/A-web.md`, A5). The original note: A restart signs every
