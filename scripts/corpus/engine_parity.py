@@ -35,7 +35,8 @@ Usage:
         [--threshold 80] [--family-queries N] [--show N]
 
     --limit N         check only the first N corpus pairs (CI subset).
-    --kinds ...       comma list of: normalize,callsign,alias,same,family.
+    --kinds ...       comma list of: normalize,callsign,alias,identity,pipe,language,
+                      same,family.
     --threshold T     decision cut both engines score at (default 80: the cut
                       decisions.json reports the engine cost at).
     --family-queries N  distractor-set rank checks to run (default 400).
@@ -65,6 +66,10 @@ CHUNK = 2000
 #: Pipe decorations the `pipe` kind wraps every corpus name in (decided N15).
 PIPE_SHAPES = ("{}", "{} | HD |", "HD | {}", "UK | {} | FHD", "{} | US", "RK: US | {}",
                "| {} | [4K] |", "{} | 1080p | +1")
+#: Bracket decorations the `language` kind wraps corpus names in (decided N16); `{w}`
+#: is a language word (rotated over `ablate.LANGUAGE_WORDS`, original/upper/lower).
+LANGUAGE_SHAPES = ("{n} ({w})", "{n} [{w}]", "({w}) {n}", "{n}({w}) HD", "{n} ( {w} ) (PT)",
+                   "{n} ({w} HD)", "{n} (({w}))")
 
 #: Worker-local decided engine for --jobs parallelism (built once per process).
 _WORKER: dict = {}
@@ -355,7 +360,7 @@ def main(argv=None) -> int:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--kinds",
-                        default="normalize,callsign,alias,identity,pipe,same,family")
+                        default="normalize,callsign,alias,identity,pipe,language,same,family")
     parser.add_argument("--threshold", type=int, default=80)
     parser.add_argument("--family-queries", type=int, default=400)
     parser.add_argument("--pool-queries", type=int, default=1500)
@@ -443,6 +448,35 @@ def main(argv=None) -> int:
                 mismatches.append(f"pipe {name!r}: rust {response.get('collapsed')!r} "
                                   f"!= python {expected!r}")
         ok &= report("pipe", len(battery), mismatches, args.show)
+
+    if "language" in kinds:
+        # Decided N16: the unwrap and the key it feeds, on every language word in
+        # every bracket shape and on corpus names wrapped with a rotating word.
+        words = [form for word in ablate.LANGUAGE_WORDS
+                 for form in (word, word.upper(), word.lower())]
+        battery = {shape.format(n="Al Jazeera", w=word)
+                   for word in words for shape in LANGUAGE_SHAPES}
+        for index, name in enumerate(names):
+            word = words[index % len(words)]
+            battery.update(shape.format(n=name, w=word) for shape in LANGUAGE_SHAPES)
+        battery = sorted(battery)
+        requests = []
+        for name in battery:
+            requests.append({"kind": "language", "name": name})
+            requests.append({"kind": "normalize", "name": name, "threshold": args.threshold})
+        responses = rust.batch(requests)
+        mismatches = []
+        for index, name in enumerate(battery):
+            unwrapped, normalized = responses[2 * index], responses[2 * index + 1]
+            expected = ablate.unwrap_language_brackets(name)
+            if unwrapped.get("unwrapped") != expected:
+                mismatches.append(f"language {name!r}: rust {unwrapped.get('unwrapped')!r} "
+                                  f"!= python {expected!r}")
+            expected = engine.normalize(name)
+            if normalized.get("normalized") != expected:
+                mismatches.append(f"language key {name!r}: rust "
+                                  f"{normalized.get('normalized')!r} != python {expected!r}")
+        ok &= report("language", len(battery), mismatches, args.show)
 
     rust_same: list[bool] = []
     if "same" in kinds:

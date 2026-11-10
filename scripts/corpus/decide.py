@@ -96,6 +96,8 @@ VARIANTS: dict[str, tuple[dict[str, list[str]], str, str]] = {
             "core", "Geographic (country tag anywhere) table"),
     "N15": ({"pipe-segments": [], "keep": ALL},
             "keep", "Pipe-delimited junk segments in names"),
+    "N16": ({"language-word": [], "drop": ALL},
+            "language-word", "Language-word parentheticals"),
     "C07": ({"callsign-first": [], "score-first": ALL},
             "callsign-first", "Network-led station callsign precedence"),
     "C08": ({"station-callsign-family": [], "key-only": ALL},
@@ -291,6 +293,38 @@ ORCHESTRATED: dict[str, tuple[str, str]] = {
             "both parts (`Sky Sports | Premier League` -> `Sky Sports Premier League`). "
             "Byte-identical Rust/Python on every corpus name bare and pipe-decorated "
             "(`engine_parity.py` kind `pipe`)."),
+    "N16": ("language-word", "User decision (cleanup after phase 3): a parenthesized or "
+            "bracketed segment whose whole trimmed content is a language word stays in the "
+            "key as a plain word (`language::unwrap_language_brackets`, run after the N15 "
+            "pipe collapse in `UnifiedEngine::normalize_key` and the alias reverse index): "
+            "`Al Jazeera (Arabic)` -> `Al Jazeera Arabic`, `Cable Public Affairs HD Channel "
+            "(French)` keeps `French`. The word list is explicit (`language::LANGUAGE_WORDS`, "
+            "38 English names and native spellings: Arabic, English, French/Français, "
+            "Spanish/Español, Portuguese/Português, German/Deutsch, Italian/Italiano, Hindi, "
+            "Urdu, Turkish/Türkçe, Russian, Chinese, Mandarin, Cantonese, Korean, Japanese, "
+            "Persian, Farsi, Hebrew, Dutch, Polish, Greek, Tamil, Telugu, Punjabi, Bengali, "
+            "Tagalog, Vietnamese, Thai, Swahili, Somali, Amharic), compared case-insensitively "
+            "through the token-sort stage's accent folding (NFKD, nonspacing marks dropped). "
+            "Two-letter codes (`(PT)`, `(EN)`) are NOT language words: they are as often "
+            "countries or zones, and stay with the normalizer's parenthetical strip, which is "
+            "otherwise unchanged (`(Backup)`, `(Arabic HD)`, `(CX)`). Evidence: the phase 3 "
+            "review's left-open case (plan notes, guide simulator pass) — every plugin's "
+            "normalizer drops the parenthetical (N03's broad `(...)`), so `Al Jazeera "
+            "(Arabic)` keyed as bare `Al Jazeera`, which the merged alias table lists under "
+            "Al Jazeera English (`Al Jazeera HD`), and A01/A05 put the Arabic channel in the "
+            "English channel's family at 100; `Al Jazeera Arabic` (no parentheses) already "
+            "keyed apart. No plugin keeps a parenthetical word, so there is no variant to "
+            "ablate. Reach: 30 of 61,028 names in the merged channel DBs, lineups, alias "
+            "table and corpus change (all a language in parentheses: `Al Jazeera (Arabic)`, "
+            "`France24 (English)`, `Fox Sports 1 HD (Spanish)`, `Comedy TV (Russian)`, "
+            "`Channel One (Persian)`, `The Weather Channel (Spanish)` ...), 10 of them corpus "
+            "names (the `Cable Public Affairs HD Channel (French)` and `Discovery En Español "
+            "(English)` spellings). Corpus effect under the decided configuration: engine "
+            "cost 844 at cut 80 (unchanged: FP 34, FN 776) and 835 at cut 95 (unchanged: "
+            "FP 8, FN 819) — no construction pair sets a language parenthetical against the "
+            "bare or other-language spelling. Byte-identical Rust/Python on every language "
+            "word in every bracket shape and on every corpus name wrapped with one "
+            "(`engine_parity.py` kind `language`, unwrap and key)."),
     "C07": ("callsign-first", "Orchestrator decision (follow-up engine fix, plan step-15 review): "
             "when the query's identity has a high-confidence callsign (the engine's "
             "existing confidence) that exists in the merged station table, a candidate "

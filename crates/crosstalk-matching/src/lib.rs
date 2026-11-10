@@ -18,6 +18,7 @@ pub mod country;
 pub mod data;
 pub mod engine;
 pub mod identity;
+pub mod language;
 pub mod market;
 pub mod normalize;
 pub mod pipeline;

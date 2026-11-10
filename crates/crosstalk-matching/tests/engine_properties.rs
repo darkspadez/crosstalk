@@ -163,7 +163,8 @@ fn rank_winner_identity_is_order_independent() {
 fn data_version_is_namespaced() {
     let version = crosstalk_matching::engine::data_version();
     // Phase 3 review: a bare station callsign joins the station's family (C08): `eng:6`.
-    assert!(version.contains("eng:6"), "{version}");
+    // A language-word parenthetical stays in the key (N16): `eng:7`.
+    assert!(version.contains("eng:7"), "{version}");
     // Two calls agree (memoized), and distinct inputs key distinctly.
     assert_eq!(version, crosstalk_matching::engine::data_version());
     let a = IdentityCache::input_key("ESPN", &ctx());
