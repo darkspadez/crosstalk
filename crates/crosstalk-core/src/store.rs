@@ -534,6 +534,15 @@ impl Store {
                     created_at TEXT NOT NULL,
                     PRIMARY KEY (kind, app, owner_key)
                 );
+
+                -- Signed-out browser sessions. A session cookie is signed rather than stored, so
+                -- signing out has to be remembered somewhere a restart keeps: one row per
+                -- revoked session id until the cookie would have expired anyway (unix seconds),
+                -- pruned on every revocation.
+                CREATE TABLE IF NOT EXISTS session_revocations (
+                    session_id TEXT    PRIMARY KEY,
+                    expires_at INTEGER NOT NULL
+                );
                 "#,
             )?;
             add_run_row_columns(connection)?;
@@ -1612,6 +1621,51 @@ impl Store {
         })
     }
 
+    /// Remember that a browser session signed out, until `expires_at` (unix seconds), when its
+    /// cookie would have died anyway. Revocations already past their expiry are pruned here.
+    pub fn revoke_session(&self, session_id: &str, expires_at: i64, now: i64) -> Result<()> {
+        self.with_connection(|connection| {
+            connection.execute(
+                "DELETE FROM session_revocations WHERE expires_at <= ?1",
+                params![now],
+            )?;
+            connection.execute(
+                "INSERT INTO session_revocations (session_id, expires_at) VALUES (?1, ?2) \
+                 ON CONFLICT(session_id) DO UPDATE SET expires_at = \
+                 max(expires_at, excluded.expires_at)",
+                params![session_id, expires_at],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Whether a browser session signed out.
+    pub fn session_revoked(&self, session_id: &str) -> Result<bool> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT 1 FROM session_revocations WHERE session_id = ?1",
+                    params![session_id],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map(|row| row.is_some())
+                .map_err(Into::into)
+        })
+    }
+
+    /// How many signed-out sessions are remembered, for tests and diagnostics.
+    pub fn session_revocation_count(&self) -> Result<u64> {
+        self.with_connection(|connection| {
+            connection
+                .query_row("SELECT COUNT(*) FROM session_revocations", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .map(|count| count as u64)
+                .map_err(Into::into)
+        })
+    }
+
     /// Backdate a run's `started_at`, for tests that seed old history.
     #[cfg(test)]
     pub(crate) fn set_started_at_for_test(&self, run_id: i64, started_at: &str) -> Result<()> {
@@ -1975,6 +2029,25 @@ fn marks(n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_revoked_session_is_remembered_until_it_would_have_expired() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("crosstalk.db");
+        let store = Store::open(&path).expect("store");
+        store.revoke_session("old", 100, 50).expect("revoke");
+        store.revoke_session("live", 1_000, 50).expect("revoke");
+        assert!(store.session_revoked("old").expect("read"));
+        assert!(!store.session_revoked("never").expect("read"));
+        // Survives a reopen, as a restart would.
+        drop(store);
+        let store = Store::open(&path).expect("reopen");
+        assert!(store.session_revoked("live").expect("read"));
+        // A later revocation prunes what has expired.
+        store.revoke_session("new", 2_000, 500).expect("revoke");
+        assert!(!store.session_revoked("old").expect("read"));
+        assert_eq!(store.session_revocation_count().expect("count"), 2);
+    }
 
     #[test]
     fn a_stream_health_row_is_upserted_and_replaced_whole() {

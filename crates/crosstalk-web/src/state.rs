@@ -31,7 +31,7 @@ pub struct AppState {
     /// Per-client auth failure counting: wrong tokens on POST /login and wrong Bearer tokens on
     /// every route.
     login_limiter: Arc<crate::auth::LoginLimiter>,
-    /// Signed-in browsers.
+    /// The session signing key and the sign-out list.
     sessions: Arc<crate::session::Sessions>,
     /// Requests in flight, bounded by [`crate::limits::MAX_IN_FLIGHT`].
     in_flight: Arc<tokio::sync::Semaphore>,
@@ -57,6 +57,7 @@ impl std::fmt::Debug for AppState {
 impl AppState {
     pub fn new(registry: Registry, config: SharedConfig, runner: JobRunner, store: Store) -> Self {
         let hooks = crosstalk_core::hooks::Hooks::new(runner.clone());
+        let sessions = crate::session::Sessions::ephemeral(store.clone());
         Self {
             registry: Arc::new(registry),
             config,
@@ -65,7 +66,7 @@ impl AppState {
             scheduler: None,
             csrf_token: crate::csrf::generate_token(),
             login_limiter: Arc::new(crate::auth::LoginLimiter::default()),
-            sessions: Arc::new(crate::session::Sessions::default()),
+            sessions: Arc::new(sessions),
             in_flight: Arc::new(tokio::sync::Semaphore::new(crate::limits::MAX_IN_FLIGHT)),
             hooks,
             // The bound is read from the live configuration per delivery, so this limiter only
@@ -75,6 +76,14 @@ impl AppState {
                 std::time::Duration::from_secs(60),
             )),
         }
+    }
+
+    /// Sign sessions with the key in the data directory, so they survive a restart (see
+    /// [`crate::session::Sessions::open`]). Without this the key lives in memory and a restart
+    /// signs every browser out.
+    pub fn with_sessions(mut self, sessions: crate::session::Sessions) -> Self {
+        self.sessions = Arc::new(sessions);
+        self
     }
 
     /// Attach the armed scheduler so host settings saves can re-arm schedules.
@@ -120,6 +129,7 @@ impl AppState {
         let server = &config.server;
         ServerView {
             token: server.resolved_token(),
+            hook_token: config.hooks.resolved_token(),
             trusted: server.trusted_cidrs(),
             public_origin: server.public_origin(),
             secure_cookies: server.secure_cookies,
@@ -141,14 +151,33 @@ impl AppState {
 
 /// The `[server]` settings a request is judged by, read once per request (the outermost layer
 /// computes it and the inner ones reuse it from the request's extensions).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ServerView {
     pub token: Option<String>,
+    /// `[hooks] token`: accepted on the webhook route only.
+    pub hook_token: Option<String>,
     pub trusted: Vec<crosstalk_core::net::Cidr>,
     pub public_origin: Option<String>,
     pub secure_cookies: bool,
     pub hsts: bool,
     pub bind: String,
+}
+
+impl std::fmt::Debug for ServerView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerView")
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field(
+                "hook_token",
+                &self.hook_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("trusted", &self.trusted)
+            .field("public_origin", &self.public_origin)
+            .field("secure_cookies", &self.secure_cookies)
+            .field("hsts", &self.hsts)
+            .field("bind", &self.bind)
+            .finish()
+    }
 }
 
 impl ServerView {
@@ -259,6 +288,9 @@ pub struct UiHooks {
     pub debounce: String,
     /// The route Dispatcharr posts to.
     pub route: String,
+    /// The setting whose token Dispatcharr sends: `hooks.token` when one is set, else
+    /// `server.token`.
+    pub credential: String,
 }
 
 /// Build the dashboard's workflow list.
@@ -339,6 +371,12 @@ pub fn hooks(config: &CrosstalkConfig) -> UiHooks {
             format!("{debounce} s")
         },
         route: crosstalk_core::hooks::ROUTE.to_string(),
+        credential: if config.hooks.resolved_token().is_some() {
+            "hooks.token"
+        } else {
+            "server.token"
+        }
+        .to_string(),
     }
 }
 

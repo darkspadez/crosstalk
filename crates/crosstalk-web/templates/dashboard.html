@@ -131,7 +131,7 @@
   </p>
   <p class="muted">
     Dispatcharr setup: add an integration of type <strong>Webhook</strong> with the URL
-    <code>{{ hooks.route }}</code>, a header <code>Authorization: Bearer &lt;server.token&gt;</code>
+    <code>{{ hooks.route }}</code>, a header <code>Authorization: Bearer &lt;{{ hooks.credential }}&gt;</code>
     (and <code>Content-Type: application/json</code> if you write a payload template), subscribe
     the events above, and give each subscription a payload template that names the event —
     e.g. <code>{"event": "m3u_refresh"}</code> — because Dispatcharr's own payload does not
