@@ -8,10 +8,31 @@
   {% include "_run_status.html" %}
 </section>
 
+{% if let Some(parent) = parent %}
+<p class="muted">
+  This run is a step of <a href="/runs/{{ parent.id }}">workflow run #{{ parent.id }}</a>
+  (<code>workflow.{{ parent.action }}</code>).
+</p>
+{% endif %}
+
+{% if !steps.is_empty() %}
+<section class="card">
+  <h2>Steps</h2>
+  {% include "_steps_table.html" %}
+</section>
+{% endif %}
+
+{% if is_workflow %}
+<p class="muted">
+  A workflow run has no result rows of its own: each step is an ordinary run with its own rows,
+  report and status.
+</p>
+{% else %}
 <section class="card">
   <h2>Results</h2>
   <div id="rows" hx-get="/runs/{{ run.id }}/rows" hx-trigger="every 5s" hx-swap="innerHTML">
     {% include "_rows.html" %}
   </div>
 </section>
+{% endif %}
 {% endblock %}

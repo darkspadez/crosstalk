@@ -13,7 +13,7 @@
 //! scores a list of query names against the same kind of candidate index, and the work scales
 //! with cores rather than with the async runtime.
 
-use crate::dispatcharr::EpgEntry;
+use crate::dispatcharr::{EpgEntry, Stream};
 use crate::jobs::{JobContext, ProgressEvent};
 use anyhow::{Context, Result};
 use crosstalk_matching::pipeline::{CandidateIndex, Matcher, Scored};
@@ -57,6 +57,33 @@ impl Candidate for EpgEntry {
         let mut fields = vec![("tvg_id", serde_json::json!(self.tvg_id))];
         if let Some(source) = self.epg_source {
             fields.push(("epg_source", serde_json::json!(source)));
+        }
+        fields
+    }
+}
+
+/// A provider stream as a candidate: its name ranks it, and the streams app then decides what
+/// to attach.
+///
+/// The request fields are what tells two same-name streams apart in a model prompt: which
+/// provider account listed it, which provider group it came from, and the guide id it carries.
+/// Without them a gate sees "ESPN HD" five times over five accounts and no way to choose.
+impl Candidate for Stream {
+    fn id(&self) -> i64 {
+        self.id
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn request_fields(&self) -> Vec<(&'static str, serde_json::Value)> {
+        let mut fields = vec![("tvg_id", serde_json::json!(self.tvg_id))];
+        if let Some(account) = self.m3u_account {
+            fields.push(("m3u_account", serde_json::json!(account)));
+        }
+        if let Some(group) = self.channel_group {
+            fields.push(("channel_group", serde_json::json!(group)));
         }
         fields
     }
@@ -491,6 +518,45 @@ mod tests {
     }
 
     #[test]
+    fn a_stream_candidate_carries_what_tells_two_providers_apart() {
+        // Stream-Mapparr attaches every matching stream, so the gate is asked about a family
+        // of same-name candidates: the account, the provider group and the guide id are the
+        // only things that distinguish them.
+        let stream = Stream {
+            id: 51_000,
+            name: "ESPN HD".to_string(),
+            tvg_id: "espn.us".to_string(),
+            m3u_account: Some(3),
+            channel_group: Some(7),
+            ..Stream::default()
+        };
+        assert_eq!(Candidate::id(&stream), 51_000);
+        assert_eq!(Candidate::name(&stream), "ESPN HD");
+        let fields = Candidate::request_fields(&stream);
+        assert_eq!(
+            fields,
+            vec![
+                ("tvg_id", serde_json::json!("espn.us")),
+                ("m3u_account", serde_json::json!(3)),
+                ("channel_group", serde_json::json!(7)),
+            ]
+        );
+
+        // A hand-made stream has no account and no group: those fields are omitted rather
+        // than sent as null, so the prompt does not imply one exists.
+        let custom = Stream {
+            id: 1,
+            name: "Local".to_string(),
+            is_custom: true,
+            ..Stream::default()
+        };
+        assert_eq!(
+            Candidate::request_fields(&custom),
+            vec![("tvg_id", serde_json::json!(""))]
+        );
+    }
+
+    #[test]
     fn only_a_channel_without_a_confident_match_needs_the_gate() {
         assert!(!needs_gate(Some(95), 95));
         assert!(!needs_gate(Some(100), 95));
@@ -509,8 +575,7 @@ mod tests {
         let names = vec!["ESPN".to_string(), "CNN".to_string()];
         let index = Arc::new(CandidateIndex::build(
             &["ESPN HD".to_string(), "CNN".to_string()],
-            matcher.normalizer(),
-            matcher.known(),
+            &matcher,
         ));
         let scored = score_names(&names, Arc::clone(&matcher), index, &matcher.tags(), None)
             .await

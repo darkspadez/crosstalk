@@ -107,9 +107,9 @@ jobs:
       - nscloud-cache-tag-crosstalk-amd64
     needs: check
     timeout-minutes: 20
-    # The Python plugin is a pinned submodule, so the reference is always present.
-    # Full history (not a shallow fetch): scripts/upstream_drift.sh compares the pin
-    # against the upstream tip, which needs the commits between them.
+    # The Python plugins are pinned submodules, so every reference is always present.
+    # Full history (not a shallow fetch): scripts/upstream_drift.sh compares each pin
+    # against its upstream tip, which needs the commits between them.
     steps:
       - uses: actions/checkout@v4
         with:
@@ -128,14 +128,77 @@ jobs:
         run: |
           python3 scripts/parity_sweep.py --kinds normalize,callsign,location,network --limit 300
           python3 scripts/parity_sweep.py --kinds match,score --limit 300 --pool 60
+      # Stream-Mapparr is the same engine under different flags, so it keeps its own sweep
+      # against its own fuzzy_matcher.py and country.py. The first run covers the
+      # adversarial corpus (zones, designators, alias folding, Unicode); the second walks
+      # real database names for the callsign ladder and zone/country detection, which is
+      # where its divergence from EPG Janitor shows. Both stay well under a minute.
+      - name: Stream-Mapparr sweep vs its own matcher
+        run: |
+          python3 -I scripts/parity_sweep_sm.py --limit 300
+          python3 -I scripts/parity_sweep_sm.py --kinds callsign,zone,country --limit 3000
       # Channel operations replace the plugin's five cleanup actions, so their selection and
       # payload logic is compared against the plugin's own code. -I keeps the harness from
       # importing anything outside the plugin checkout (which it puts on sys.path itself).
       - name: Channel ops vs the plugin's cleanup actions
         run: python3 -I scripts/channel_ops_parity.py
-      # Informational, never failing: what upstream changed since the pinned reference commit
-      # in the files crosstalk ports. The weekly schedule is what makes it a reminder; the
-      # script itself exits 0 whatever it finds (see plans/plugin-consolidation.md).
-      - name: Upstream drift since the reference pin
+      # The streams sort is Stream-Mapparr's quality model, ported. The harness drives the
+      # plugin's REAL `_sort_streams_by_quality` / `_zone_routed_map` (with the Django stubs the
+      # plugin's own tests install) and compares the per-channel orders with
+      # `crates/streams/examples/sort_io`. ~10s over 840 cases, 1500 channels.
+      - name: Streams sort vs the plugin's quality model
+        run: python3 -I scripts/sort_parity.py
+      # The streams match pipeline is Stream-Mapparr's Match & Assign, ported. The harness
+      # drives the plugin's REAL `_build_channel_groups`, `_match_streams_to_channel`,
+      # `_channels_to_update_for_group`, `_streams_to_assign`, `_same_country_ids_for` and
+      # `_write_channel_streams` (with the Django stubs its own tests install, plus a fake
+      # ChannelStream table) and compares every channel's final stream list with
+      # `crates/streams/examples/match_io`. ~20s over 1,800 swept cases plus randomised ones,
+      # EPG placeholder fixtures included.
+      - name: Streams match vs the plugin's collector
+        run: python3 -I scripts/match_parity.py
+      # The three read-only streams tools, against the plugin's own code: its
+      # `check_stream_countries_action` and `test_regex_rules_action` driven end to end, and
+      # `placeholder_scan.py` imported directly (it is plain Python). The EPG placeholder path
+      # is part of the match step above, with the two ORM lookups stubbed to fixtures.
+      - name: Streams read-only tools vs the plugin's own code
+        run: python3 -I scripts/tools_parity.py
+      # The mirror fill is Stream-Mapparr's Fill Mirror Backups, ported: server-group accounts,
+      # the provider-id index, the active/host rules, the insert position before trailing
+      # custom streams and the readout's counts. The harness drives the plugin's REAL
+      # `fill_mirror_backups_action` (with M3UAccount/ChannelStream/Stream faked the way the
+      # plugin's own tests fake them) and compares the written orders with
+      # `crates/streams/examples/mirror_io`.
+      - name: Streams mirror fill vs the plugin's own action
+        run: python3 -I scripts/mirror_parity.py
+      # The probe is IPTV Checker's stream check, ported. The harness replays outputs recorded
+      # from the REAL ffprobe/ffmpeg (crates/streams/tests/fixtures/probe/corpus.json, made by
+      # scripts/probe_fixtures.py) through the plugin's own `check_stream`, `_analyze_stream_content`
+      # and `_channels_where`, and compares the command lines, the parse, the classification, the
+      # stats merge and the per-channel verdicts with `crates/streams/examples/probe_io`.
+      - name: Streams probe vs the plugin's stream check
+        run: python3 -I scripts/probe_parity.py
+      # Channel visibility is Stream-Mapparr's Manage Channel Visibility, ported: it drives the
+      # plugin's REAL `manage_channel_visibility_action` (with `ChannelProfileMembership` faked
+      # as a table) plus the shared `_build_channel_groups`, and compares the resulting
+      # membership per channel with `crates/streams/examples/visibility_io`.
+      - name: Streams visibility vs the plugin's own action
+        run: python3 -I scripts/visibility_parity.py
+      # Triage and restore are IPTV Checker's seven post-actions and its Restore Recovered
+      # Channels, ported. The harness runs the plugin's REAL rename/move/suffix actions in its
+      # own scheduled order (with the channel table faked as a dict and the real
+      # `_capture_original_state` writing a state file), then its `restore_channels_action` with
+      # that state file built from the same recorded changes, and compares every channel's final
+      # name and group with `crates/streams/examples/triage_io`. Two shapes are counted rather
+      # than failed — the plugin's repeated tag and a quality tag it strips that crosstalk never
+      # recorded — and both are documented divergences.
+      - name: Streams triage and restore vs the plugin's own actions
+        run: python3 -I scripts/triage_parity.py
+      # Informational, never failing: what upstream changed since each pinned reference
+      # commit in the files crosstalk ports from it. Covers every reference submodule
+      # (EPG Janitor, Stream-Mapparr, IPTV Checker), each with its own ported-file list.
+      # The weekly schedule is what makes it a reminder; the script itself exits 0
+      # whatever it finds (see plans/plugin-consolidation.md).
+      - name: Upstream drift since each reference pin
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         run: ./scripts/upstream_drift.sh

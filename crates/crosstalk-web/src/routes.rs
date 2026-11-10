@@ -1,8 +1,9 @@
 //! The HTTP routes: pages, the JSON API, and the actions that start runs.
 
 use crate::auth::{self, COOKIE};
-use crate::state::{self, AppState, UiApp, UiField, UiRow, UiSettings};
+use crate::state::{self, AppState, UiApp, UiField, UiHooks, UiRow, UiSettings, UiWorkflow};
 use askama::Template;
+use axum::body::Bytes;
 use axum::extract::{Form, Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
@@ -32,6 +33,11 @@ pub fn router(state: AppState) -> Router {
         .route("/settings", get(settings_page))
         .route("/settings/host", post(save_host_settings))
         .route("/settings/:app", post(save_app_settings))
+        // Dispatcharr Connect posts here. Bearer-only (`auth::require`), CSRF-exempt because of
+        // that (`csrf::check`), and it answers 202 before any work starts.
+        .route(crosstalk_core::hooks::ROUTE, post(dispatcharr_hook))
+        // A workflow's Run button on the dashboard. It writes, so it confirms like an apply.
+        .route("/workflows/:name/run", post(start_workflow))
         .route("/api/v1/apps", get(api_apps))
         .route("/api/v1/runs", get(api_runs))
         .route("/api/v1/runs/:id", get(api_run))
@@ -77,6 +83,8 @@ struct DashboardTemplate {
     csrf_token: String,
     apps: Vec<UiApp>,
     schedules: Vec<crosstalk_core::scheduler::ScheduleInfo>,
+    workflows: Vec<UiWorkflow>,
+    hooks: UiHooks,
     runs: Vec<RunRecord>,
     warnings: Vec<String>,
     /// What the last "clear exports" did, on the page it redirected back to.
@@ -116,6 +124,12 @@ struct RunTemplate {
     rows: Vec<UiRow>,
     /// Whether the CSV the run recorded is still on disk.
     report_available: bool,
+    /// The steps of a workflow run, in the order they ran. Empty for an ordinary run.
+    steps: Vec<RunRecord>,
+    /// Whether this run is a workflow's, whose results live on its steps' pages.
+    is_workflow: bool,
+    /// The workflow run this run is a step of, when it is one.
+    parent: Option<RunRecord>,
 }
 
 #[derive(Template)]
@@ -264,6 +278,8 @@ async fn dashboard(
         csrf_token: state.csrf_token().to_string(),
         apps: state::apps(&state.registry, &state.store),
         schedules: state::schedules(&snapshot),
+        workflows: state::workflows(&state.runner, &snapshot, &state.store),
+        hooks: state::hooks(&snapshot),
         runs,
         warnings,
         notice: clear_notice(&query),
@@ -392,6 +408,11 @@ struct StartForm {
     /// The UI's confirm dialog submits it; a forged POST without it is rejected.
     #[serde(default)]
     confirm: Option<String>,
+    /// "Start fresh": ignore and discard the progress a paused run saved. Unchecked is the
+    /// default because resuming is the point of a windowed job; the checkbox is how an
+    /// operator asks for the backlog from the beginning.
+    #[serde(default)]
+    fresh: Option<String>,
 }
 
 async fn start_action(
@@ -418,7 +439,16 @@ async fn start_action(
     let dry_run = !action.kind.touches_channels()
         || form.dry_run.as_deref().is_some_and(|value| value == "true");
 
-    match state.runner.start(&app_id, &action_id, dry_run) {
+    let options = crosstalk_core::runner::RunOptions::default();
+    let options = if form.fresh.as_deref().is_some_and(|value| value == "true") {
+        options.fresh()
+    } else {
+        options
+    };
+    match state
+        .runner
+        .start_with(&app_id, &action_id, dry_run, options)
+    {
         Ok(started) => Redirect::to(&format!("/runs/{}", started.run_id)).into_response(),
         Err(error) => (
             StatusCode::CONFLICT,
@@ -426,6 +456,141 @@ async fn start_action(
         )
             .into_response(),
     }
+}
+
+/// `POST /workflows/:name/run`: the dashboard's Run button.
+///
+/// A workflow writes (a workflow of read-only steps is possible, but not the default), so it
+/// confirms exactly like an apply action does: the browser dialog is convenience, and the
+/// hidden `confirm` field is what the server checks.
+async fn start_workflow(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Form(form): Form<StartForm>,
+) -> Response {
+    let snapshot = state.snapshot();
+    if !snapshot.workflows.contains_key(&name) {
+        return (StatusCode::NOT_FOUND, "no such workflow\n").into_response();
+    }
+    let dry_run = crosstalk_core::workflow::scheduled_dry_run(&state.registry, &snapshot, &name);
+    if !dry_run && form.confirm.as_deref() != Some("true") {
+        return (
+            StatusCode::BAD_REQUEST,
+            "this workflow changes data: resubmit the form with confirm=true\n",
+        )
+            .into_response();
+    }
+
+    let options = crosstalk_core::runner::RunOptions::default();
+    let options = if form.fresh.as_deref().is_some_and(|value| value == "true") {
+        options.fresh()
+    } else {
+        options
+    };
+    // Shape AND registry: a workflow whose step names no action is a configuration error to
+    // report, not a run that fails a second later.
+    if let Err(error) = crosstalk_core::workflow::resolve(&state.runner, &name) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("workflow {name} cannot run: {error:#}\n"),
+        )
+            .into_response();
+    }
+    match crosstalk_core::workflow::start(&state.runner, &name, dry_run, options) {
+        Ok(started) => Redirect::to(&format!("/runs/{}", started.run_id)).into_response(),
+        Err(error) => (
+            StatusCode::CONFLICT,
+            format!("could not start the workflow: {error:#}\n"),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /hooks/dispatcharr`: one Dispatcharr Connect delivery.
+///
+/// Answers 202 as soon as the delivery is understood, because Dispatcharr's webhook handler waits
+/// ten seconds for an answer and a match or a probe takes far longer: the work is the debounced
+/// task's, not this request's (see [`crosstalk_core::hooks`]).
+///
+/// Every response after authentication is 202, including an unknown event: Dispatcharr logs a
+/// failed delivery for anything else, and "I do not act on this event" is not a delivery failure.
+async fn dispatcharr_hook(
+    State(state): State<AppState>,
+    connect: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Response {
+    let snapshot = state.snapshot();
+    let ip = connect
+        .map(|info| info.0.ip())
+        .unwrap_or_else(|| std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+
+    // A delivery starts real work, so the route counts them per address. The bound comes from
+    // the live configuration, so raising it needs no restart.
+    let limit = snapshot.hooks.rate_per_minute;
+    if limit > 0 && state.hook_limiter().hits(ip) >= limit {
+        let retry = state.hook_limiter().retry_after_secs(ip).max(1);
+        let mut response = (
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("too many hook deliveries: retry in {retry}s\n"),
+        )
+            .into_response();
+        if let Ok(value) = header::HeaderValue::from_str(&retry.to_string()) {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        return response;
+    }
+    state.hook_limiter().record_hit(ip);
+
+    let fields = crosstalk_core::hooks::read_fields(&body);
+    let configured: std::collections::BTreeSet<String> =
+        snapshot.hooks.events.keys().cloned().collect();
+    let resolved = crosstalk_core::hooks::read_event(
+        query.get("event").map(String::as_str),
+        &fields,
+        &configured,
+    );
+    let Some(event) = resolved else {
+        tracing::info!(
+            bytes = body.len(),
+            fields = ?fields.keys().collect::<Vec<_>>(),
+            "hook delivery names no event this configuration knows; ignored"
+        );
+        return (
+            StatusCode::ACCEPTED,
+            "accepted: no event named, nothing to do\n",
+        )
+            .into_response();
+    };
+
+    // The payload's own fields, logged (never discarded silently): it is what tells an operator
+    // which account refreshed, and it is all Dispatcharr sends about the burst.
+    tracing::info!(
+        event = event.name.as_str(),
+        from = event.source.as_str(),
+        account = fields
+            .get("account_name")
+            .map(String::as_str)
+            .unwrap_or("-"),
+        source = fields.get("source_name").map(String::as_str).unwrap_or("-"),
+        "hook delivery received"
+    );
+    let delivered = state.hooks().deliver(&event.name);
+    let body = match &delivered {
+        crosstalk_core::hooks::Delivered::Unknown => {
+            format!("accepted: {} is not a configured event\n", event.name)
+        }
+        crosstalk_core::hooks::Delivered::Unconfigured => {
+            format!("accepted: {} has no targets configured\n", event.name)
+        }
+        crosstalk_core::hooks::Delivered::Coalesced { event } => {
+            format!("accepted: joined the settling {event} burst\n")
+        }
+        crosstalk_core::hooks::Delivered::Scheduled { event, targets } => {
+            format!("accepted: {event} runs {targets} target(s) once the burst settles\n")
+        }
+    };
+    (StatusCode::ACCEPTED, body).into_response()
 }
 
 async fn runs_page(State(state): State<AppState>) -> Response {
@@ -454,6 +619,9 @@ async fn run_page(State(state): State<AppState>, Path(id): Path<i64>) -> Respons
                 .find(|entry| entry.run_id == id),
             rows: state::rows(&state.store, id),
             report_available: state::report_available(&run),
+            steps: state::steps_of(&state.store, &run),
+            is_workflow: run.app == crosstalk_core::workflow::APP_ID,
+            parent: state::parent_of(&state.store, &run),
             run,
         }
         .into_response(),
@@ -737,12 +905,17 @@ async fn save_host_settings(
         );
     }
 
-    let previous_schedules = state.snapshot().schedules;
+    let previous = state.snapshot();
+    let previous_schedules = previous.schedules;
+    // A workflow's steps are what decide a `workflow.<name>` schedule's dry-run flag, and a
+    // schedule naming a workflow that did not exist was not armed at all: both make the
+    // workflows part of "did anything that decides the armed jobs change".
+    let previous_workflows = previous.workflows;
     state.config.replace(fresh);
     let snapshot = state.snapshot();
-    // The re-arm only matters when the expressions changed: re-adding identical jobs would
-    // churn every schedule's next firing for no reason.
-    if previous_schedules != snapshot.schedules {
+    // The re-arm only matters when what the armed jobs DO changed: re-adding identical jobs
+    // would churn every schedule's next firing for no reason.
+    if previous_schedules != snapshot.schedules || previous_workflows != snapshot.workflows {
         if let Some(scheduler) = &state.scheduler {
             if let Err(error) = scheduler.lock().await.rearm(&state.runner, &snapshot).await {
                 tracing::error!(

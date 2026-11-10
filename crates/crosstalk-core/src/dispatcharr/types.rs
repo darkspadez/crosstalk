@@ -44,6 +44,19 @@ pub struct Channel {
     /// The channel's streams, in playback order.
     #[serde(default)]
     pub streams: Vec<i64>,
+    /// The channel this one is attached to, when the build has the column.
+    ///
+    /// Dispatcharr's own `Channel` model has no such field (checked against
+    /// `apps/channels/models.py`), and its serializer therefore never sends the key — so this
+    /// stays `None` on a stock install. Stream-Mapparr reads it defensively
+    /// (`_get_all_channels` adds it only when `Channel._meta.get_field('attached_channel')`
+    /// exists) for one rule: an attached channel is never made visible by
+    /// `manage_channel_visibility`, because it is not the channel the guide plays. The field
+    /// is named here so a build that does carry it gets the plugin's rule instead of silently
+    /// enabling both halves of an attached pair; `None` is the honest answer for a build that
+    /// does not.
+    #[serde(default)]
+    pub attached_channel_id: Option<i64>,
 }
 
 impl Channel {
@@ -173,14 +186,24 @@ pub struct EpgEntry {
 
 /// One provider stream.
 ///
-/// The four fields the streams phase reasons about are `name` (what the matcher scores),
+/// The fields the streams phase reasons about are `name` (what the matcher scores),
 /// `tvg_id` (the guide id it can inherit), `m3u_account` and `channel_group` (where it came
-/// from), and `stream_stats` (what a probe wrote).
+/// from), `stream_id` (the provider's own id, which survives a credential change),
+/// `stream_stats` (what a probe wrote) and `url` (what a probe fetches).
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Stream {
     pub id: i64,
     #[serde(default)]
     pub name: String,
+    /// The provider's own stream id (`Stream.stream_id`, an Xtream `stream_id` or a provider
+    /// row id). Stable across a credential change, which is what makes it useful for mirror
+    /// fills: the same stream on two accounts shares it.
+    #[serde(default)]
+    pub stream_id: Option<i64>,
+    /// A hand-made stream rather than one an M3U account imported. Its name, url and guide id
+    /// stay editable, and match/restore must not drop it.
+    #[serde(default)]
+    pub is_custom: bool,
     /// Nullable upstream.
     #[serde(default, deserialize_with = "null_to_empty")]
     pub tvg_id: String,
@@ -188,6 +211,11 @@ pub struct Stream {
     pub m3u_account: Option<i64>,
     #[serde(default)]
     pub channel_group: Option<i64>,
+    /// The URL a player (and a probe) fetches. `StreamSerializer` only sends it to an
+    /// administrator and omits the key for everyone else, so this is `None` unless the run's
+    /// key is an admin's — which a probe needs.
+    #[serde(default)]
+    pub url: Option<String>,
     #[serde(default)]
     pub logo_url: Option<String>,
     /// The provider's own channel number, when the playlist carried one.
@@ -216,7 +244,7 @@ pub struct M3uAccount {
     pub name: String,
     #[serde(default = "default_true")]
     pub is_active: bool,
-    /// `m3u`, `xtream_codes` or `custom`.
+    /// `STD` for a playlist URL or an uploaded file, `XC` for Xtream Codes.
     #[serde(default)]
     pub account_type: String,
     /// The system `custom` account is locked: its streams are hand-made, not provider ones.
@@ -228,6 +256,14 @@ pub struct M3uAccount {
     pub priority: i64,
     #[serde(default)]
     pub status: String,
+    /// The provider's base URL, nullable upstream (an uploaded playlist has none).
+    #[serde(default)]
+    pub server_url: Option<String>,
+    /// The `ServerGroup` this account belongs to, as its id: `M3UAccount.server_group` is a
+    /// foreign key and the serializer sends the primary key. Accounts sharing one are mirrors
+    /// of each other, which is what the mirror actions group by.
+    #[serde(default)]
+    pub server_group: Option<i64>,
 }
 
 /// One logo.
@@ -359,7 +395,12 @@ pub struct ChannelEdit {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Set::is_unchanged")]
     pub channel_number: Set<f64>,
-    /// `Set::Value(group)` moves the channel, `Set::Null` moves it to "No Group".
+    /// `Set::Value(group)` moves the channel. `Set::Null` would be a move to "No Group", which
+    /// this API cannot express: `ChannelSerializer.channel_group_id` is a
+    /// `PrimaryKeyRelatedField` without `allow_null`, so DRF rejects a null with "This field
+    /// may not be null." and `edit/bulk` then rejects the row's whole chunk. Kept because the
+    /// wire shape is right for a build (or a plugin) that does allow it; `channel_ops::apply`
+    /// refuses such a row rather than sending it.
     #[serde(default, skip_serializing_if = "Set::is_unchanged")]
     pub channel_group_id: Set<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -402,6 +443,9 @@ impl ChannelEdit {
     }
 
     /// A move to another group (`None` = "No Group").
+    ///
+    /// See [`Self::channel_group_id`]: a `None` target sends the null the field is shaped for,
+    /// which Dispatcharr's serializer rejects today.
     pub fn move_to_group(id: i64, group: Option<i64>) -> Self {
         Self {
             channel_group_id: group.map_or(Set::Null, Set::Value),
@@ -840,6 +884,46 @@ impl World {
             Some(group) => group.name.clone(),
             None => "No Group".to_string(),
         }
+    }
+}
+
+/// One programme airing right now on an EPG entry, as `/epg/current-programs/` answers it.
+///
+/// The endpoint is asked per EPG entry and answers a FLAT array, so each programme carries the
+/// `epg_data_id` it belongs to. Two shapes arrive in the same array: a real programme (with a
+/// title and a time span) and the endpoint's `{"epg_data_id": N, "parsing": true}` marker for
+/// an entry whose guide index is still being built. A caller that treats the marker as "no
+/// programme" would drop every placeholder channel on a busy instance.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct CurrentProgram {
+    /// The EPG entry this programme belongs to. Always present; the rest is not.
+    #[serde(default)]
+    pub epg_data_id: i64,
+    #[serde(default, deserialize_with = "null_to_empty")]
+    pub title: String,
+    #[serde(default, deserialize_with = "null_to_empty")]
+    pub sub_title: String,
+    #[serde(default)]
+    pub start_time: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub end_time: Option<DateTime<Utc>>,
+    /// The guide id the programme was parsed under, when the source carried one.
+    #[serde(default, deserialize_with = "null_to_empty")]
+    pub tvg_id: String,
+    /// The answer was "this entry's index is being rebuilt", not "nothing is airing".
+    #[serde(default)]
+    pub parsing: bool,
+}
+
+impl CurrentProgram {
+    /// Whether this is the endpoint's "index rebuilding" marker rather than a programme.
+    pub fn is_parsing(&self) -> bool {
+        self.parsing
+    }
+
+    /// Whether it carries a title to match a placeholder name against.
+    pub fn has_title(&self) -> bool {
+        !self.parsing && !self.title.trim().is_empty()
     }
 }
 

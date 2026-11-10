@@ -39,18 +39,101 @@
   <p class="muted">No schedules. Add one under <code>[schedules]</code> in <code>crosstalk.toml</code>.</p>
   {% else %}
   <table>
-    <thead><tr><th>Schedule</th><th>Cron</th><th>Next run</th></tr></thead>
+    <thead><tr><th>Schedule</th><th>Cron</th><th>Window</th><th>Next run</th></tr></thead>
     <tbody>
       {% for entry in schedules %}
       <tr>
         <td><code>{{ entry.key }}</code></td>
         <td><code>{{ entry.cron }}</code></td>
+        <td>{% if let Some(window) = entry.window %}{{ window }}{% else %}<span class="muted">unbounded</span>{% endif %}</td>
         <td>{% if let Some(next) = entry.next_run %}{{ next }}{% else %}<span class="muted">not a valid expression</span>{% endif %}</td>
       </tr>
       {% endfor %}
     </tbody>
   </table>
-  <p class="muted">Schedules fire in UTC.</p>
+  <p class="muted">
+    Schedules fire in UTC. A windowed schedule stops its run at the window's end, records it
+    <span class="status status-paused">paused</span>, and resumes it on the next firing.
+  </p>
+  {% endif %}
+</section>
+
+<section class="card">
+  <h2>Workflows</h2>
+  {% if workflows.is_empty() %}
+  <p class="muted">
+    No workflows. A workflow is a named sequence of actions the host runs in order; add one as
+    <code>[workflows.&lt;name&gt;] steps = ["streams.probe", "streams.sort_apply"]</code> in
+    <code>crosstalk.toml</code>, and schedule it as <code>"workflow.&lt;name&gt;"</code>.
+  </p>
+  {% else %}
+  <table>
+    <thead><tr><th>Workflow</th><th>Steps</th><th>Last run</th><th></th></tr></thead>
+    <tbody>
+      {% for workflow in workflows %}
+      <tr>
+        <td><code>workflow.{{ workflow.name }}</code>{% if workflow.fresh %} <span class="tag read">fresh</span>{% endif %}</td>
+        <td>{% if workflow.steps.is_empty() %}<span class="muted">no steps</span>{% else %}{{ workflow.steps }}{% endif %}</td>
+        <td class="muted">{% if let Some(last) = workflow.last_run %}{{ last }}{% else %}never run{% endif %}</td>
+        <td>
+          {% if let Some(error) = workflow.error %}
+          <span class="muted">{{ error }}</span>
+          {% else if workflow.busy %}
+          <span class="muted">a workflow is running</span>
+          {% else %}
+          <form method="post" action="/workflows/{{ workflow.name }}/run" class="inline"
+                data-confirm="Run {{ workflow.name }} now? It runs {{ workflow.step_count }} step{% if workflow.step_count != 1 %}s{% endif %} in order and stops at the first that fails.">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="confirm" value="true">
+            <button type="submit" class="{% if workflow.dry_run %}ghost{% endif %}">Run</button>
+          </form>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="muted">
+    Steps run in order through the same runner a manual run uses, so each one gets its own run
+    page, report and status. A step that pauses at its window's end pauses the workflow; the next
+    firing resumes that step. One workflow runs at a time.
+  </p>
+  {% endif %}
+</section>
+
+<section class="card">
+  <h2>Dispatcharr hook</h2>
+  {% if hooks.events.is_empty() %}
+  <p class="muted">
+    Nothing is triggered by Dispatcharr events. Add
+    <code>[hooks] m3u_refresh = ["streams.match_apply"]</code> to <code>crosstalk.toml</code> and
+    point a Connect webhook integration at <code>{{ hooks.route }}</code>.
+  </p>
+  {% else %}
+  <table>
+    <thead><tr><th>Event</th><th>Triggers</th></tr></thead>
+    <tbody>
+      {% for (event, targets) in hooks.events %}
+      <tr>
+        <td><code>{{ event }}</code></td>
+        <td>{% for target in targets %}<code>{{ target }}</code>{% if !loop.last %}, {% endif %}{% endfor %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="muted">
+    A burst of the same event (several M3U accounts finishing together) restarts the
+    {{ hooks.debounce }} timer, so one run happens after the burst settles. If the target is busy,
+    one follow-up run is queued for when it frees. Unknown events are logged and ignored.
+  </p>
+  <p class="muted">
+    Dispatcharr setup: add an integration of type <strong>Webhook</strong> with the URL
+    <code>{{ hooks.route }}</code>, a header <code>Authorization: Bearer &lt;server.token&gt;</code>
+    (and <code>Content-Type: application/json</code> if you write a payload template), subscribe
+    the events above, and give each subscription a payload template that names the event —
+    e.g. <code>{"event": "m3u_refresh"}</code> — because Dispatcharr's own payload does not
+    carry the event name.
+  </p>
   {% endif %}
 </section>
 

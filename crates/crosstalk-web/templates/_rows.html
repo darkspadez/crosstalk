@@ -4,7 +4,7 @@
 <table>
   <thead>
     <tr>
-      <th>Channel</th><th>Group</th><th>Score</th><th>Method</th>
+      <th>Subject</th><th>Group</th><th>Score</th><th>Method</th>
       <th>Chosen guide</th><th>Source</th>
       <th>Field</th><th>Before</th><th>After</th>
       <th>Status</th><th>Reason</th><th>AI</th>
@@ -14,6 +14,7 @@
     {% for row in rows %}
     <tr>
       <td>
+        <span class="muted">{{ row.subject }}</span>
         {{ row.channel_name }}
         {% if !row.channel_number.is_empty() %}<span class="muted">#{{ row.channel_number }}</span>{% endif %}
       </td>
@@ -35,7 +36,8 @@
 <p class="muted">
   A matching row fills in the score and the guide it chose; a channel-operation row fills in the
   field it wrote and the value on each side of the write. Skips are listed too, with the reason
-  they were left alone. A watchdog row is per EPG source rather than per channel: the Channel
-  and Source columns both name the source, and the reason tells the whole story.
+  they were left alone. The first column says what a row is about: a channel (every channel
+  operation and guide action), a provider stream (a probe), or an EPG source (the guide's
+  freshness watchdog), whose id then sits where a channel id would.
 </p>
 {% endif %}

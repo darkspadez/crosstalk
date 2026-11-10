@@ -6,6 +6,7 @@
 //!   * `validate` — check configuration against Dispatcharr
 //!   * `exports clear` — delete the CSV reports the sub-apps wrote
 //!   * `simulate-streams` — offline stream-to-channel match simulation (the parity oracle)
+//!   * `bench` — time the parts of a run, to decide whether REST is fast enough
 
 mod registry;
 mod simulate;
@@ -40,6 +41,8 @@ enum Command {
     Validate(ConfigArgs),
     /// Manage the CSV reports the sub-apps write.
     Exports(ExportsArgs),
+    /// Time the parts of a sub-app's run: the plan phases, and the writes they would issue.
+    Bench(BenchArgs),
     /// Offline stream-to-channel match simulation.
     #[command(name = "simulate-streams")]
     SimulateStreams(SimulateArgs),
@@ -54,10 +57,12 @@ struct ServeArgs {
 
 #[derive(Args, Debug)]
 struct RunArgs {
-    /// Sub-app id, for example `guide`.
+    /// Sub-app id, for example `guide`, or `workflow` for a named workflow.
     app: String,
-    /// Action id, for example `match_apply`.
-    action: String,
+    /// Action id, for example `match_apply`, or the workflow's name after `workflow`.
+    ///
+    /// Omitted when the first argument already names a workflow: `run workflow.<name>`.
+    action: Option<String>,
     /// Directory holding the configuration files.
     #[arg(long, default_value = "config", env = "CROSSTALK_CONFIG_DIR")]
     config: PathBuf,
@@ -65,6 +70,59 @@ struct RunArgs {
     #[arg(long = "dry-run", alias = "preview")]
     dry_run: bool,
     /// Confirm an action that changes data. Without it, such an action is refused.
+    #[arg(long, short = 'y')]
+    yes: bool,
+    /// Ignore and discard the progress a paused run saved, and start the backlog over.
+    ///
+    /// The default is to resume: a windowed job checkspoints where it stopped, so the next run
+    /// continues. This is how an operator says "no, start from the beginning" — after changing
+    /// the scope, for instance.
+    #[arg(long)]
+    fresh: bool,
+}
+
+#[derive(Args, Debug)]
+struct BenchArgs {
+    #[command(subcommand)]
+    target: BenchTarget,
+}
+
+#[derive(Subcommand, Debug)]
+enum BenchTarget {
+    /// Benchmark the streams sub-app: match, sort, mirror and visibility plans.
+    Streams(StreamsBenchArgs),
+}
+
+/// One of `--synthetic` or `--live` must be chosen: a bench that silently measured nothing
+/// would be worse than one that refuses.
+#[derive(Args, Debug)]
+struct StreamsBenchArgs {
+    /// Directory holding the configuration files.
+    #[arg(long, default_value = "config", env = "CROSSTALK_CONFIG_DIR")]
+    config: PathBuf,
+    /// Time a synthetic world built in memory. No network, no Dispatcharr.
+    #[arg(long)]
+    synthetic: bool,
+    /// Time the plans against the Dispatcharr the configuration names. Read-only.
+    #[arg(long)]
+    live: bool,
+    /// Synthetic channels to build (the plan's target size by default).
+    #[arg(long, default_value_t = 20_000, requires = "synthetic")]
+    channels: usize,
+    /// Synthetic streams to build.
+    #[arg(long, default_value_t = 50_000, requires = "synthetic")]
+    streams: usize,
+    /// Synthetic M3U accounts to build.
+    #[arg(long, default_value_t = 100, requires = "synthetic")]
+    accounts: usize,
+    /// Read back the sampled channels' stream lists and rewrite them to that value, to time
+    /// the two write patterns. Idempotent: nothing changes. Needs --yes.
+    #[arg(long, requires = "live")]
+    write_timing: bool,
+    /// Channels to sample for --write-timing, comma-separated ids.
+    #[arg(long = "channel-ids", requires = "write_timing", value_delimiter = ',')]
+    channel_ids: Vec<i64>,
+    /// Confirm the write timing's no-op rewrite.
     #[arg(long, short = 'y')]
     yes: bool,
 }
@@ -185,6 +243,9 @@ fn main() -> Result<()> {
         }
         Command::Serve(args) => serve(args),
         Command::Run(args) => run_once(args),
+        Command::Bench(args) => match args.target {
+            BenchTarget::Streams(args) => bench_streams(args),
+        },
         Command::Validate(args) => validate(args),
         Command::Exports(args) => match args.command {
             ExportsCommand::Clear(args) => clear_exports(args),
@@ -244,6 +305,31 @@ fn serve(args: ServeArgs) -> Result<()> {
                 None => println!("schedule {} is not valid and will not run", entry.key),
             }
         }
+        // Workflows and hooks are configuration too, and a typo in either is silent until it
+        // runs (or never does), so start-up says what the file actually describes.
+        for workflow in crosstalk_core::workflow::describe(&snapshot) {
+            match (&workflow.error, workflow.steps.is_empty()) {
+                (Some(error), _) => println!("workflow {} will not run: {error}", workflow.name),
+                (None, true) => println!("workflow {} has no steps", workflow.name),
+                (None, false) => println!(
+                    "workflow {}: {} step(s) — {}",
+                    workflow.name,
+                    workflow.steps.len(),
+                    workflow.steps.join(" → ")
+                ),
+            }
+        }
+        for (event, targets) in crosstalk_core::hooks::describe(&snapshot.hooks) {
+            println!(
+                "hook {event} -> {} (debounced {} s)",
+                if targets.is_empty() {
+                    "nothing".to_string()
+                } else {
+                    targets.join(", ")
+                },
+                snapshot.hooks.debounce_secs
+            );
+        }
 
         // With `ConnectInfo`: without it the login limiter's `ConnectInfo<SocketAddr>`
         // extractor is always `None` and every client shares the one fallback bucket, so ten
@@ -297,7 +383,10 @@ async fn wait_for_drain(runner: &JobRunner, timeout: std::time::Duration) {
 fn install_logging() {
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_env("RUST_LOG").unwrap_or_else(|_| {
-        EnvFilter::new("info,crosstalk_core=info,crosstalk_web=info,crosstalk_guide=info")
+        EnvFilter::new(
+            "info,crosstalk_core=info,crosstalk_web=info,crosstalk_guide=info,\
+             crosstalk_streams=info",
+        )
     });
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -330,15 +419,119 @@ async fn shutdown_signal() {
     println!("shutting down");
 }
 
+/// The workflow a `run` invocation names, or `None` for an ordinary action run.
+///
+/// Two spellings, one target: `run workflow nightly` (the app-and-action shape) and
+/// `run workflow.nightly` (the schedule-key shape, which is what a hook and a schedule write).
+/// A bare `run <app>` with no second argument is refused here rather than reaching the action
+/// lookup with a `None` that means nothing.
+fn cli_workflow_name(args: &RunArgs) -> Result<Option<String>> {
+    match (args.app.as_str(), args.action.as_deref()) {
+        ("workflow", Some(name)) => Ok(Some(name.to_string())),
+        ("workflow", None) => {
+            anyhow::bail!("`run workflow` needs a workflow name: crosstalk run workflow <name>")
+        }
+        (key, None) => match key.strip_prefix("workflow.") {
+            Some(name) if !name.is_empty() => Ok(Some(name.to_string())),
+            _ => anyhow::bail!(
+                "`run {key}` needs an action, for example `crosstalk run {key} <action>`, or \
+                 name a workflow: `crosstalk run workflow.<name>`"
+            ),
+        },
+        (_, Some(_)) => Ok(None),
+    }
+}
+
+/// `run workflow <name>`: one workflow, once, without the daemon.
+///
+/// The same two refusals a writing action gets — `--yes` to confirm, and the cross-process
+/// "already running" check — for the same reasons: a workflow writes and holds the `workflow`
+/// slot, which the daemon's own workflow runs also hold.
+fn run_workflow_once(args: RunArgs, name: &str) -> Result<()> {
+    let registry = registry::builtin();
+    let config = CrosstalkConfig::load(&args.config)?;
+    let workflow = crosstalk_core::workflow::Workflow::from_config(&config, name)?;
+    let writes = !crosstalk_core::workflow::scheduled_dry_run(&registry, &config, name);
+    if writes && !args.yes && !args.dry_run {
+        println!("workflow {name}: {} step(s)", workflow.steps.len());
+        for step in workflow.labels() {
+            println!("  {step}");
+        }
+        anyhow::bail!(
+            "refusing to run workflow {name:?} without --yes: it changes data. Add --yes to \
+             proceed, or --dry-run to run every writing step as its preview"
+        );
+    }
+
+    let store = Store::open_shared(config.data_dir().join("crosstalk.db"))?;
+    let live = store.running_runs(crosstalk_core::workflow::APP_ID)?;
+    if let Some(current) = live.first() {
+        anyhow::bail!(
+            "a workflow is already running: workflow.{} #{} (started {}); wait for it to \
+             finish or cancel it. If no daemon is running, this row is stale from a crash and \
+             clears when the daemon next starts.",
+            current.action,
+            current.id,
+            current.started_at,
+        );
+    }
+    let runner = JobRunner::new(registry, SharedConfig::new(config), store);
+    let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
+    let options = if args.fresh {
+        crosstalk_core::runner::RunOptions::default().fresh()
+    } else {
+        crosstalk_core::runner::RunOptions::default()
+    };
+    let outcome = runtime.block_on(crosstalk_core::workflow::run_to_completion(
+        &runner,
+        name,
+        args.dry_run,
+        options,
+    ))?;
+
+    println!("{}", outcome.summary);
+    for (key, value) in &outcome.counts {
+        println!("  {key}: {value}");
+    }
+    // The step runs, so a terminal operator can follow one to its report without the UI.
+    if let Some(record) = runner
+        .store()
+        .recent_runs_for(crosstalk_core::workflow::APP_ID, 1)?
+        .into_iter()
+        .next()
+    {
+        println!("  workflow run: #{}", record.id);
+        for step in runner.store().child_runs(record.id)? {
+            println!(
+                "    #{} {} {} — {}",
+                step.id,
+                if step.dry_run { "preview" } else { "apply" },
+                step.action,
+                step.summary.as_deref().unwrap_or(""),
+            );
+        }
+    }
+    Ok(())
+}
+
 fn run_once(args: RunArgs) -> Result<()> {
+    // `run workflow <name>` and `run workflow.<name>` are the same target; both go through the
+    // workflow executor, which records the workflow run and one run per step.
+    if let Some(name) = cli_workflow_name(&args)? {
+        return run_workflow_once(args, &name);
+    }
+    let Some(action_id) = args.action.clone() else {
+        unreachable!("cli_workflow_name refuses a bare app id");
+    };
+
     let registry = registry::builtin();
     let config = CrosstalkConfig::load(&args.config)?;
     let (_, action) = registry
-        .find_action(&args.app, &args.action)
+        .find_action(&args.app, &action_id)
         .with_context(|| {
             format!(
                 "no action {:?} in sub-app {:?}; known apps: {}",
-                args.action,
+                action_id,
                 args.app,
                 registry
                     .iter()
@@ -362,7 +555,11 @@ fn run_once(args: RunArgs) -> Result<()> {
         action
     };
 
-    if action.kind.requires_confirmation() && !args.yes {
+    // `--dry-run` stands in for `--yes`: a dry run changes nothing, which is exactly what the
+    // refusal's own wording offers ("or --dry-run to change nothing"). It matters for the one
+    // writing action that is not a pair — `streams.probe`, whose `--dry-run` records health and
+    // writes no stream stats — because there is no preview action to redirect it to.
+    if action.kind.requires_confirmation() && !args.yes && !args.dry_run {
         // A one-shot run has no dialog to confirm in, so the flag has to stand in for it.
         println!(
             "{}\n{}",
@@ -402,15 +599,87 @@ fn run_once(args: RunArgs) -> Result<()> {
     }
     let runner = JobRunner::new(registry, SharedConfig::new(config), store);
     let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
-    let outcome = runtime.block_on(runner.run_to_completion(&args.app, action.id, args.dry_run))?;
+    let options = if args.fresh {
+        crosstalk_core::runner::RunOptions::default().fresh()
+    } else {
+        crosstalk_core::runner::RunOptions::default()
+    };
+    let outcome = runtime.block_on(runner.run_to_completion_with(
+        &args.app,
+        action.id,
+        args.dry_run,
+        options,
+    ))?;
 
     println!("{}", outcome.summary);
+    if outcome.is_paused() {
+        // A one-shot run has no deadline, so this cannot happen today; say so loudly rather
+        // than reporting a partial run as a finished one if that ever changes.
+        println!("  paused: this run stopped at its window's end and will resume");
+    }
     for (key, value) in &outcome.counts {
         println!("  {key}: {value}");
     }
     if let Some(path) = &outcome.report_path {
         println!("  report: {}", path.display());
     }
+    Ok(())
+}
+
+/// `bench streams`: the timing tool the plan promised, in two modes.
+///
+/// The prints are the report's own lines, so a test can assert on the same strings an
+/// operator reads, and so the numbers a decision quotes are the ones this command wrote.
+fn bench_streams(args: StreamsBenchArgs) -> Result<()> {
+    if args.synthetic == args.live {
+        anyhow::bail!(
+            "choose exactly one mode: --synthetic times a world built in memory (no network), \
+             --live times the Dispatcharr the configuration names"
+        );
+    }
+    let config = CrosstalkConfig::load(&args.config)?;
+    // The settings a run would use, so the numbers describe the configuration in front of the
+    // operator and not a default nobody runs.
+    let registry = registry::builtin();
+    let app = registry
+        .get(crosstalk_streams::APP_ID)
+        .expect("the streams app is registered");
+    let settings_path = app.settings_path(&config.config_dir);
+    let settings = crosstalk_streams::settings::load(&settings_path)?;
+
+    let mut report = if args.synthetic {
+        let options = crosstalk_streams::bench::SyntheticOptions {
+            channels: args.channels,
+            streams: args.streams,
+            accounts: args.accounts,
+        };
+        crosstalk_streams::bench::synthetic(&settings, &config.matching, &options)?
+    } else {
+        if args.write_timing && !args.yes {
+            anyhow::bail!(
+                "refusing --write-timing without --yes: it rewrites the sampled channels' \
+                 stream lists (each read back just before, so nothing changes) to time \
+                 the write path. Add --yes to proceed."
+            );
+        }
+        let ids = if args.write_timing {
+            if args.channel_ids.is_empty() {
+                anyhow::bail!(
+                    "--write-timing needs --channel-ids: name the channels to sample, for \
+                     example --channel-ids 12,13,14"
+                );
+            }
+            Some(args.channel_ids.as_slice())
+        } else {
+            None
+        };
+        let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
+        runtime.block_on(crosstalk_streams::bench::live(&config, &settings, ids))?
+    };
+    report
+        .notes
+        .insert(0, format!("settings: {}", settings_path.display()));
+    report.print();
     Ok(())
 }
 
@@ -428,6 +697,11 @@ fn preview_counterpart(action: &str) -> Option<&'static str> {
         "clear_by_regex_apply" => Some("clear_by_regex_preview"),
         "clear_groups_apply" => Some("clear_groups_preview"),
         "watchdog_apply" => Some("watchdog_preview"),
+        "sort_apply" => Some("sort_preview"),
+        "mirror_apply" => Some("mirror_preview"),
+        "visibility_apply" => Some("visibility_preview"),
+        "triage_apply" => Some("triage_preview"),
+        "restore_apply" => Some("restore_preview"),
         _ => None,
     }
 }
@@ -549,8 +823,54 @@ fn validate(args: ConfigArgs) -> Result<()> {
     }
 
     for key in registry.unknown_schedules(&config) {
-        println!("error: schedule {key:?} does not name a known <app>.<action>");
+        println!("error: schedule {key:?} does not name a known <app>.<action> or workflow.<name>");
         failed = true;
+    }
+    for (workflow, step) in registry.unknown_workflow_steps(&config) {
+        println!("error: workflow {workflow:?} step {step:?} does not name a known <app>.<action>");
+        failed = true;
+    }
+    for (event, target) in registry.unknown_hook_targets(&config) {
+        println!("error: hooks.{event} target {target:?} does not name a known action or workflow");
+        failed = true;
+    }
+    for workflow in crosstalk_core::workflow::describe(&config) {
+        match (&workflow.error, workflow.steps.is_empty()) {
+            (_, true) => println!("workflow {}: no steps", workflow.name),
+            (Some(error), _) => println!("workflow {}: {error}", workflow.name),
+            (None, _) => println!(
+                "workflow {}: {} step(s){}",
+                workflow.name,
+                workflow.steps.len(),
+                if workflow.fresh {
+                    ", each new pass starts from the beginning"
+                } else {
+                    ""
+                }
+            ),
+        }
+    }
+    for (event, targets) in crosstalk_core::hooks::describe(&config.hooks) {
+        // A hook's pacing and targets are what decides whether a refresh storm becomes one run
+        // or twenty, so `validate` says both rather than only that the table parsed.
+        println!(
+            "hook {event}: {} (debounced {} s)",
+            if targets.is_empty() {
+                "no targets".to_string()
+            } else {
+                targets.join(", ")
+            },
+            config.hooks.debounce_secs
+        );
+    }
+    for entry in crosstalk_core::scheduler::describe(&config) {
+        // The window is what says whether the job finishes in one firing: a schedule whose
+        // window is shorter than its work pauses every time and continues, which is a very
+        // different thing from one that runs to the end.
+        match &entry.window {
+            Some(window) => println!("schedule {}: window {window}", entry.key),
+            None => println!("schedule {}: no window (runs to the end)", entry.key),
+        }
     }
 
     for app in registry.iter() {
@@ -663,6 +983,120 @@ mod cli_tests {
         assert!(Cli::try_parse_from(["crosstalk", "exports", "nope"]).is_err());
     }
 
+    fn run_args(args: &[&str]) -> RunArgs {
+        match parse(args).command {
+            Command::Run(args) => args,
+            other => panic!("expected a run command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_workflow_is_named_two_ways_and_an_action_one() {
+        // `run workflow nightly` and `run workflow.nightly` are the same target; the CLI keeps
+        // both spellings because the docs, the schedule keys and an operator's fingers disagree
+        // about which is natural.
+        let spaced = run_args(&["crosstalk", "run", "workflow", "nightly"]);
+        assert_eq!(
+            cli_workflow_name(&spaced).expect("parses"),
+            Some("nightly".into())
+        );
+
+        let dotted = run_args(&["crosstalk", "run", "workflow.nightly"]);
+        assert_eq!(
+            cli_workflow_name(&dotted).expect("parses"),
+            Some("nightly".into())
+        );
+
+        let action = run_args(&["crosstalk", "run", "guide", "match_preview"]);
+        assert_eq!(cli_workflow_name(&action).expect("parses"), None);
+    }
+
+    #[test]
+    fn a_bare_app_id_is_refused_with_the_shape_it_wants() {
+        let bare = run_args(&["crosstalk", "run", "workflow"]);
+        let error = cli_workflow_name(&bare).expect_err("refused");
+        assert!(format!("{error}").contains("workflow <name>"), "{error}");
+
+        let no_action = run_args(&["crosstalk", "run", "guide"]);
+        let error = cli_workflow_name(&no_action).expect_err("refused");
+        assert!(format!("{error}").contains("needs an action"), "{error}");
+    }
+
+    /// A config directory whose `crosstalk.toml` defines one workflow.
+    ///
+    /// The credentials are fake and never used: they are what makes the host configuration
+    /// valid, so an offline step such as `streams.validate` — which reports configuration
+    /// problems — has nothing to complain about.
+    fn config_dir_with(steps: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let steps = steps
+            .iter()
+            .map(|step| format!("\"{step}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        std::fs::write(
+            dir.path().join("crosstalk.toml"),
+            format!(
+                "[dispatcharr]\nbase_url = \"http://127.0.0.1:9191\"\napi_key = \"test\"\n\n\
+                 [workflows.offline]\nsteps = [{steps}]\n"
+            ),
+        )
+        .expect("write");
+        dir
+    }
+
+    #[test]
+    fn a_workflow_runs_once_from_the_cli() {
+        // Both steps are offline, so this is a real end-to-end run without a Dispatcharr.
+        let dir = config_dir_with(&["streams.validate", "streams.status"]);
+        run_workflow_once(
+            RunArgs {
+                app: "workflow".to_string(),
+                action: Some("offline".to_string()),
+                config: dir.path().to_path_buf(),
+                dry_run: false,
+                yes: true,
+                fresh: false,
+            },
+            "offline",
+        )
+        .expect("runs");
+
+        let store =
+            Store::open_shared(dir.path().join("data").join("crosstalk.db")).expect("store");
+        let record = store
+            .recent_runs_for(crosstalk_core::workflow::APP_ID, 1)
+            .expect("runs")
+            .into_iter()
+            .next()
+            .expect("a workflow run");
+        assert_eq!(record.status, crosstalk_core::store::RunStatus::Succeeded);
+        assert_eq!(store.child_runs(record.id).expect("steps").len(), 2);
+    }
+
+    #[test]
+    fn a_writing_workflow_is_refused_without_yes() {
+        // The same rule a writing action gets: a one-shot run has no dialog, so the flag stands
+        // in for it — and nothing is recorded when it is missing.
+        let dir = config_dir_with(&["streams.sort_apply"]);
+        let error = run_workflow_once(
+            RunArgs {
+                app: "workflow".to_string(),
+                action: Some("offline".to_string()),
+                config: dir.path().to_path_buf(),
+                dry_run: false,
+                yes: false,
+                fresh: false,
+            },
+            "offline",
+        )
+        .expect_err("refused");
+        assert!(format!("{error}").contains("--yes"), "{error}");
+        let store =
+            Store::open_shared(dir.path().join("data").join("crosstalk.db")).expect("store");
+        assert_eq!(store.run_count().expect("count"), 0, "nothing ran");
+    }
+
     /// A config directory with an exports subdirectory holding a backdated report.
     fn config_dir_with_exports() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -710,6 +1144,156 @@ mod cli_tests {
         assert!(foreign.exists(), "another program's file is untouched");
     }
 
+    fn bench_args(args: &[&str]) -> StreamsBenchArgs {
+        match parse(args).command {
+            Command::Bench(BenchArgs {
+                target: BenchTarget::Streams(args),
+            }) => args,
+            other => panic!("expected a bench streams command, got {other:?}"),
+        }
+    }
+
+    fn bare_bench_args(config: std::path::PathBuf) -> StreamsBenchArgs {
+        StreamsBenchArgs {
+            config,
+            synthetic: false,
+            live: false,
+            channels: 20_000,
+            streams: 50_000,
+            accounts: 100,
+            write_timing: false,
+            channel_ids: Vec::new(),
+            yes: false,
+        }
+    }
+
+    #[test]
+    fn bench_streams_takes_a_mode_and_the_synthetic_size() {
+        let args = bench_args(&["crosstalk", "bench", "streams", "--synthetic"]);
+        assert!(args.synthetic);
+        assert!(!args.live);
+        assert_eq!(args.channels, 20_000);
+        assert_eq!(args.streams, 50_000);
+        assert_eq!(args.accounts, 100);
+        assert!(!args.write_timing, "a bench is read-only until asked");
+        assert_eq!(args.config, Path::new("config"));
+
+        let args = bench_args(&[
+            "crosstalk",
+            "bench",
+            "streams",
+            "--synthetic",
+            "--channels",
+            "500",
+            "--streams",
+            "1000",
+            "--accounts",
+            "5",
+        ]);
+        assert_eq!(args.channels, 500);
+        assert_eq!(args.streams, 1_000);
+        assert_eq!(args.accounts, 5);
+    }
+
+    #[test]
+    fn the_synthetic_size_belongs_to_a_synthetic_run() {
+        // A size on a live run would be read and silently ignored, which is how a report ends
+        // up describing a world nobody measured.
+        assert!(Cli::try_parse_from([
+            "crosstalk",
+            "bench",
+            "streams",
+            "--live",
+            "--channels",
+            "10"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "crosstalk",
+            "bench",
+            "streams",
+            "--synthetic",
+            "--channels",
+            "10"
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn write_timing_needs_a_live_run_and_channel_ids() {
+        assert!(Cli::try_parse_from([
+            "crosstalk",
+            "bench",
+            "streams",
+            "--synthetic",
+            "--write-timing"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "crosstalk",
+            "bench",
+            "streams",
+            "--live",
+            "--channel-ids",
+            "1"
+        ])
+        .is_err());
+        let args = bench_args(&[
+            "crosstalk",
+            "bench",
+            "streams",
+            "--live",
+            "--write-timing",
+            "--channel-ids",
+            "12,13",
+            "--yes",
+        ]);
+        assert!(args.write_timing);
+        assert!(args.yes);
+        assert_eq!(args.channel_ids, vec![12, 13]);
+    }
+
+    #[test]
+    fn a_bench_without_exactly_one_mode_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (synthetic, live) in [(false, false), (true, true)] {
+            let error = bench_streams(StreamsBenchArgs {
+                synthetic,
+                live,
+                ..bare_bench_args(dir.path().to_path_buf())
+            })
+            .expect_err("refused");
+            assert!(format!("{error}").contains("exactly one mode"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_synthetic_bench_runs_end_to_end_from_the_cli() {
+        // Every step is offline: this is a real CLI run against a world built in memory.
+        let dir = tempfile::tempdir().expect("tempdir");
+        bench_streams(StreamsBenchArgs {
+            synthetic: true,
+            channels: 20,
+            streams: 100,
+            accounts: 20,
+            ..bare_bench_args(dir.path().to_path_buf())
+        })
+        .expect("runs");
+    }
+
+    #[test]
+    fn write_timing_without_yes_is_refused_and_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let error = bench_streams(StreamsBenchArgs {
+            live: true,
+            write_timing: true,
+            channel_ids: vec![1],
+            ..bare_bench_args(dir.path().to_path_buf())
+        })
+        .expect_err("refused");
+        assert!(format!("{error}").contains("--yes"), "{error}");
+    }
+
     #[test]
     fn clearing_names_an_unknown_app() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -720,7 +1304,7 @@ mod cli_tests {
         })
         .expect_err("fails");
         assert!(
-            format!("{error}").contains("known apps: guide"),
+            format!("{error}").contains("known apps: guide, streams"),
             "{error:#}"
         );
     }
@@ -792,6 +1376,20 @@ mod tests {
                 "{action} must be armed as a read"
             );
         }
+    }
+
+    #[test]
+    fn a_dry_run_never_needs_yes() {
+        // The refusal's own wording offers `--dry-run` as the alternative, and for the one
+        // writing action that is not a preview/apply pair (`streams.probe`) it is the only way
+        // to run it from the CLI without `--yes`: a dry run records health and writes nothing.
+        let registry = registry::builtin();
+        let (_, probe) = registry
+            .find_action("streams", "probe")
+            .expect("streams.probe is an action");
+        assert!(probe.kind.requires_confirmation(), "it writes stream stats");
+        // The redirect map has no entry for it, so the action itself receives the flag.
+        assert!(preview_counterpart(probe.id).is_none());
     }
 
     #[test]

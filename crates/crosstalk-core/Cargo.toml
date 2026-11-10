@@ -24,6 +24,7 @@ rusqlite.workspace = true
 dashmap.workspace = true
 csv.workspace = true
 chrono.workspace = true
+chrono-tz.workspace = true
 tracing.workspace = true
 tokio-cron-scheduler.workspace = true
 croner.workspace = true
@@ -32,4 +33,6 @@ uuid.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 wiremock.workspace = true
-tokio = { workspace = true }
+# `test-util` gives the tests a paused clock: the limiter's spacing and rate limits are
+# measured in seconds and minutes, and a test that really slept would be slow or flaky.
+tokio = { workspace = true, features = ["test-util"] }

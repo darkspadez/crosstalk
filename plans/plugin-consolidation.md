@@ -265,6 +265,10 @@ pieces each phase adds, and the cross-cutting rules below.
 
 ### Phase 2: `streams` (Stream-Mapparr + IPTV Checker + Lineuparr's stream half)
 
+> Detailed plan: `plans/phase-2-streams.md`. Changed there: Lineuparr's stream half moves to
+> phase 3 (it needs the lineup files); Stream-Mapparr's sort model is the one model; the
+> webhook and workflows are built in phase 2; no bridge (REST behind a writer seam).
+
 | crosstalk action | Merged from | Notes |
 |---|---|---|
 | `match_preview` / `match_apply` | SM `preview_changes`, `add_streams_to_channels`, `match_us_ota_only`; LU `preview_stream_match`, `apply_stream_match` | OTA-only becomes a scope option. Replace vs append (`overwrite_streams` / LU `preserve_existing_streams`) and country restriction are options, not separate actions |

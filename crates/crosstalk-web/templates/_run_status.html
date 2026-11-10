@@ -9,6 +9,13 @@
   <span class="muted">{{ active.phase }}{% if let Some(percent) = active.percent() %} ({{ percent }}%){% endif %}</span>
 </p>
 {% endif %}
+{% if run.status.is_paused() %}
+<p class="muted">
+  Paused at its window's end: this run kept its place, and the next run of the same action
+  resumes from that checkpoint. <code>--fresh</code> (or the "start fresh" checkbox) starts
+  over instead.
+</p>
+{% endif %}
 {% if let Some(summary) = run.summary %}
 <p>{{ summary }}</p>
 {% endif %}

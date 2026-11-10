@@ -33,7 +33,15 @@ impl SubApp for EchoApp {
     fn actions(&self) -> Vec<ActionSpec> {
         vec![
             ActionSpec::new("peek", "Peek", "reads", ActionKind::Read),
+            // A read-only status query: it must stay clickable while another run holds the app,
+            // which is exactly when an operator wants it (the phase-1 review's finding).
+            ActionSpec::new("status", "Status", "reads the store", ActionKind::Read)
+                .offline()
+                .unguarded(),
             ActionSpec::new("poke", "Poke", "writes", ActionKind::Write)
+                .with_confirm("This writes data. Continue?"),
+            // Slow enough for a test to see the app busy.
+            ActionSpec::new("slow", "Slow", "takes a moment", ActionKind::Write)
                 .with_confirm("This writes data. Continue?"),
         ]
     }
@@ -59,6 +67,10 @@ impl SubApp for EchoApp {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<JobOutcome>> + Send + 'a>>
     {
         Box::pin(async move {
+            if _action == "slow" {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                return Ok(JobOutcome::new("slowly done"));
+            }
             context.record_rows(&[crosstalk_core::store::RunRow {
                 ordinal: 0,
                 channel_id: 1,
@@ -76,11 +88,21 @@ impl SubApp for EchoApp {
 }
 
 fn state(token: Option<&str>) -> (AppState, Store, tempfile::TempDir) {
+    state_with(token, |_config| {})
+}
+
+/// A state over a configuration the test tweaks: the workflows and hooks it exercises are
+/// configuration, so a test has to be able to set them.
+fn state_with(
+    token: Option<&str>,
+    tweak: impl FnOnce(&mut CrosstalkConfig),
+) -> (AppState, Store, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut config = CrosstalkConfig::load(dir.path()).expect("config");
     config.server.token = token.unwrap_or_default().to_string();
     config.server.token_env = String::new();
     config.jobs.exports_dir = dir.path().join("exports").display().to_string();
+    tweak(&mut config);
 
     let store = Store::in_memory().expect("store");
     let registry = Registry::new(vec![Arc::new(EchoApp)]);
@@ -256,6 +278,162 @@ async fn a_form_cannot_turn_a_preview_action_into_an_apply() {
 }
 
 #[tokio::test]
+async fn a_status_action_stays_clickable_while_another_run_holds_the_app() {
+    let (state, _store, _dir) = state(None);
+    let started = state.runner.start("echo", "slow", false).expect("started");
+    assert!(state.runner.is_busy("echo"));
+
+    let (status, body) = get(&state, "/apps/echo").await;
+    assert_eq!(status, StatusCode::OK);
+    // The apply is disabled while the app is busy…
+    assert!(body.contains("a run is in progress"), "{body}");
+    // …but the unguarded status action is offered, because the guard does not apply to it.
+    assert!(
+        body.contains(r#"action="/apps/echo/actions/status""#),
+        "the status action is still clickable: {body}"
+    );
+    state.runner.cancel(started.run_id);
+}
+
+#[tokio::test]
+async fn a_status_run_is_recorded_without_blocking_the_app() {
+    let (state, store, _dir) = state(None);
+    // Start the status action while a long run holds the app: it must not be refused.
+    let live = state.runner.start("echo", "slow", false).expect("started");
+    let status = post_form(&state, "/apps/echo/actions/status", "dry_run=true").await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "an unguarded action is not refused as busy"
+    );
+    for _ in 0..100 {
+        if store
+            .recent_runs_for("echo", 10)
+            .expect("runs")
+            .iter()
+            .any(|run| run.action == "status" && !run.status.is_running())
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    state.runner.cancel(live.run_id);
+}
+
+#[tokio::test]
+async fn the_start_fresh_checkbox_discards_saved_progress() {
+    let (state, store, _dir) = state(None);
+    store
+        .save_checkpoint("echo", "poke", &serde_json::json!({"done": 7}))
+        .expect("seed a checkpoint");
+
+    // Without the checkbox the checkpoint is left alone, so the run resumes.
+    let no_fresh = post_form(
+        &state,
+        "/apps/echo/actions/poke",
+        "dry_run=false&confirm=true",
+    )
+    .await;
+    assert_eq!(no_fresh, StatusCode::SEE_OTHER);
+    for _ in 0..100 {
+        if store.run_count().expect("count") > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    for _ in 0..100 {
+        if !state.runner.is_busy("echo") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        store
+            .load_checkpoint("echo", "poke")
+            .expect("read")
+            .is_some(),
+        "a normal run resumes rather than discarding"
+    );
+
+    // With it, the saved progress is gone before the action reads anything.
+    let fresh = post_form(
+        &state,
+        "/apps/echo/actions/poke",
+        "dry_run=false&confirm=true&fresh=true",
+    )
+    .await;
+    assert_eq!(fresh, StatusCode::SEE_OTHER);
+    for _ in 0..100 {
+        if store
+            .load_checkpoint("echo", "poke")
+            .expect("read")
+            .is_none()
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(store.load_checkpoint("echo", "poke").expect("read"), None);
+}
+
+#[tokio::test]
+async fn a_paused_run_page_says_it_will_resume() {
+    let (state, store, _dir) = state(None);
+    let run_id = store.start_run("echo", "poke", false).expect("start");
+    store
+        .finish_run(
+            run_id,
+            crosstalk_core::store::RunStatus::Paused,
+            Some("paused after 120 of 900 stream(s)"),
+            &serde_json::json!({"done": 120}),
+            None,
+        )
+        .expect("finish");
+
+    let (status, body) = get(&state, &format!("/runs/{run_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("status-paused"), "{body}");
+    assert!(
+        body.contains("Paused at its window's end"),
+        "a paused run explains itself: {body}"
+    );
+    assert!(
+        body.contains("resumes from that checkpoint"),
+        "and says it continues: {body}"
+    );
+
+    // The dashboard says the same in one line, so an operator browsing apps sees which ones
+    // have a backlog waiting for the next window.
+    let (status, body) = get(&state, "/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("resumes at its next window"),
+        "the dashboard names the paused backlog: {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_dashboard_lists_a_schedule_window() {
+    let (state, _store, _dir) = state(None);
+    // The window is what tells an operator that a four-hour job will not run to the end in one
+    // firing; the dashboard shows it beside the expression.
+    let mut config = CrosstalkConfig::load_file(state.config.config_dir()).expect("config");
+    config.schedules.insert(
+        "echo.poke".to_string(),
+        crosstalk_core::config::ScheduleEntry::Windowed(crosstalk_core::config::ScheduleTable {
+            cron: "0 23 * * *".to_string(),
+            window: Some("4h".to_string()),
+            until: None,
+            timezone: None,
+        }),
+    );
+    state.config.replace(config);
+    let (status, body) = get(&state, "/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("4h from start"), "{body}");
+}
+
+#[tokio::test]
 async fn the_run_page_shows_status_rows_and_the_csv_link() {
     let (state, store, dir) = state(None);
     let run_id = store.start_run("echo", "peek", true).expect("run");
@@ -405,6 +583,41 @@ async fn a_channel_operation_row_shows_its_field_and_both_sides() {
     // A hostile channel name is escaped, not rendered.
     assert!(body.contains("&lt;img"), "{body}");
     assert!(!body.contains("<img src=x"), "{body}");
+}
+
+#[tokio::test]
+async fn a_watchdog_row_is_labelled_as_an_epg_source() {
+    // A watchdog row carries a source id where a channel id would be. The page says which it
+    // is, so nobody reads "4" as channel 4 — which is what the phase-1 footnote had to explain
+    // in prose instead.
+    let (state, store, _dir) = state(None);
+    let run_id = store
+        .start_run("guide", "watchdog_apply", false)
+        .expect("run");
+    store
+        .append_rows(
+            run_id,
+            &[crosstalk_core::store::RunRow {
+                ordinal: 0,
+                subject: crosstalk_core::store::Subject::EpgSource,
+                channel_id: 4,
+                channel_name: "Schedules Direct".to_string(),
+                field: "epg_source".to_string(),
+                method: "watchdog".to_string(),
+                status: "stale".to_string(),
+                reason: "stale; status error -> success".to_string(),
+                ..Default::default()
+            }],
+        )
+        .expect("rows");
+
+    let (status, body) = get(&state, &format!("/runs/{run_id}/rows")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("EPG source"), "{body}");
+    assert!(body.contains("Schedules Direct"), "{body}");
+    // The column says what the rows are about rather than claiming they are channels.
+    assert!(body.contains("<th>Subject</th>"), "{body}");
+    assert!(!body.contains("<th>Channel</th>"), "{body}");
 }
 
 #[tokio::test]
@@ -1322,4 +1535,301 @@ async fn the_dashboard_reports_what_a_clear_deleted() {
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("Deleted 0 report files."), "{body}");
     assert!(body.contains("1 could not be deleted"), "{body}");
+}
+
+// --- workflows and the Dispatcharr hook --------------------------------------------
+
+/// The hook a test posts to.
+const HOOK: &str = crosstalk_core::hooks::ROUTE;
+
+/// A configuration that triggers one workflow and one action from Dispatcharr events.
+fn with_hooks(config: &mut CrosstalkConfig) {
+    config.workflows.insert(
+        "nightly".to_string(),
+        crosstalk_core::config::WorkflowConfig {
+            steps: vec!["echo.peek".to_string()],
+            fresh: false,
+        },
+    );
+    config.workflows.insert(
+        "writing".to_string(),
+        crosstalk_core::config::WorkflowConfig {
+            steps: vec!["echo.poke".to_string()],
+            fresh: false,
+        },
+    );
+    config.hooks.debounce_secs = 0.0;
+    config
+        .hooks
+        .events
+        .insert("m3u_refresh".to_string(), vec!["echo.peek".to_string()]);
+    config.hooks.events.insert(
+        "epg_refresh".to_string(),
+        vec!["workflow.nightly".to_string()],
+    );
+}
+
+/// POST a hook delivery the way Dispatcharr would: a bearer token, and a body.
+async fn post_hook(
+    state: &AppState,
+    body: &str,
+    header: Option<(&str, String)>,
+) -> (StatusCode, axum::http::HeaderMap, String) {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(HOOK)
+        .header("content-type", "application/json");
+    if let Some((name, value)) = header {
+        builder = builder.header(name, value);
+    }
+    let response = router(state.clone())
+        .oneshot(builder.body(Body::from(body.to_string())).expect("request"))
+        .await
+        .expect("response");
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .expect("body");
+    (status, headers, String::from_utf8_lossy(&body).to_string())
+}
+
+async fn wait_for_runs(store: &Store, app: &str, wanted: usize) {
+    for _ in 0..200 {
+        if store.recent_runs_for(app, 100).expect("runs").len() >= wanted {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("expected {wanted} run(s) of {app}");
+}
+
+#[tokio::test]
+async fn the_webhook_accepts_only_a_bearer_token() {
+    let (state, store, _dir) = state_with(Some("s3cret"), with_hooks);
+
+    // No credential at all.
+    let (status, _headers, body) = post_hook(&state, r#"{"event": "m3u_refresh"}"#, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+
+    // The session cookie alone is refused, and refused as an auth failure rather than as a
+    // missing CSRF token: this route is bearer-only on purpose.
+    let (status, _headers, body) = post_hook(
+        &state,
+        r#"{"event": "m3u_refresh"}"#,
+        Some(("cookie", "crosstalk_token=s3cret".to_string())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert!(body.contains("Bearer"), "{body}");
+
+    // A wrong token is a 401 like any other.
+    let (status, _headers, _body) = post_hook(
+        &state,
+        r#"{"event": "m3u_refresh"}"#,
+        Some(("authorization", "Bearer wrong".to_string())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // The right one is accepted with no CSRF token at all: it is a script, not a browser form.
+    let (status, _headers, body) = post_hook(
+        &state,
+        r#"{"event": "m3u_refresh"}"#,
+        Some(("authorization", "Bearer s3cret".to_string())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    wait_for_runs(&store, "echo", 1).await;
+    assert_eq!(store.recent_runs(1).expect("runs")[0].action, "peek");
+}
+
+#[tokio::test]
+async fn the_webhook_refuses_a_daemon_with_no_token() {
+    // With no credential to check, a route that starts real work cannot be open: the operator
+    // gets a 401 that says what to configure.
+    let (state, store, _dir) = state_with(None, with_hooks);
+    let (status, _headers, body) = post_hook(
+        &state,
+        r#"{"event": "m3u_refresh"}"#,
+        Some(("authorization", "Bearer anything".to_string())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert!(body.contains("server.token"), "{body}");
+    assert_eq!(store.run_count().expect("count"), 0);
+}
+
+#[tokio::test]
+async fn an_unknown_event_is_accepted_logged_and_ignored() {
+    // Dispatcharr logs a failed delivery for a non-2xx answer, and "I do not act on this event"
+    // is not a failure: it is 202 with an explanation.
+    let (state, store, _dir) = state_with(Some("s3cret"), with_hooks);
+    let (status, _headers, body) = post_hook(
+        &state,
+        r#"{"event": "channel_start", "channel_name": "ESPN"}"#,
+        Some(("authorization", "Bearer s3cret".to_string())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert!(body.contains("channel_start"), "{body}");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(store.run_count().expect("count"), 0, "nothing ran");
+}
+
+#[tokio::test]
+async fn dispatcharrs_own_payload_shape_is_understood_without_an_event_name() {
+    // A default Connect subscription posts the details dict form-encoded, with no event name.
+    // The payload's keys are what identify it, and only for an event the configuration names.
+    let (state, store, _dir) = state_with(Some("s3cret"), with_hooks);
+    let (status, _headers, body) = post_hook(
+        &state,
+        "account_name=Provider+A&elapsed_time=12.3&streams_created=5",
+        Some(("authorization", "Bearer s3cret".to_string())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert!(body.contains("m3u_refresh"), "{body}");
+    wait_for_runs(&store, "echo", 1).await;
+}
+
+#[tokio::test]
+async fn a_hook_can_trigger_a_workflow_from_its_url() {
+    // The query parameter is the reliable way to name the event when no payload template is set
+    // (Dispatcharr's own payload carries no event name).
+    let (state, store, _dir) = state_with(Some("s3cret"), with_hooks);
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(format!("{HOOK}?event=epg_refresh"))
+        .header("authorization", "Bearer s3cret");
+    builder = builder.header("content-type", "application/json");
+    let response = router(state.clone())
+        .oneshot(builder.body(Body::from("{}")).expect("request"))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    wait_for_runs(&store, crosstalk_core::workflow::APP_ID, 1).await;
+    let record = store
+        .recent_runs_for(crosstalk_core::workflow::APP_ID, 1)
+        .expect("runs")
+        .into_iter()
+        .next()
+        .expect("a workflow run");
+    assert_eq!(record.action, "nightly");
+}
+
+#[tokio::test]
+async fn the_webhook_is_rate_limited_per_address() {
+    // The bound comes from the live configuration, so raising it needs no restart.
+    let (state, _store, _dir) = state_with(Some("s3cret"), |config| {
+        with_hooks(config);
+        config.hooks.rate_per_minute = 2;
+    });
+    for attempt in 0..2 {
+        let (status, _headers, body) = post_hook(
+            &state,
+            r#"{"event": "channel_start"}"#,
+            Some(("authorization", "Bearer s3cret".to_string())),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "attempt {attempt}: {body}");
+    }
+    let (status, headers, body) = post_hook(
+        &state,
+        r#"{"event": "channel_start"}"#,
+        Some(("authorization", "Bearer s3cret".to_string())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert!(headers.contains_key("retry-after"));
+}
+
+#[tokio::test]
+async fn the_dashboard_lists_workflows_and_hooks_and_runs_one() {
+    let (state, store, _dir) = state_with(None, with_hooks);
+    let (status, body) = get(&state, "/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Workflows"), "{body}");
+    assert!(body.contains("workflow.nightly"), "{body}");
+    assert!(body.contains("echo.peek"), "{body}");
+    assert!(body.contains("Dispatcharr hook"), "{body}");
+    assert!(body.contains("m3u_refresh"), "{body}");
+    assert!(body.contains("/hooks/dispatcharr"), "{body}");
+
+    // The Run button posts a form with the CSRF token and a confirmation.
+    let status = post_form(&state, "/workflows/nightly/run", "confirm=true").await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    wait_for_runs(&store, crosstalk_core::workflow::APP_ID, 1).await;
+    let record = store
+        .recent_runs_for(crosstalk_core::workflow::APP_ID, 1)
+        .expect("runs")
+        .into_iter()
+        .next()
+        .expect("a workflow run");
+    assert_eq!(record.action, "nightly");
+
+    // Its run page lists the steps it ran.
+    for _ in 0..200 {
+        if store
+            .run(record.id)
+            .expect("run")
+            .is_some_and(|run| !run.status.is_running())
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let (status, body) = get(&state, &format!("/runs/{}", record.id)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Steps"), "{body}");
+    assert!(body.contains("echo.peek"), "{body}");
+}
+
+#[tokio::test]
+async fn a_writing_workflow_needs_the_confirmation_and_an_unknown_one_is_a_404() {
+    let (state, store, _dir) = state_with(None, with_hooks);
+    // A workflow with a writing step changes data, so the server demands the confirmation the
+    // browser dialog cannot be trusted for.
+    let status = post_form(&state, "/workflows/writing/run", "").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(store.run_count().expect("count"), 0);
+
+    let status = post_form(&state, "/workflows/writing/run", "confirm=true").await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    let status = post_form(&state, "/workflows/nope/run", "confirm=true").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_step_run_page_links_the_workflow_it_belongs_to() {
+    let (state, store, _dir) = state_with(None, with_hooks);
+    let status = post_form(&state, "/workflows/nightly/run", "confirm=true").await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    wait_for_runs(&store, crosstalk_core::workflow::APP_ID, 1).await;
+
+    let record = store
+        .recent_runs_for(crosstalk_core::workflow::APP_ID, 1)
+        .expect("runs")
+        .into_iter()
+        .next()
+        .expect("a workflow run");
+    for _ in 0..200 {
+        if !store.child_runs(record.id).expect("steps").is_empty()
+            && !store
+                .run(record.id)
+                .expect("run")
+                .is_some_and(|run| run.status.is_running())
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let step = store.child_runs(record.id).expect("steps")[0].clone();
+    let (status, body) = get(&state, &format!("/runs/{}", step.id)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains(&format!("/runs/{}", record.id)),
+        "the step links its workflow: {body}"
+    );
 }

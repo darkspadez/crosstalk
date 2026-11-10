@@ -15,6 +15,7 @@ crosstalk-core.workspace = true
 crosstalk-matching.workspace = true
 crosstalk-web.workspace = true
 crosstalk-guide.workspace = true
+crosstalk-streams.workspace = true
 
 anyhow.workspace = true
 axum.workspace = true

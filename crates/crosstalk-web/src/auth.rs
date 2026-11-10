@@ -20,12 +20,18 @@ pub const MAX_LOGIN_FAILURES: u32 = 10;
 /// The window those failures are counted in.
 pub const LOGIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
-/// Brute-force guard for `POST /login`: per-IP failure counting.
+/// A per-address sliding-window counter, used for two things: brute-force guard on
+/// `POST /login` (failed sign-ins) and rate limiting `POST /hooks/dispatcharr` (every delivery).
 ///
 /// Ten wrong tokens in five minutes locks the address out with a 429, because the one
 /// token guards everything and never expires. A correct sign-in clears the address's
 /// failures, so a typo streak followed by the right token does not lock anyone out.
 /// Expired failures are pruned on every check, so idle addresses do not accumulate.
+///
+/// The webhook route uses the same counting through [`LoginLimiter::hits`], because a delivery
+/// starts real work and a Connect integration configured twice (or a loop) must not start a run
+/// per request. Its bound comes from the live configuration rather than from the limiter, so
+/// raising `hooks.rate_per_minute` takes effect without a restart.
 #[derive(Debug)]
 pub struct LoginLimiter {
     failures:
@@ -45,6 +51,14 @@ impl LoginLimiter {
 
     /// Whether this address may attempt a sign-in now.
     pub fn allowed(&self, ip: std::net::IpAddr) -> bool {
+        self.hits(ip) < self.max_failures
+    }
+
+    /// How many counted events this address has inside the window, expired ones pruned.
+    ///
+    /// The webhook route compares this against `hooks.rate_per_minute` itself, so the bound comes
+    /// from the configuration rather than from the limiter that holds the count.
+    pub fn hits(&self, ip: std::net::IpAddr) -> u32 {
         let mut failures = self.failures.lock().expect("login limiter lock");
         let now = std::time::Instant::now();
         let window = self.window;
@@ -54,7 +68,18 @@ impl LoginLimiter {
         });
         failures
             .get(&ip)
-            .is_none_or(|instants| (instants.len() as u32) < self.max_failures)
+            .map(|instants| instants.len() as u32)
+            .unwrap_or(0)
+    }
+
+    /// Count one event for this address: a failed sign-in, or one webhook delivery.
+    pub fn record_hit(&self, ip: std::net::IpAddr) {
+        self.failures
+            .lock()
+            .expect("login limiter lock")
+            .entry(ip)
+            .or_default()
+            .push(std::time::Instant::now());
     }
 
     /// Seconds until the oldest failure expires, for the `Retry-After` header.
@@ -75,12 +100,7 @@ impl LoginLimiter {
 
     /// Record a wrong token from this address.
     pub fn record_failure(&self, ip: std::net::IpAddr) {
-        self.failures
-            .lock()
-            .expect("login limiter lock")
-            .entry(ip)
-            .or_default()
-            .push(std::time::Instant::now());
+        self.record_hit(ip);
     }
 
     /// A correct sign-in clears the address's failures.
@@ -110,25 +130,34 @@ pub fn requires_token(bind: &str, token: Option<&str>) -> bool {
     !(bind == "localhost" || bind.starts_with("127.") || bind == "::1" || bind == "[::1]")
 }
 
-/// Pull the presented token out of a request: the header first, then the cookie.
-pub fn presented_token(request: &Request) -> Option<String> {
-    if let Some(value) = request
+/// The Bearer token in the `Authorization` header, and nothing else.
+///
+/// A script (and the webhook) presents the token this way; a browser sends the cookie instead.
+/// The distinction matters twice: CSRF exempts a request whose Bearer token checks out (a
+/// cross-site form cannot set that header), and the webhook route accepts ONLY this form, so a
+/// session cookie alone cannot trigger work.
+pub fn bearer_token(request: &Request) -> Option<String> {
+    let value = request
         .headers()
         .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-    {
-        let value = value.trim();
-        if let Some(token) = value
-            .strip_prefix("Bearer ")
-            .or_else(|| value.strip_prefix("bearer "))
-        {
-            let token = token.trim();
-            if !token.is_empty() {
-                return Some(token.to_string());
-            }
-        }
+        .and_then(|value| value.to_str().ok())?;
+    let value = value.trim();
+    let token = value
+        .strip_prefix("Bearer ")
+        .or_else(|| value.strip_prefix("bearer "))?
+        .trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
     }
+}
 
+/// Pull the presented token out of a request: the header first, then the cookie.
+pub fn presented_token(request: &Request) -> Option<String> {
+    if let Some(token) = bearer_token(request) {
+        return Some(token);
+    }
     let cookies = request.headers().get(header::COOKIE)?.to_str().ok()?;
     for cookie in cookies.split(';') {
         let cookie = cookie.trim();
@@ -171,6 +200,13 @@ pub async fn require(
     request: Request,
     next: Next,
 ) -> Response {
+    // The webhook route has its own rule: a Bearer token, never the session cookie. It is
+    // checked before the "no token configured means open" default, because that default would
+    // leave a route that starts real work reachable with no credential at all.
+    if request.uri().path() == crosstalk_core::hooks::ROUTE {
+        return require_webhook_bearer(state, request, next).await;
+    }
+
     let Some(expected) = state.token() else {
         return next.run(request).await;
     };
@@ -193,6 +229,40 @@ pub async fn require(
                 (StatusCode::UNAUTHORIZED, "a token is required\n").into_response()
             }
         }
+    }
+}
+
+/// Authenticate a webhook delivery: a Bearer token, and nothing else.
+///
+/// Three refusals, all 401:
+///   * no `server.token` configured — the route has no credential to check, and a route that
+///     starts real work must not be reachable without one. (The daemon only runs tokenless on a
+///     loopback bind, where Dispatcharr on another host could not reach it anyway.)
+///   * no `Authorization: Bearer …` header. A session cookie is deliberately NOT accepted: a
+///     browser session should not be able to trigger an apply by visiting a URL.
+///   * a token that does not match.
+async fn require_webhook_bearer(
+    state: crate::state::AppState,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some(expected) = state.token() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "the webhook route needs a configured server token: set server.token or \
+             server.token_env and give Dispatcharr the same value as a Bearer token\n",
+        )
+            .into_response();
+    };
+    match bearer_token(&request) {
+        Some(presented) if tokens_match(&expected, &presented) => next.run(request).await,
+        Some(_) => (StatusCode::UNAUTHORIZED, "invalid token\n").into_response(),
+        None => (
+            StatusCode::UNAUTHORIZED,
+            "the webhook route accepts only an Authorization: Bearer <token> header, not a \
+             session cookie\n",
+        )
+            .into_response(),
     }
 }
 
@@ -302,6 +372,22 @@ mod limiter_tests {
         assert!(!limiter.allowed(ip()));
         std::thread::sleep(std::time::Duration::from_millis(80));
         assert!(limiter.allowed(ip()));
+    }
+
+    #[test]
+    fn the_counter_is_reusable_with_a_bound_from_elsewhere() {
+        // The webhook route keeps its own count and reads the bound from the live configuration,
+        // so the limiter has to expose the count rather than only a yes/no against its own max.
+        let limiter = LoginLimiter::new(u32::MAX, LOGIN_WINDOW);
+        assert_eq!(limiter.hits(ip()), 0);
+        for expected in 1..=3 {
+            limiter.record_hit(ip());
+            assert_eq!(limiter.hits(ip()), expected);
+        }
+        // `record_failure` is the same counter: a sign-in attempt and a hook delivery are both
+        // "one more event from this address".
+        limiter.record_failure(ip());
+        assert_eq!(limiter.hits(ip()), 4);
     }
 
     #[test]

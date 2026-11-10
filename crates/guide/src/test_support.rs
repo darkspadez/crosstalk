@@ -268,7 +268,13 @@ impl Fixture {
         let run_id = store.start_run(app, action, true).expect("start run");
         JobContext::new(Arc::new(self.config.clone()), Arc::new(VecSink::new()))
             .with_dispatcharr(self.client())
-            .for_run(run_id, store.clone(), Arc::new(AtomicBool::new(false)))
+            .for_run(
+                app,
+                action,
+                run_id,
+                store.clone(),
+                Arc::new(AtomicBool::new(false)),
+            )
     }
 
     /// The in-scope channels of `world`, as the actions resolve them.

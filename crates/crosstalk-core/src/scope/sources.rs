@@ -15,7 +15,7 @@
 //! Filtering the CANDIDATES by source, and ordering them, stays with the app: only it knows
 //! what a candidate is and how the two relate.
 
-use crate::dispatcharr::EpgSource;
+use crate::dispatcharr::{EpgSource, M3uAccount};
 use crate::wildcard::{expand_patterns, parse_tokens};
 use std::collections::HashSet;
 
@@ -28,6 +28,26 @@ pub trait SourceKind {
 }
 
 impl SourceKind for EpgSource {
+    fn id(&self) -> i64 {
+        self.id
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn enabled(&self) -> bool {
+        self.is_active
+    }
+}
+
+/// An M3U account is the streams app's kind of source, and it answers the same three
+/// questions: whether the filter names it, what it is called, and whether it is switched on.
+///
+/// The streams app adds its own layer on top — an ORDERED priority list, and the plugin's `*`
+/// entry meaning every other source — because an account's position decides failover order,
+/// which no EPG source has. Eligibility itself is this shared filter's.
+impl SourceKind for M3uAccount {
     fn id(&self) -> i64 {
         self.id
     }
@@ -179,6 +199,44 @@ mod tests {
             selection.is_eligible(0),
             "the plugin proceeds with everything"
         );
+    }
+
+    #[test]
+    fn an_m3u_account_is_a_source_too() {
+        // The streams app filters M3U accounts with this same function; only what a source IS
+        // differs, so the rules (named, switched on, `*` wildcards, case-insensitive names)
+        // are the ones guide already proved.
+        let accounts = vec![
+            M3uAccount {
+                id: 1,
+                name: "Main Provider".to_string(),
+                is_active: true,
+                ..M3uAccount::default()
+            },
+            M3uAccount {
+                id: 2,
+                name: "Retired Provider".to_string(),
+                is_active: false,
+                ..M3uAccount::default()
+            },
+        ];
+
+        let selection = select(&accounts, "");
+        assert_eq!(selection.named, None);
+        assert!(selection.is_eligible(1));
+        assert!(
+            !selection.is_eligible(2),
+            "a switched-off account is skipped"
+        );
+
+        let selection = select(&accounts, "main provider");
+        assert_eq!(selection.named, Some(HashSet::from([1])));
+        assert!(selection.is_eligible(1));
+        assert!(!selection.is_eligible(2));
+
+        let selection = select(&accounts, "Retired Provider");
+        assert_eq!(selection.named, Some(HashSet::from([2])));
+        assert!(!selection.is_eligible(2), "named and off is still skipped");
     }
 
     #[test]

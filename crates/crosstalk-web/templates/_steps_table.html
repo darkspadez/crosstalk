@@ -1,0 +1,21 @@
+{% if steps.is_empty() %}
+<p class="muted">No steps ran.</p>
+{% else %}
+<table>
+  <thead>
+    <tr><th>Step</th><th>Run</th><th>Mode</th><th>Status</th><th>Started</th><th>Summary</th></tr>
+  </thead>
+  <tbody>
+    {% for step in steps %}
+    <tr>
+      <td><code>{{ step.app }}.{{ step.action }}</code></td>
+      <td><a href="/runs/{{ step.id }}">#{{ step.id }}</a></td>
+      <td>{% if step.dry_run %}<span class="tag read">preview</span>{% else %}<span class="tag destructive">apply</span>{% endif %}</td>
+      <td><span class="status status-{{ step.status }}">{{ step.status }}</span></td>
+      <td class="muted">{{ step.started_at }}</td>
+      <td class="muted">{% if let Some(summary) = step.summary %}{{ summary }}{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}

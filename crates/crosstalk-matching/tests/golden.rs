@@ -126,22 +126,12 @@ fn normalize_name_matches_baseline() {
     assert_eq!(combos.len(), 2, "the baseline holds two flag combinations");
 
     let normalizers = [
-        (
-            "all_on",
-            Normalizer::new(NormalizeFlags {
-                ignore_quality: true,
-                ignore_regional: true,
-                ignore_geographic: true,
-                ignore_misc: true,
-            }),
-        ),
+        ("all_on", Normalizer::new(NormalizeFlags::default())),
         (
             "regional_off",
             Normalizer::new(NormalizeFlags {
-                ignore_quality: true,
                 ignore_regional: false,
-                ignore_geographic: true,
-                ignore_misc: true,
+                ..NormalizeFlags::default()
             }),
         ),
     ];

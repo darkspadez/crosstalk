@@ -172,22 +172,15 @@ pub async fn run(
         name.as_deref(),
     );
 
-    // A cancel that stopped every write is a cancelled run, like a cancelled scan or match:
-    // the rows and the report above say what was left undone. One that landed after a batch
-    // was written stays a result, so the history never hides a write that happened.
-    if applied
-        .as_ref()
-        .is_some_and(|applied| applied.ok == 0 && applied.failed > 0)
-        && context.is_cancelled()
-    {
-        bail!("cancelled by the operator before any change was written");
+    let mut built =
+        outcome(action, &plan, applied.as_ref(), dry_run, scan.as_ref()).report(Some(report));
+    // The cancel rule (see `crosstalk_core::jobs`): a cancelled run keeps the rows and the
+    // report it produced and is recorded cancelled, never as a success. Phase 1 kept a
+    // partially-written run a success, which made a half-applied cleanup look finished.
+    if let Some(note) = channel_ops::cancelled_note(context, &plan, applied.as_ref()) {
+        built = built.cancelled().note(note);
     }
-
-    Ok(
-        outcome(action, &plan, applied.as_ref(), dry_run, scan.as_ref())
-            .report(Some(report))
-            .build(),
-    )
+    Ok(built.build())
 }
 
 /// The selection, the operations and the plan options for one preset.
@@ -916,7 +909,9 @@ mod tests {
         let run_id = context.run_id().expect("run id");
         context.cancel();
 
-        let error = run(
+        // A cancelled run is not an error any more: it keeps the rows and the report it made
+        // and says it was cancelled, so the history shows both that nothing landed and why.
+        let outcome = run(
             &GuideApp::new(),
             &context,
             &GuideSettings::default(),
@@ -924,10 +919,17 @@ mod tests {
             false,
         )
         .await
-        .expect_err("nothing was written, so the run is a cancelled one");
+        .expect("a cancelled run still reports what it did");
+        assert!(outcome.is_cancelled(), "{}", outcome.summary);
         assert!(
-            format!("{error:#}").contains("cancelled by the operator"),
-            "{error:#}"
+            outcome.summary.contains("cancelled by the operator"),
+            "{}",
+            outcome.summary
+        );
+        assert_eq!(outcome.counts.get("written"), Some(&0));
+        assert!(
+            outcome.report_path.is_some(),
+            "the report is what says which rows were left undone"
         );
         assert!(cleared(&fixture).await.is_empty());
         let rows = store.rows(run_id).expect("rows");

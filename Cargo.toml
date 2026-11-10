@@ -4,6 +4,7 @@ members = [
     "crates/crosstalk-matching",
     "crates/crosstalk-core",
     "crates/guide",
+    "crates/streams",
     "crates/crosstalk-web",
     "crates/crosstalk",
 ]
@@ -21,9 +22,11 @@ crosstalk-matching = { path = "crates/crosstalk-matching" }
 crosstalk-core = { path = "crates/crosstalk-core" }
 crosstalk-web = { path = "crates/crosstalk-web" }
 crosstalk-guide = { path = "crates/guide" }
+crosstalk-streams = { path = "crates/streams" }
 
 # Async / runtime
 tokio = { version = "1", features = ["full"] }
+libc = "0.2"
 futures = "0.3"
 
 # HTTP
@@ -61,6 +64,7 @@ clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
 tokio-cron-scheduler = "0.13"
 uuid = "1"
 croner = { version = "2", features = ["serde"] }

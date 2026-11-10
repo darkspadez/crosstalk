@@ -1,26 +1,32 @@
 //! Channel-name normalisation.
 //!
 //! A statement-for-statement port of `FuzzyMatcher.normalize_name` in
-//! `reference/Dispatcharr-EPG-Janitor-Plugin/EPG-Janitor/fuzzy_matcher.py`.
+//! `reference/Dispatcharr-EPG-Janitor-Plugin/EPG-Janitor/fuzzy_matcher.py`, and of the
+//! vendored `matching_core.py` body that Stream-Mapparr runs instead
+//! (`NormalizeFlags::core_pipeline`). They are one function with two documented branches,
+//! not two normalisers: the flags decide which plugin's body runs, and everything that is
+//! the same text is shared.
 //!
-//! It is the *plugin's* version, not `matching_core.py`'s, and the two differ in ways
-//! that change output: the core strips Unicode format characters (category Cf) up front
-//! and replaces decorative symbols (`So`/`No`/`Lm`/`Sk`, such as `★`) with spaces at the
-//! end, while the plugin does neither. It also applies its own quality-tag table, its
-//! own regional and geographic tables, and a two-token floor before stripping a trailing
-//! `Network`/`Channel`/`TV`. Port the plugin's; the golden baseline in
-//! `tests/fixtures/matcher_golden_baseline.json` was generated from it.
+//! The default branch is the *plugin's* version, not `matching_core.py`'s, and the two
+//! differ in ways that change output: the core strips Unicode format characters (category
+//! Cf) up front and replaces decorative symbols (`So`/`No`/`Lm`/`Sk`, such as `★`) with
+//! spaces at the end, while the plugin does neither. It also applies its own quality-tag
+//! table, its own regional and geographic tables, and a two-token floor before stripping a
+//! trailing `Network`/`Channel`/`TV`. The golden baseline in
+//! `tests/fixtures/matcher_golden_baseline.json` was generated from the plugin's branch.
 //!
-//! Three details are load-bearing and easy to "improve" into bugs:
+//! Details that are load-bearing and easy to "improve" into bugs:
 //!
 //!   * Quality, resolution and geographic substitutions replace with an EMPTY string,
 //!     while quality tags in brackets, regional and misc substitutions replace with a
 //!     SPACE. Deleting instead of spacing glues a tag to its neighbours (`CNN [HD] USA`
-//!     -> `CNNUSA`).
+//!     -> `CNNUSA`). The core branch has the same rule with its own tables.
 //!   * Whitespace is collapsed only at the very end. Collapsing earlier breaks the
 //!     anchored `\s+Network$` rules.
-//!   * Hyphens become spaces before the provider-prefix table runs, which is why the
-//!     table's own `-` alternatives are effectively dead for the hyphen form.
+//!   * In the plugin branch, hyphens become spaces before the provider-prefix table runs,
+//!     which is why the table's own `-` alternatives are effectively dead for the hyphen
+//!     form. The core branch runs the table FIRST, which is why `FR - Canal+ FHD` loses
+//!     its prefix there and not in the plugin.
 
 use crate::pyre::{
     py_split_whitespace, py_trim, py_trim_start, python_escape, pythonize,
@@ -171,6 +177,65 @@ const MISC_PATTERNS: [&str; 3] = [r"\s*\([A-Z]\)\s*", r"\s*\(CX\)\s*", r"\s*\([^
 /// The broad catch-all in [`MISC_PATTERNS`].
 const MISC_CATCH_ALL: &str = r"\s*\([^)]*\)\s*";
 
+// ---------------------------------------------------------------------------
+// `matching_core.py` (the vendored shared core) pattern tables.
+//
+// Stream-Mapparr subclasses the shared core and does NOT override
+// `normalize_name`, so its normalisation is this table's, not the EPG Janitor
+// plugin's (which overrode the method outright). The two disagree in several
+// load-bearing places — provider prefixes are stripped before hyphens become
+// spaces, `[HD]` is stripped even when quality tags are kept, trailing
+// `Network`/`Channel`/`TV` go unconditionally, and decorative Unicode
+// categories are removed — so they are kept as separate tables rather than
+// merged into one mostly-shared list.
+// ---------------------------------------------------------------------------
+
+/// The shared core's quality table: `HDR`/`HEVC` are quality tags there, and there is
+/// no trailing-colon form (that one belongs to EPG Janitor).
+const CORE_QUALITY_PATTERNS: [&str; 5] = [
+    r"\s*\[(4K|8K|UHD|FHD|HD|HDR|HEVC|SD|FD|Unknown|Unk|Slow|Dead|Backup)\]\s*",
+    r"\s*\((4K|8K|UHD|FHD|HD|HDR|HEVC|SD|FD|Unknown|Unk|Slow|Dead|Backup)\)\s*",
+    r"^\s*(4K|8K|UHD|FHD|HD|HDR|HEVC|SD|FD|Unknown|Unk|Slow|Dead)\b\s*",
+    r"\s*\b(4K|8K|UHD|FHD|HD|HDR|HEVC|SD|FD|Unknown|Unk|Slow|Dead)$",
+    r"\s+\b(4K|8K|UHD|FHD|HD|HDR|HEVC|SD|FD|Unknown|Unk|Slow|Dead)\b\s+",
+];
+
+/// The shared core strips only the parenthesised region words; bare `Pacific`/
+/// `Central`/`Mountain`/`Atlantic` are brands (`Comedy Central`, `The Atlantic`).
+const CORE_REGIONAL_PATTERNS: [&str; 4] = [
+    r"\s*\([Pp][Aa][Cc][Ii][Ff][Ii][Cc]\)\s*",
+    r"\s*\([Cc][Ee][Nn][Tt][Rr][Aa][Ll]\)\s*",
+    r"\s*\([Mm][Oo][Uu][Nn][Tt][Aa][Ii][Nn]\)\s*",
+    r"\s*\([Aa][Tt][Ll][Aa][Nn][Tt][Ii][Cc]\)\s*",
+];
+
+/// The shared core's country-prefix table, in its own order: delimited prefixes, bare
+/// country words, the `USA ` brand guard, a country glued to a quality tag, a balanced
+/// delimiter wrap, a trailing bar tag, content categories, then FAST platform tags.
+const CORE_PROVIDER_PREFIX_PATTERNS: [&str; 8] = [
+    r"^(?:US|USA|UK|CA|AU|FR|DE|ES|[iI\u{131}\u{130}]T|NL|BR|MX|[iI\u{131}\u{130}]N)\s*[:\-\|┃│]\s*",
+    r"^(?:US|UK|CA|AU|FR|DE|MX|MEX|FRA|GER)\s+",
+    r"^USA\s+(?!NETWORK\b)",
+    r"^(?:US|UK)(?:SD|HD|FHD|UHD|FD|HEVC|4K|8K)\b\s*[:\-\|┃│]?\s*",
+    r"^\s*(?:\(\s*(?:US|USA|UK|CA|AU|FR|DE|ES|IT|NL|BR|MX|IN)\s*\)|\[\s*(?:US|USA|UK|CA|AU|FR|DE|ES|IT|NL|BR|MX|IN)\s*\]|\|\s*(?:US|USA|UK|CA|AU|FR|DE|ES|IT|NL|BR|MX|IN)\s*\||┃\s*(?:US|USA|UK|CA|AU|FR|DE|ES|IT|NL|BR|MX|IN)\s*┃|│\s*(?:US|USA|UK|CA|AU|FR|DE|ES|IT|NL|BR|MX|IN)\s*│)\s*",
+    r"\s*[\|┃│]\s*(?:US|USA|UK|CA|AU|FR|DE|ES|IT|NL|BR|MX|IN)\s*$",
+    r"^(?:ADULT|EROTIC|PRIME|GOLD)\s*[:\-\|┃│]\s*",
+    r"^(?:RK|GO|TUBI|PLUTO|XUMO|PLEX|STIRR|FREEVEE|GLANCE)\s*[:\-\|┃│]\s*",
+];
+
+/// The shared core's country tag table: no `USA:`/`USA ` brand guards (those live in its
+/// provider-prefix table) and the same four marker shapes as EPG Janitor's.
+const CORE_GEOGRAPHIC_PATTERNS: [&str; 4] = [
+    r"\b[A-Z]{2,3}[:┃│]\s*",
+    r"\b[A-Z]{2,3}\s*-\s*",
+    r"(?:\|[A-Z]{2,3}\||┃[A-Z]{2,3}┃|│[A-Z]{2,3}│)\s*",
+    r"\[[A-Z]{2,3}\]\s*",
+];
+
+/// The shared core's only miscellaneous pattern. It runs only when BOTH `ignore_misc` and
+/// `ignore_regional` are set, so a preserved `(East)` stays visible to the region filter.
+const CORE_MISC_PATTERNS: [&str; 1] = [r"\s*\([^)]*\)\s*"];
+
 /// The bracketed country tag, which doubles as a quality tag (`[HD]`) when quality tags
 /// are preserved.
 const GEO_BRACKET: &str = r"\[[A-Z]{2,3}\]\s*";
@@ -201,12 +266,30 @@ const EMOJI_LETTERS: [(char, char); 1] = [('\u{26BD}', 'o')];
 const EMOJI_ORNAMENTS: [char; 3] = ['\u{266C}', '\u{263E}', '\u{26BD}'];
 
 /// The flags that decide how much is stripped. Defaults are Janitor's shipped defaults.
+///
+/// The first four are the plugin's four toggles. The rest exist because EPG Janitor and
+/// Stream-Mapparr normalise through different code: Janitor overrides `normalize_name`
+/// outright, Stream-Mapparr runs the vendored shared core and only repairs designators
+/// on top of it. Each flag below names the plugin that needs it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NormalizeFlags {
     pub ignore_quality: bool,
     pub ignore_regional: bool,
     pub ignore_geographic: bool,
     pub ignore_misc: bool,
+    /// Stream-Mapparr needs this: run `matching_core.py`'s `normalize_name` body instead
+    /// of EPG Janitor's plugin override. The two differ in provider-prefix ordering,
+    /// quality tables, East/West and region handling, trailing-suffix stripping and the
+    /// decorative-Unicode strip, none of which is a toggle in either plugin.
+    pub core_pipeline: bool,
+    /// Stream-Mapparr needs this: rejoin a designator the core split apart, so `F1` and
+    /// `TF1` stay whole instead of becoming `F 1` (its issue #50 fix). Only a split the
+    /// raw name itself wrote glued is undone; `Sky Sports 1` stays two tokens.
+    pub rejoin_designators: bool,
+    /// Stream-Mapparr needs this: strip a leading `Cinemax` (the shared core's opt-in
+    /// `remove_cinemax`), which its match passes for a channel whose name mentions `max`
+    /// so `Cinemax` and `MoreMax` can meet. EPG Janitor never sets it.
+    pub remove_cinemax: bool,
 }
 
 impl Default for NormalizeFlags {
@@ -216,6 +299,9 @@ impl Default for NormalizeFlags {
             ignore_regional: true,
             ignore_geographic: true,
             ignore_misc: true,
+            core_pipeline: false,
+            rejoin_designators: false,
+            remove_cinemax: false,
         }
     }
 }
@@ -308,7 +394,75 @@ fn tables() -> &'static Tables {
     })
 }
 
-/// True for a stylised letterform or ornament that carries no meaning in a channel name.
+/// `matching_core.py`'s pattern set, compiled once. Only the tables that differ from
+/// EPG Janitor's live here; the shared ones (resolution markers, number words, the
+/// callsign and parenthesis strips, the ASCII spacers and the camel-case splits) are
+/// the same text and are reused from [`tables`].
+struct CoreTables {
+    quality: Vec<Pat>,
+    regional: Vec<Pat>,
+    geographic: Vec<Pat>,
+    provider_prefixes: Vec<Pat>,
+    misc: Vec<Pat>,
+    region_paren_east_west: Pat,
+    region_bare_east_west: Pat,
+    dot_between_word_chars: Pat,
+    the_prefix: Pat,
+    cinemax: Pat,
+}
+
+/// Python's word character, `[^\W]`: every alphanumeric category plus `_`.
+const PY_WORD_CLASS: &str = r"[\p{L}\p{Nd}\p{Nl}\p{No}_]";
+
+fn core_tables() -> &'static CoreTables {
+    static TABLES: OnceLock<CoreTables> = OnceLock::new();
+    TABLES.get_or_init(|| CoreTables {
+        quality: CORE_QUALITY_PATTERNS
+            .iter()
+            .map(|p| Pat::py_ci(p))
+            .collect(),
+        regional: CORE_REGIONAL_PATTERNS
+            .iter()
+            .map(|p| Pat::py_ci(p))
+            .collect(),
+        geographic: CORE_GEOGRAPHIC_PATTERNS
+            .iter()
+            .map(|p| Pat::py_ci(p))
+            .collect(),
+        provider_prefixes: CORE_PROVIDER_PREFIX_PATTERNS
+            .iter()
+            .map(|p| Pat::py_ci(p))
+            .collect(),
+        misc: CORE_MISC_PATTERNS.iter().map(|p| Pat::py_ci(p)).collect(),
+        // `\((eastern|east|e|west|w))` and the bare words, both when regional tags go.
+        region_paren_east_west: Pat::py_ci(r"\(\s*(?:eastern|east|e|west|w)\s*\)"),
+        region_bare_east_west: Pat::py_ci(r"\b(?:eastern|east|west)\b"),
+        // `(?<=\w)\.(?=\w)`; `\w` is Python's, not the Rust engine's.
+        dot_between_word_chars: Pat::fancy(&format!("(?<={PY_WORD_CLASS})\\.(?={PY_WORD_CLASS})")),
+        // `^\s*The\s+`: the leading `\s*` matters because the substitutions above leave
+        // the name starting with a space once a prefix is removed.
+        the_prefix: Pat::py_ci(r"^\s*The\s+"),
+        cinemax: Pat::py_ci(r"\bCinemax\b\s*"),
+    })
+}
+
+/// The split of a glued designator the core made: `"F 1"`, `"TF 1"`.
+fn rejoin_designator_re() -> &'static FancyRegex {
+    static RE: OnceLock<FancyRegex> = OnceLock::new();
+    RE.get_or_init(|| {
+        FancyRegex::new(r"(?<![A-Za-z0-9])([A-Za-z]{1,2}) ([0-9]{1,2})(?![A-Za-z0-9])")
+            .expect("static regex")
+    })
+}
+
+/// Designators written glued in the RAW name, lowercased. Only these may be rejoined.
+fn source_designator_re() -> &'static FancyRegex {
+    static RE: OnceLock<FancyRegex> = OnceLock::new();
+    RE.get_or_init(|| {
+        FancyRegex::new(r"(?<![A-Za-z0-9])[A-Za-z]{1,2}[0-9]{1,2}").expect("static regex")
+    })
+}
+
 ///
 /// Detection is by Unicode character *name*, so it covers superscripts, modifier-letter
 /// superscript capitals and Latin small capitals wherever they live, including outside
@@ -403,12 +557,176 @@ impl Normalizer {
         self.flags
     }
 
+    /// The same flags with `matching_core`'s `remove_cinemax` cleared.
+    ///
+    /// Stream-Mapparr's collector sets that opt-in from the CHANNEL name (`'max' in
+    /// `channel_name`), but the channel side itself is never stripped: `plugin.py`
+    /// cleans the channel name without it and `fuzzy_match`/`find_best_match` normalise
+    /// the query without it. Only the candidate side can carry it, and even there the
+    /// precomputed index is built without it (the plugin's `precompute_normalizations`
+    /// takes no such flag); it reaches only `find_best_match`'s uncached-candidate
+    /// fallback. Clearing it here reproduces that asymmetry, exactly as in the plugin.
+    pub fn without_cinemax(&self) -> Self {
+        self.with_remove_cinemax(false)
+    }
+
+    /// The same flags with `matching_core`'s `remove_cinemax` set as requested.
+    ///
+    /// Used for the one path that honours it: a candidate the index did not precompute
+    /// (a name normalising to under two characters), which the plugin normalises
+    /// on the fly with the call's flag.
+    pub fn with_remove_cinemax(&self, remove_cinemax: bool) -> Self {
+        Self {
+            flags: NormalizeFlags {
+                remove_cinemax,
+                ..self.flags
+            },
+        }
+    }
+
     /// Remove tags, prefixes and noise so two names can be compared.
     ///
     /// `user_ignored_tags` are extra literals to strip. A tag containing brackets or
     /// parentheses is treated as a literal substring; a bare word is stripped on word
     /// boundaries; anything else as a literal substring.
     pub fn normalize_name(&self, name: &str, user_ignored_tags: &[&str]) -> String {
+        let normalized = if self.flags.core_pipeline {
+            self.normalize_core(name, user_ignored_tags)
+        } else {
+            self.normalize_plugin(name, user_ignored_tags)
+        };
+        if self.flags.rejoin_designators && !normalized.is_empty() {
+            rejoin_designators(&normalized, name)
+        } else {
+            normalized
+        }
+    }
+
+    /// `matching_core.py`'s `normalize_name`, statement for statement.
+    ///
+    /// This is the body Stream-Mapparr runs (it subclasses the shared core and does not
+    /// override normalisation). It differs from EPG Janitor's override in more than one
+    /// place, all of them reproduced here rather than tidied into agreement: provider
+    /// prefixes before hyphen normalisation, the `HDR`/`HEVC` quality table with no
+    /// colon form, a Unicode-word dot split, `(e)`/`(w)`/`eastern`/`east`/`west`
+    /// stripping, `[HD]` stripped as a country tag even when quality tags are kept, the
+    /// misc catch-all gated on both flags, unconditional trailing
+    /// `Network`/`Channel`/`TV` stripping, and the decorative-Unicode strip at the end.
+    fn normalize_core(&self, name: &str, user_ignored_tags: &[&str]) -> String {
+        let t = core_tables();
+        let shared = tables();
+        let f = self.flags;
+
+        // Zero-width/invisible format characters (category Cf) are padding, so they are
+        // removed rather than spaced.
+        let mut s: String = name
+            .chars()
+            .filter(|c| get_general_category(*c) != GeneralCategory::Format)
+            .collect();
+
+        s = shared.leading_bar_tag.sub(&s, "");
+        s = normalize_emoji(&s);
+        s = strip_stylized_tokens(&s);
+
+        // Provider prefixes run BEFORE hyphens become spaces, so `FR - Canal+ FHD` loses
+        // its `FR - ` while the separator is still a hyphen.
+        for pattern in &t.provider_prefixes {
+            s = pattern.sub(&s, "");
+        }
+
+        if f.ignore_quality {
+            // Chained markers (`4K HDR`) expose another tag on the next pass.
+            loop {
+                let previous = s.clone();
+                for pattern in &shared.resolution {
+                    s = pattern.sub(&s, "");
+                }
+                for pattern in &t.quality {
+                    s = pattern.sub(&s, " ");
+                }
+                if previous == s {
+                    break;
+                }
+            }
+        }
+
+        s = shared.letter_digit.sub(&s, "$1 $2");
+        s = shared.digit_letter.sub(&s, "$1 $2");
+        s = shared.hyphen.sub(&s, " ");
+        s = t.dot_between_word_chars.sub(&s, " ");
+        s = shared.num_words.sub_fn(&s, &number_word_as_digit);
+        s = shared.camel_lower_upper_lower.sub(&s, "$1 $2");
+        s = shared.camel_acronym.sub(&s, "$1 $2");
+
+        if f.ignore_regional {
+            s = t.region_paren_east_west.sub(&s, " ");
+            s = t.region_bare_east_west.sub(&s, " ");
+        }
+
+        while py_trim_start(&s).starts_with('(') {
+            let next = shared.leading_paren.sub(&s, "");
+            if next == s {
+                break;
+            }
+            s = next;
+        }
+
+        // The shared core's other opt-in, `remove_country_prefix`, is never set by any
+        // shipping plugin, so it is not a flag here.
+        if f.remove_cinemax {
+            s = t.cinemax.sub(&s, "");
+        }
+
+        if f.ignore_regional {
+            for pattern in &t.regional {
+                s = pattern.sub(&s, " ");
+            }
+        }
+        if f.ignore_geographic {
+            for pattern in &t.geographic {
+                s = pattern.sub(&s, " ");
+            }
+        }
+        // The catch-all would also strip `(East)`/`(West)`, which the region filter still
+        // needs when regional tags are preserved.
+        if f.ignore_misc && f.ignore_regional {
+            for pattern in &t.misc {
+                s = pattern.sub(&s, " ");
+            }
+        }
+
+        for tag in user_ignored_tags {
+            s = self.apply_ignored_tag(&s, tag);
+        }
+
+        if f.ignore_regional {
+            s = shared.callsign_paren.sub(&s, "");
+        } else {
+            s = shared.callsign_paren_keep_region.sub(&s, "");
+        }
+
+        if f.ignore_regional {
+            s = shared.paren_alnum.sub(&s, "");
+        }
+
+        // No two-token floor here, unlike EPG Janitor: the shared core strips a trailing
+        // `Network`/`Channel`/`TV` unconditionally.
+        s = t.the_prefix.sub(&s, "");
+        s = shared.trailing_network.sub(&s, "");
+        s = shared.trailing_channel.sub(&s, "");
+        s = shared.trailing_tv.sub(&s, "");
+
+        // Decorative Unicode badges (`◉`, `²`, superscript `ᴿᴬᵂ`) become spaces.
+        s = s
+            .chars()
+            .map(|c| if is_decorator_category(c) { ' ' } else { c })
+            .collect();
+
+        py_trim(&shared.whitespace.sub(&s, " ")).to_string()
+    }
+
+    /// EPG Janitor's own `normalize_name`, the plugin override (not the shared core's).
+    fn normalize_plugin(&self, name: &str, user_ignored_tags: &[&str]) -> String {
         let t = tables();
         let f = self.flags;
         let mut s = name.to_string();
@@ -536,6 +854,48 @@ impl Normalizer {
             .map(|cow| cow.into_owned())
             .unwrap_or_else(|_| name.to_string())
     }
+}
+
+/// Rejoin digit stems the shared core split apart, keeping `F1`/`TF1` whole.
+///
+/// Stream-Mapparr's issue #50: the core splits a letter from a following digit
+/// unconditionally, so `Sky Sports F1` became `Sky Sports F 1` and the manufactured bare
+/// `1` then read as a numbered sibling of `Sky Sports UHD 1`. Rejoining restores the
+/// designator; the numeric-sibling guard in the matcher then refuses the pair. Only a
+/// split the RAW name itself wrote glued is undone (`High Street TV 1` stays apart),
+/// which is what keeps this a fix for a handful of names rather than a rewrite of every
+/// numbered one.
+fn rejoin_designators(normalized: &str, original: &str) -> String {
+    let glued: std::collections::HashSet<String> = source_designator_re()
+        .find_iter(original)
+        .filter_map(Result::ok)
+        .map(|m| m.as_str().to_lowercase())
+        .collect();
+    if glued.is_empty() {
+        return normalized.to_string();
+    }
+
+    let mut out = String::with_capacity(normalized.len());
+    let mut last = 0;
+    for captures in rejoin_designator_re().captures_iter(normalized) {
+        let Ok(captures) = captures else { continue };
+        let Some(whole) = captures.get(0) else {
+            continue;
+        };
+        let (Some(stem), Some(digits)) = (captures.get(1), captures.get(2)) else {
+            continue;
+        };
+        out.push_str(&normalized[last..whole.start()]);
+        let joined = format!("{}{}", stem.as_str(), digits.as_str());
+        if glued.contains(&joined.to_lowercase()) {
+            out.push_str(&joined);
+        } else {
+            out.push_str(whole.as_str());
+        }
+        last = whole.end();
+    }
+    out.push_str(&normalized[last..]);
+    out
 }
 
 /// Compile (and cache) the pattern for one user-configured tag.
@@ -803,5 +1163,140 @@ mod tests {
     #[test]
     fn ampersand_becomes_and() {
         assert_eq!(all_on("U&Yesterday"), "U and Yesterday");
+    }
+}
+
+#[cfg(test)]
+mod core_branch_tests {
+    use super::*;
+
+    /// Stream-Mapparr's normaliser: the shared core's body plus the designator repair.
+    fn stream_mapparr() -> Normalizer {
+        Normalizer::new(NormalizeFlags {
+            core_pipeline: true,
+            rejoin_designators: true,
+            ..NormalizeFlags::default()
+        })
+    }
+
+    fn all_on(name: &str) -> String {
+        stream_mapparr().normalize_name(name, &[])
+    }
+
+    /// Every expected value here is `matching_core.py`'s output for the same input
+    /// (plus the plugin's designator repair). The sweep checks this at scale; these pin
+    /// the load-bearing differences so a plain `cargo test` catches a regression.
+    #[test]
+    fn core_normalisation_differs_from_the_plugin_where_it_should() {
+        // Provider prefixes run BEFORE hyphens become spaces, so the hyphen is still a
+        // separator when `FR - ` is removed.
+        assert_eq!(all_on("FR - Canal+ FHD"), "Canal+");
+        // Trailing Network/Channel/TV go unconditionally (no two-token floor).
+        assert_eq!(all_on("Justice Network"), "Justice");
+        assert_eq!(all_on("True Crime Network"), "True Crime");
+        assert_eq!(all_on("West TV"), "");
+        assert_eq!(all_on("Slow TV"), "");
+        // `USA Network` loses `Network` here, and `US Open` loses the country word.
+        assert_eq!(all_on("US: USA Network HD"), "USA");
+        assert_eq!(all_on("US Open"), "Open");
+        // Ampersands are left alone (the plugin folds them to "and").
+        assert_eq!(all_on("U&Yesterday"), "U&Yesterday");
+        assert_eq!(all_on("A&E"), "A&E");
+        // Decorative Unicode categories become spaces; zero-width format characters go.
+        assert_eq!(all_on("★ CNN ★"), "CNN");
+        assert_eq!(all_on("◉ CNN"), "CNN");
+        assert_eq!(all_on("Channel \u{b2}"), "Channel");
+        assert_eq!(all_on("Ч\u{200b}\u{200b} CNN"), "Ч CNN");
+        // HDR/HEVC are quality tags in the core, and chained markers strip in passes.
+        assert_eq!(all_on("ESPN 4K HDR"), "ESPN");
+        assert_eq!(all_on("TNT UHD RAW"), "TNT RAW");
+        // A dot between word characters splits, and camel case still splits.
+        assert_eq!(all_on("JusticeCentral.TV"), "Justice Central");
+        assert_eq!(all_on("NewsNation"), "News Nation");
+        assert_eq!(all_on("getTV"), "getTV");
+        assert_eq!(all_on("BBC Three"), "BBC 3");
+    }
+
+    #[test]
+    fn core_quality_geographic_gating() {
+        // The core strips `[HD]` as a country tag even when quality tags are kept; the
+        // plugin skips that pattern in the same situation.
+        let keep_quality = Normalizer::new(NormalizeFlags {
+            core_pipeline: true,
+            ignore_quality: false,
+            ..NormalizeFlags::default()
+        });
+        assert_eq!(keep_quality.normalize_name("CNN [HD] USA", &[]), "CNN USA");
+        assert_eq!(keep_quality.normalize_name("HBO HD", &[]), "HBO HD");
+        let plugin = Normalizer::new(NormalizeFlags {
+            ignore_quality: false,
+            ..NormalizeFlags::default()
+        });
+        assert_eq!(plugin.normalize_name("CNN [HD] USA", &[]), "CNN [HD] USA");
+    }
+
+    #[test]
+    fn core_region_and_misc_gating() {
+        let keep_region = Normalizer::new(NormalizeFlags {
+            core_pipeline: true,
+            ignore_regional: false,
+            ..NormalizeFlags::default()
+        });
+        // `(W)` and bare East/West survive when regional tags are kept...
+        assert_eq!(keep_region.normalize_name("HBO (W)", &[]), "HBO (W)");
+        assert_eq!(
+            keep_region.normalize_name("BBC One West", &[]),
+            "BBC 1 West"
+        );
+        // ...and so does the misc catch-all, because the core gates it on BOTH flags.
+        let keep_misc = Normalizer::new(NormalizeFlags {
+            core_pipeline: true,
+            ignore_misc: false,
+            ..NormalizeFlags::default()
+        });
+        assert_eq!(
+            keep_misc.normalize_name("Big Ten Network (Southern California) Alternate", &[]),
+            "Big 10 Network (Southern California) Alternate"
+        );
+        assert_eq!(
+            keep_misc.normalize_name("Penthouse (TEN) On Demand", &[]),
+            "Penthouse On Demand"
+        );
+    }
+
+    #[test]
+    fn designator_repair_only_undoes_a_split_the_raw_name_had() {
+        assert_eq!(all_on("Sky Sports F1 UHD"), "Sky Sports F1");
+        // The manufactured bare `1` is what used to make the sibling look matchable.
+        assert_eq!(all_on("Sky Sports UHD 1"), "Sky Sports 1");
+        // Nothing the source wrote apart is joined.
+        assert_eq!(all_on("High Street TV 1"), "High Street TV 1");
+        assert_eq!(all_on("That's 60s"), "That's 60 s");
+        assert_eq!(all_on("at 49ers"), "at 49 ers");
+        // Without the flag the core's split stands.
+        let no_repair = Normalizer::new(NormalizeFlags {
+            core_pipeline: true,
+            ..NormalizeFlags::default()
+        });
+        assert_eq!(
+            no_repair.normalize_name("Sky Sports F1 UHD", &[]),
+            "Sky Sports F 1"
+        );
+        // The repair is driven by the RAW name: `F1` there is what licenses joining the
+        // normalized `F 1`. Writing `F 1` apart in the source changes nothing by itself.
+        assert_eq!(all_on("Sky Sports F 1"), "Sky Sports F 1");
+    }
+
+    #[test]
+    fn cinemax_is_an_opt_in() {
+        assert_eq!(all_on("Cinemax Action"), "Cinemax Action");
+        let cinemax = Normalizer::new(NormalizeFlags {
+            core_pipeline: true,
+            rejoin_designators: true,
+            remove_cinemax: true,
+            ..NormalizeFlags::default()
+        });
+        assert_eq!(cinemax.normalize_name("Cinemax Action", &[]), "Action");
+        assert_eq!(cinemax.normalize_name("Cinemax", &[]), "");
     }
 }

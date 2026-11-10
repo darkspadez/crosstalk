@@ -4,8 +4,11 @@
 > was called `janitor` then, and some options have since moved (`[scope]` and `[exports]` to
 > `crosstalk.toml`); the names and the config split below are the current ones. **The current
 > plan — four sub-apps (guide, streams, lineup, events), what merges where and what is not
-> ported — is [`plans/plugin-consolidation.md`](plans/plugin-consolidation.md).** This file is
-> the history of how `guide` was built, not the roadmap.
+> ported — is [`plans/plugin-consolidation.md`](plans/plugin-consolidation.md), and the phase
+> that built the second one, `streams`, is
+> [`plans/phase-2-streams.md`](plans/phase-2-streams.md).** This file is the history of how
+> `guide` was built, not the roadmap: `guide` shipped in the five phases below, and `streams`
+> shipped in phase 2 of the consolidation plan.
 
 ## Context
 

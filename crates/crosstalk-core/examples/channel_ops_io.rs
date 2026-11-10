@@ -8,10 +8,16 @@
 //!
 //! ```json
 //! {
-//!   "world": {"channels": [...], "groups": [...], "profiles": [...], "entries": [...]},
+//!   "world": {"channels": [...], "groups": [...], "profiles": [...], "entries": [...],
+//!             "streams": [...]},
 //!   "cases": [{"name": "clear_groups", "selection": {...}, "ops": [{"op": "clear_epg"}]}]
 //! }
 //! ```
+//!
+//! A per-channel operation is `{"op": "set", "field": "<field>", "values": {"<channel id>":
+//! <value>}}`, and its values take the field's own shape: `{"name": "…"}`, `{"group": 20}`,
+//! `{"group": null}`, `{"epg": 31}`, `{"flag": true}`, `{"streams": [30, 20]}`. A move to
+//! "No Group" is `{"op": "move_group", "group_id": null}`.
 //!
 //! Output, one line per case, in input order:
 //!
@@ -26,7 +32,7 @@
 //! harness checks that a Python-only pattern is rejected rather than matched differently.
 
 use crosstalk_core::channel_ops::{self, Op, Plan, PlanOptions, Selection};
-use crosstalk_core::dispatcharr::{Channel, ChannelGroup, ChannelProfile, EpgEntry, World};
+use crosstalk_core::dispatcharr::{Channel, ChannelGroup, ChannelProfile, EpgEntry, Stream, World};
 use serde::Deserialize;
 use std::io::{Read, Write};
 
@@ -37,6 +43,8 @@ struct Fixture {
     groups: Vec<ChannelGroup>,
     profiles: Vec<ChannelProfile>,
     entries: Vec<EpgEntry>,
+    /// Only for the names a stream list prints; the lists themselves come with the channels.
+    streams: Vec<Stream>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -80,6 +88,7 @@ fn main() {
         groups: document.world.groups,
         profiles: document.world.profiles,
         entries: document.world.entries,
+        streams: document.world.streams,
         ..World::default()
     };
 

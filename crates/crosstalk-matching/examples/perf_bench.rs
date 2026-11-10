@@ -142,8 +142,14 @@ fn main() {
     }
     let build_names: Vec<String> = build_names.into_iter().take(20000).collect();
     let known = Arc::new(KnownCallsigns::shipped().cloned().unwrap_or_default());
+    let matcher = Matcher::new(
+        NormalizeFlags::default(),
+        AliasMap::builtin(),
+        Arc::clone(&known),
+        Default::default(),
+    );
     let start = Instant::now();
-    let index = CandidateIndex::build(&build_names, &normalizer, &known);
+    let index = CandidateIndex::build(&build_names, &matcher);
     let elapsed = start.elapsed();
     println!(
         "    {:<42} {:>10.3} ms total ({:.0} names/s)",
@@ -172,13 +178,7 @@ fn main() {
         candidates
     };
     let queries: Vec<String> = names.iter().take(200).map(|n| format!("{n} HD")).collect();
-    let cand_index = CandidateIndex::build(&candidates, &normalizer, &known);
-    let matcher = Matcher::new(
-        NormalizeFlags::default(),
-        AliasMap::builtin(),
-        Arc::clone(&known),
-        Default::default(),
-    );
+    let cand_index = CandidateIndex::build(&candidates, &matcher);
     let pairs = queries.len() as u64 * candidates.len() as u64;
     // One warmup iteration before timing the hard path, so the measured run does
     // not include first-touch allocation and thread-pool spin-up.

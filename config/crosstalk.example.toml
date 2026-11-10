@@ -142,7 +142,42 @@ run_history_days = 15
 # Schedules, as `<app>.<action>` with a cron expression. Five fields (minute hour day month
 # weekday) is what most people write, and six (with seconds) is accepted. They fire in UTC.
 # [schedules]
+# A plain expression is a run with no deadline. A table adds a window: the run stops at the
+# window's end, is recorded "paused", and the next firing resumes from its checkpoint.
+#   "streams.probe" = { cron = "0 23 * * *", window = "4h" }
+#   "streams.probe_weekend" = { cron = "0 22 * * 5", until = "06:00", timezone = "America/New_York" }
 # "guide.watchdog_apply" = "0 */6 * * *"
 # "guide.scan" = "30 */6 * * *"
 # "guide.match_apply" = "0 4 * * *"
 # "guide.heal_apply" = "0 6 * * *"
+
+# Named workflows: a sequence of `<app>.<action>` steps the host runs in order, each as an
+# ordinary run of its own (own run page, own CSV, own checkpoint), plus one run record for the
+# workflow itself that links them. It stops at the first step that fails or is cancelled; a step
+# that pauses at its window's end pauses the workflow, and the next firing resumes that step.
+# Schedule one as "workflow.<name>", like an action.
+# [workflows.nightly]
+# steps = ["streams.probe", "streams.sort_apply"]
+# A new pass discards each step's saved progress. Off by default, which resumes instead: what
+# an operator turns on after widening the scope.
+# fresh = false
+
+# Dispatcharr Connect events, and what they trigger. A target is an `<app>.<action>` or a
+# `workflow.<name>`; the event names are whatever you subscribe to in Dispatcharr
+# (m3u_refresh, epg_refresh, m3u_error, …), so unknown names are allowed.
+#
+# Setup, in Dispatcharr: Settings → Connect → Add Connection, type Webhook, URL
+# `http://<crosstalk host>:8730/hooks/dispatcharr` (crosstalk's own `server.port`, which
+# defaults to 8730 — not Dispatcharr's port), header `Authorization: Bearer <server.token>`
+# (and `Content-Type: application/json` if you use a payload template), then subscribe the
+# events below. Dispatcharr's own payload carries no event name, so either add `?event=<name>`
+# to the URL or give the subscription a payload template like {"event": "m3u_refresh"}.
+#
+# A burst of the same event (several M3U accounts refreshing together) restarts the debounce
+# timer and results in ONE run after the burst settles. If the target is busy, one follow-up run
+# is queued for when it frees.
+# [hooks]
+# debounce_secs = 60
+# rate_per_minute = 60
+# m3u_refresh = ["streams.match_apply"]
+# epg_refresh = ["workflow.nightly"]

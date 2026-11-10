@@ -11,25 +11,35 @@ pub mod channel_ops;
 pub mod config;
 pub mod csv_report;
 pub mod dispatcharr;
+pub mod hooks;
 pub mod jobs;
+pub mod limiter;
 pub mod match_run;
 pub mod runner;
 pub mod scheduler;
 pub mod scope;
+pub mod status;
 pub mod store;
 pub mod subapp;
+pub mod target;
 pub mod wildcard;
+pub mod window;
+pub mod workflow;
 
 #[cfg(test)]
 mod test_app;
 
 pub use ai::{AiService, Answer, Decider, DecisionRequest, DecisionResponse, Question, Verdict};
 pub use channel_ops::{
-    apply, plan, plan_with_options, run_rows, write_ops_report, ApplyReport, Change, Field, Op,
-    OpKind, Plan, PlanOptions, RenameKind, ReportSpec, RowStatus, SelectedChannel, Selection, Skip,
-    Value,
+    apply, apply_with_writer, parse_stream_ids, plan, plan_with_options, rows_for_field, run_rows,
+    write_ops_report, ApplyReport, Change, Field, ListedStream, Op, OpKind, Plan, PlanOptions,
+    RenameKind, ReportSpec, RestStreamListWriter, RowStatus, SelectedChannel, Selection, SetValue,
+    Skip, StreamListWriter, Value,
 };
-pub use config::{ConfigReport, CrosstalkConfig, SharedConfig};
+pub use config::{
+    ConfigReport, CrosstalkConfig, HooksConfig, ScheduleEntry, ScheduleTable, SharedConfig,
+    WorkflowConfig,
+};
 pub use csv_report::{
     app_exports, clear_app_exports, clear_exports, exports_to_clear, exports_to_delete,
     grace_doomed, is_our_export, owning_prefix, preamble, prune_exports, report_path, safe_cell,
@@ -37,19 +47,23 @@ pub use csv_report::{
 };
 pub use dispatcharr::{
     Channel, ChannelCreate, ChannelEdit, ChannelGroup, ChannelProfile, ChannelRegexRename,
-    DispatcharrClient, EpgEntry, EpgHorizon, EpgRefresh, EpgSource, EpgSourceEdit, EpgSourceState,
-    HasPrograms, Logo, M3uAccount, PluginActionInfo, PluginInfo, ProgramWindow, QueuedTask, Set,
-    Stream, StreamsToChannels, World, WorldKind, WorldKinds,
+    CurrentProgram, DispatcharrClient, EpgEntry, EpgHorizon, EpgRefresh, EpgSource, EpgSourceEdit,
+    EpgSourceState, HasPrograms, Logo, M3uAccount, PluginActionInfo, PluginInfo, ProgramWindow,
+    QueuedTask, Set, Stream, StreamsToChannels, World, WorldKind, WorldKinds,
 };
+pub use hooks::Hooks;
 pub use jobs::{JobContext, ProgressEvent, ProgressSink};
-pub use runner::{ActiveRun, JobRunner, StartedRun};
+pub use limiter::{Limiter, LimiterConfig, Permit};
+pub use runner::{ActiveRun, JobRunner, RunOptions, StartedRun, WorkflowSlot};
 pub use scheduler::{ScheduleInfo, Scheduler};
-pub use store::{AiDecision, RunRecord, RunRow, RunStatus, Store};
+pub use store::{AiDecision, RunRecord, RunRow, RunStatus, Store, Subject};
 pub use subapp::{
-    ActionKind, ActionSpec, FieldKind, FieldSpec, FieldValue, JobOutcome, OutcomeBuilder, Registry,
-    SettingsSchema, SettingsValues, SubApp,
+    ActionKind, ActionSpec, FieldKind, FieldSpec, FieldValue, JobOutcome, OutcomeBuilder,
+    OutcomeStatus, Registry, SettingsSchema, SettingsValues, SubApp,
 };
+pub use target::Target;
 pub use wildcard::{expand_patterns, parse_tokens};
+pub use window::{End as WindowEnd, Window};
 
 pub const HOST_NAME: &str = "crosstalk";
 pub const HOST_VERSION: &str = env!("CARGO_PKG_VERSION");

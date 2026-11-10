@@ -91,6 +91,8 @@ code { font-family: var(--mono); font-size: 0.88em; background: #0e1219;
 .status-failed { color: #ff8b84; }
 .status-running { color: var(--accent); }
 .status-cancelled { color: var(--muted); }
+/* Paused is neither a failure nor a finished job: work is saved and continues next window. */
+.status-paused { color: #f0c68a; }
 .status-matched, .status-healed, .status-ok { color: #6fd7a8; }
 .status-no_match, .status-no_replacement_found, .status-skipped, .status-planned {
   color: var(--muted);
