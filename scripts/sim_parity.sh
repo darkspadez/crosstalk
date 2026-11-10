@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Parity oracle: `crosstalk simulate` versus the Python plugin's tools/match_sim.py.
+# Parity oracle: `crosstalk simulate-streams` versus the Python plugin's tools/match_sim.py.
 #
 # Builds a channels CSV and a provider M3U from the shipped channel databases, runs both
 # simulators over the same inputs, and compares the report files byte for byte. Any
-# difference is a port bug, so this is the gate before the janitor sub-app is wired up.
+# difference is a port bug, so this is the gate before the guide sub-app is wired up.
 #
 # Several configurations are compared, not just the defaults: the default flags, a
 # --no-ignore-quality run, a --custom-aliases run, and a --countries US run. The stream
@@ -83,7 +83,7 @@ if quick:
     names = names[:1200]
 
 with open(os.path.join(work, "channels.csv"), "w", newline="", encoding="utf-8") as fh:
-    fh.write("# EPG Janitor - parity fixture\n")
+    fh.write("# crosstalk guide - parity fixture\n")
     writer = csv.writer(fh)
     writer.writerow(["channel_id", "channel_name", "channel_number", "channel_group"])
     for index, name in enumerate(names):
@@ -144,7 +144,7 @@ compare_case() {
     --threshold 80 \
     --out "$WORK/py-$label" "$@" >/dev/null
 
-  "$REPO/target/release/crosstalk" simulate \
+  "$REPO/target/release/crosstalk" simulate-streams \
     --channels "$WORK/channels.csv" \
     --streams "$WORK/streams.m3u" \
     --threshold 80 \

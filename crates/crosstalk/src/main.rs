@@ -1,10 +1,11 @@
-//! crosstalk: the host daemon for Dispatcharr tools, with `janitor` as its first sub-app.
+//! crosstalk: the host daemon for Dispatcharr tools, with `guide` as its first sub-app.
 //!
 //! Subcommands:
 //!   * `serve`   — run the daemon (REST API, scheduler, web UI)
 //!   * `run`     — run one sub-app action once, without the daemon
 //!   * `validate` — check configuration against Dispatcharr
-//!   * `simulate` — offline stream-to-channel match simulation (the parity oracle)
+//!   * `exports clear` — delete the CSV reports the sub-apps wrote
+//!   * `simulate-streams` — offline stream-to-channel match simulation (the parity oracle)
 
 mod registry;
 mod simulate;
@@ -12,7 +13,6 @@ mod simulate;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use crosstalk_core::config::{CrosstalkConfig, SharedConfig};
-use crosstalk_core::jobs::JobContext;
 use crosstalk_core::runner::JobRunner;
 use crosstalk_core::store::Store;
 use std::path::PathBuf;
@@ -38,8 +38,11 @@ enum Command {
     Run(RunArgs),
     /// Validate the configuration files and each sub-app's settings.
     Validate(ConfigArgs),
+    /// Manage the CSV reports the sub-apps write.
+    Exports(ExportsArgs),
     /// Offline stream-to-channel match simulation.
-    Simulate(SimulateArgs),
+    #[command(name = "simulate-streams")]
+    SimulateStreams(SimulateArgs),
 }
 
 #[derive(Args, Debug)]
@@ -51,9 +54,9 @@ struct ServeArgs {
 
 #[derive(Args, Debug)]
 struct RunArgs {
-    /// Sub-app id, for example `janitor`.
+    /// Sub-app id, for example `guide`.
     app: String,
-    /// Action id, for example `automatch`.
+    /// Action id, for example `match_apply`.
     action: String,
     /// Directory holding the configuration files.
     #[arg(long, default_value = "config", env = "CROSSTALK_CONFIG_DIR")]
@@ -73,8 +76,33 @@ struct ConfigArgs {
 }
 
 #[derive(Args, Debug)]
+struct ExportsArgs {
+    #[command(subcommand)]
+    command: ExportsCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum ExportsCommand {
+    /// Delete the CSV reports the sub-apps wrote. Other files in the directory are untouched.
+    Clear(ExportsClearArgs),
+}
+
+#[derive(Args, Debug)]
+struct ExportsClearArgs {
+    /// Directory holding the configuration files; the exports directory comes from it.
+    #[arg(long, default_value = "config", env = "CROSSTALK_CONFIG_DIR")]
+    config: PathBuf,
+    /// Only this sub-app's reports, for example `guide`. Default: every sub-app's.
+    #[arg(long)]
+    app: Option<String>,
+    /// Confirm the deletion. Without it, the command lists what it would delete and stops.
+    #[arg(long, short = 'y')]
+    yes: bool,
+}
+
+#[derive(Args, Debug)]
 struct SimulateArgs {
-    /// Channels CSV, for example a Janitor export.
+    /// Channels CSV, for example a guide export.
     #[arg(long)]
     channels: PathBuf,
     /// Provider M3U.
@@ -123,7 +151,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Simulate(args) => {
+        Command::SimulateStreams(args) => {
             let tags = [
                 !args.no_ignore_quality,
                 !args.no_ignore_regional,
@@ -158,6 +186,9 @@ fn main() -> Result<()> {
         Command::Serve(args) => serve(args),
         Command::Run(args) => run_once(args),
         Command::Validate(args) => validate(args),
+        Command::Exports(args) => match args.command {
+            ExportsCommand::Clear(args) => clear_exports(args),
+        },
     }
 }
 
@@ -266,7 +297,7 @@ async fn wait_for_drain(runner: &JobRunner, timeout: std::time::Duration) {
 fn install_logging() {
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_env("RUST_LOG").unwrap_or_else(|_| {
-        EnvFilter::new("info,crosstalk_core=info,crosstalk_web=info,janitor=info")
+        EnvFilter::new("info,crosstalk_core=info,crosstalk_web=info,crosstalk_guide=info")
     });
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -302,7 +333,7 @@ async fn shutdown_signal() {
 fn run_once(args: RunArgs) -> Result<()> {
     let registry = registry::builtin();
     let config = CrosstalkConfig::load(&args.config)?;
-    let (app, action) = registry
+    let (_, action) = registry
         .find_action(&args.app, &args.action)
         .with_context(|| {
             format!(
@@ -345,16 +376,33 @@ fn run_once(args: RunArgs) -> Result<()> {
         );
     }
 
-    // Only connect when the action needs Dispatcharr, so `validate` still works on a host
-    // that cannot reach it yet.
-    let context = JobContext::headless(config);
-    let context = if action.needs_dispatcharr {
-        context.connect()?
-    } else {
-        context
-    };
+    // Only the action's own id and dry-run flag matter from here; the run is recorded, so a
+    // one-shot run shows up in the history and — for `scan` — leaves the result set the cleanup
+    // actions select from. Without a store, `crosstalk run guide scan` followed by
+    // `crosstalk run guide clear_missing_apply --yes` could never work.
+    //
+    // `open_shared`, never `open`: this is a second process on the daemon's file, and a plain
+    // open would retire the daemon's live `running` rows out from under it. The store is
+    // shared (WAL + busy_timeout), but the one-run-per-app guard is per process, so a live
+    // row for this app here means the daemon (or another CLI) is mid-run: refuse rather
+    // than run the same app twice. The reserve below enforces the same rule atomically for
+    // the race this check cannot see.
+    let store = Store::open_shared(config.data_dir().join("crosstalk.db"))?;
+    let live = store.running_runs(&args.app)?;
+    if let Some(current) = live.first() {
+        anyhow::bail!(
+            "{} already has {} #{} in progress (started {}); wait for it to finish or cancel \
+             it. If no daemon is running, this row is stale from a crash and clears when the \
+             daemon next starts.",
+            args.app,
+            current.action,
+            current.id,
+            current.started_at,
+        );
+    }
+    let runner = JobRunner::new(registry, SharedConfig::new(config), store);
     let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
-    let outcome = runtime.block_on(app.run(action.id, &context, args.dry_run))?;
+    let outcome = runtime.block_on(runner.run_to_completion(&args.app, action.id, args.dry_run))?;
 
     println!("{}", outcome.summary);
     for (key, value) in &outcome.counts {
@@ -367,12 +415,91 @@ fn run_once(args: RunArgs) -> Result<()> {
 }
 
 /// The preview action that stands in for an apply action.
+///
+/// Every writing action is a `<verb>_preview` / `<verb>_apply` pair, so `--dry-run` on an apply
+/// is redirected to its preview rather than trusting the apply to honour the flag.
 fn preview_counterpart(action: &str) -> Option<&'static str> {
     match action {
-        "automatch_apply" => Some("automatch_preview"),
+        "match_apply" => Some("match_preview"),
         "heal_apply" => Some("heal_preview"),
+        "tag_missing_apply" => Some("tag_missing_preview"),
+        "clear_missing_apply" => Some("clear_missing_preview"),
+        "clear_hidden_apply" => Some("clear_hidden_preview"),
+        "clear_by_regex_apply" => Some("clear_by_regex_preview"),
+        "clear_groups_apply" => Some("clear_groups_preview"),
+        "watchdog_apply" => Some("watchdog_preview"),
         _ => None,
     }
+}
+
+/// `exports clear`: the host feature that replaced each plugin's `clear_csv_exports`.
+///
+/// Only the registered sub-apps' own files are considered (by their export prefix), so a
+/// directory shared with the plugins loses nothing that is not ours. Reports written in the
+/// last couple of minutes are kept: a daemon run may be holding one, and this command cannot
+/// ask the daemon — opening the run store would retire its in-flight runs.
+fn clear_exports(args: ExportsClearArgs) -> Result<()> {
+    let config = CrosstalkConfig::load(&args.config)?;
+    let registry = registry::builtin();
+    let all_prefixes: Vec<String> = registry.iter().map(|app| app.export_prefix()).collect();
+    // The single-app filter is ownership against the whole registry, not a lone prefix
+    // match: a nested id's files (a future `guide_extra_*` alongside `guide_*`) start with
+    // both prefixes, and belong to the longest match.
+    let wanted: Option<String> = match &args.app {
+        Some(id) => {
+            let app = registry.get(id).with_context(|| {
+                format!(
+                    "no sub-app {id:?}; known apps: {}",
+                    registry
+                        .iter()
+                        .map(|app| app.id())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
+            Some(app.export_prefix())
+        }
+        None => None,
+    };
+
+    let directory = config.exports_dir();
+    println!("exports: {}", directory.display());
+    if !args.yes {
+        // A one-shot command has no dialog to confirm in, so the flag stands in for it.
+        let listed = crosstalk_core::csv_report::app_exports(&directory, &all_prefixes);
+        let count = match &wanted {
+            Some(prefix) => listed
+                .iter()
+                .filter(|file| {
+                    crosstalk_core::csv_report::owning_prefix(&file.name, &all_prefixes)
+                        == Some(prefix.as_str())
+                })
+                .count(),
+            None => listed.len(),
+        };
+        anyhow::bail!(
+            "refusing to delete {count} report file(s) without --yes. Add --yes to proceed."
+        );
+    }
+
+    let summary = match &wanted {
+        Some(prefix) => {
+            crosstalk_core::csv_report::clear_app_exports(&directory, &all_prefixes, prefix)
+        }
+        None => crosstalk_core::csv_report::clear_exports(&directory, &all_prefixes),
+    };
+    println!("deleted: {}", summary.deleted);
+    if summary.kept_recent > 0 {
+        println!(
+            "kept: {} written in the last {} minutes, in case a run is still using them",
+            summary.kept_recent,
+            crosstalk_core::csv_report::CLEAR_GRACE.as_secs() / 60
+        );
+    }
+    if summary.failed > 0 {
+        println!("failed: {} (the log says why)", summary.failed);
+    }
+    Ok(())
 }
 
 fn validate(args: ConfigArgs) -> Result<()> {
@@ -401,6 +528,17 @@ fn validate(args: ConfigArgs) -> Result<()> {
         config.matching.ignore_misc_tags
     );
     println!("threads: {}", config.jobs.resolved_worker_threads());
+    // The shared scope and export settings: they decide which channels a run may touch and
+    // how much history it leaves behind, so `validate` should show them without opening the
+    // file.
+    println!(
+        "scope: profiles [{}], groups [{}], ignore groups [{}]",
+        config.scope.profiles, config.scope.groups, config.scope.ignore_groups
+    );
+    println!(
+        "exports: kept {} day(s), 0 means every report",
+        config.exports.retention_days
+    );
 
     for warning in &report.warnings {
         println!("warning: {warning}");
@@ -462,6 +600,209 @@ mod shutdown_tests {
         let runner = idle_runner();
         runner.shutdown();
         wait_for_drain(&runner, std::time::Duration::from_secs(5)).await;
-        assert!(runner.start("janitor", "automatch_preview", true).is_err());
+        assert!(runner.start("guide", "match_preview", true).is_err());
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(args).expect("the command line parses")
+    }
+
+    fn clear_args(args: &[&str]) -> ExportsClearArgs {
+        match parse(args).command {
+            Command::Exports(ExportsArgs {
+                command: ExportsCommand::Clear(args),
+            }) => args,
+            other => panic!("expected an exports clear command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exports_clear_takes_a_config_dir_an_app_and_yes() {
+        let args = clear_args(&[
+            "crosstalk",
+            "exports",
+            "clear",
+            "--config",
+            "/etc/crosstalk",
+        ]);
+        assert_eq!(args.config, Path::new("/etc/crosstalk"));
+        assert_eq!(args.app, None);
+        assert!(!args.yes, "a deletion is never the default");
+
+        let args = clear_args(&[
+            "crosstalk",
+            "exports",
+            "clear",
+            "--config",
+            "/etc/crosstalk",
+            "--app",
+            "guide",
+            "--yes",
+        ]);
+        assert_eq!(args.app.as_deref(), Some("guide"));
+        assert!(args.yes);
+    }
+
+    #[test]
+    fn exports_clear_defaults_to_the_same_config_dir_as_run() {
+        // `run` and `serve` default to `config` and honour the environment; a destructive
+        // command that pointed somewhere else would be a trap.
+        let args = clear_args(&["crosstalk", "exports", "clear"]);
+        assert_eq!(args.config, Path::new("config"));
+    }
+
+    #[test]
+    fn exports_clear_needs_the_clear_subcommand() {
+        assert!(Cli::try_parse_from(["crosstalk", "exports"]).is_err());
+        assert!(Cli::try_parse_from(["crosstalk", "exports", "nope"]).is_err());
+    }
+
+    /// A config directory with an exports subdirectory holding a backdated report.
+    fn config_dir_with_exports() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let exports = dir.path().join("exports");
+        std::fs::create_dir_all(&exports).expect("exports");
+        let report = exports.join("guide_match_preview_20250101_000000_000.csv");
+        std::fs::write(&report, "x").expect("write");
+        let file = std::fs::File::options()
+            .write(true)
+            .open(&report)
+            .expect("open for time");
+        file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(86_400))
+            .expect("set mtime");
+        (dir, report)
+    }
+
+    #[test]
+    fn clearing_without_yes_refuses_and_deletes_nothing() {
+        let (dir, report) = config_dir_with_exports();
+        let error = clear_exports(ExportsClearArgs {
+            config: dir.path().to_path_buf(),
+            app: None,
+            yes: false,
+        })
+        .expect_err("refuses");
+        assert!(format!("{error}").contains("--yes"), "{error:#}");
+        assert!(report.exists(), "nothing was deleted");
+    }
+
+    #[test]
+    fn clearing_with_yes_deletes_only_the_registered_apps_reports() {
+        let (dir, report) = config_dir_with_exports();
+        let exports = dir.path().join("exports");
+        let foreign = exports.join("lineuparr_export.csv");
+        std::fs::write(&foreign, "x").expect("write");
+
+        clear_exports(ExportsClearArgs {
+            config: dir.path().to_path_buf(),
+            app: Some("guide".to_string()),
+            yes: true,
+        })
+        .expect("clears");
+
+        assert!(!report.exists(), "the guide's own report is deleted");
+        assert!(foreign.exists(), "another program's file is untouched");
+    }
+
+    #[test]
+    fn clearing_names_an_unknown_app() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let error = clear_exports(ExportsClearArgs {
+            config: dir.path().to_path_buf(),
+            app: Some("nope".to_string()),
+            yes: true,
+        })
+        .expect_err("fails");
+        assert!(
+            format!("{error}").contains("known apps: guide"),
+            "{error:#}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_apply_action_has_its_preview_counterpart() {
+        // The naming rule every sub-app follows: an action that writes is `<verb>_preview` /
+        // `<verb>_apply`. `--dry-run` on an apply is redirected through this map, so a pair the
+        // map does not know would silently run the apply and ignore the flag.
+        for app in registry::builtin().iter() {
+            let ids: Vec<&str> = app.actions().iter().map(|action| action.id).collect();
+            for id in ids.iter().copied() {
+                let Some(verb) = id.strip_suffix("_apply") else {
+                    continue;
+                };
+                let expected = format!("{verb}_preview");
+                let found = preview_counterpart(id)
+                    .unwrap_or_else(|| panic!("{id} has no preview counterpart"));
+                assert_eq!(found, expected);
+                assert!(
+                    ids.contains(&found),
+                    "{found} is not an action of {}",
+                    app.id()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_scheduled_cleanup_apply_is_a_real_run_and_a_scheduled_scan_is_a_read() {
+        // The scheduler derives the dry-run flag from the action's kind, so a cleanup apply is
+        // armed as a write and the scan as a read. Nothing else has to list the new actions.
+        let runner = JobRunner::new(
+            registry::builtin(),
+            SharedConfig::new(CrosstalkConfig::default()),
+            Store::in_memory().expect("store"),
+        );
+        for action in [
+            "tag_missing_apply",
+            "clear_missing_apply",
+            "clear_hidden_apply",
+            "clear_by_regex_apply",
+            "clear_groups_apply",
+            "watchdog_apply",
+            "match_apply",
+            "heal_apply",
+        ] {
+            assert!(
+                !runner.scheduled_dry_run("guide", action),
+                "{action} must be armed as a write"
+            );
+        }
+        for action in [
+            "scan",
+            "tag_missing_preview",
+            "clear_missing_preview",
+            "clear_hidden_preview",
+            "clear_by_regex_preview",
+            "clear_groups_preview",
+            "watchdog_preview",
+        ] {
+            assert!(
+                runner.scheduled_dry_run("guide", action),
+                "{action} must be armed as a read"
+            );
+        }
+    }
+
+    #[test]
+    fn a_preview_is_not_redirected_anywhere() {
+        // Only the writing half of a pair redirects; a preview is already a read.
+        for app in registry::builtin().iter() {
+            for action in app.actions() {
+                if action.id.ends_with("_preview") {
+                    assert!(preview_counterpart(action.id).is_none(), "{}", action.id);
+                }
+            }
+        }
     }
 }

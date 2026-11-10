@@ -11,7 +11,7 @@ __pycache__/
 
 # Local config with credentials
 /config/crosstalk.toml
-/config/janitor.toml
+/config/guide.toml
 /config/*.toml
 !/config/*.example.toml
 

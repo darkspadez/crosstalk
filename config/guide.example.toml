@@ -1,0 +1,84 @@
+# Guide settings.
+#
+# This file holds what the guide app decides for itself: which EPG sources are in scope, the
+# confidence thresholds, and the heal fallback list. Anything shared with the other sub-apps
+# -- the channel scope (profiles, groups, ignored groups), the CSV retention and the AI
+# matching policy -- lives in crosstalk.toml under [scope], [exports] and [ai.verify].
+#
+# The daemon writes back to this file when a setting is changed in the web UI, preserving
+# comments. The matcher's own defaults are the Python plugin's.
+
+# Comma-separated EPG source names to draw candidates from, a filter rather than a priority
+# list. Supports * and ? wildcards. Priority comes from each source's Dispatcharr priority,
+# and disabled sources are skipped. Empty makes every active source eligible, foreign
+# guides included, and the matcher has no country awareness: scope this to your region.
+epg_sources_to_match = ""
+# How far ahead programme data must exist for a match to count.
+check_hours = 12
+
+# 0-100. Matches below this are rejected. 95 is strict; lower values accept more matches at
+# higher false-positive risk.
+match_confidence_threshold = 95
+# Accept an EPG entry with no current schedule. Usually off, but needed for the first
+# auto-match against a freshly added source: Dispatcharr only imports programmes for
+# channels already mapped, so a new source starts empty.
+allow_epg_without_programs = false
+
+# Sources heal may pick replacements from. Empty means the channel's current source only.
+heal_fallback_sources = ""
+heal_confidence_threshold = 95
+
+# --- Cleanup & Maintenance -------------------------------------------------------------
+#
+# `scan` stores its result set in the run history; the cleanup actions select from the last
+# finished scan. They re-read every channel's current name and guide before writing, so a
+# stale scan can only be out of date, never unsafe: nothing is tagged twice and a guide that
+# was reassigned since is left alone. There is no age limit for that reason.
+
+# A regex matched against the assigned guide's NAME (not the channel's), case-sensitively and
+# unanchored, for `clear_by_regex_preview` / `clear_by_regex_apply`. Empty means the action
+# refuses to run. Python's `re` and Rust's `regex` differ: backreferences and lookaround are
+# refused with an explanation rather than silently matching something else.
+epg_regex_to_remove = ""
+# Appended verbatim to the name of every channel the scan found without programme data. The
+# leading space is part of the value: without it the name reads "ESPN[BadEPG]". Empty means
+# `tag_missing_*` refuses to run, as in the plugin.
+bad_epg_suffix = " [BadEPG]"
+# Also unassign the guide in the same pass. A channel that already carries the suffix is
+# skipped entirely, so with this on it also keeps its guide.
+remove_epg_with_suffix = false
+
+# `clear_groups_*` and `clear_hidden_*` take their channel set from [scope] in crosstalk.toml:
+# `groups` (clear_groups refuses to run when it is empty, which the plugin treated as "every
+# channel") and `profiles` (clear_hidden needs the profiles whose disabled channels it clears).
+
+# --- EPG Freshness Watchdog -------------------------------------------------------------
+#
+# Dispatcharr's own EPG refresh has no retry and no freshness awareness, so a source that
+# fails, or whose guide simply runs out, stays broken until somebody notices. The watchdog
+# audits every active source that has channels mapped to it and refreshes the ones that are
+# errored or about to run dry, then re-reads them and records whether that helped. It never
+# touches a channel.
+#
+# `watchdog_preview` reports what would be refreshed; `watchdog_apply` refreshes. There is no
+# on/off switch and no interval: arm it with a schedule in crosstalk.toml instead, e.g.
+#   [schedules]
+#   "guide.watchdog_apply" = "0 */6 * * *"
+# A schedule naming the preview half stays a preview. Use an administrator's API key: with a
+# lesser key the programme search only returns rows on guide data a reachable channel is
+# mapped to, so sources read short or empty (and refresh POSTs answer 403).
+
+# A source whose newest programme ends within this many hours is refreshed now. At least 1:
+# 0 would make every guide stale. The outcome of a refresh is judged by RELATIVE improvement
+# (the error cleared, or the horizon moved forward), so a feed that legitimately ends sooner
+# than this is not reported "still broken" for ever.
+watchdog_horizon_threshold_hours = 12
+# How long to wait for a queued refresh to move a source. A large XMLTV fetch and parse takes
+# minutes; the waits are sequential, one source at a time, so Dispatcharr's Celery worker is
+# never asked to fetch several guides at once. 0 requests the refresh and does not wait.
+watchdog_refresh_timeout_minutes = 10
+# Comma-separated EPGSource ids the watchdog must never touch, e.g. "39, 21".
+watchdog_exclude_source_ids = ""
+# Log every recovery. A failure is always logged, and every source gets a row in the report
+# either way. (The plugin wrote a Dispatcharr System Event here; crosstalk has none.)
+watchdog_log_on_recovery = true

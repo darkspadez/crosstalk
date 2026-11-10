@@ -30,6 +30,9 @@ RUN addgroup -g "${PGID}" -S crosstalk \
 
 COPY --from=builder /src/target/release/crosstalk /usr/local/bin/crosstalk
 
+# The licence and the notices for the ported plugin travel with the image, as MIT requires.
+COPY LICENSE THIRD_PARTY_NOTICES.md /usr/share/doc/crosstalk/
+
 VOLUME ["/config"]
 WORKDIR /config
 USER crosstalk

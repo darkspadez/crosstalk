@@ -315,7 +315,7 @@ mod tests {
     fn paced_reporter_limits_updates_but_always_reports_the_end() {
         let sink = Arc::new(VecSink::new());
         let context = JobContext::new(Arc::new(CrosstalkConfig::default()), sink.clone());
-        let mut paced = context.paced("janitor.automatch", 100, Duration::from_secs(60));
+        let mut paced = context.paced("guide.match", 100, Duration::from_secs(60));
         for index in 0..10 {
             paced.set(index, "working");
         }

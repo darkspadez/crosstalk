@@ -220,6 +220,26 @@ impl Default for NormalizeFlags {
     }
 }
 
+impl NormalizeFlags {
+    /// The `user_ignored_tags` list a run passes, in the plugin's order.
+    pub fn ignored_tags(&self) -> Vec<String> {
+        let mut tags = Vec::new();
+        if self.ignore_quality {
+            tags.push("quality".to_string());
+        }
+        if self.ignore_regional {
+            tags.push("regional".to_string());
+        }
+        if self.ignore_geographic {
+            tags.push("geographic".to_string());
+        }
+        if self.ignore_misc {
+            tags.push("misc".to_string());
+        }
+        tags
+    }
+}
+
 struct Tables {
     quality: Vec<Pat>,
     resolution: Vec<Pat>,

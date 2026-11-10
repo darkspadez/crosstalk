@@ -8,22 +8,49 @@
 //!   * **rescue** — no candidate reached the band, but some candidate scored above the rescue
 //!     floor. The heuristics found nothing; the model may still see the match.
 //!
-//! A heuristic result at or above the automatch confidence threshold NEVER reaches the
-//! model: the model may promote inside the band, but it never re-checks or vetoes a
-//! heuristic win. Spending latency and tokens to re-check results the heuristics are
-//! already sure about would make the tool slower without making it more accurate.
+//! A heuristic result at or above the match confidence threshold NEVER reaches the model: the
+//! model may promote inside the band, but it never re-checks or vetoes a heuristic win.
+//! Spending latency and tokens to re-check results the heuristics are already sure about would
+//! make the tool slower without making it more accurate.
 //!
 //! One request carries the whole shortlist. TypeSafe answers every question against one state
 //! in parallel, so asking about five candidates costs about as much as asking about one.
+//!
+//! The gate is generic over what is being matched ([`Query`]) and what it is matched against
+//! ([`Candidate`]), because "is this the same channel?" is the same question whatever the
+//! candidate is: an EPG entry for guide, a stream for streams, a logo set for lineup.
 
-use crosstalk_core::ai::{AiService, Answer, DecisionRequest, Question};
-use crosstalk_core::dispatcharr::{Channel, EpgEntry};
-use crosstalk_core::store::AiDecision;
-use crosstalk_matching::callsign::{extract_location, network_keyword, KnownCallsigns};
+use crate::ai::{AiService, Answer, DecisionRequest, Question};
+use crate::config::{AiVerifyConfig, CrosstalkConfig};
+use crate::dispatcharr::Channel;
+use crate::match_run::Candidate;
+use crate::store::AiDecision;
+use crosstalk_matching::callsign::KnownCallsigns;
+use crosstalk_matching::callsign::{extract_callsign, extract_location, network_keyword};
 use crosstalk_matching::pipeline::Scored;
 use std::collections::BTreeMap;
 
-use crate::settings::AiSettings;
+/// The thing being matched: a channel now, a lineup entry later.
+///
+/// What the model is told about it comes from the shared payload built in [`build_request`],
+/// so every app describes its query side the same way.
+pub trait Query {
+    fn name(&self) -> &str;
+    /// The number the operator sees, printed as the reports print it.
+    ///
+    /// `None` when the query has no number: a lineup entry or a stream is still a query.
+    fn number(&self) -> Option<f64>;
+}
+
+impl Query for Channel {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn number(&self) -> Option<f64> {
+        self.display_number()
+    }
+}
 
 /// Why a channel reached the model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +114,26 @@ impl GateOutcome {
             response: self.response.clone(),
         }
     }
+
+    /// The "no result" value: the run was cancelled before this channel was asked.
+    pub fn cancelled(reason: GateReason, model: String) -> Self {
+        Self {
+            accepted: None,
+            reason,
+            picked: None,
+            probability: None,
+            confidence: None,
+            decision: "cancelled by the operator".to_string(),
+            model,
+            calibrated: false,
+            latency_ms: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            request: serde_json::json!({}),
+            response: serde_json::json!({}),
+            answered: false,
+        }
+    }
 }
 
 /// Which candidates a channel should offer the model, if any.
@@ -94,14 +141,14 @@ impl GateOutcome {
 /// Returns the slice of `scored` worth sending, and why. Empty when the heuristics are
 /// confident enough that a request would be wasted.
 ///
-/// The shortlist holds one position per candidate NAME: guide listings routinely carry the
-/// same name under several entries (regional duplicates), and offering the model the same
-/// name twice spends tokens without adding information. The first position in score order
-/// wins each name, so the kept entry is the highest-scored one.
-pub fn shortlist(
+/// The shortlist holds one position per candidate NAME: listings routinely carry the same name
+/// under several entries (regional duplicates for guide, mirrored streams for streams), and
+/// offering the model the same name twice spends tokens without adding information. The first
+/// position in score order wins each name, so the kept entry is the highest-scored one.
+pub fn shortlist<C: Candidate>(
     scored: &[Scored],
-    entries: &[EpgEntry],
-    settings: &AiSettings,
+    candidates: &[C],
+    settings: &AiVerifyConfig,
 ) -> Option<(GateReason, Vec<usize>)> {
     if !settings.enabled || scored.is_empty() {
         return None;
@@ -112,7 +159,7 @@ pub fn shortlist(
     if in_band {
         return Some((
             GateReason::Verify,
-            take_unique(scored, entries, settings.shortlist),
+            take_unique(scored, candidates, settings.shortlist),
         ));
     }
 
@@ -123,7 +170,7 @@ pub fn shortlist(
             .filter(|(_, candidate)| candidate.score >= settings.rescue_floor)
             .map(|(position, _)| position)
             .collect();
-        let offered = dedupe_names(scored, entries, &eligible, settings.shortlist);
+        let offered = dedupe_names(scored, candidates, &eligible, settings.shortlist);
         if !offered.is_empty() {
             return Some((GateReason::Rescue, offered));
         }
@@ -134,89 +181,86 @@ pub fn shortlist(
 
 /// Up to `limit` positions from the head of `scored`, in order, keeping the first
 /// position seen for each candidate name.
-fn take_unique(scored: &[Scored], entries: &[EpgEntry], limit: usize) -> Vec<usize> {
+fn take_unique<C: Candidate>(scored: &[Scored], candidates: &[C], limit: usize) -> Vec<usize> {
     let all: Vec<usize> = (0..scored.len().min(limit.max(1))).collect();
-    dedupe_names(scored, entries, &all, limit)
+    dedupe_names(scored, candidates, &all, limit)
 }
 
-fn dedupe_names(
+fn dedupe_names<C: Candidate>(
     scored: &[Scored],
-    entries: &[EpgEntry],
-    candidates: &[usize],
+    candidates: &[C],
+    candidates_to_offer: &[usize],
     limit: usize,
 ) -> Vec<usize> {
     let mut seen = std::collections::HashSet::new();
-    candidates
+    candidates_to_offer
         .iter()
         .copied()
         .filter(|position| {
             scored
                 .get(*position)
-                .and_then(|candidate| entries.get(candidate.index))
-                .is_some_and(|entry| seen.insert(entry.name.clone()))
+                .and_then(|candidate| candidates.get(candidate.index))
+                .is_some_and(|entry| seen.insert(entry.name().to_string()))
         })
         .take(limit.max(1))
         .collect()
 }
 
-/// Build the request: the channel, the shortlist, and the questions.
+/// Build the request: the query, the shortlist, and the questions.
 ///
-/// The callsign is extracted with the run's allowlist, the same one the matcher scores
-/// with — never an empty default, which would hide denylisted-but-real callsigns (like
-/// `KING`) from the model while the matcher itself sees them.
-pub fn build_request(
-    channel: &Channel,
-    entries: &[EpgEntry],
+/// The callsign is extracted with the run's allowlist, the same one the matcher scores with —
+/// never an empty default, which would hide denylisted-but-real callsigns (like `KING`) from
+/// the model while the matcher itself sees them.
+pub fn build_request<Q: Query, C: Candidate>(
+    query: &Q,
+    candidates: &[C],
     scored: &[Scored],
     offered: &[usize],
     known: &KnownCallsigns,
-    settings: &AiSettings,
+    settings: &AiVerifyConfig,
 ) -> DecisionRequest {
-    let callsign = crosstalk_matching::callsign::extract_callsign(&channel.name, known);
-    let location = extract_location(&channel.name);
-    let network = network_keyword(&channel.name);
+    let callsign = extract_callsign(query.name(), known);
+    let location = extract_location(query.name());
+    let network = network_keyword(query.name());
 
-    let mut state_channel = serde_json::json!({
-        "name": channel.name,
-        "number": channel.display_number(),
+    let mut state_query = serde_json::json!({
+        "name": query.name(),
+        "number": query.number(),
     });
     if let Some(callsign) = callsign {
-        state_channel["callsign"] = serde_json::json!(callsign);
+        state_query["callsign"] = serde_json::json!(callsign);
     }
     if let Some(state) = location.state {
-        state_channel["state"] = serde_json::json!(state);
+        state_query["state"] = serde_json::json!(state);
     }
     if let Some(city) = location.city {
-        state_channel["city"] = serde_json::json!(city);
+        state_query["city"] = serde_json::json!(city);
     }
     if let Some(network) = network {
-        state_channel["network"] = serde_json::json!(network);
+        state_query["network"] = serde_json::json!(network);
     }
 
-    let candidates: Vec<serde_json::Value> = offered
+    let offered_candidates: Vec<serde_json::Value> = offered
         .iter()
         .filter_map(|position| {
             let candidate = scored.get(*position)?;
-            let entry = entries.get(candidate.index)?;
+            let entry = candidates.get(candidate.index)?;
             let mut payload = serde_json::json!({
                 "id": format!("candidate_{}", candidate.index),
-                "name": entry.name,
+                "name": entry.name(),
                 "score": candidate.score,
                 "method": candidate.method_label(),
-                "tvg_id": entry.tvg_id,
             });
-            // The source id is what the model needs to tell two same-name entries apart;
-            // the source NAME is not plumbed this far, so the id is what is offered.
-            if let Some(source) = entry.epg_source {
-                payload["epg_source"] = serde_json::json!(source);
+            for (key, value) in entry.request_fields() {
+                payload[key] = value;
             }
             Some(payload)
         })
         .collect();
 
     let state = serde_json::json!({
-        "channel": state_channel,
-        "candidates": candidates,
+        "channel": state_query,
+        "candidates": offered_candidates,
     });
 
     let mut request =
@@ -232,7 +276,7 @@ pub fn build_request(
         let Some(candidate) = scored.get(*position) else {
             continue;
         };
-        let Some(entry) = entries.get(candidate.index) else {
+        let Some(entry) = candidates.get(candidate.index) else {
             continue;
         };
         let id = format!("candidate_{}", candidate.index);
@@ -249,7 +293,7 @@ pub fn build_request(
         );
         options.insert(
             id,
-            format!("{} (heuristic score {})", entry.name, candidate.score),
+            format!("{} (heuristic score {})", entry.name(), candidate.score),
         );
     }
 
@@ -271,14 +315,14 @@ pub fn build_request(
 }
 
 /// Combine the answers into a decision.
-pub fn combine(
+pub fn combine<C: Candidate>(
     outcome: &mut GateOutcome,
     request: &DecisionRequest,
-    response: &crosstalk_core::ai::DecisionResponse,
+    response: &crate::ai::DecisionResponse,
     scored: &[Scored],
-    entries: &[EpgEntry],
+    candidates: &[C],
     offered: &[usize],
-    settings: &AiSettings,
+    settings: &AiVerifyConfig,
 ) {
     outcome.model = response.model.clone();
     outcome.calibrated = response.calibrated;
@@ -325,7 +369,7 @@ pub fn combine(
     };
 
     let candidate = &scored[position];
-    let Some(entry) = entries.get(candidate.index) else {
+    let Some(entry) = candidates.get(candidate.index) else {
         return;
     };
     let probability = response.noul(&format!("same_{}", candidate.index));
@@ -338,7 +382,7 @@ pub fn combine(
         outcome.decision = format!(
             "{}: {} (undecided, missing same_{} probability, confidence {:.2})",
             outcome.reason.as_str(),
-            entry.name,
+            entry.name(),
             candidate.index,
             choice_confidence
         );
@@ -347,7 +391,7 @@ pub fn combine(
 
     // A missing choice confidence arrives as 0.0 (see the OpenAI-compatible backend),
     // which fails the `min_confidence` floor below instead of auto-passing it.
-    let verdict = crosstalk_core::ai::Verdict {
+    let verdict = crate::ai::Verdict {
         probability,
         confidence: Some(choice_confidence),
     };
@@ -363,7 +407,7 @@ pub fn combine(
         outcome.decision = format!(
             "{}: {} {:.2} (accept{})",
             outcome.reason.as_str(),
-            entry.name,
+            entry.name(),
             probability,
             if response.calibrated {
                 ""
@@ -375,7 +419,7 @@ pub fn combine(
         outcome.decision = format!(
             "{}: {} {:.2} (undecided, confidence {:.2})",
             outcome.reason.as_str(),
-            entry.name,
+            entry.name(),
             probability,
             choice_confidence
         );
@@ -389,15 +433,15 @@ pub fn combine(
 /// A failed request is reported as `answered: false` and never fails the run: an install whose
 /// AI endpoint is down should still match the channels the heuristics are sure about.
 #[allow(clippy::too_many_arguments)]
-pub async fn ask(
+pub async fn ask<Q: Query, C: Candidate>(
     service: Option<&AiService>,
-    channel: &Channel,
-    entries: &[EpgEntry],
+    query: &Q,
+    candidates: &[C],
     scored: &[Scored],
     offered: &[usize],
     reason: GateReason,
     known: &KnownCallsigns,
-    settings: &AiSettings,
+    settings: &AiVerifyConfig,
 ) -> GateOutcome {
     let mut outcome = GateOutcome {
         accepted: None,
@@ -419,7 +463,7 @@ pub async fn ask(
     let Some(service) = service else {
         return outcome;
     };
-    let request = build_request(channel, entries, scored, offered, known, settings);
+    let request = build_request(query, candidates, scored, offered, known, settings);
     outcome.request = serde_json::to_value(&request).unwrap_or_default();
 
     match service.decide(&request).await {
@@ -430,7 +474,7 @@ pub async fn ask(
                 &request,
                 &response,
                 scored,
-                entries,
+                candidates,
                 offered,
                 settings,
             );
@@ -449,16 +493,53 @@ pub fn is_answered(outcome: &GateOutcome) -> bool {
 }
 
 /// The companion answer for the report: whether the model saw the same network.
-pub fn network_agreement(response: &crosstalk_core::ai::DecisionResponse) -> Option<String> {
+pub fn network_agreement(response: &crate::ai::DecisionResponse) -> Option<String> {
     match response.answers.get("same_network") {
         Some(Answer::Noul { noul }) => Some(format!("network {noul:.2}")),
         _ => None,
     }
 }
 
+/// The AI service a run uses, if the policy is on and its provider is configured.
+///
+/// An enabled gate with no provider is a warning rather than an error: the run proceeds
+/// heuristic-only, which is what the plugin does when its endpoint is unavailable.
+pub fn service(config: &CrosstalkConfig) -> Option<AiService> {
+    let policy = &config.ai.verify;
+    let service = AiService::from_config(config);
+    if policy.enabled && service.has(&policy.provider) {
+        Some(service)
+    } else {
+        if policy.enabled {
+            tracing::warn!(
+                "ai.verify.enabled is on but provider {:?} is not configured; matching \
+                 without it",
+                policy.provider
+            );
+        }
+        None
+    }
+}
+
+/// The concurrent bound for the AI fan-out: the configured provider's own cap.
+///
+/// The single source of truth is `[ai.providers.<name>].max_concurrency` in the host config,
+/// which both backends also enforce on their own HTTP semaphores. An unknown provider name
+/// falls back to the default cap (8); validation enforces a minimum of 1.
+pub fn fanout_bound(config: &CrosstalkConfig, provider: &str) -> usize {
+    config
+        .ai
+        .providers
+        .get(provider)
+        .map(|provider| provider.max_concurrency.max(1))
+        .unwrap_or(8)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dispatcharr::EpgEntry;
+    use crosstalk_matching::callsign::KnownCallsigns;
     use crosstalk_matching::pipeline::MatchMethod;
 
     fn scored(score: u8, index: usize) -> Scored {
@@ -469,8 +550,8 @@ mod tests {
         }
     }
 
-    fn settings() -> AiSettings {
-        AiSettings {
+    fn settings() -> AiVerifyConfig {
+        AiVerifyConfig {
             enabled: true,
             provider: "typesafe".to_string(),
             model: "jev-latest".to_string(),
@@ -554,7 +635,7 @@ mod tests {
     fn rescue_can_be_turned_off() {
         let entries = named_entries(&["A"]);
         let ranked = vec![scored(70, 0)];
-        let settings = AiSettings {
+        let settings = AiVerifyConfig {
             rescue: false,
             ..settings()
         };
@@ -565,7 +646,7 @@ mod tests {
     fn disabled_ai_sends_nothing() {
         let entries = named_entries(&["A"]);
         let ranked = vec![scored(90, 0)];
-        let settings = AiSettings {
+        let settings = AiVerifyConfig {
             enabled: false,
             ..settings()
         };
@@ -633,7 +714,7 @@ mod tests {
         picked: &str,
         probability: Option<f64>,
         confidence: f64,
-    ) -> crosstalk_core::ai::DecisionResponse {
+    ) -> crate::ai::DecisionResponse {
         let mut answers = BTreeMap::new();
         answers.insert(
             "best".to_string(),
@@ -646,7 +727,7 @@ mod tests {
         if let Some(probability) = probability {
             answers.insert("same_0".to_string(), Answer::Noul { noul: probability });
         }
-        crosstalk_core::ai::DecisionResponse {
+        crate::ai::DecisionResponse {
             model: "jev-1.14.0".to_string(),
             answers,
             input_tokens: 400,
@@ -1003,5 +1084,43 @@ mod tests {
         };
         assert_eq!(candidate.method_label(), "Alias");
         assert_eq!(MatchMethod::Alias.component(), "Alias");
+    }
+
+    #[test]
+    fn the_ai_fanout_bound_comes_from_the_provider_config() {
+        let mut config = CrosstalkConfig::default();
+        assert_eq!(
+            fanout_bound(&config, "typesafe"),
+            8,
+            "an unconfigured provider falls back to the default cap"
+        );
+
+        config.ai.providers.insert(
+            "typesafe".to_string(),
+            crate::config::AiProviderConfig {
+                kind: "typesafe".to_string(),
+                max_concurrency: 3,
+                ..crate::config::AiProviderConfig::default()
+            },
+        );
+        assert_eq!(
+            fanout_bound(&config, "typesafe"),
+            3,
+            "the provider's own max_concurrency bounds the fan-out"
+        );
+
+        config.ai.providers.insert(
+            "zero".to_string(),
+            crate::config::AiProviderConfig {
+                kind: "typesafe".to_string(),
+                max_concurrency: 0,
+                ..crate::config::AiProviderConfig::default()
+            },
+        );
+        assert_eq!(
+            fanout_bound(&config, "zero"),
+            1,
+            "a zero cap still allows one request rather than deadlocking"
+        );
     }
 }

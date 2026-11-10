@@ -28,6 +28,7 @@ pub fn router(state: AppState) -> Router {
         .route("/runs/:id/rows", get(run_rows))
         .route("/runs/:id/csv", get(run_csv))
         .route("/runs/:id/cancel", post(cancel_run))
+        .route("/exports/clear", post(clear_exports))
         .route("/settings", get(settings_page))
         .route("/settings/host", post(save_host_settings))
         .route("/settings/:app", post(save_app_settings))
@@ -78,6 +79,10 @@ struct DashboardTemplate {
     schedules: Vec<crosstalk_core::scheduler::ScheduleInfo>,
     runs: Vec<RunRecord>,
     warnings: Vec<String>,
+    /// What the last "clear exports" did, on the page it redirected back to.
+    notice: Option<String>,
+    /// The apps' own report files currently on disk, so the button says what it would delete.
+    export_count: usize,
 }
 
 #[derive(Template)]
@@ -109,6 +114,8 @@ struct RunTemplate {
     active: Option<crosstalk_core::runner::ActiveRun>,
     counts: Vec<(String, i64)>,
     rows: Vec<UiRow>,
+    /// Whether the CSV the run recorded is still on disk.
+    report_available: bool,
 }
 
 #[derive(Template)]
@@ -118,6 +125,7 @@ struct RunStatusTemplate {
     run: RunRecord,
     active: Option<crosstalk_core::runner::ActiveRun>,
     counts: Vec<(String, i64)>,
+    report_available: bool,
 }
 
 #[derive(Template)]
@@ -244,7 +252,10 @@ async fn logout() -> Response {
     response
 }
 
-async fn dashboard(State(state): State<AppState>) -> Response {
+async fn dashboard(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>,
+) -> Response {
     let runs = state.store.recent_runs(20).unwrap_or_default();
     let snapshot = state.snapshot();
     let warnings = snapshot.validate().warnings;
@@ -255,7 +266,89 @@ async fn dashboard(State(state): State<AppState>) -> Response {
         schedules: state::schedules(&snapshot),
         runs,
         warnings,
+        notice: clear_notice(&query),
+        export_count: state::exports_on_disk(&snapshot, &state.registry),
     }
+    .into_response()
+}
+
+/// The summary a "clear exports" redirects back to the dashboard with.
+///
+/// A count per outcome, because "deleted 12" on its own would hide the answers an operator
+/// needs: how much was kept because a run may still hold it, and whether anything refused to go.
+fn clear_notice(query: &HashMap<String, String>) -> Option<String> {
+    let count = |key: &str| {
+        query
+            .get(key)
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0)
+    };
+    if !query.contains_key("cleared") {
+        return None;
+    }
+    let (deleted, kept, failed) = (count("cleared"), count("kept"), count("failed"));
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    let mut notice = format!("Deleted {deleted} report file{}.", plural(deleted));
+    if kept > 0 {
+        notice.push_str(&format!(
+            " Kept {kept} written in the last {} minutes, in case a run is still using them.",
+            crosstalk_core::csv_report::CLEAR_GRACE.as_secs() / 60
+        ));
+    }
+    if failed > 0 {
+        notice.push_str(&format!(
+            " {failed} could not be deleted; the log says why."
+        ));
+    }
+    Some(notice)
+}
+
+/// Delete the registered apps' CSV exports. One host feature for what every plugin had its own
+/// `clear_csv_exports` action for.
+async fn clear_exports(
+    State(state): State<AppState>,
+    Form(form): Form<ClearExportsForm>,
+) -> Response {
+    // The same server-side confirmation every channel-changing action needs: the browser's
+    // dialog is convenience, not protection.
+    if form.confirm.as_deref() != Some("true") {
+        return (
+            StatusCode::BAD_REQUEST,
+            "clearing deletes files: resubmit the form with confirm=true\n",
+        )
+            .into_response();
+    }
+
+    // A run writes its report and then applies it, so a clear during a run could delete the
+    // file that run is about to link. The daemon knows its own runs exactly, so it refuses
+    // rather than guessing from timestamps; a one-shot CLI clear cannot know and keeps the
+    // most recent reports instead (see `csv_report::CLEAR_GRACE`).
+    if let Some(active) = state.runner.running().into_iter().next() {
+        return (
+            StatusCode::CONFLICT,
+            format!(
+                "a run is in progress ({} / {}): clear the exports after it finishes\n",
+                active.app, active.action
+            ),
+        )
+            .into_response();
+    }
+
+    let snapshot = state.snapshot();
+    let summary = crosstalk_core::csv_report::clear_exports(
+        &snapshot.exports_dir(),
+        &state::export_prefixes(&state.registry),
+    );
+    tracing::info!(
+        deleted = summary.deleted,
+        kept = summary.kept_recent,
+        failed = summary.failed,
+        "cleared the CSV exports"
+    );
+    Redirect::to(&format!(
+        "/?cleared={}&kept={}&failed={}",
+        summary.deleted, summary.kept_recent, summary.failed
+    ))
     .into_response()
 }
 
@@ -282,6 +375,13 @@ async fn app_page(State(state): State<AppState>, Path(app_id): Path<String>) -> 
         runs: state.store.recent_runs_for(&app_id, 15).unwrap_or_default(),
     }
     .into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct ClearExportsForm {
+    /// Server-side confirmation for a deletion, mirroring the CLI's `--yes`.
+    #[serde(default)]
+    confirm: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -353,6 +453,7 @@ async fn run_page(State(state): State<AppState>, Path(id): Path<i64>) -> Respons
                 .into_iter()
                 .find(|entry| entry.run_id == id),
             rows: state::rows(&state.store, id),
+            report_available: state::report_available(&run),
             run,
         }
         .into_response(),
@@ -372,6 +473,7 @@ async fn run_status(State(state): State<AppState>, Path(id): Path<i64>) -> Respo
     RunStatusTemplate {
         csrf_token: state.csrf_token().to_string(),
         counts: state::counts(&run),
+        report_available: state::report_available(&run),
         run,
         active,
     }
@@ -464,43 +566,12 @@ async fn settings_page(
                 .to_string()
         }),
         host_fields: state::fields(
-            &crosstalk_core::config::matching_schema(),
-            &host_values(&snapshot),
+            &crosstalk_core::config::host_schema(),
+            &crosstalk_core::config::host_values(&snapshot),
         ),
         apps: app_forms(&state, None),
     }
     .into_response()
-}
-
-/// The host's own settings as values, for the form.
-fn host_values(config: &crosstalk_core::CrosstalkConfig) -> crosstalk_core::SettingsValues {
-    use crosstalk_core::subapp::{FieldValue, SettingsValues};
-    let mut values = SettingsValues::new();
-    values.insert(
-        "matching.ignore_quality_tags",
-        FieldValue::Boolean(config.matching.ignore_quality_tags),
-    );
-    values.insert(
-        "matching.ignore_regional_tags",
-        FieldValue::Boolean(config.matching.ignore_regional_tags),
-    );
-    values.insert(
-        "matching.ignore_geographic_tags",
-        FieldValue::Boolean(config.matching.ignore_geographic_tags),
-    );
-    values.insert(
-        "matching.ignore_misc_tags",
-        FieldValue::Boolean(config.matching.ignore_misc_tags),
-    );
-    values.insert(
-        "matching.enabled_databases",
-        FieldValue::Text(config.matching.databases().join(", ")),
-    );
-    values.insert(
-        "matching.custom_aliases",
-        FieldValue::Json(config.matching.custom_aliases.clone()),
-    );
-    values
 }
 
 fn app_forms(state: &AppState, error: Option<String>) -> Vec<UiSettings> {
@@ -531,8 +602,8 @@ fn settings_with_host_error(state: &AppState, error: String) -> Response {
         host_error: Some(error),
         host_notice: None,
         host_fields: state::fields(
-            &crosstalk_core::config::matching_schema(),
-            &host_values(&snapshot),
+            &crosstalk_core::config::host_schema(),
+            &crosstalk_core::config::host_values(&snapshot),
         ),
         apps: app_forms(state, None),
     }
@@ -557,40 +628,45 @@ async fn save_host_settings(
         }
     };
 
-    let flag = |key: &str| form.get(key).is_some_and(|value| value == "true");
-    config.matching.ignore_quality_tags = flag("matching.ignore_quality_tags");
-    config.matching.ignore_regional_tags = flag("matching.ignore_regional_tags");
-    config.matching.ignore_geographic_tags = flag("matching.ignore_geographic_tags");
-    config.matching.ignore_misc_tags = flag("matching.ignore_misc_tags");
-    config.matching.enabled_databases = form
-        .get("matching.enabled_databases")
-        .map(|value| {
-            value
-                .split([',', '\n'])
-                .map(str::trim)
-                .filter(|code| !code.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
-    if let Some(text) = form.get("matching.custom_aliases") {
-        let text = text.trim();
-        if !text.is_empty() {
-            match serde_json::from_str::<std::collections::BTreeMap<String, Vec<String>>>(text) {
-                Ok(map) => config.matching.custom_aliases = map,
-                Err(error) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        format!(
-                            "custom aliases must be a JSON object of name -> [aliases]: {error}\n"
-                        ),
-                    )
-                        .into_response()
-                }
-            }
-        } else {
-            config.matching.custom_aliases.clear();
+    // What was already wrong before this save. The form cannot fix a missing Dispatcharr
+    // key, so those problems must not block saving; a problem the save INTRODUCES must.
+    let already_wrong = config.validate().errors;
+
+    // The schema decides the types, as it does for an app's own form. A control the page
+    // did not submit is left alone rather than cleared, so a partial POST cannot reset
+    // values it never mentioned; an unticked checkbox is the exception, because browsers
+    // send nothing for it and "absent" there means false.
+    let schema = crosstalk_core::config::host_schema();
+    let mut values = match state::values_from_form(&schema, &form) {
+        Ok(values) => values,
+        Err(errors) => {
+            return (StatusCode::BAD_REQUEST, format!("{}\n", errors.join("; "))).into_response()
         }
+    };
+    for field in schema.editable() {
+        if field.kind != crosstalk_core::subapp::FieldKind::Boolean && !form.contains_key(field.id)
+        {
+            values.remove(field.id);
+        }
+    }
+    if let Err(error) = crosstalk_core::config::apply_host_values(&mut config, &values) {
+        return (StatusCode::BAD_REQUEST, format!("{error:#}\n")).into_response();
+    }
+    // Cross-field rules (the AI band, the scope conflict between groups and ignore_groups)
+    // were caught when these fields lived on an app's form, and they still are: a save that
+    // introduces one is refused before it reaches the file.
+    let introduced: Vec<String> = config
+        .validate()
+        .errors
+        .into_iter()
+        .filter(|error| !already_wrong.contains(error))
+        .collect();
+    if !introduced.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("this change is inconsistent: {}\n", introduced.join("; ")),
+        )
+            .into_response();
     }
 
     let path = config_dir.join("crosstalk.toml");
@@ -653,7 +729,7 @@ async fn save_host_settings(
     // The file holds exactly what the form submitted, so any difference between it and the
     // effective config is an environment override the form cannot change. Name it on the
     // page rather than showing values the operator cannot edit into effect.
-    let overridden = env_override_fields(&config.matching, &fresh.matching);
+    let overridden = env_override_fields(&config, &fresh);
     if !overridden.is_empty() {
         tracing::warn!(
             fields = overridden.join(", ").as_str(),
@@ -697,35 +773,24 @@ async fn save_host_settings(
     }
 }
 
-/// The host-matching fields where the effective config differs from the file.
+/// The host-form fields where the effective config differs from the file.
 ///
 /// After a save the file holds exactly what the form submitted, so a difference here means
 /// an environment variable is overriding the UI for that field: the page shows the effective
-/// value, and saving the form cannot change it until the override is removed.
+/// value, and saving the form cannot change it until the override is removed. Compared over
+/// the form's own values so a field added to the schema is covered without a second list to
+/// keep in step.
 fn env_override_fields(
-    file: &crosstalk_core::config::MatchingConfig,
-    effective: &crosstalk_core::config::MatchingConfig,
+    file: &crosstalk_core::CrosstalkConfig,
+    effective: &crosstalk_core::CrosstalkConfig,
 ) -> Vec<&'static str> {
-    let mut fields = Vec::new();
-    if file.ignore_quality_tags != effective.ignore_quality_tags {
-        fields.push("matching.ignore_quality_tags");
-    }
-    if file.ignore_regional_tags != effective.ignore_regional_tags {
-        fields.push("matching.ignore_regional_tags");
-    }
-    if file.ignore_geographic_tags != effective.ignore_geographic_tags {
-        fields.push("matching.ignore_geographic_tags");
-    }
-    if file.ignore_misc_tags != effective.ignore_misc_tags {
-        fields.push("matching.ignore_misc_tags");
-    }
-    if file.databases() != effective.databases() {
-        fields.push("matching.enabled_databases");
-    }
-    if file.custom_aliases != effective.custom_aliases {
-        fields.push("matching.custom_aliases");
-    }
-    fields
+    let from_file = crosstalk_core::config::host_values(file);
+    let from_env = crosstalk_core::config::host_values(effective);
+    crosstalk_core::config::host_schema()
+        .editable()
+        .filter(|field| from_file.get(field.id) != from_env.get(field.id))
+        .map(|field| field.id)
+        .collect()
 }
 
 async fn save_app_settings(
@@ -748,8 +813,8 @@ async fn save_app_settings(
                 host_error: None,
                 host_notice: None,
                 host_fields: state::fields(
-                    &crosstalk_core::config::matching_schema(),
-                    &host_values(&snapshot),
+                    &crosstalk_core::config::host_schema(),
+                    &crosstalk_core::config::host_values(&snapshot),
                 ),
                 apps: app_forms(&state, Some(errors.join("; "))),
             }
@@ -767,8 +832,8 @@ async fn save_app_settings(
             host_error: None,
             host_notice: None,
             host_fields: state::fields(
-                &crosstalk_core::config::matching_schema(),
-                &host_values(&snapshot),
+                &crosstalk_core::config::host_schema(),
+                &crosstalk_core::config::host_values(&snapshot),
             ),
             apps: app_forms(&state, Some(format!("{error:#}"))),
         }
@@ -866,54 +931,75 @@ pub fn describe_registry(registry: &Registry) -> String {
 #[cfg(test)]
 mod tests {
     use super::env_override_fields;
-    use crosstalk_core::config::MatchingConfig;
+    use crosstalk_core::config::CrosstalkConfig;
 
     #[test]
-    fn identical_matching_configs_have_no_overrides() {
-        let file = MatchingConfig::default();
-        let effective = MatchingConfig::default();
+    fn identical_configs_have_no_overrides() {
+        let file = CrosstalkConfig::default();
+        let effective = CrosstalkConfig::default();
         assert!(env_override_fields(&file, &effective).is_empty());
     }
 
     #[test]
-    fn every_matching_field_the_form_edits_is_compared() {
-        let file = MatchingConfig::default();
-        let mut effective = MatchingConfig {
-            ignore_quality_tags: !file.ignore_quality_tags,
-            ignore_regional_tags: !file.ignore_regional_tags,
-            ignore_geographic_tags: !file.ignore_geographic_tags,
-            ignore_misc_tags: !file.ignore_misc_tags,
-            enabled_databases: vec!["UK".to_string()],
-            ..MatchingConfig::default()
+    fn every_host_field_the_form_edits_is_compared() {
+        // The shared settings moved into the same form: a difference an environment variable
+        // makes there has to be named too, or the page would show values that cannot be saved.
+        let file = CrosstalkConfig::default();
+        let mut effective = CrosstalkConfig {
+            matching: crosstalk_core::config::MatchingConfig {
+                ignore_quality_tags: !file.matching.ignore_quality_tags,
+                ignore_regional_tags: !file.matching.ignore_regional_tags,
+                ignore_geographic_tags: !file.matching.ignore_geographic_tags,
+                ignore_misc_tags: !file.matching.ignore_misc_tags,
+                enabled_databases: vec!["UK".to_string()],
+                ..crosstalk_core::config::MatchingConfig::default()
+            },
+            scope: crosstalk_core::config::ScopeConfig {
+                profiles: "All".to_string(),
+                groups: String::new(),
+                ignore_groups: "PPV".to_string(),
+            },
+            exports: crosstalk_core::config::ExportsConfig { retention_days: 7 },
+            ..CrosstalkConfig::default()
         };
         effective
+            .matching
             .custom_aliases
             .insert("ESPN".to_string(), vec!["ESPN US".to_string()]);
+        effective.ai.verify.enabled = !file.ai.verify.enabled;
+        effective.ai.verify.model = "another-model".to_string();
 
         let fields = env_override_fields(&file, &effective);
+        for expected in [
+            "matching.ignore_quality_tags",
+            "matching.ignore_regional_tags",
+            "matching.ignore_geographic_tags",
+            "matching.ignore_misc_tags",
+            "matching.enabled_databases",
+            "matching.custom_aliases",
+            "scope.profiles",
+            "scope.ignore_groups",
+            "exports.retention_days",
+            "ai.verify.enabled",
+            "ai.verify.model",
+        ] {
+            assert!(fields.contains(&expected), "{expected} missing: {fields:?}");
+        }
         assert!(
-            fields.contains(&"matching.ignore_quality_tags"),
-            "{fields:?}"
+            !fields.contains(&"scope.groups"),
+            "an unchanged field is not named: {fields:?}"
         );
-        assert!(
-            fields.contains(&"matching.ignore_regional_tags"),
-            "{fields:?}"
-        );
-        assert!(
-            fields.contains(&"matching.ignore_geographic_tags"),
-            "{fields:?}"
-        );
-        assert!(fields.contains(&"matching.ignore_misc_tags"), "{fields:?}");
-        assert!(fields.contains(&"matching.enabled_databases"), "{fields:?}");
-        assert!(fields.contains(&"matching.custom_aliases"), "{fields:?}");
     }
 
     #[test]
     fn only_the_differing_fields_are_named() {
-        let file = MatchingConfig::default();
-        let effective = MatchingConfig {
-            ignore_quality_tags: !file.ignore_quality_tags,
-            ..MatchingConfig::default()
+        let file = CrosstalkConfig::default();
+        let effective = CrosstalkConfig {
+            matching: crosstalk_core::config::MatchingConfig {
+                ignore_quality_tags: !file.matching.ignore_quality_tags,
+                ..crosstalk_core::config::MatchingConfig::default()
+            },
+            ..CrosstalkConfig::default()
         };
         assert_eq!(
             env_override_fields(&file, &effective),

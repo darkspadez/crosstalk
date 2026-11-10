@@ -327,11 +327,11 @@ mod tests {
 
     #[test]
     fn describe_reports_the_next_run() {
-        let config = config_with(&[("janitor.automatch_apply", "0 4 * * *")]);
+        let config = config_with(&[("guide.match_apply", "0 4 * * *")]);
         let described = describe(&config);
         assert_eq!(described.len(), 1);
-        assert_eq!(described[0].app, "janitor");
-        assert_eq!(described[0].action, "automatch_apply");
+        assert_eq!(described[0].app, "guide");
+        assert_eq!(described[0].action, "match_apply");
         assert_eq!(described[0].cron, "0 4 * * *");
         let next = described[0].next_run.as_deref().expect("a next run");
         let parsed: chrono::DateTime<chrono::Utc> = next.parse().expect("iso 8601");
@@ -340,7 +340,7 @@ mod tests {
 
     #[test]
     fn describe_marks_a_bad_key_or_expression_without_failing() {
-        let config = config_with(&[("typo", "0 4 * * *"), ("janitor.heal_apply", "nope")]);
+        let config = config_with(&[("typo", "0 4 * * *"), ("guide.heal_apply", "nope")]);
         let described = describe(&config);
         assert_eq!(described.len(), 2);
         assert!(described.iter().all(|entry| entry.next_run.is_none()));
@@ -350,9 +350,9 @@ mod tests {
     #[tokio::test]
     async fn arming_skips_unknown_actions_and_bad_expressions() {
         let config = config_with(&[
-            ("janitor.nope", "0 4 * * *"),
+            ("guide.nope", "0 4 * * *"),
             ("not-a-key", "0 4 * * *"),
-            ("janitor.automatch_apply", "not a cron"),
+            ("guide.match_apply", "not a cron"),
         ]);
         let store = crate::store::Store::in_memory().expect("store");
         let runner = JobRunner::new(
@@ -375,16 +375,16 @@ mod tests {
         struct PreviewApp;
         impl crate::subapp::SubApp for PreviewApp {
             fn id(&self) -> &'static str {
-                "janitor"
+                "guide"
             }
             fn name(&self) -> &'static str {
-                "Janitor"
+                "Guide"
             }
             fn description(&self) -> &'static str {
                 "test"
             }
             fn actions(&self) -> Vec<ActionSpec> {
-                vec![ActionSpec::new("automatch", "Automatch", "runs", ActionKind::Read).offline()]
+                vec![ActionSpec::new("match", "Match", "runs", ActionKind::Read).offline()]
             }
             fn schema(&self) -> &crate::subapp::SettingsSchema {
                 static SCHEMA: std::sync::OnceLock<crate::subapp::SettingsSchema> =
@@ -429,7 +429,7 @@ mod tests {
         assert_eq!(scheduler.jobs_count(), 0);
 
         // Re-arm with one schedule: it arms.
-        let with_one = config_with(&[("janitor.automatch", "0 4 * * *")]);
+        let with_one = config_with(&[("guide.match", "0 4 * * *")]);
         scheduler.rearm(&runner, &with_one).await.expect("re-arms");
         assert_eq!(scheduler.jobs_count(), 1);
         assert_eq!(describe(&with_one).len(), 1);
@@ -459,17 +459,17 @@ mod tests {
         struct TwoActionApp;
         impl crate::subapp::SubApp for TwoActionApp {
             fn id(&self) -> &'static str {
-                "janitor"
+                "guide"
             }
             fn name(&self) -> &'static str {
-                "Janitor"
+                "Guide"
             }
             fn description(&self) -> &'static str {
                 "test"
             }
             fn actions(&self) -> Vec<ActionSpec> {
                 vec![
-                    ActionSpec::new("automatch", "Automatch", "runs", ActionKind::Read).offline(),
+                    ActionSpec::new("match", "Match", "runs", ActionKind::Read).offline(),
                     ActionSpec::new("heal", "Heal", "runs", ActionKind::Read).offline(),
                 ]
             }
@@ -517,9 +517,9 @@ mod tests {
         // action first, a bad expression on a known action last. The good entry must still
         // arm, and its id must be tracked.
         let partial = config_with(&[
-            ("janitor.aardvark", "0 4 * * *"),
-            ("janitor.automatch", "0 4 * * *"),
-            ("janitor.heal", "not a cron"),
+            ("guide.aardvark", "0 4 * * *"),
+            ("guide.match", "0 4 * * *"),
+            ("guide.heal", "not a cron"),
         ]);
         scheduler.rearm(&runner, &partial).await.expect("re-arms");
         assert_eq!(scheduler.jobs_count(), 1);

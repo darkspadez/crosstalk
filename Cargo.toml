@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "crates/crosstalk-matching",
     "crates/crosstalk-core",
-    "crates/janitor",
+    "crates/guide",
     "crates/crosstalk-web",
     "crates/crosstalk",
 ]
@@ -20,7 +20,7 @@ repository = "https://github.com/darkspadez/crosstalk"
 crosstalk-matching = { path = "crates/crosstalk-matching" }
 crosstalk-core = { path = "crates/crosstalk-core" }
 crosstalk-web = { path = "crates/crosstalk-web" }
-janitor = { path = "crates/janitor" }
+crosstalk-guide = { path = "crates/guide" }
 
 # Async / runtime
 tokio = { version = "1", features = ["full"] }

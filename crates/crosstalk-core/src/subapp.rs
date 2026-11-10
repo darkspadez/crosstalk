@@ -299,6 +299,11 @@ impl SettingsValues {
         self.0.get(id)
     }
 
+    /// Drop a value, so an absent form control can mean "unchanged" rather than "cleared".
+    pub fn remove(&mut self, id: &str) -> Option<FieldValue> {
+        self.0.remove(id)
+    }
+
     pub fn text(&self, id: &str) -> Option<&str> {
         match self.0.get(id) {
             Some(FieldValue::Text(text)) => Some(text),
@@ -344,6 +349,37 @@ impl SettingsValues {
     }
 }
 
+/// A number that must already be a whole number in range.
+///
+/// Truncating silently is how a typed `6.7` becomes `6` and a typed `-1` becomes `0`; both
+/// look like a saved setting and neither is what was asked for. Shared because every
+/// settings form, the host's included, needs the same rule.
+pub fn whole_number(field: &str, value: f64, min: u32, max: u32) -> Result<u32> {
+    if !value.is_finite() || value.fract() != 0.0 {
+        anyhow::bail!("{field} must be a whole number, got {value}");
+    }
+    if value < f64::from(min) || value > f64::from(max) {
+        anyhow::bail!("{field} must be between {min} and {max}, got {value}");
+    }
+    Ok(value as u32)
+}
+
+/// A number that must sit in 0-100, rounded rather than truncated.
+pub fn clamp_u8(value: f64) -> Result<u8> {
+    if !(0.0..=100.0).contains(&value) {
+        anyhow::bail!("value {value} is outside 0-100");
+    }
+    Ok(value.round() as u8)
+}
+
+/// A number that must sit in 0-1: the AI probability thresholds.
+pub fn clamp_unit(value: f64) -> Result<f64> {
+    if !(0.0..=1.0).contains(&value) {
+        anyhow::bail!("value {value} is outside 0-1");
+    }
+    Ok(value)
+}
+
 /// How one action finished, for the run record and the toast.
 #[derive(Debug, Clone)]
 pub struct JobOutcome {
@@ -374,6 +410,54 @@ impl JobOutcome {
     }
 }
 
+/// Assemble a run's outcome: the one-line summary, the counts and the CSV it wrote.
+///
+/// Every action ends by saying what it did, and the shape is the same each time: a sentence,
+/// a `, {clause}` per thing worth mentioning, the machine-readable counts, and the report. The
+/// clauses are the app's own wording; the collection is this.
+#[derive(Debug, Clone, Default)]
+pub struct OutcomeBuilder {
+    summary: String,
+    counts: BTreeMap<String, i64>,
+    report: Option<PathBuf>,
+}
+
+impl OutcomeBuilder {
+    pub fn new(summary: impl Into<String>) -> Self {
+        Self {
+            summary: summary.into(),
+            counts: BTreeMap::new(),
+            report: None,
+        }
+    }
+
+    /// Append `, {note}` to the summary: a clause such as `3 below threshold`.
+    pub fn note(mut self, note: impl std::fmt::Display) -> Self {
+        self.summary.push_str(&format!(", {note}"));
+        self
+    }
+
+    /// A machine-readable count, shown in the UI and stored with the run.
+    pub fn count(mut self, key: impl Into<String>, value: i64) -> Self {
+        self.counts.insert(key.into(), value);
+        self
+    }
+
+    /// The CSV the action wrote, if it wrote one.
+    pub fn report(mut self, report: Option<PathBuf>) -> Self {
+        self.report = report;
+        self
+    }
+
+    pub fn build(self) -> JobOutcome {
+        JobOutcome {
+            summary: self.summary,
+            counts: self.counts,
+            report_path: self.report,
+        }
+    }
+}
+
 /// A crosstalk sub-app.
 pub trait SubApp: Send + Sync {
     /// Stable id, used in URLs, schedule keys and the CLI.
@@ -397,6 +481,33 @@ pub trait SubApp: Send + Sync {
     /// Where this app's settings file lives, given the host config directory.
     fn settings_path(&self, config_dir: &Path) -> PathBuf {
         config_dir.join(format!("{}.toml", self.id()))
+    }
+
+    /// The file-name prefix this app's CSV exports carry in the shared exports directory.
+    ///
+    /// `/data/exports` is shared with the plugins and with the other sub-apps, so the prefix is
+    /// how an app recognizes its own history: retention only prunes these files, and the host's
+    /// "clear exports" only deletes them. Derived from the id so the two can never drift apart.
+    ///
+    /// Ids must not nest: no id may start with another id plus `_` (so no `guide_extra` while
+    /// `guide` exists), because `guide_extra_….csv` would otherwise also match `guide_` and a
+    /// single-prefix decision could delete the wrong app's files. The registry test pins this; a
+    /// per-app decision against the full registry uses `owning_prefix` for the same reason.
+    fn export_prefix(&self) -> String {
+        format!("{}_", self.id())
+    }
+
+    /// The first line of a report: `# crosstalk <name> v<version> - <report>`.
+    ///
+    /// A comment, like every other preamble line, so a spreadsheet skips it and reads the
+    /// columns from the first line that does not start with a `#`. The app names itself here
+    /// for the same reason the prefix comes from the id: a caller cannot forget to update it.
+    fn report_title(&self, report: &str) -> String {
+        format!(
+            "# crosstalk {} v{} - {report}",
+            self.name(),
+            crate::HOST_VERSION
+        )
     }
 
     /// Write settings back, preserving comments.
@@ -568,6 +679,38 @@ mod tests {
     }
 
     #[test]
+    fn whole_number_refuses_fractions_and_out_of_range_values() {
+        // Truncating silently would turn a typed 6.7 into 6 and look like a saved setting.
+        assert_eq!(whole_number("hours", 6.0, 0, 8_760).expect("ok"), 6);
+        assert!(whole_number("hours", 6.7, 0, 8_760).is_err());
+        assert!(whole_number("hours", -1.0, 0, 8_760).is_err());
+        assert!(whole_number("hours", 8_761.0, 0, 8_760).is_err());
+        assert!(whole_number("hours", f64::NAN, 0, 8_760).is_err());
+        // The error names the field, because a form has several.
+        assert!(format!("{}", whole_number("hours", 6.7, 0, 8_760).unwrap_err()).contains("hours"));
+    }
+
+    #[test]
+    fn the_clamps_hold_their_ranges() {
+        assert_eq!(clamp_u8(94.4).expect("ok"), 94);
+        assert_eq!(clamp_u8(100.0).expect("ok"), 100);
+        assert!(clamp_u8(101.0).is_err());
+        assert!(clamp_u8(-1.0).is_err());
+
+        assert_eq!(clamp_unit(0.8).expect("ok"), 0.8);
+        assert!(clamp_unit(1.5).is_err());
+        assert!(clamp_unit(-0.1).is_err());
+    }
+
+    #[test]
+    fn a_value_can_be_dropped_from_a_form_snapshot() {
+        let mut values = SettingsValues::new();
+        values.insert("hours", FieldValue::Number(12.0));
+        assert!(values.remove("hours").is_some());
+        assert!(values.get("hours").is_none());
+    }
+
+    #[test]
     fn settings_accessors_fall_back() {
         let mut values = SettingsValues::new();
         values.insert("hours", FieldValue::Number(12.0));
@@ -581,56 +724,21 @@ mod tests {
         assert_eq!(values.text("name"), Some("All"));
     }
 
-    /// A minimal sub-app, so the registry can be tested without depending on janitor (which
-    /// depends on this crate, so it cannot be referenced here).
-    struct StubApp;
-
-    impl SubApp for StubApp {
-        fn id(&self) -> &'static str {
-            "stub"
-        }
-
-        fn name(&self) -> &'static str {
-            "Stub"
-        }
-
-        fn description(&self) -> &'static str {
-            "test app"
-        }
-
-        fn actions(&self) -> Vec<ActionSpec> {
-            vec![
-                ActionSpec::new("preview", "Preview", "reads", ActionKind::Read),
-                ActionSpec::new("apply", "Apply", "writes", ActionKind::Write),
-            ]
-        }
-
-        fn schema(&self) -> &SettingsSchema {
-            static SCHEMA: std::sync::OnceLock<SettingsSchema> = std::sync::OnceLock::new();
-            SCHEMA.get_or_init(SettingsSchema::default)
-        }
-
-        fn load_settings(&self, _path: &Path) -> Result<SettingsValues> {
-            Ok(SettingsValues::new())
-        }
-
-        fn save_settings(&self, _path: &Path, _values: &SettingsValues) -> Result<()> {
-            Ok(())
-        }
-
-        fn run<'a>(
-            &'a self,
-            _action: &'a str,
-            _context: &'a JobContext,
-            _dry_run: bool,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<JobOutcome>> + Send + 'a>>
-        {
-            Box::pin(async { Ok(JobOutcome::new("ok")) })
-        }
-    }
+    /// The shared minimal sub-app: the core cannot depend on a real one, which depends on it.
+    use crate::test_app::StubApp;
 
     fn stub_registry() -> Registry {
-        Registry::new(vec![Arc::new(StubApp)])
+        Registry::new(vec![Arc::new(StubApp::new())])
+    }
+
+    #[test]
+    fn an_apps_exports_are_named_after_its_id() {
+        let app = StubApp::new();
+        assert_eq!(app.export_prefix(), "stub_");
+        assert_eq!(
+            app.report_title("Preview Report"),
+            format!("# crosstalk Stub v{} - Preview Report", crate::HOST_VERSION)
+        );
     }
 
     #[test]

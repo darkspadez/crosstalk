@@ -11,11 +11,13 @@ pub mod callsign;
 pub mod data;
 pub mod normalize;
 pub mod pipeline;
+pub mod profile;
 pub mod pyre;
 pub mod similarity;
 pub mod tokens;
 
 pub use normalize::{NormalizeFlags, Normalizer};
+pub use profile::{MatchProfile, MatcherConfig};
 
 /// The fuzzy-matching floor used by Janitor (`FUZZY_MATCH_THRESHOLD` in `plugin.py`).
 pub const FUZZY_MATCH_THRESHOLD: u8 = 85;

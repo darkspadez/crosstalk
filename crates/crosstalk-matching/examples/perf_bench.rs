@@ -11,7 +11,7 @@
 //! audit's throwaway harness used), falling back to a synthetic list when the files
 //! are absent. The hard-path shape mirrors the audit: queries with HD/quality
 //! variants against 5,000 candidates, scored through `score_candidates` on rayon,
-//! exactly as automatch stage 1 calls it.
+//! exactly as the guide app's `match_preview` scoring stage calls it.
 
 use crosstalk_matching::alias::AliasMap;
 use crosstalk_matching::callsign::KnownCallsigns;

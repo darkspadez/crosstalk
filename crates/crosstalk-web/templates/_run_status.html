@@ -24,5 +24,9 @@
   {% endfor %}
 </p>
 {% if let Some(report) = run.report_path %}
+{% if report_available %}
 <p><a class="button" href="/runs/{{ run.id }}/csv">Download CSV</a> <span class="muted">{{ report }}</span></p>
+{% else %}
+<p class="muted">The report file is gone, deleted by retention or "Clear exports": {{ report }}</p>
+{% endif %}
 {% endif %}

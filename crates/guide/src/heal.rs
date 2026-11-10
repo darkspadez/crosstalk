@@ -12,15 +12,18 @@
 //! one already assigned), take the first candidate that clears the threshold AND has
 //! programmes, then apply only those.
 
-use crate::scope::{ScopedChannels, ScopedEntries};
-use crate::settings::JanitorSettings;
+use crate::scope::ScopedEntries;
+use crate::settings::GuideSettings;
 use anyhow::{Context, Result};
 use crosstalk_core::csv_report;
 use crosstalk_core::dispatcharr::{EpgEntry, HasPrograms, ProgramWindow, World};
 use crosstalk_core::jobs::{JobContext, ProgressEvent};
+use crosstalk_core::match_run::{self, ConfidenceBand};
+use crosstalk_core::scope::ScopedChannels;
 use crosstalk_core::store::RunRow;
-use crosstalk_core::subapp::JobOutcome;
-use crosstalk_matching::pipeline::{CandidateIndex, MatchOptions, Matcher, Scored};
+use crosstalk_core::subapp::{JobOutcome, OutcomeBuilder, SubApp};
+use crosstalk_matching::pipeline::{CandidateIndex, Scored};
+use crosstalk_matching::MatchProfile;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -105,6 +108,7 @@ impl HealRow {
             status: self.status.as_str().to_string(),
             reason: self.reason.clone(),
             ai_decision: None,
+            ..RunRow::default()
         }
     }
 }
@@ -122,8 +126,9 @@ pub struct HealOutcome {
 
 /// Run scan & heal.
 pub async fn run(
+    app: &dyn SubApp,
     context: &JobContext,
-    settings: &JanitorSettings,
+    settings: &GuideSettings,
     world: &World,
     scoped_channels: &ScopedChannels,
     scoped_entries: &ScopedEntries,
@@ -149,7 +154,7 @@ pub async fn run(
     // The checks fan out (P1), bounded by the Dispatcharr concurrency; assignments that
     // need no request resolve without one. Broken channels collect in channel order.
     context.progress(&ProgressEvent::new(
-        "janitor.heal",
+        "guide.heal",
         0,
         scoped_channels.channels.len() as u64,
         "checking existing assignments",
@@ -240,12 +245,7 @@ pub async fn run(
     let scanned = scoped_channels.channels.len();
 
     // Step 2: search a replacement for each broken channel.
-    let matcher = Arc::new(Matcher::new(
-        context.config().matching.normalize_flags(),
-        crate::matcher_aliases(context),
-        Arc::new(crate::known_callsigns(context)),
-        MatchOptions::default(),
-    ));
+    let matcher = Arc::new(context.config().matching.matcher(MatchProfile::EpgJanitor));
     let names: Vec<String> = scoped_entries
         .entries
         .iter()
@@ -256,26 +256,20 @@ pub async fn run(
         matcher.normalizer(),
         matcher.known(),
     ));
-    let tags = crate::tag_list(context.config().matching.normalize_flags());
+    let tags = matcher.tags();
 
-    // Step 2a: score every broken channel off the async runtime (P3), the same
-    // spawn_blocking + rayon shape automatch uses, so a big heal never stalls a Tokio
-    // worker. `par_iter` preserves order on collect: `scored_all[i]` is broken[i].
-    let scored_all: Vec<Vec<Scored>> = {
-        let matcher = Arc::clone(&matcher);
-        let index = Arc::clone(&index);
-        let broken_names: Vec<String> = broken.iter().map(|channel| channel.name.clone()).collect();
-        tokio::task::spawn_blocking(move || {
-            use rayon::prelude::*;
-            let tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
-            broken_names
-                .par_iter()
-                .map(|name| matcher.score_candidates(name, &index, &tag_refs, None))
-                .collect()
-        })
-        .await
-        .context("the scoring stage panicked")?
-    };
+    // Step 2a: score every broken channel off the async runtime (P3), through the shared
+    // scoring stage: no progress bar, because only the broken channels are scored.
+    // `scored_all[i]` is `broken[i]`.
+    let broken_names: Vec<String> = broken.iter().map(|channel| channel.name.clone()).collect();
+    let scored_all: Vec<Vec<Scored>> = match_run::score_names(
+        &broken_names,
+        Arc::clone(&matcher),
+        Arc::clone(&index),
+        &tags,
+        None,
+    )
+    .await?;
 
     // Step 2b: walk each broken channel's ranked list serially, concurrently across
     // channels (P1). Picks resolve by channel order below. Work runs in batches so
@@ -347,7 +341,7 @@ pub async fn run(
             }
         }
         context.progress(&ProgressEvent::new(
-            "janitor.heal",
+            "guide.heal",
             batch_end as u64,
             broken_ref.len() as u64,
             "searching replacements",
@@ -416,7 +410,7 @@ pub async fn run(
 
         if position % 50 == 0 {
             context.progress(&ProgressEvent::new(
-                "janitor.heal",
+                "guide.heal",
                 position as u64,
                 broken.len() as u64,
                 "searching replacements",
@@ -438,18 +432,18 @@ pub async fn run(
 
     // Step 3: write the report BEFORE applying, so it reflects the plan. On an apply
     // failure the CSV still exists on disk recording what was attempted and confirmed,
-    // and the error below names it (mirroring automatch, which also reports before it
+    // and the error below names it (mirroring matching, which also reports before it
     // writes). The run record itself cannot link it: the runner drops the report path on
     // a failed run.
-    let report = write_report(context, settings, scanned, &rows, dry_run)?;
+    let report = write_report(app, context, settings, scanned, &rows, dry_run)?;
 
     // Step 4: write the replacements that clear the threshold.
     let mut applied = 0;
     if !dry_run {
-        let associations: Vec<(i64, i64)> = rows
+        let associations: Vec<(i64, Option<i64>)> = rows
             .iter()
             .filter(|row| row.status == HealStatus::Healed)
-            .filter_map(|row| row.new_epg_id.map(|epg| (row.channel_id, epg)))
+            .filter_map(|row| row.new_epg_id.map(|epg| (row.channel_id, Some(epg))))
             .collect();
         if !associations.is_empty() {
             let plan = report
@@ -470,7 +464,8 @@ pub async fn run(
             .map(|name| name.to_string_lossy().to_string());
         csv_report::prune_exports(
             &context.exports_dir(),
-            settings.csv_retention_days,
+            &app.export_prefix(),
+            context.config().exports.retention_days,
             name.as_deref(),
         );
     }
@@ -495,16 +490,16 @@ fn reason_for(row: &HealRow, threshold: u8, allow_without_programs: bool) -> Str
         ),
         _ => {
             let confidence = row.confidence;
-            if confidence >= 95 {
-                format!("Excellent replacement match ({confidence}%)")
-            } else if confidence >= 85 {
-                format!("High confidence replacement ({confidence}%)")
-            } else if confidence >= 75 {
-                format!("Good replacement match ({confidence}%)")
-            } else if confidence >= 60 {
-                format!("Moderate confidence replacement ({confidence}%)")
-            } else {
-                format!("Low confidence replacement ({confidence}%)")
+            match ConfidenceBand::of(confidence) {
+                ConfidenceBand::Excellent => {
+                    format!("Excellent replacement match ({confidence}%)")
+                }
+                ConfidenceBand::High => format!("High confidence replacement ({confidence}%)"),
+                ConfidenceBand::Good => format!("Good replacement match ({confidence}%)"),
+                ConfidenceBand::Moderate => {
+                    format!("Moderate confidence replacement ({confidence}%)")
+                }
+                ConfidenceBand::Low => format!("Low confidence replacement ({confidence}%)"),
             }
         }
     };
@@ -518,81 +513,82 @@ fn reason_for(row: &HealRow, threshold: u8, allow_without_programs: bool) -> Str
 }
 
 fn write_report(
+    app: &dyn SubApp,
     context: &JobContext,
-    settings: &JanitorSettings,
+    settings: &GuideSettings,
     scanned: usize,
     rows: &[HealRow],
     dry_run: bool,
 ) -> Result<Option<PathBuf>> {
-    let path = csv_report::report_path(
-        &context.exports_dir(),
-        if dry_run {
-            "heal_preview"
-        } else {
-            "heal_applied"
-        },
-    );
-
     let replacements = rows.iter().filter(|row| row.new_epg_id.is_some()).count();
     let applied = rows
         .iter()
         .filter(|row| row.status == HealStatus::Healed)
         .count();
 
-    let preamble = csv_report::preamble(
-        context.config(),
-        &crate::settings::schema(),
-        &crate::settings::to_values(settings),
+    let exports_dir = context.exports_dir();
+    let report = csv_report::Report::new(
+        &exports_dir,
+        app,
+        if dry_run {
+            "heal_preview"
+        } else {
+            "heal_applied"
+        },
         if dry_run {
             "Scan and Heal Preview Report"
         } else {
             "Scan and Heal Applied Report"
         },
-        scanned,
-        &[
-            ("Broken assignments examined", rows.len().to_string()),
-            ("Replacements found", replacements.to_string()),
-            (
-                "Replacements written",
-                if dry_run {
-                    "none, this was a preview".to_string()
-                } else {
-                    applied.to_string()
-                },
-            ),
-        ],
+    )
+    .channels_processed(scanned)
+    .result("Broken assignments examined", rows.len())
+    .result("Replacements found", replacements)
+    .result(
+        "Replacements written",
+        if dry_run {
+            "none, this was a preview".to_string()
+        } else {
+            applied.to_string()
+        },
     );
 
-    csv_report::write_report(&path, &preamble, &COLUMNS, |writer| {
-        for row in rows {
-            // Names and reasons come from Dispatcharr: defuse spreadsheet formulas.
-            writer.write_record([
-                row.channel_id.to_string(),
-                csv_report::safe_cell(&row.channel_name),
-                row.channel_number
-                    .map(|number| format!("{number}"))
-                    .unwrap_or_default(),
-                csv_report::safe_cell(&row.channel_group),
-                csv_report::safe_cell(&row.original_epg_name),
-                csv_report::safe_cell(&row.original_epg_source),
-                csv_report::safe_cell(
-                    &row.new_epg_name
-                        .clone()
-                        .unwrap_or_else(|| "N/A".to_string()),
-                ),
-                csv_report::safe_cell(
-                    &row.new_epg_source
-                        .clone()
-                        .unwrap_or_else(|| "N/A".to_string()),
-                ),
-                row.confidence.to_string(),
-                csv_report::safe_cell(&row.method),
-                row.status.as_str().to_string(),
-                csv_report::safe_cell(&row.reason),
-            ])?;
-        }
-        Ok(())
-    })?;
+    let path = report.write(
+        context.config(),
+        &crate::settings::schema(),
+        &crate::settings::to_values(settings),
+        &COLUMNS,
+        |writer| {
+            for row in rows {
+                // Names and reasons come from Dispatcharr: defuse spreadsheet formulas.
+                writer.write_record([
+                    row.channel_id.to_string(),
+                    csv_report::safe_cell(&row.channel_name),
+                    row.channel_number
+                        .map(|number| format!("{number}"))
+                        .unwrap_or_default(),
+                    csv_report::safe_cell(&row.channel_group),
+                    csv_report::safe_cell(&row.original_epg_name),
+                    csv_report::safe_cell(&row.original_epg_source),
+                    csv_report::safe_cell(
+                        &row.new_epg_name
+                            .clone()
+                            .unwrap_or_else(|| "N/A".to_string()),
+                    ),
+                    csv_report::safe_cell(
+                        &row.new_epg_source
+                            .clone()
+                            .unwrap_or_else(|| "N/A".to_string()),
+                    ),
+                    row.confidence.to_string(),
+                    csv_report::safe_cell(&row.method),
+                    row.status.as_str().to_string(),
+                    csv_report::safe_cell(&row.reason),
+                ])?;
+            }
+            Ok(())
+        },
+    )?;
     Ok(Some(path))
 }
 
@@ -609,15 +605,21 @@ pub fn outcome(result: &HealOutcome, dry_run: bool, threshold: u8) -> JobOutcome
         .filter(|row| row.status == HealStatus::SkippedLowConfidence)
         .count();
 
-    let mut summary = format!(
+    let mut outcome = OutcomeBuilder::new(format!(
         "Scan & Heal {}: scanned {}, {} broken, {} replacement(s) found",
         if dry_run { "preview" } else { "applied" },
         result.scanned,
         result.broken,
         result.replacements
-    );
+    ))
+    .count("scanned", result.scanned as i64)
+    .count("broken", result.broken as i64)
+    .count("replacements", result.replacements as i64)
+    .count("low_confidence", low_confidence as i64)
+    .count("healed", high_confidence as i64)
+    .count("applied", result.applied as i64);
     if low_confidence > 0 {
-        summary.push_str(&format!(", {low_confidence} below threshold"));
+        outcome = outcome.note(format!("{low_confidence} below threshold"));
     }
     if dry_run {
         let would_apply = result
@@ -625,30 +627,20 @@ pub fn outcome(result: &HealOutcome, dry_run: bool, threshold: u8) -> JobOutcome
             .iter()
             .filter(|row| row.new_epg_id.is_some() && row.confidence >= threshold)
             .count();
-        summary.push_str(&format!(", {would_apply} would be applied"));
+        outcome = outcome.note(format!("{would_apply} would be applied"));
     } else {
-        summary.push_str(&format!(
-            ", {high_confidence} healed, {} assignments written",
+        outcome = outcome.note(format!(
+            "{high_confidence} healed, {} assignments written",
             result.applied
         ));
     }
-
-    let mut outcome = JobOutcome::new(summary)
-        .with_count("scanned", result.scanned as i64)
-        .with_count("broken", result.broken as i64)
-        .with_count("replacements", result.replacements as i64)
-        .with_count("low_confidence", low_confidence as i64)
-        .with_count("healed", high_confidence as i64)
-        .with_count("applied", result.applied as i64);
-    if let Some(report) = result.report.clone() {
-        outcome = outcome.with_report(report);
-    }
-    outcome
+    outcome.report(result.report.clone()).build()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::GuideApp;
     use crosstalk_core::dispatcharr::{Channel, ChannelGroup, DispatcharrClient, EpgSource};
     use crosstalk_core::jobs::VecSink;
     use wiremock::matchers::{method, path, query_param};
@@ -775,6 +767,7 @@ mod tests {
                 name: "Schedules Direct".to_string(),
                 is_active: true,
                 priority: 5,
+                ..EpgSource::default()
             }],
             entries: vec![
                 EpgEntry {
@@ -808,9 +801,9 @@ mod tests {
     }
 
     fn scoped(world: &World) -> (ScopedChannels, ScopedEntries) {
-        let settings = JanitorSettings::default();
+        let scope = crosstalk_core::config::ScopeConfig::default();
         (
-            crate::scope::scope_channels(world, &settings).expect("channels"),
+            crosstalk_core::scope::scope_channels(world, &scope).expect("channels"),
             crate::scope::scope_entries(world, ""),
         )
     }
@@ -818,12 +811,20 @@ mod tests {
     #[tokio::test]
     async fn a_broken_assignment_gets_a_working_replacement() {
         let (_server, world, context) = fixture(false, true).await;
-        let settings = JanitorSettings::default();
+        let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
 
-        let result = run(&context, &settings, &world, &channels, &entries, true)
-            .await
-            .expect("preview");
+        let result = run(
+            &GuideApp::new(),
+            &context,
+            &settings,
+            &world,
+            &channels,
+            &entries,
+            true,
+        )
+        .await
+        .expect("preview");
         assert_eq!(result.broken, 1);
         let row = &result.rows[0];
         assert_eq!(row.status, HealStatus::ReplacementPreview);
@@ -836,11 +837,19 @@ mod tests {
     #[tokio::test]
     async fn an_apply_writes_the_replacement() {
         let (_server, world, context) = fixture(false, true).await;
-        let settings = JanitorSettings::default();
+        let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
-        let result = run(&context, &settings, &world, &channels, &entries, false)
-            .await
-            .expect("apply");
+        let result = run(
+            &GuideApp::new(),
+            &context,
+            &settings,
+            &world,
+            &channels,
+            &entries,
+            false,
+        )
+        .await
+        .expect("apply");
         assert_eq!(result.rows[0].status, HealStatus::Healed);
         assert_eq!(result.applied, 1);
     }
@@ -851,11 +860,19 @@ mod tests {
         // on disk and names it in the error (the runner drops the report path on failure).
         let (_server, world, context) =
             fixture_with_names("ESPN HD", "ESPN (broken)", "ESPN", false, true, false).await;
-        let settings = JanitorSettings::default();
+        let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
-        let error = run(&context, &settings, &world, &channels, &entries, false)
-            .await
-            .expect_err("the apply fails");
+        let error = run(
+            &GuideApp::new(),
+            &context,
+            &settings,
+            &world,
+            &channels,
+            &entries,
+            false,
+        )
+        .await
+        .expect_err("the apply fails");
         let message = format!("{error:#}");
         assert!(message.contains("recorded in"), "{message}");
 
@@ -883,11 +900,19 @@ mod tests {
         // with `=`, `+` or `@` must reach the CSV quoted, never as live formulas.
         let (_server, world, context) =
             fixture_with_names("+ESPN HD", "=ESPN (broken)", "@ESPN", false, true, true).await;
-        let settings = JanitorSettings::default();
+        let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
-        let result = run(&context, &settings, &world, &channels, &entries, true)
-            .await
-            .expect("preview");
+        let result = run(
+            &GuideApp::new(),
+            &context,
+            &settings,
+            &world,
+            &channels,
+            &entries,
+            true,
+        )
+        .await
+        .expect("preview");
         assert_eq!(result.broken, 1);
         let row = &result.rows[0];
         assert_eq!(row.original_epg_name, "=ESPN (broken)");
@@ -914,11 +939,19 @@ mod tests {
     #[tokio::test]
     async fn a_working_assignment_is_never_touched() {
         let (_server, world, context) = fixture(true, true).await;
-        let settings = JanitorSettings::default();
+        let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
-        let result = run(&context, &settings, &world, &channels, &entries, false)
-            .await
-            .expect("preview");
+        let result = run(
+            &GuideApp::new(),
+            &context,
+            &settings,
+            &world,
+            &channels,
+            &entries,
+            false,
+        )
+        .await
+        .expect("preview");
         assert_eq!(result.broken, 0);
         assert!(result.rows.is_empty());
         assert_eq!(result.applied, 0);
@@ -927,11 +960,19 @@ mod tests {
     #[tokio::test]
     async fn a_channel_with_no_working_replacement_is_left_alone() {
         let (_server, world, context) = fixture(false, false).await;
-        let settings = JanitorSettings::default();
+        let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
-        let result = run(&context, &settings, &world, &channels, &entries, false)
-            .await
-            .expect("apply");
+        let result = run(
+            &GuideApp::new(),
+            &context,
+            &settings,
+            &world,
+            &channels,
+            &entries,
+            false,
+        )
+        .await
+        .expect("apply");
         assert_eq!(result.rows[0].status, HealStatus::NoReplacementFound);
         assert_eq!(result.rows[0].new_epg_id, None);
         assert_eq!(
@@ -954,13 +995,21 @@ mod tests {
             true,
         )
         .await;
-        let settings = JanitorSettings::default();
+        let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
         assert!(settings.heal_confidence_threshold > 50);
 
-        let result = run(&context, &settings, &world, &channels, &entries, false)
-            .await
-            .expect("apply");
+        let result = run(
+            &GuideApp::new(),
+            &context,
+            &settings,
+            &world,
+            &channels,
+            &entries,
+            false,
+        )
+        .await
+        .expect("apply");
         assert_eq!(result.broken, 1);
         let row = &result.rows[0];
         assert_eq!(row.status, HealStatus::SkippedLowConfidence);
@@ -980,9 +1029,17 @@ mod tests {
 
         // A preview records the replacement too, whatever the score: only an apply
         // splits Healed from SkippedLowConfidence.
-        let preview = run(&context, &settings, &world, &channels, &entries, true)
-            .await
-            .expect("preview");
+        let preview = run(
+            &GuideApp::new(),
+            &context,
+            &settings,
+            &world,
+            &channels,
+            &entries,
+            true,
+        )
+        .await
+        .expect("preview");
         assert_eq!(preview.rows[0].status, HealStatus::ReplacementPreview);
         assert_eq!(preview.rows[0].new_epg_id, Some(8));
         assert_eq!(preview.applied, 0);
@@ -1101,11 +1158,19 @@ mod tests {
         // the in-future checks plus the batch guards must abort the run.
         let (_server, world, context) = fixture(false, true).await;
         context.cancel();
-        let settings = JanitorSettings::default();
+        let settings = GuideSettings::default();
         let (channels, entries) = scoped(&world);
-        let error = run(&context, &settings, &world, &channels, &entries, true)
-            .await
-            .expect_err("a cancelled run aborts");
+        let error = run(
+            &GuideApp::new(),
+            &context,
+            &settings,
+            &world,
+            &channels,
+            &entries,
+            true,
+        )
+        .await
+        .expect_err("a cancelled run aborts");
         assert!(format!("{error:#}").contains("cancelled"));
     }
 }

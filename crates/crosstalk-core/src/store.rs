@@ -14,6 +14,12 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+/// The data version, kept in `PRAGMA user_version`.
+///
+/// The schema itself is created with `IF NOT EXISTS`, so it needs no version; what does need
+/// one is the one-time rename of recorded history below, which must not run twice.
+const DATA_VERSION: i64 = 1;
+
 /// How a run ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -92,6 +98,16 @@ pub struct RunRow {
     pub reason: String,
     /// What the model said, when it was asked. Empty when it was not.
     pub ai_decision: Option<String>,
+    /// The channel field a channel operation wrote (`name`, `channel_group_id`, `epg_data_id`,
+    /// `hidden_from_output`, `profile_membership:<id>`), empty for a matching row.
+    ///
+    /// `before_value`/`after_value` are the machine values of that field: an id for a group
+    /// or an EPG entry, `none` for an unassigned one, `true`/`false` for a flag. Together with
+    /// the identity columns they are what a later `restore` reverses, which is why they are
+    /// generic rather than EPG-shaped: phase 2 restores names and groups, not only guides.
+    pub field: String,
+    pub before_value: Option<String>,
+    pub after_value: Option<String>,
 }
 
 /// One AI request and its answer, kept for auditing why a row was accepted.
@@ -121,7 +137,29 @@ impl std::fmt::Debug for Store {
 
 impl Store {
     /// Open (or create) the database at `path` and migrate it.
+    ///
+    /// For the daemon: a run left `running` by a crash or a restart can never finish, so
+    /// opening retires those rows. A SECOND process must not use this (see
+    /// [`Store::open_shared`]): retiring from the CLI would mark the daemon's live run
+    /// failed while it is still writing.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with(path, true)
+    }
+
+    /// Open the database from a second process (the one-shot CLI), without retiring.
+    ///
+    /// Same schema migration as [`Store::open`], but `running` rows are left alone: they
+    /// belong to the daemon's live runs, and only the daemon's next [`Store::open`] may
+    /// retire them. Callers must refuse to start work an already-`running` row covers (see
+    /// [`Store::running_runs`]): the in-process one-run-per-app guard cannot see across
+    /// processes, and SQLite serialises writers but does not stop two processes from
+    /// running the same app at once. (`WAL` + `busy_timeout` below are what let the two
+    /// processes share the file at all.)
+    pub fn open_shared(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with(path, false)
+    }
+
+    fn open_with(path: impl AsRef<Path>, retire_running: bool) -> Result<Self> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -132,7 +170,7 @@ impl Store {
         let store = Self {
             connection: Arc::new(Mutex::new(connection)),
         };
-        store.migrate()?;
+        store.migrate(retire_running)?;
         Ok(store)
     }
 
@@ -141,7 +179,7 @@ impl Store {
         let store = Self {
             connection: Arc::new(Mutex::new(Connection::open_in_memory()?)),
         };
-        store.migrate()?;
+        store.migrate(true)?;
         Ok(store)
     }
 
@@ -156,7 +194,10 @@ impl Store {
     }
 
     /// Create the schema. Idempotent, so it runs on every open.
-    fn migrate(&self) -> Result<()> {
+    ///
+    /// `retire_running` is true for the daemon's own open and false for a second
+    /// process's [`Store::open_shared`]: only the daemon may declare another run dead.
+    fn migrate(&self, retire_running: bool) -> Result<()> {
         self.with_connection(|connection| {
             connection.execute_batch(
                 r#"
@@ -195,6 +236,9 @@ impl Store {
                     status           TEXT    NOT NULL DEFAULT '',
                     reason           TEXT    NOT NULL DEFAULT '',
                     ai_decision      TEXT,
+                    field            TEXT    NOT NULL DEFAULT '',
+                    before_value     TEXT,
+                    after_value      TEXT,
                     PRIMARY KEY (run_id, ordinal)
                 );
                 CREATE INDEX IF NOT EXISTS run_rows_channel ON run_rows(run_id, channel_id);
@@ -222,13 +266,41 @@ impl Store {
                 "#,
             )?;
             // A run left `running` by a crash or a restart can never finish, and pruning
-            // skips running rows, so it would otherwise show as live forever.
-            connection.execute(
-                "UPDATE runs SET status = 'failed', \
-                 summary = COALESCE(summary, 'the daemon restarted while this run was in progress'), \
-                 finished_at = COALESCE(finished_at, ?1) WHERE status = 'running'",
-                params![chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)],
-            )?;
+            // skips running rows, so it would otherwise show as live forever. Only the
+            // daemon's own open retires: a second process cannot tell a live run from a
+            // stale one, and retiring a live run rewrites history under it.
+            if retire_running {
+                connection.execute(
+                    "UPDATE runs SET status = 'failed', \
+                     summary = COALESCE(summary, 'the daemon restarted while this run was in progress'), \
+                     finished_at = COALESCE(finished_at, ?1) WHERE status = 'running'",
+                    params![chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)],
+                )?;
+            }
+            add_run_row_columns(connection)?;
+            // Before the index below: the rename turns `janitor` rows into `guide` rows, and
+            // must not be the statement that trips over it.
+            rename_recorded_history(connection)?;
+            // One live run per app, across processes: the in-memory busy map stops two runs
+            // in THIS process, but the CLI is another process on the same file. A partial
+            // index (no extra row when nothing is running), created after the retire above
+            // so a restarted daemon never trips on its own stale rows.
+            let index = connection.execute_batch(
+                "CREATE UNIQUE INDEX IF NOT EXISTS runs_one_running_per_app ON runs(app) WHERE \
+                 status = 'running'",
+            );
+            match index {
+                Ok(()) => {}
+                // A database from before the index can hold two stale `running` rows for one
+                // app (a crash while the CLI and the daemon both ran it). Only the daemon may
+                // retire them, so a shared open goes without the index until then; the CLI
+                // still refuses to start over a `running` row (`running_runs`).
+                Err(error) if !retire_running => tracing::warn!(
+                    "the one-run-per-app index cannot be created until the daemon retires \
+                     stale running rows: {error}"
+                ),
+                Err(error) => return Err(error.into()),
+            }
             Ok(())
         })
     }
@@ -291,8 +363,10 @@ impl Store {
                 let mut statement = transaction.prepare(
                     "INSERT OR REPLACE INTO run_rows (run_id, ordinal, channel_id, channel_name, \
                      channel_group, channel_number, current_epg_name, epg_data_id, epg_name, \
-                     epg_source, score, method, status, reason, ai_decision) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                     epg_source, score, method, status, reason, ai_decision, field, \
+                     before_value, after_value) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
+                     ?16, ?17, ?18)",
                 )?;
                 for row in rows {
                     statement.execute(params![
@@ -311,6 +385,9 @@ impl Store {
                         row.status,
                         row.reason,
                         row.ai_decision,
+                        row.field,
+                        row.before_value,
+                        row.after_value,
                     ])?;
                 }
             }
@@ -384,6 +461,48 @@ impl Store {
         })
     }
 
+    /// The most recent SUCCEEDED run of one action for one app.
+    ///
+    /// This is how a later action finds the result set an earlier one produced (the guide's
+    /// cleanup actions read the last `scan`), which is why it is keyed by app AND action and
+    /// requires the run to have finished cleanly: a cancelled or failed run may hold partial
+    /// rows, and a partial result set would silently skip channels the run never reached.
+    /// There is no age limit — the planning step re-reads the current state of every channel
+    /// anyway, so a stale result set is safe, only out of date.
+    pub fn last_succeeded_run(&self, app: &str, action: &str) -> Result<Option<RunRecord>> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT id, app, action, dry_run, started_at, finished_at, status, summary, \
+                 counts, report_path FROM runs WHERE app = ?1 AND action = ?2 AND status = ?3 \
+                 ORDER BY started_at DESC, id DESC LIMIT 1",
+            )?;
+            statement
+                .query_row(params![app, action, RunStatus::Succeeded.as_str()], map_run)
+                .optional()
+                .map_err(Into::into)
+        })
+    }
+
+    /// The live (`running`) runs of one app, oldest first.
+    ///
+    /// The cross-process guard: a second process (the one-shot CLI) refuses to start an
+    /// app that has one of these, because the in-process busy map cannot see it. A row
+    /// here is either the daemon's live run or a stale row from a crash, which only the
+    /// daemon's next [`Store::open`] retires — so the caller reports both cases and lets
+    /// the operator decide, rather than retiring what might be alive.
+    pub fn running_runs(&self, app: &str) -> Result<Vec<RunRecord>> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT id, app, action, dry_run, started_at, finished_at, status, summary, \
+                 counts, report_path FROM runs WHERE app = ?1 AND status = ?2 \
+                 ORDER BY started_at, id",
+            )?;
+            let rows = statement.query_map(params![app, RunStatus::Running.as_str()], map_run)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
+    }
+
     /// One run by id.
     pub fn run(&self, run_id: i64) -> Result<Option<RunRecord>> {
         self.with_connection(|connection| {
@@ -404,7 +523,8 @@ impl Store {
             let mut statement = connection.prepare(
                 "SELECT ordinal, channel_id, channel_name, channel_group, channel_number, \
                  current_epg_name, epg_data_id, epg_name, epg_source, score, method, status, \
-                 reason, ai_decision FROM run_rows WHERE run_id = ?1 ORDER BY ordinal",
+                 reason, ai_decision, field, before_value, after_value FROM run_rows \
+                 WHERE run_id = ?1 ORDER BY ordinal",
             )?;
             let rows = statement.query_map(params![run_id], |row| {
                 Ok(RunRow {
@@ -422,6 +542,9 @@ impl Store {
                     status: row.get(11)?,
                     reason: row.get(12)?,
                     ai_decision: row.get(13)?,
+                    field: row.get(14)?,
+                    before_value: row.get(15)?,
+                    after_value: row.get(16)?,
                 })
             })?;
             rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -526,6 +649,63 @@ impl Store {
     }
 }
 
+/// Add the columns channel operations record, when this database predates them.
+///
+/// `CREATE TABLE IF NOT EXISTS` leaves an existing `run_rows` alone, so a store written by an
+/// earlier build would reject the new inserts. The columns are nullable or defaulted, so an
+/// old row reads back as "no channel-operation data", which is exactly what it is.
+fn add_run_row_columns(connection: &Connection) -> Result<()> {
+    let mut statement = connection.prepare("PRAGMA table_info(run_rows)")?;
+    let existing: std::collections::HashSet<String> = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (name, definition) in [
+        ("field", "TEXT NOT NULL DEFAULT ''"),
+        ("before_value", "TEXT"),
+        ("after_value", "TEXT"),
+    ] {
+        if !existing.contains(name) {
+            connection.execute_batch(&format!(
+                "ALTER TABLE run_rows ADD COLUMN {name} {definition}"
+            ))?;
+        }
+    }
+    Ok(())
+}
+
+/// Rename the pre-rename history once: the sub-app is `guide` and its matching actions are
+/// `match_*`.
+///
+/// The store records what it was told, so a database written by an earlier build would show
+/// the old names in the UI and make `recent_runs_for("guide")` miss every old run. The rewrite
+/// is one transaction, and the version stamp makes it idempotent: a later open sees
+/// `DATA_VERSION` and touches nothing. Nothing else is renamed — the old rows carry no other
+/// reference to the app.
+fn rename_recorded_history(connection: &Connection) -> Result<()> {
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version >= DATA_VERSION {
+        return Ok(());
+    }
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute("UPDATE runs SET app = 'guide' WHERE app = 'janitor'", [])?;
+    transaction.execute(
+        "UPDATE runs SET action = 'match_preview' WHERE action = 'automatch_preview'",
+        [],
+    )?;
+    transaction.execute(
+        "UPDATE runs SET action = 'match_apply' WHERE action = 'automatch_apply'",
+        [],
+    )?;
+    transaction.execute(
+        "UPDATE settings_history SET app = 'guide' WHERE app = 'janitor'",
+        [],
+    )?;
+    // `PRAGMA` takes no bound parameter, and the value is a constant of this build.
+    transaction.execute_batch(&format!("PRAGMA user_version = {DATA_VERSION}"))?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn map_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
     let counts: String = row.get(8)?;
     let status: String = row.get(6)?;
@@ -563,6 +743,9 @@ mod tests {
             status: "HEALED".to_string(),
             reason: "Excellent replacement match (100%)".to_string(),
             ai_decision: None,
+            field: String::new(),
+            before_value: None,
+            after_value: None,
         }
     }
 
@@ -570,7 +753,7 @@ mod tests {
     fn a_run_round_trips() {
         let store = Store::in_memory().expect("store");
         let run_id = store
-            .start_run("janitor", "automatch_apply", false)
+            .start_run("guide", "match_apply", false)
             .expect("start");
 
         let running = store.run(run_id).expect("run").expect("present");
@@ -606,11 +789,199 @@ mod tests {
     }
 
     #[test]
-    fn rows_are_replaced_not_duplicated() {
+    fn a_channel_operation_row_keeps_what_it_changed() {
+        // A restore reads these three columns, so they have to survive the round trip even
+        // though the matching columns are empty.
         let store = Store::in_memory().expect("store");
         let run_id = store
-            .start_run("janitor", "heal_apply", true)
+            .start_run("guide", "clear_groups_apply", false)
             .expect("start");
+        store
+            .append_rows(
+                run_id,
+                &[RunRow {
+                    ordinal: 0,
+                    channel_id: 7,
+                    channel_name: "ESPN".to_string(),
+                    field: "epg_data_id".to_string(),
+                    before_value: Some("31".to_string()),
+                    after_value: Some("none".to_string()),
+                    method: "clear_epg".to_string(),
+                    status: "ok".to_string(),
+                    ..RunRow::default()
+                }],
+            )
+            .expect("rows");
+
+        let rows = store.rows(run_id).expect("rows");
+        assert_eq!(rows[0].field, "epg_data_id");
+        assert_eq!(rows[0].before_value.as_deref(), Some("31"));
+        assert_eq!(rows[0].after_value.as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn a_store_written_before_the_channel_operation_columns_is_upgraded() {
+        // The columns arrived with channel operations; an existing database (cedro's) must
+        // gain them rather than fail the first insert.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("runs.db");
+        {
+            let connection = Connection::open(&path).expect("open");
+            connection
+                .execute_batch(
+                    "CREATE TABLE run_rows (run_id INTEGER NOT NULL, ordinal INTEGER NOT NULL, \
+                     channel_id INTEGER NOT NULL, channel_name TEXT NOT NULL, \
+                     channel_group TEXT NOT NULL DEFAULT '', channel_number REAL, \
+                     current_epg_name TEXT, epg_data_id INTEGER, epg_name TEXT, epg_source TEXT, \
+                     score INTEGER NOT NULL DEFAULT 0, method TEXT NOT NULL DEFAULT '', \
+                     status TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '', \
+                     ai_decision TEXT, PRIMARY KEY (run_id, ordinal));",
+                )
+                .expect("old schema");
+            // The rename migration already ran on this database (it is at DATA_VERSION),
+            // so only the column upgrade may touch it.
+            connection
+                .execute_batch("PRAGMA user_version = 1")
+                .expect("stamp version");
+        }
+
+        let store = Store::open(&path).expect("reopens");
+        let run_id = store
+            .start_run("guide", "tag_missing_apply", false)
+            .expect("start");
+        store
+            .append_rows(
+                run_id,
+                &[RunRow {
+                    ordinal: 0,
+                    channel_id: 1,
+                    field: "name".to_string(),
+                    before_value: Some("ESPN".to_string()),
+                    after_value: Some("ESPN [BadEPG]".to_string()),
+                    ..RunRow::default()
+                }],
+            )
+            .expect("inserts into the upgraded table");
+        assert_eq!(store.rows(run_id).expect("rows").len(), 1);
+    }
+
+    #[test]
+    fn the_last_succeeded_run_is_found_by_app_and_action() {
+        // The guide's cleanup actions read the result set of the last `scan` through this.
+        let store = Store::in_memory().expect("store");
+        assert!(store
+            .last_succeeded_run("guide", "scan")
+            .expect("query")
+            .is_none());
+
+        let scan = store.start_run("guide", "scan", true).expect("start");
+        store
+            .finish_run(
+                scan,
+                RunStatus::Succeeded,
+                Some("3 missing"),
+                &serde_json::json!({}),
+                None,
+            )
+            .expect("finish");
+        // A cancelled scan is not a result set: its rows are partial by definition.
+        let cancelled = store.start_run("guide", "scan", true).expect("start");
+        store
+            .finish_run(
+                cancelled,
+                RunStatus::Cancelled,
+                Some("cancelled"),
+                &serde_json::json!({}),
+                None,
+            )
+            .expect("finish");
+        // Another action's run is not a scan, however recent.
+        let other = store
+            .start_run("guide", "match_preview", true)
+            .expect("start");
+        store
+            .finish_run(
+                other,
+                RunStatus::Succeeded,
+                None,
+                &serde_json::json!({}),
+                None,
+            )
+            .expect("finish");
+
+        let found = store
+            .last_succeeded_run("guide", "scan")
+            .expect("query")
+            .expect("the succeeded scan");
+        assert_eq!(found.id, scan);
+        assert!(store
+            .last_succeeded_run("streams", "scan")
+            .expect("query")
+            .is_none());
+    }
+
+    #[test]
+    fn a_shared_open_leaves_running_rows_alone() {
+        // The one-shot CLI opens the daemon's file with this: retiring here would mark the
+        // daemon's live run failed while it is still writing.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("crosstalk.db");
+        let store = Store::open(&path).expect("open");
+        let run_id = store.start_run("guide", "scan", true).expect("start");
+
+        let shared = Store::open_shared(&path).expect("shared open");
+        let running = shared.running_runs("guide").expect("query");
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].id, run_id);
+        assert_eq!(running[0].status, RunStatus::Running);
+        assert!(shared.running_runs("streams").expect("query").is_empty());
+
+        // And the daemon's own next open still retires the stale row.
+        drop(store);
+        drop(shared);
+        let store = Store::open(&path).expect("reopen");
+        assert!(store.running_runs("guide").expect("query").is_empty());
+        assert_eq!(
+            store.run(run_id).expect("run").expect("present").status,
+            RunStatus::Failed
+        );
+    }
+
+    #[test]
+    fn a_second_live_run_for_the_same_app_is_refused() {
+        // The cross-process guard: the busy map cannot see another process, so the store
+        // itself refuses a second `running` row per app. Finished rows never conflict, and
+        // another app is unaffected.
+        let store = Store::in_memory().expect("store");
+        let _first = store.start_run("guide", "scan", true).expect("start");
+        let error = store
+            .start_run("guide", "clear_missing_apply", false)
+            .expect_err("refused");
+        assert!(
+            format!("{error:#}").contains("UNIQUE constraint failed"),
+            "{error:#}"
+        );
+        store
+            .start_run("streams", "scan", true)
+            .expect("another app may run");
+        store
+            .finish_run(
+                _first,
+                RunStatus::Succeeded,
+                None,
+                &serde_json::json!({}),
+                None,
+            )
+            .expect("finish");
+        store
+            .start_run("guide", "scan", true)
+            .expect("free again after finish");
+    }
+
+    #[test]
+    fn rows_are_replaced_not_duplicated() {
+        let store = Store::in_memory().expect("store");
+        let run_id = store.start_run("guide", "heal_apply", true).expect("start");
         store
             .append_rows(run_id, &[sample_row(0, "ESPN", 100)])
             .expect("first");
@@ -626,7 +997,7 @@ mod tests {
     fn ai_decisions_round_trip() {
         let store = Store::in_memory().expect("store");
         let run_id = store
-            .start_run("janitor", "automatch_preview", true)
+            .start_run("guide", "match_preview", true)
             .expect("start");
         let decision = AiDecision {
             row_ordinal: 3,
@@ -653,7 +1024,7 @@ mod tests {
     fn recent_runs_are_newest_first_and_filterable() {
         let store = Store::in_memory().expect("store");
         let first = store
-            .start_run("janitor", "automatch_preview", true)
+            .start_run("guide", "match_preview", true)
             .expect("start");
         // SQLite's timestamp resolution is a second, so order by id as well; this sleeps to
         // make the timestamps differ where the platform allows it.
@@ -665,9 +1036,9 @@ mod tests {
         assert_eq!(all[0].id, second);
         assert_eq!(all[1].id, first);
 
-        let janitor_only = store.recent_runs_for("janitor", 10).expect("runs");
-        assert_eq!(janitor_only.len(), 1);
-        assert_eq!(janitor_only[0].id, first);
+        let guide_only = store.recent_runs_for("guide", 10).expect("runs");
+        assert_eq!(guide_only.len(), 1);
+        assert_eq!(guide_only[0].id, first);
 
         assert_eq!(store.run_count().expect("count"), 2);
     }
@@ -676,7 +1047,7 @@ mod tests {
     fn settings_changes_are_recorded() {
         let store = Store::in_memory().expect("store");
         store
-            .record_settings_change("janitor", &serde_json::json!({"check_hours": 6}))
+            .record_settings_change("guide", &serde_json::json!({"check_hours": 6}))
             .expect("record");
         let count: i64 = store
             .with_connection(|connection| {
@@ -694,7 +1065,7 @@ mod tests {
     fn pruning_keeps_recent_runs_and_a_minimum() {
         let store = Store::in_memory().expect("store");
         let run_id = store
-            .start_run("janitor", "automatch_preview", true)
+            .start_run("guide", "match_preview", true)
             .expect("start");
         store
             .finish_run(
@@ -726,7 +1097,7 @@ mod tests {
     fn pruning_off_by_default() {
         let store = Store::in_memory().expect("store");
         store
-            .start_run("janitor", "automatch_preview", true)
+            .start_run("guide", "match_preview", true)
             .expect("start");
         assert_eq!(store.prune(0, 0).expect("prune"), 0);
         assert_eq!(store.run_count().expect("count"), 1);
@@ -736,7 +1107,7 @@ mod tests {
     fn a_running_run_is_never_pruned() {
         let store = Store::in_memory().expect("store");
         let run_id = store
-            .start_run("janitor", "automatch_apply", false)
+            .start_run("guide", "match_apply", false)
             .expect("start");
         let old = (chrono::Utc::now() - chrono::Duration::days(30))
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -768,7 +1139,7 @@ mod tests {
         {
             let store = Store::open(&path).expect("open");
             let run_id = store
-                .start_run("janitor", "automatch_preview", true)
+                .start_run("guide", "match_preview", true)
                 .expect("start");
             store
                 .finish_run(
@@ -782,5 +1153,201 @@ mod tests {
         }
         let store = Store::open(&path).expect("reopen");
         assert_eq!(store.run_count().expect("count"), 1);
+    }
+
+    #[test]
+    fn a_fresh_database_is_stamped_without_touching_history() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("crosstalk.db");
+        let store = Store::open(&path).expect("open");
+        let version: i64 = store
+            .with_connection(|connection| {
+                connection
+                    .query_row("PRAGMA user_version", [], |row| row.get(0))
+                    .map_err(Into::into)
+            })
+            .expect("version");
+        assert_eq!(version, DATA_VERSION);
+        // A fresh database has nothing to rename and stays usable.
+        let run_id = store
+            .start_run("guide", "match_preview", true)
+            .expect("start");
+        assert_eq!(store.recent_runs_for("guide", 10).expect("runs").len(), 1);
+        assert_eq!(
+            store.run(run_id).expect("run").expect("present").app,
+            "guide"
+        );
+    }
+
+    #[test]
+    fn an_old_history_is_renamed_and_only_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("crosstalk.db");
+        {
+            let store = Store::open(&path).expect("open");
+            for (action, dry_run) in [("automatch_preview", true), ("automatch_apply", false)] {
+                let run_id = store.start_run("janitor", action, dry_run).expect("start");
+                store
+                    .finish_run(
+                        run_id,
+                        RunStatus::Succeeded,
+                        Some("ok"),
+                        &serde_json::json!({}),
+                        None,
+                    )
+                    .expect("finish");
+            }
+            // A heal run keeps its action: only the app is renamed.
+            let heal_id = store
+                .start_run("janitor", "heal_preview", true)
+                .expect("start");
+            store
+                .finish_run(
+                    heal_id,
+                    RunStatus::Succeeded,
+                    Some("ok"),
+                    &serde_json::json!({}),
+                    None,
+                )
+                .expect("finish");
+            // A row already written under the new name must survive untouched.
+            let guide_id = store
+                .start_run("guide", "match_preview", true)
+                .expect("start");
+            store
+                .finish_run(
+                    guide_id,
+                    RunStatus::Succeeded,
+                    Some("ok"),
+                    &serde_json::json!({}),
+                    None,
+                )
+                .expect("finish");
+            store
+                .record_settings_change("janitor", &serde_json::json!({"check_hours": 6}))
+                .expect("record");
+            // Rewind the stamp: this is what a database written before the rename looks like.
+            store
+                .with_connection(|connection| {
+                    connection
+                        .execute_batch("PRAGMA user_version = 0")
+                        .map_err(Into::into)
+                })
+                .expect("rewind");
+        }
+
+        let store = Store::open(&path).expect("reopen");
+        let runs = store.recent_runs_for("guide", 10).expect("runs");
+        assert_eq!(runs.len(), 4);
+        // Newest first: the pre-existing guide row was written last.
+        assert_eq!(runs[0].action, "match_preview");
+        assert!(runs.iter().all(|run| run.app == "guide"));
+        let actions: Vec<&str> = runs.iter().map(|run| run.action.as_str()).collect();
+        assert!(actions.contains(&"match_apply"));
+        assert!(actions.contains(&"heal_preview"));
+        // The heal run kept its action; only the app was renamed.
+        let heal = runs
+            .iter()
+            .find(|run| run.action == "heal_preview")
+            .expect("heal");
+        assert_eq!(heal.app, "guide");
+        assert!(store
+            .recent_runs_for("janitor", 10)
+            .expect("runs")
+            .is_empty());
+
+        let apps: Vec<String> = store
+            .with_connection(|connection| {
+                let mut statement = connection.prepare("SELECT app FROM settings_history")?;
+                let apps = statement
+                    .query_map([], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()?;
+                Ok(apps)
+            })
+            .expect("settings history");
+        assert_eq!(apps, vec!["guide".to_string()]);
+
+        // A second open is a no-op: the stamp says the rewrite already ran, so a row written
+        // afterwards keeps whatever app it was given.
+        store
+            .start_run("janitor", "automatch_apply", false)
+            .expect("start");
+        let store = Store::open(&path).expect("reopen again");
+        assert_eq!(store.recent_runs_for("janitor", 10).expect("runs").len(), 1);
+        assert_eq!(store.recent_runs_for("guide", 10).expect("runs").len(), 4);
+    }
+
+    /// The schema exactly as v0.1.0 (`e74a3ad`) created it: no channel-operation columns, no
+    /// one-run-per-app index, `user_version` 0.
+    const V0_1_0_SCHEMA: &str = "
+        CREATE TABLE runs (id INTEGER PRIMARY KEY AUTOINCREMENT, app TEXT NOT NULL,
+            action TEXT NOT NULL, dry_run INTEGER NOT NULL, started_at TEXT NOT NULL,
+            finished_at TEXT, status TEXT NOT NULL, summary TEXT,
+            counts TEXT NOT NULL DEFAULT '{}', report_path TEXT);
+        CREATE INDEX runs_started ON runs(started_at DESC);
+        CREATE INDEX runs_app ON runs(app, started_at DESC);
+        CREATE TABLE run_rows (run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+            ordinal INTEGER NOT NULL, channel_id INTEGER NOT NULL, channel_name TEXT NOT NULL,
+            channel_group TEXT NOT NULL DEFAULT '', channel_number REAL, current_epg_name TEXT,
+            epg_data_id INTEGER, epg_name TEXT, epg_source TEXT,
+            score INTEGER NOT NULL DEFAULT 0, method TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '', ai_decision TEXT,
+            PRIMARY KEY (run_id, ordinal));
+        CREATE INDEX run_rows_channel ON run_rows(run_id, channel_id);
+        CREATE TABLE ai_decisions (run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+            row_ordinal INTEGER NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,
+            latency_ms INTEGER NOT NULL DEFAULT 0, input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0, request TEXT NOT NULL DEFAULT '{}',
+            response TEXT NOT NULL DEFAULT '{}', PRIMARY KEY (run_id, row_ordinal));
+        CREATE TABLE settings_history (id INTEGER PRIMARY KEY AUTOINCREMENT, app TEXT NOT NULL,
+            changed_at TEXT NOT NULL, settings TEXT NOT NULL);
+    ";
+
+    #[test]
+    fn a_v0_1_0_database_with_stale_running_rows_upgrades_from_either_process() {
+        // v0.1.0 had no cross-process guard, so a crash with the CLI and the daemon both on
+        // janitor can leave two `running` rows for it. The CLI opening first must still work
+        // (it cannot create the index yet), and the daemon's open must retire, rename and
+        // index in one go.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("crosstalk.db");
+        {
+            let connection = Connection::open(&path).expect("open");
+            connection
+                .execute_batch(V0_1_0_SCHEMA)
+                .expect("v0.1.0 schema");
+            for action in ["automatch_apply", "heal_apply"] {
+                connection
+                    .execute(
+                        "INSERT INTO runs (app, action, dry_run, started_at, status) \
+                         VALUES ('janitor', ?1, 0, '2026-10-30T00:00:00Z', 'running')",
+                        params![action],
+                    )
+                    .expect("stale run");
+            }
+            connection
+                .execute(
+                    "INSERT INTO run_rows (run_id, ordinal, channel_id, channel_name) \
+                     VALUES (1, 0, 7, 'ESPN')",
+                    [],
+                )
+                .expect("old row");
+        }
+
+        let shared = Store::open_shared(&path).expect("the CLI opens a v0.1.0 database");
+        // Renamed, and still running: only the daemon may retire them.
+        assert_eq!(shared.running_runs("guide").expect("running").len(), 2);
+        assert_eq!(shared.rows(1).expect("rows")[0].field, "");
+        drop(shared);
+
+        let store = Store::open(&path).expect("the daemon opens it");
+        assert!(store.running_runs("guide").expect("running").is_empty());
+        let runs = store.recent_runs_for("guide", 10).expect("runs");
+        assert!(runs.iter().any(|run| run.action == "match_apply"));
+        // The index exists now: a second live run for the app is refused.
+        store
+            .start_run("guide", "scan", true)
+            .expect("first live run");
+        assert!(store.start_run("guide", "scan", true).is_err());
     }
 }

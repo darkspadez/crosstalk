@@ -6,32 +6,48 @@
 //! without either knowing about the other.
 
 pub mod ai;
+pub mod ai_gate;
+pub mod channel_ops;
 pub mod config;
 pub mod csv_report;
 pub mod dispatcharr;
 pub mod jobs;
+pub mod match_run;
 pub mod runner;
 pub mod scheduler;
+pub mod scope;
 pub mod store;
 pub mod subapp;
 pub mod wildcard;
 
+#[cfg(test)]
+mod test_app;
+
 pub use ai::{AiService, Answer, Decider, DecisionRequest, DecisionResponse, Question, Verdict};
+pub use channel_ops::{
+    apply, plan, plan_with_options, run_rows, write_ops_report, ApplyReport, Change, Field, Op,
+    OpKind, Plan, PlanOptions, RenameKind, ReportSpec, RowStatus, SelectedChannel, Selection, Skip,
+    Value,
+};
 pub use config::{ConfigReport, CrosstalkConfig, SharedConfig};
 pub use csv_report::{
-    exports_to_delete, is_our_export, preamble, prune_exports, report_path, safe_cell,
-    write_report, ExportFile,
+    app_exports, clear_app_exports, clear_exports, exports_to_clear, exports_to_delete,
+    grace_doomed, is_our_export, owning_prefix, preamble, prune_exports, report_path, safe_cell,
+    write_report, ClearSummary, ExportFile, Report, CLEAR_GRACE,
 };
 pub use dispatcharr::{
-    Channel, DispatcharrClient, EpgEntry, EpgSource, HasPrograms, ProgramWindow, World,
+    Channel, ChannelCreate, ChannelEdit, ChannelGroup, ChannelProfile, ChannelRegexRename,
+    DispatcharrClient, EpgEntry, EpgHorizon, EpgRefresh, EpgSource, EpgSourceEdit, EpgSourceState,
+    HasPrograms, Logo, M3uAccount, PluginActionInfo, PluginInfo, ProgramWindow, QueuedTask, Set,
+    Stream, StreamsToChannels, World, WorldKind, WorldKinds,
 };
 pub use jobs::{JobContext, ProgressEvent, ProgressSink};
 pub use runner::{ActiveRun, JobRunner, StartedRun};
 pub use scheduler::{ScheduleInfo, Scheduler};
 pub use store::{AiDecision, RunRecord, RunRow, RunStatus, Store};
 pub use subapp::{
-    ActionKind, ActionSpec, FieldKind, FieldSpec, FieldValue, JobOutcome, Registry, SettingsSchema,
-    SettingsValues, SubApp,
+    ActionKind, ActionSpec, FieldKind, FieldSpec, FieldValue, JobOutcome, OutcomeBuilder, Registry,
+    SettingsSchema, SettingsValues, SubApp,
 };
 pub use wildcard::{expand_patterns, parse_tokens};
 

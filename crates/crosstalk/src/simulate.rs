@@ -1,4 +1,4 @@
-//! `crosstalk simulate`: the offline stream-to-channel match simulator.
+//! `crosstalk simulate-streams`: the offline stream-to-channel match simulator.
 //!
 //! Port of `tools/match_sim.py` from the Python plugin. Its purpose is the parity oracle:
 //! given the same channels CSV and provider M3U, the per-stream table must be identical

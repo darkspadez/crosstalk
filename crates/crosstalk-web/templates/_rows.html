@@ -5,18 +5,26 @@
   <thead>
     <tr>
       <th>Channel</th><th>Group</th><th>Score</th><th>Method</th>
-      <th>Chosen guide</th><th>Source</th><th>Status</th><th>Reason</th><th>AI</th>
+      <th>Chosen guide</th><th>Source</th>
+      <th>Field</th><th>Before</th><th>After</th>
+      <th>Status</th><th>Reason</th><th>AI</th>
     </tr>
   </thead>
   <tbody>
     {% for row in rows %}
     <tr>
-      <td>{{ row.channel_name }}</td>
+      <td>
+        {{ row.channel_name }}
+        {% if !row.channel_number.is_empty() %}<span class="muted">#{{ row.channel_number }}</span>{% endif %}
+      </td>
       <td class="muted">{{ row.channel_group }}</td>
-      <td>{{ row.score }}</td>
-      <td><code>{{ row.method }}</code></td>
+      <td>{% if row.score != 0 %}{{ row.score }}{% endif %}</td>
+      <td>{% if !row.method.is_empty() %}<code>{{ row.method }}</code>{% endif %}</td>
       <td>{{ row.epg_name }}</td>
       <td class="muted">{{ row.epg_source }}</td>
+      <td class="muted">{% if !row.field.is_empty() %}<code>{{ row.field }}</code>{% endif %}</td>
+      <td class="muted">{{ row.before }}</td>
+      <td class="muted">{{ row.after }}</td>
       <td><span class="status status-{{ row.status_class }}">{{ row.status }}</span></td>
       <td class="muted">{{ row.reason }}</td>
       <td class="muted">{% if let Some(ai) = row.ai_decision %}{{ ai }}{% endif %}</td>
@@ -24,4 +32,10 @@
     {% endfor %}
   </tbody>
 </table>
+<p class="muted">
+  A matching row fills in the score and the guide it chose; a channel-operation row fills in the
+  field it wrote and the value on each side of the write. Skips are listed too, with the reason
+  they were left alone. A watchdog row is per EPG source rather than per channel: the Channel
+  and Source columns both name the source, and the reason tells the whole story.
+</p>
 {% endif %}
