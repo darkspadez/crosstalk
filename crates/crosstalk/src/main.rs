@@ -6,6 +6,7 @@
 //!   * `validate` — check configuration against Dispatcharr
 //!   * `exports clear` — delete the CSV reports the sub-apps wrote
 //!   * `bridge secret|rotate|ping` — the `crosstalk-bridge` plugin's secret, and a signed ping
+//!   * `sessions revoke-all` — sign every browser out by replacing the session key
 //!   * `simulate-streams` — offline stream-to-channel match simulation (the unified engine;
 //!     the Janitor oracle with `--features oracle --oracle janitor`)
 //!   * `bench` — time the parts of a run, to decide whether REST is fast enough
@@ -50,6 +51,8 @@ enum Command {
     Undo(UndoArgs),
     /// The crosstalk-bridge Dispatcharr plugin: its shared secret, and a signed ping.
     Bridge(BridgeArgs),
+    /// Web UI sign-ins.
+    Sessions(SessionsArgs),
     /// The objects a sub-app created in Dispatcharr and still tracks.
     Ownership(OwnershipArgs),
     /// Time the parts of a sub-app's run: the plan phases, and the writes they would issue.
@@ -250,6 +253,20 @@ struct BridgeSecretArgs {
 }
 
 #[derive(Args, Debug)]
+struct SessionsArgs {
+    #[command(subcommand)]
+    command: SessionsCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum SessionsCommand {
+    /// Sign every browser out: replace the session key in the data directory. A running daemon
+    /// picks the new key up on its next request.
+    #[command(name = "revoke-all")]
+    RevokeAll(ConfigArgs),
+}
+
+#[derive(Args, Debug)]
 struct OwnershipArgs {
     #[command(subcommand)]
     command: OwnershipCommand,
@@ -415,7 +432,23 @@ fn main() -> Result<()> {
         Command::Ownership(args) => match args.command {
             OwnershipCommand::ForgetDeleted(args) => ownership_forget_deleted(args),
         },
+        Command::Sessions(args) => match args.command {
+            SessionsCommand::RevokeAll(args) => sessions_revoke_all(args),
+        },
     }
+}
+
+/// `crosstalk sessions revoke-all`: a new session key, so no cookie signed under the old one
+/// verifies.
+fn sessions_revoke_all(args: ConfigArgs) -> Result<()> {
+    let config = CrosstalkConfig::load(&args.config)?;
+    let path = crosstalk_web::session::rotate_key(&config.data_dir())?;
+    println!(
+        "replaced {}: every browser session is signed out (a running daemon notices on its \
+         next request)",
+        path.display()
+    );
+    Ok(())
 }
 
 fn serve(args: ServeArgs) -> Result<()> {
@@ -439,10 +472,10 @@ fn serve(args: ServeArgs) -> Result<()> {
         // The listener rules the configuration report calls errors: a token too short for a
         // reachable daemon, trusted proxies without a token, a range or public URL that does
         // not parse. Each would leave the daemon weaker than the operator thinks it is.
-        let security = snapshot.server.security_errors();
+        let security = snapshot.security_errors();
         if !security.is_empty() {
             anyhow::bail!(
-                "refusing to start with an unsafe [server] configuration:\n  - {}",
+                "refusing to start with an unsafe listener configuration:\n  - {}",
                 security.join("\n  - ")
             );
         }
@@ -471,8 +504,12 @@ fn serve(args: ServeArgs) -> Result<()> {
             crosstalk_core::scheduler::Scheduler::start(runner.clone(), &snapshot).await?,
         ));
 
+        // Signed session cookies under the key in the data directory, so a restart signs
+        // nobody out. Refuses a key file other accounts can read.
+        let sessions = crosstalk_web::session::Sessions::open(&snapshot.data_dir(), store.clone())?;
         let state = crosstalk_web::AppState::new(registry, config, runner.clone(), store)
-            .with_scheduler(Arc::clone(&scheduler));
+            .with_scheduler(Arc::clone(&scheduler))
+            .with_sessions(sessions);
         let app = crosstalk_web::router(state);
 
         let address = format!("{}:{}", snapshot.server.bind, snapshot.server.port);

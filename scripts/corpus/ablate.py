@@ -47,6 +47,7 @@ import re
 import sys
 import textwrap
 import types
+import unicodedata
 
 sys.dont_write_bytecode = True
 
@@ -438,6 +439,64 @@ def collapse_pipe_segments(name: str) -> str:
     return out
 
 
+#: Language words a parenthetical may hold to stay in the key (decided N16),
+#: mirroring `language::LANGUAGE_WORDS` in Rust: English names plus common native
+#: spellings, compared through `_fold_language_word`.
+LANGUAGE_WORDS = (
+    "Arabic", "English", "French", "Français", "Spanish", "Español", "Portuguese",
+    "Português", "German", "Deutsch", "Italian", "Italiano", "Hindi", "Urdu", "Turkish",
+    "Türkçe", "Russian", "Chinese", "Mandarin", "Cantonese", "Korean", "Japanese",
+    "Persian", "Farsi", "Hebrew", "Dutch", "Polish", "Greek", "Tamil", "Telugu",
+    "Punjabi", "Bengali", "Tagalog", "Vietnamese", "Thai", "Swahili", "Somali",
+    "Amharic")
+
+
+def _fold_language_word(word: str) -> str:
+    """NFKD, drop nonspacing marks, lowercase (Rust `fold_language_word`)."""
+    return "".join(c for c in unicodedata.normalize("NFKD", word)
+                   if unicodedata.category(c) != "Mn").lower()
+
+
+_LANGUAGE_FOLDED = frozenset(_fold_language_word(word) for word in LANGUAGE_WORDS)
+_BRACKETS = "()[]"
+
+
+def unwrap_language_brackets(name: str) -> str:
+    """Unwrap `(Language)` / `[Language]` into plain words (decided N16).
+
+    Mirrors `language::unwrap_language_brackets` in Rust byte for byte: a matched
+    `(`..`)` or `[`..`]` holding no other bracket whose trimmed content is a whole
+    language word becomes that word, spaced from non-whitespace neighbours
+    (`Al Jazeera (Arabic)` -> `Al Jazeera Arabic`); every other parenthetical is
+    left to the normalizer (`RTP (PT)`, `HBO (Backup)`)."""
+    if not name or ("(" not in name and "[" not in name):
+        return name
+    out = []
+    i = 0
+    while i < len(name):
+        char = name[i]
+        close = {"(": ")", "[": "]"}.get(char)
+        if close is None:
+            out.append(char)
+            i += 1
+            continue
+        j = i + 1
+        while j < len(name) and name[j] not in _BRACKETS:
+            j += 1
+        word = name[i + 1:j].strip(_RUST_WS) if j < len(name) and name[j] == close else ""
+        if word and _fold_language_word(word) in _LANGUAGE_FOLDED:
+            if out and out[-1] and out[-1][-1] not in _RUST_WS:
+                out.append(" ")
+            out.append(word)
+            if j + 1 < len(name) and name[j + 1] not in _RUST_WS:
+                out.append(" ")
+            i = j + 1
+        else:
+            out.append(char)
+            i += 1
+    return "".join(out)
+
+
 def _peel_zone_shift(text: str):
     """Prefix before a trailing `+N` shift marker, else None (mirrors Rust)."""
     end = len(text)
@@ -748,8 +807,10 @@ class Engine:
         def normalize_name(inner, name, *args, **kwargs):
             # Decided N15: the key collapses `|` junk segments first, so no key
             # carries `|` residue (`Cinemax East | HD |` keys as `Cinemax East`).
+            # Decided N16: then a language-word parenthetical becomes a plain
+            # word (`Al Jazeera (Arabic)` keys as `Al Jazeera Arabic`).
             if isinstance(name, str):
-                name = collapse_pipe_segments(name)
+                name = unwrap_language_brackets(collapse_pipe_segments(name))
             # SM fuzzy_match strips Cinemax from CANDIDATES only, when the
             # channel name contains "max" (fuzzy_matcher.py:778-800).
             if cinemax and inner._cinemax_pair and name != inner._query:
@@ -1432,6 +1493,19 @@ def self_test() -> int:
     # country word is stranded (`RK: US | CNN` keys like `US | CNN` and `CNN`).
     for name in ("RK: US | CNN", "US | CNN", "UK | CNN | HD", "CNN | US"):
         check(f"N15 pipe key strips country {name}", norm({}, name), "CNN")
+    for name, unwrapped in [("Al Jazeera (Arabic)", "Al Jazeera Arabic"),
+                             ("Al Jazeera [English]", "Al Jazeera English"),
+                             ("CPAC(French)HD", "CPAC French HD"),
+                             ("TV5 ( Français )", "TV5 Français"),
+                             ("TRT (TÜRKÇE)", "TRT TÜRKÇE"),
+                             ("X ((Arabic))", "X ( Arabic )"),
+                             ("RTP (PT)", "RTP (PT)"),
+                             ("HBO (Backup)", "HBO (Backup)"),
+                             ("TV (Arabic HD)", "TV (Arabic HD)"),
+                             ("X (Arabic]", "X (Arabic]")]:
+        check(f"N16 language unwrap {name}", unwrap_language_brackets(name), unwrapped)
+    check("N16 language key", norm({}, "Al Jazeera (Arabic)"), "Al Jazeera Arabic")
+    check("N16 country code still strips", norm({}, "RTP (PT)"), norm({}, "RTP"))
     engine = Engine({}, 80, alias_map)
     routed = Engine({"ZONE": "sm-zone-noguard"}, 80, alias_map)
     for name, zone in [("HBO West (Backup)", "WEST"),

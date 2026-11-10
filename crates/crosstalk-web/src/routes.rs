@@ -310,13 +310,23 @@ async fn login(
     }
     state.login_limiter().record_success(client.key);
 
-    // The browser gets a session id, never the token itself.
-    let session = state.sessions().create(&expected);
+    // The browser gets a signed session cookie, never the token itself.
+    let Some(issued) = state.sessions().create(&expected) else {
+        // The session key is missing or unsafe (the log says which): no session can be
+        // issued until it is fixed.
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "sign-in is unavailable: the session key is missing or unsafe (see the log)\n",
+        )
+            .into_response();
+    };
     let secure = state.server_view().secure_cookies || client.https;
     let mut response = Redirect::to("/").into_response();
-    if let Ok(value) =
-        header::HeaderValue::from_str(&crate::session::set_cookie(&session.id, secure))
-    {
+    if let Ok(value) = header::HeaderValue::from_str(&crate::session::set_cookie(
+        &issued.cookie,
+        issued.max_age,
+        secure,
+    )) {
         response.headers_mut().append(header::SET_COOKIE, value);
     }
     // A cookie an older version set to the raw token is cleared on the way in.
@@ -328,8 +338,17 @@ async fn login(
 }
 
 async fn logout(State(state): State<AppState>, client: ClientInfo, headers: HeaderMap) -> Response {
-    if let Some(id) = crate::session::session_id(&headers) {
-        state.sessions().remove(&id);
+    // Remembered in the store until the cookie would have expired, so a copy of it dies here
+    // too, across restarts.
+    if let (Some(cookie), Some(token)) = (crate::session::cookie_value(&headers), state.token()) {
+        if let Err(error) = state.sessions().revoke(&cookie, &token) {
+            tracing::error!("could not record a sign-out: {error:#}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not sign out: try again\n",
+            )
+                .into_response();
+        }
     }
     let secure = state.server_view().secure_cookies || client.https;
     let mut response = Redirect::to("/login").into_response();
@@ -1103,11 +1122,11 @@ async fn save_host_settings(
     // The same listener rules the daemon starts under: a too-short token on a reachable bind,
     // trusted proxies without a token, a bad CIDR or public URL. The file is saved; the daemon
     // keeps running the old values.
-    let security = fresh.server.security_errors();
+    let security = fresh.security_errors();
     if !security.is_empty() {
         tracing::warn!(
             problems = security.join("; ").as_str(),
-            "host settings saved but NOT applied: the reloaded [server] settings are unsafe"
+            "host settings saved but NOT applied: the reloaded listener settings are unsafe"
         );
         return (
             StatusCode::INTERNAL_SERVER_ERROR,

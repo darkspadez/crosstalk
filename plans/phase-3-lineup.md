@@ -985,7 +985,7 @@ marked LEFT.
   drops the parenthetical (`Al Jazeera`) and the alias table lists bare `Al Jazeera HD`
   under the English channel; the pairwise verdict (A01, 100) predates A05, which only
   made the family agree with it. A data fix (an Arabic canonical in the alias table) is
-  the remedy, not a rule. Also LEFT: a run-together regional spelling (`StarzKidsWest`)
+  the remedy, not a rule. (Superseded 2026-11-10: the user chose a rule, N16 `language-word`, which keeps a bracketed full language word in the name; `Al Jazeera (Arabic)` now keys as `al jazeera arabic`.) Also LEFT: a run-together regional spelling (`StarzKidsWest`)
   loses its zone through the nospace alias lookup (`Starz Kids & Family`'s family, not
   `Starz Kids West`'s), a synthetic shape no corpus name has.
   Two fixes came out of the pass, neither a decision row: (a) **T12 gains a

@@ -53,6 +53,7 @@
 //! | N13 `strip` | invisible-format (Cf) strip | core Cf strip as-is |
 //! | N14 `core` | core geographic table | `core_pipeline: true` |
 //! | N15 `pipe-segments` | pipe junk collapses before key/zone/country; a country code keeps a delimiter | [`crate::tags::collapse_pipe_segments`] in [`UnifiedEngine::normalize_key`], [`extract_zone_noguard`], [`lineuparr_stream_country`] |
+//! | N16 `language-word` | a `(Language)`/`[Language]` segment stays as a plain word before keying | [`crate::language::unwrap_language_brackets`] in [`UnifiedEngine::normalize_key`] and the alias reverse index |
 //! | R01 `fallback` | pure-Python-equivalent arithmetic | [`similarity`] fallback port (no rapidfuzz) |
 //! | T01 `core` | core majority-overlap guard | [`has_token_overlap_core`] |
 //! | T02 `always` | basic-mode token floor always on | every stage calls the guard (never skipped) |
@@ -118,7 +119,23 @@ pub use crate::country::{extract_zone_noguard, is_group_header};
 /// is high-confidence like `KSDK`), an alias member keys as its canonical (decided
 /// A05 `canonical-key`: `CNN USA` is in `CNN`'s family), and identities carry
 /// `callsign_high`: `6`.
-pub const ENGINE_VERSION: &str = "6";
+///
+/// A parenthetical or bracketed language word stays in the key as a plain word
+/// (decided N16 `language-word`: `Al Jazeera (Arabic)` keys as `Al Jazeera Arabic`,
+/// no longer bare `Al Jazeera`, which the alias table maps to Al Jazeera English): `7`.
+pub const ENGINE_VERSION: &str = "7";
+
+/// The name the decided normalizer keys: pipe junk collapsed (N15), then
+/// language-word parentheticals unwrapped into words (N16).
+fn key_input(name: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    match crate::tags::collapse_pipe_segments(name) {
+        Cow::Borrowed(collapsed) => crate::language::unwrap_language_brackets(collapsed),
+        Cow::Owned(collapsed) => {
+            Cow::Owned(crate::language::unwrap_language_brackets(&collapsed).into_owned())
+        }
+    }
+}
 
 /// How many configurations [`UnifiedEngine::cached`] keeps built.
 pub const ENGINE_CACHE_CAPACITY: usize = 8;
@@ -480,10 +497,11 @@ impl UnifiedEngine {
                 }
             }
             for variant in ordered {
-                // Decided N15, like `normalize_key`: alias variants collapse pipe
-                // junk before the reverse index keys them.
-                let collapsed = crate::tags::collapse_pipe_segments(variant.as_str());
-                let normalized = normalizer.normalize_name(&collapsed, &[]);
+                // Decided N15/N16, like `normalize_key`: alias variants collapse pipe
+                // junk and unwrap language parentheticals before the reverse index
+                // keys them.
+                let prepared = key_input(variant.as_str());
+                let normalized = normalizer.normalize_name(&prepared, &[]);
                 if normalized.is_empty() {
                     continue;
                 }
@@ -612,9 +630,10 @@ impl UnifiedEngine {
     ///
     /// Decided N15: pipe-delimited junk segments collapse first (`Cinemax East |
     /// HD |` keys as `cinemax`), so the key carries no junk-segment residue.
+    /// Decided N16: a language-word parenthetical stays as a word (`Al Jazeera
+    /// (Arabic)` keys as `Al Jazeera Arabic`, not bare `Al Jazeera`).
     pub fn normalize_key(&self, name: &str) -> String {
-        let collapsed = crate::tags::collapse_pipe_segments(name);
-        self.normalizer.normalize_name(&collapsed, &[])
+        self.normalizer.normalize_name(&key_input(name), &[])
     }
 
     /// The identity key of a name (decided A05 `canonical-key`, phase 3 review): the
@@ -2263,6 +2282,73 @@ mod tests {
             "WFOR" => "CBS",
             _ => panic!("unknown station {station}"),
         }
+    }
+
+    /// The identity family key `name` resolves to (test helper only).
+    fn family_of(engine: &UnifiedEngine, name: &str) -> FamilyKey {
+        crate::identity::resolve_with(engine, name, &crate::identity::ResolveContext::default())
+            .family_key()
+    }
+
+    #[test]
+    fn a_language_parenthetical_stays_in_the_identity() {
+        // Decided N16: `(Arabic)` is a word of the name, not packaging, so the Arabic
+        // channel no longer keys as bare `Al Jazeera` (the English channel's alias).
+        let engine = UnifiedEngine::decided();
+        assert_eq!(
+            engine.normalize_key("Al Jazeera (Arabic)"),
+            "Al Jazeera Arabic"
+        );
+        assert_eq!(engine.alias_canonical("Al Jazeera (Arabic)"), None);
+        let arabic = family_of(&engine, "Al Jazeera (Arabic)");
+        let english = family_of(&engine, "Al Jazeera English");
+        assert_ne!(arabic, english);
+        assert_eq!(arabic, family_of(&engine, "Al Jazeera Arabic"));
+        assert_eq!(arabic, family_of(&engine, "Al Jazeera [ARABIC]"));
+        assert!(!engine.same("Al Jazeera (Arabic)", "Al Jazeera English"));
+        let candidates: Vec<String> = ["Al Jazeera English", "Al Jazeera Arabic"]
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        let family = engine.rank_in("Al Jazeera (Arabic)", None, &candidates);
+        let names: Vec<&str> = family
+            .iter()
+            .map(|r| candidates[r.index].as_str())
+            .collect();
+        assert_eq!(names, ["Al Jazeera Arabic"]);
+
+        // `(English)` joins the English channel.
+        assert_eq!(family_of(&engine, "Al Jazeera (English)"), english);
+        assert!(engine.same("Al Jazeera (English)", "Al Jazeera English"));
+
+        // The bare name is unchanged: the alias table still reads it as English.
+        assert_eq!(engine.normalize_key("Al Jazeera"), "Al Jazeera");
+        assert_eq!(
+            engine.alias_canonical("Al Jazeera").as_deref(),
+            Some("Al Jazeera English")
+        );
+        assert_eq!(family_of(&engine, "Al Jazeera"), english);
+
+        // CPAC's French feed is not CPAC.
+        let french = "Cable Public Affairs HD Channel (French)";
+        assert_ne!(
+            family_of(&engine, french),
+            family_of(&engine, "Cable Public Affairs Channel")
+        );
+        assert!(!engine.same(french, "Cable Public Affairs Channel"));
+        assert!(!engine.same("CPAC (French)", "CPAC"));
+
+        // A two-letter code is not a language word: `(PT)` strips from the key as before,
+        // and keeps its existing meaning of the Pacific feed (zone West), which predates
+        // this rule.
+        assert_eq!(
+            engine.normalize_key("RTP (PT)"),
+            engine.normalize_key("RTP")
+        );
+        assert_eq!(
+            family_of(&engine, "RTP (PT)").zone,
+            crate::country::FeedZone::West
+        );
     }
 
     #[test]

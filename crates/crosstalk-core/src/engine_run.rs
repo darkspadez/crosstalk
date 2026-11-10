@@ -275,8 +275,8 @@ mod tests {
         assert_eq!(memory.resolve("US: ESPN HD", &ctx), via_run);
 
         // The version namespaces the rows: a rule change misses every old identity.
-        // `-eng:6`: a bare station callsign joins the station's family (C08, after C07's `-eng:5`).
-        assert!(run.engine().identity_version().contains("-eng:6"));
+        // `-eng:7`: a language-word parenthetical stays in the key (N16, after C08's `-eng:6`).
+        assert!(run.engine().identity_version().contains("-eng:7"));
     }
 
     #[tokio::test]

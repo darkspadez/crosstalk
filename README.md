@@ -233,6 +233,7 @@ carry `THIRD_PARTY_LICENSES`, the licence text of every Rust crate compiled in.
 | `crosstalk exports clear [--app <id>] [--yes]` | Delete the CSV reports the sub-apps wrote (the UI's **Clear exports** button does the same) |
 | `crosstalk bridge secret [--force] [--config <dir>]` | Generate the [bridge plugin](#bridge-plugin)'s shared secret, write it to `crosstalk.toml` `[bridge] secret` (0600) and print it once. Refuses when one is set (`--force` overwrites) or when `[bridge] secret_env` supplies it |
 | `crosstalk bridge rotate [--config <dir>]` | Replace the bridge secret and print the order to roll it into the plugin without breaking it |
+| `crosstalk sessions revoke-all [--config <dir>]` | Sign every browser out: replace the session key in `<data_dir>/session.key` (a running daemon notices on its next request). See [Web UI](#web-ui) |
 | `crosstalk ownership forget-deleted --app <id> [--config <dir>]` | Forget the objects an app created that Dispatcharr no longer has, however many. A run refuses to forget more than max(25, 5%) of what the app owns at once (a short listing, or a run against the wrong Dispatcharr, must never make the next create duplicate an install); after a deliberate mass deletion in Dispatcharr that refusal names this command. Each missing id is confirmed with its own GET and only a 404 forgets it; an empty listing is still refused |
 | `crosstalk bridge ping [--config <dir>]` | Send the bridge plugin a signed ping (even while `[bridge] enabled = false`) and say whether this crosstalk can use it |
 | `crosstalk bench streams --synthetic [--config <dir>] [--channels N --streams N --accounts N]` | Time the streams plans on a world built in memory: no network, no Dispatcharr. See [Scale](#scale) |
@@ -328,14 +329,17 @@ accident.
   that the file's value is shadowed. A blank variable falls back to the file. The
   `CROSSTALK_<SECTION>__<KEY>` overrides of `token`, `api_key`, `password`, `secret`,
   `username`, `base_url` and `public_url` are taken verbatim: `CROSSTALK_SERVER__TOKEN=0123456`
-  stays `0123456`. The bridge secret works the same way (`[bridge] secret` /
-  `secret_env = "CROSSTALK_BRIDGE_SECRET"`); the settings page shows only whether it is set and
+  stays `0123456`. The bridge secret and the webhook's own token work the same way
+  (`[bridge] secret` / `secret_env = "CROSSTALK_BRIDGE_SECRET"`, `[hooks] token` /
+  `token_env = "CROSSTALK_HOOK_TOKEN"`); the settings page shows only whether each is set and
   where from, and never changes it.
 - **`base_url` credentials.** A `user:pass@` in `dispatcharr.base_url` (for a proxy in front of
   Dispatcharr) is sent as HTTP basic auth and never printed: `validate`, errors and logs show
   the URL without it.
 - **File permissions.** The run store (`<data_dir>/crosstalk.db` and SQLite's `-wal`/`-shm`)
-  is made `0600` and its directory `0700` whenever it is opened; CSV reports are written
+  is made `0600` and its directory `0700` whenever it is opened; the session signing key
+  (`<data_dir>/session.key`) is created `0600` and `serve` refuses to start while other
+  accounts can access it; CSV reports are written
   `0600` into a `0700` exports directory; a settings save writes `0600`. `validate` and
   `serve` warn when `crosstalk.toml` or an app's `.toml` is readable by other accounts AND
   holds an inline secret (`chmod 600` it, or move the secret to the environment). Unix only.
@@ -944,9 +948,10 @@ Setting it up, in Dispatcharr's own UI:
    event you are subscribing) if you do not use a payload template, because Dispatcharr's own
    payload carries no event name. The URL is *exact*: keep the path, and note the port is
    `server.port`.
-3. Header: `Authorization: Bearer <server.token>`. The route accepts **only** this: a session
+3. Header: `Authorization: Bearer <hooks.token>` — a **hook-only token** (below), or
+   `<server.token>` when none is set. The route accepts **only** a Bearer header: a session
    cookie is refused (a browser session must not be able to trigger an apply by visiting a
-   URL), and a daemon with no `server.token` refuses every delivery rather than accept
+   URL), and a daemon with neither token refuses every delivery rather than accept
    unauthenticated work.
 4. Add `Content-Type: application/json` and a per-event **payload template** such as
    `{"event": "m3u_refresh", "account": "{{ account_name }}"}` if you want a JSON body; without
@@ -956,9 +961,9 @@ Setting it up, in Dispatcharr's own UI:
 
 How a delivery is handled:
 
-- **Auth**: `Authorization: Bearer <server.token>`, never a cookie; the route is exempt from
-  CSRF only for that reason. A wrong token counts toward the same per-client lockout as a
-  wrong sign-in (ten in five minutes, then `429`). Deliveries are rate limited per client
+- **Auth**: `Authorization: Bearer <hooks.token>` (or `<server.token>`), never a cookie; the
+  route is exempt from CSRF only for that reason. A wrong token counts toward the same
+  per-client lockout as a wrong sign-in (ten in five minutes, then `429`). Deliveries are rate limited per client
   (`hooks.rate_per_minute` over a minute, `429` with `Retry-After`); bodies over 64 KiB are
   refused with `413`.
 - **Which event**: an `?event=` query parameter, then an `event` or `type` field in the body,
@@ -981,9 +986,35 @@ How a delivery is handled:
   the work runs in the background. An event the configuration does not name is logged and
   answered `202` too — "I do not act on this" is not a delivery failure.
 
+### The hook-only token
+
+Dispatcharr stores the Bearer token you give Connect in its own database and sends it with every
+delivery, so whatever you give it is only as safe as that database. Give it a token that can do
+nothing but trigger the configured hooks:
+
+```toml
+[hooks]
+token_env = "CROSSTALK_HOOK_TOKEN"   # the default; or token = "..." in the file (chmod 600)
+```
+
+- Accepted **only** on `POST /hooks/dispatcharr`, through the same auth gate and lockout as
+  every other credential. Anywhere else it is a wrong token: `401`, and it counts toward the
+  client's ten-in-five-minutes lockout.
+- Resolved like every secret: the variable `token_env` names wins over `token`, a blank
+  variable falls back to the file, it is never written back from the environment, debug output
+  prints `<redacted>`, and the settings page shows only whether it is set and where from.
+- At least 32 bytes when the daemon is reachable from elsewhere (a non-loopback bind or
+  `trusted_proxies`), exactly like `server.token`: `validate` reports a shorter one, `serve`
+  refuses to start and a settings save refuses to apply it.
+- **Migration**: while a hook token is set, the master token is still accepted on the hook
+  route for this release, and the first such delivery logs a warning naming the change. Put
+  the hook token in Dispatcharr's Connect header. **crosstalk 0.2.0 removes the fallback**:
+  with a hook token set, the master token will be refused on the hook route.
+- With no hook token configured nothing changes: the route takes `server.token`.
+
 ```bash
 curl -X POST http://127.0.0.1:8730/hooks/dispatcharr \
-  -H "Authorization: Bearer $CROSSTALK_SERVER_TOKEN" \
+  -H "Authorization: Bearer $CROSSTALK_HOOK_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"event": "m3u_refresh", "account_name": "test"}'
 ```
@@ -1010,10 +1041,29 @@ The UI binds to `127.0.0.1` by default. To expose it, set `server.bind` and a `s
 of at least 32 bytes (`openssl rand -hex 32`); the daemon refuses to start on a non-loopback
 address without one, or with a shorter one. A browser signs in at `/login` with the token and
 gets a **session** cookie (`crosstalk_session`, `HttpOnly; SameSite=Strict`, plus `Secure`
-over https): a random id held in memory, never the token itself, which expires after 12 hours
-idle or 7 days at most, ends on **Sign out**, and ends on a token rotation or a daemon restart.
-A script sends `Authorization: Bearer <token>`; that header is the only way the token itself
-travels.
+over https), never the token itself. A script sends `Authorization: Bearer <token>`; that
+header is the only way the token itself travels.
+
+Sessions:
+
+- **Signed, not stored.** The cookie is a random session id with its issue time, last-seen
+  time and absolute expiry, signed with HMAC-SHA256 under a random 32-byte key in
+  `<data_dir>/session.key`. Nothing is kept per live session, so **a daemon restart (a settings
+  change that needs one, an upgrade) signs nobody out**.
+- **Expiry**: 12 hours idle, 7 days at most. An active browser's cookie is re-issued at most
+  once every 5 minutes to carry its last-seen time.
+- **Sign out** records the session id in the run store until the cookie would have expired,
+  so a copied cookie stops working at sign-out, across restarts too.
+- **Rotating the master token** signs every session out (the signature covers a digest of
+  it). **`crosstalk sessions revoke-all`** replaces the key and signs everyone out; a running
+  daemon picks the new key up on its next request.
+- **The key file** is created `0600` on first start. The daemon refuses to start while it is
+  accessible to other accounts (`chmod 600` it, or delete it to sign everyone out and get a
+  new one); if it goes missing or loose while running, every cookie is refused and sign-in
+  answers `503` until it is fixed. Anyone who can read it can forge a session, so treat the
+  data directory like the token.
+- Each session's CSRF token is derived from its id with the same key, so it too survives a
+  restart.
 
 Bots and scripts talk to the same routes the forms do, with two differences from a browser:
 
@@ -1103,9 +1153,10 @@ server {
 }
 ```
 
-The webhook goes through the same proxy and the same token: point Dispatcharr at
-`https://crosstalk.example.com/hooks/dispatcharr` with the `Authorization: Bearer` header. There
-is no separate webhook token (a deliberate choice: one token, hardened).
+The webhook goes through the same proxy and the same gate: point Dispatcharr at
+`https://crosstalk.example.com/hooks/dispatcharr` with an `Authorization: Bearer` header carrying
+the [hook-only token](#the-hook-only-token) (`[hooks] token`), so the credential Dispatcharr
+stores cannot sign in or run anything else.
 
 ## How matching works
 
@@ -1171,6 +1222,7 @@ in `docs/oracle-reports/`.
 | engine | Callsign-first (C07): a known-station callsign outranks the bare national entry | `ABC (WABC)` with the station listed joins the station, not bare `ABC`; without the station the national entry is the fallback. Fixes network-led names ranking the stripped key first (writes different: the station's entry instead of the national one) |
 | engine | Same-station callsign names are one family (C08); a trailing tag never demotes a callsign (C09); alias members key as their canonical (A05); ties go to the query's own zone | A stream or entry carrying the station's callsign (`KSDK`, `KSDK HD`, `WABC-TV`, `13 WREX`, `NBC 5 St. Louis KSDK`) joins `NBC (KSDK)` / `NBC - IL Rockford (WREX)`'s family whatever spelling leads the pool, where before it joined only when no network-led spelling was present (the `callsign-anchor` rows of the streams report; Stream-Mapparr attached it). Subchannels (`KSDK-DT2`, `WREX 13.2`) keep their own identity, and a `+N` feed keeps its low-confidence read, so no new pair matches on the corpus (cost unchanged). `CNN USA` (an alias of `CNN`) is in `CNN`'s family beside the exact spelling, so two channels spelled as two names of one identity (`Cinemax Action` and `ActionMax`, `HBO2` and `HBO Hits`) both take a stream spelled either way. At equal score the candidate in the query's own zone leads (`UK: BBC One HD` -> `BBC One`, not `BBC One East HD`), then the candidate spelled as the query (`DISCOVERY` -> `Discovery`, not `Discovery Channel`), then the token overlap. The names OTA template therefore keeps the renamed channel inside the family it came from, and `names`, `categorize`, `create`, guide and streams give one answer per entity (`crates/lineup/tests/cross_app_identity.rs`) (writes more: the callsign and alias streams/entries Stream-Mapparr also attached; writes different: the same-zone DB spelling) |
 | engine | Pipe segments split before keying (N15) | `Cinemax East \| HD \|` keys as `cinemax` with zone East; a core country code beside a bar keeps a delimiter. Fixes decoration changing the family key (writes same-or-more) |
+| engine | Language words in brackets stay in the name (N16) | The plugins strip every parenthetical, so `Al Jazeera (Arabic)` keyed as bare `Al Jazeera`, which all four alias tables give to Al Jazeera English. crosstalk keeps a bracketed full language word (`(Arabic)`, `(French)`, `[Español]`; 38 words, accents folded) as a plain word, so the Arabic feed and CPAC's French feed are their own channels. Two-letter codes such as `(PT)` strip as before. 30 of 61,028 known names change (writes fewer: a language feed no longer joins the other language's channel) |
 | engine | Trailing writer tags strip before the zone read (Z08) | `HBO West [4K]` and `ITV1 (Central East) HD` route by their feed zone instead of joining the default family. Fixes cross-feed families (writes same-or-more) |
 | engine | One tag vocabulary, one quality model, one template/collision engine, one logo resolver | NC junk, CM ignored tags, IC format suffixes, triage and `[Unk]` tags in one table; one quality tier feed; one rename/template + global collision guard; one logo tier walk. No app re-implements another's rule (writes same, consistently) |
 | engine | Identity cache per run, persisted | `identity_cache` rows keyed by input + identity version (data, decisions, engine version, normalisation/alias settings); one warm pass per run. No output effect (writes same) |

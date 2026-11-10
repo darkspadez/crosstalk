@@ -100,6 +100,7 @@ fn state_with(
     let mut config = CrosstalkConfig::load(dir.path()).expect("config");
     config.server.token = token.unwrap_or_default().to_string();
     config.server.token_env = String::new();
+    config.hooks.token_env = String::new();
     config.jobs.exports_dir = dir.path().join("exports").display().to_string();
     tweak(&mut config);
 
@@ -134,7 +135,8 @@ async fn get(state: &AppState, uri: &str) -> (StatusCode, String) {
     (status, String::from_utf8_lossy(&body).to_string())
 }
 
-/// Sign in through the login form, returning the session id and the session's CSRF token.
+/// Sign in through the login form, returning the session cookie's value and the session's CSRF
+/// token.
 async fn sign_in(state: &AppState, token: &str) -> (String, String) {
     let response = router(state.clone())
         .oneshot(
@@ -168,8 +170,9 @@ async fn sign_in(state: &AppState, token: &str) -> (String, String) {
         .expect("a session cookie");
     let csrf = state
         .sessions()
-        .touch(&id, token)
+        .verify(&id, token)
         .expect("a live session")
+        .session
         .csrf;
     (id, csrf)
 }
@@ -2463,7 +2466,11 @@ async fn the_login_page_hands_out_a_session_not_the_token() {
             .any(|cookie| cookie.starts_with("crosstalk_token=;") && cookie.contains("Max-Age=0")),
         "{cookies:?}"
     );
-    assert_eq!(state.sessions().len(), 1);
+    // Signed, and only as long as the absolute lifetime.
+    assert!(
+        session.contains(&format!("Max-Age={}", crate::session::ABSOLUTE.as_secs())),
+        "{session}"
+    );
 }
 
 #[tokio::test]
@@ -2519,7 +2526,7 @@ async fn the_session_cookie_is_secure_over_https() {
 
 #[tokio::test]
 async fn signing_out_ends_the_session_server_side() {
-    let (state, _store, _dir) = state(Some("s3cret"));
+    let (state, store, _dir) = state(Some("s3cret"));
     let (session, csrf) = sign_in(&state, "s3cret").await;
     let cookie = format!("{}={session}", crate::session::COOKIE);
     let (status, _h, _b) = send(
@@ -2535,7 +2542,7 @@ async fn signing_out_ends_the_session_server_side() {
     )
     .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    assert!(state.sessions().is_empty());
+    assert_eq!(store.session_revocation_count().expect("count"), 1);
     // A copy of the cookie kept by someone else is worthless now.
     let (status, _body) = get_with_cookie(&state, "/api/v1/apps", &session).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -2897,4 +2904,343 @@ async fn the_hook_answer_echoes_only_a_tame_event_name() {
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
     assert!(!body.contains('<'), "{body}");
     assert!(body.contains("?script?alert?1???script?"), "{body}");
+}
+
+// --- the hook-only token -------------------------------------------------------------
+
+/// A hook token, distinct from [`LONG`] (the master token in these tests).
+const HOOK_TOKEN: &str = "hook-0123456789abcdef0123456789ab";
+
+fn with_hook_token(config: &mut CrosstalkConfig) {
+    with_hooks(config);
+    config.hooks.token = HOOK_TOKEN.to_string();
+}
+
+#[tokio::test]
+async fn the_hook_token_works_on_the_hook_route_only() {
+    let (state, store, _dir) = state_with(Some(LONG), with_hook_token);
+    let bearer = format!("Bearer {HOOK_TOKEN}");
+    let (status, _headers, body) = post_hook(
+        &state,
+        r#"{"event": "m3u_refresh"}"#,
+        Some(("authorization", bearer.clone())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    wait_for_runs(&store, "echo", 1).await;
+
+    // Anywhere else it is a wrong token: a read, and a form POST.
+    let form = ("content-type", "application/x-www-form-urlencoded");
+    for (method, uri) in [("GET", "/api/v1/runs"), ("POST", "/exports/clear")] {
+        let (status, _headers, body) = send(
+            &state,
+            method,
+            uri,
+            Some("192.0.2.7:4000"),
+            &[("authorization", bearer.as_str()), form],
+            b"confirm=true".to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}: {body}");
+    }
+    // ...and each refusal counted toward the client's lockout.
+    let client: std::net::IpAddr = "192.0.2.7".parse().expect("ip");
+    assert_eq!(state.login_limiter().hits(client), 2);
+}
+
+#[tokio::test]
+async fn a_wrong_hook_token_counts_toward_the_lockout() {
+    let (state, _store, _dir) = state_with(Some(LONG), with_hook_token);
+    for attempt in 0..10 {
+        let (status, _headers, body) = post_hook(
+            &state,
+            r#"{"event": "m3u_refresh"}"#,
+            Some(("authorization", "Bearer hook-wrong".to_string())),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "attempt {attempt}: {body}"
+        );
+    }
+    // Locked out, even with the right hook token.
+    let (status, headers, _body) = post_hook(
+        &state,
+        r#"{"event": "m3u_refresh"}"#,
+        Some(("authorization", format!("Bearer {HOOK_TOKEN}"))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(headers.contains_key("retry-after"));
+}
+
+#[tokio::test]
+async fn the_master_token_still_works_on_the_hook_route_with_a_warning() {
+    let (state, store, _dir) = state_with(Some(LONG), with_hook_token);
+    let (status, _headers, body) = post_hook(
+        &state,
+        r#"{"event": "m3u_refresh"}"#,
+        Some(("authorization", format!("Bearer {LONG}"))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    wait_for_runs(&store, "echo", 1).await;
+    assert!(
+        crate::auth::master_on_hook_warned(),
+        "the migration warning was logged"
+    );
+}
+
+#[tokio::test]
+async fn the_dashboard_names_the_hook_token_when_one_is_set() {
+    let (state, _store, _dir) = state_with(Some(LONG), with_hook_token);
+    let bearer = format!("Bearer {LONG}");
+    let (status, _headers, body) = send(
+        &state,
+        "GET",
+        "/",
+        None,
+        &[("authorization", bearer.as_str())],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Bearer &lt;hooks.token&gt;"), "{body}");
+    assert!(!body.contains(HOOK_TOKEN), "{body}");
+}
+
+#[tokio::test]
+async fn saving_host_settings_refuses_a_short_hook_token_on_a_reachable_bind() {
+    let (state, _store, dir) = state(Some(LONG));
+    std::fs::write(
+        dir.path().join("crosstalk.toml"),
+        format!(
+            "[server]\nbind = \"0.0.0.0\"\ntoken = \"{LONG}\"\ntoken_env = \"\"\n\n\
+             [hooks]\ntoken = \"short\"\ntoken_env = \"\"\n"
+        ),
+    )
+    .expect("seed");
+    let bearer = format!("Bearer {LONG}");
+    let (status, body) = post_page(
+        &state,
+        "/settings/host",
+        "matching.enabled_databases=US",
+        &[("authorization", bearer.as_str())],
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(body.contains("NOT applied"), "{body}");
+    assert!(body.contains("hooks.token is 5 bytes"), "{body}");
+    assert_eq!(state.snapshot().server.bind, "127.0.0.1", "not swapped in");
+}
+
+// --- signed sessions that survive a restart ---------------------------------------------
+
+/// A daemon over `dir` as `serve` builds it: the run store and the session key in the data
+/// directory. Calling it twice on one directory is a restart.
+fn daemon_over(dir: &Path, token: &str) -> (AppState, Store) {
+    let mut config = CrosstalkConfig::load(dir).expect("config");
+    config.server.token = token.to_string();
+    config.server.token_env = String::new();
+    config.hooks.token_env = String::new();
+    config.jobs.exports_dir = dir.join("exports").display().to_string();
+    let data = config.data_dir();
+    let store = Store::open(data.join("crosstalk.db")).expect("store");
+    let shared = crosstalk_core::config::SharedConfig::new(config);
+    let runner = JobRunner::new(
+        Registry::new(vec![Arc::new(EchoApp)]),
+        shared.clone(),
+        store.clone(),
+    );
+    let sessions = crate::session::Sessions::open(&data, store.clone()).expect("session key");
+    let state = AppState::new(
+        Registry::new(vec![Arc::new(EchoApp)]),
+        shared,
+        runner,
+        store.clone(),
+    )
+    .with_sessions(sessions);
+    (state, store)
+}
+
+#[tokio::test]
+async fn a_session_survives_a_restart_with_its_csrf_token() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (before, _store) = daemon_over(dir.path(), LONG);
+    let (session, csrf) = sign_in(&before, LONG).await;
+    drop(before);
+
+    let (after, store) = daemon_over(dir.path(), LONG);
+    let (status, body) = get_with_cookie(&after, "/apps/echo", &session).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains(&csrf), "the same CSRF token: {body}");
+
+    // ...and CSRF is still enforced per session after the restart.
+    let cookie = format!("{}={session}", crate::session::COOKIE);
+    let form = ("content-type", "application/x-www-form-urlencoded");
+    let (status, _h, _b) = send(
+        &after,
+        "POST",
+        "/apps/echo/actions/peek",
+        None,
+        &[("cookie", cookie.as_str()), form],
+        b"dry_run=true".to_vec(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _h, _b) = send(
+        &after,
+        "POST",
+        "/apps/echo/actions/peek",
+        None,
+        &[
+            ("cookie", cookie.as_str()),
+            (crate::csrf::CSRF_HEADER, csrf.as_str()),
+            form,
+        ],
+        b"dry_run=true".to_vec(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    wait_for_runs(&store, "echo", 1).await;
+}
+
+#[tokio::test]
+async fn a_signed_out_cookie_stays_dead_after_a_restart() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (before, _store) = daemon_over(dir.path(), LONG);
+    let (session, csrf) = sign_in(&before, LONG).await;
+    let cookie = format!("{}={session}", crate::session::COOKIE);
+    let (status, _h, _b) = send(
+        &before,
+        "POST",
+        "/logout",
+        None,
+        &[
+            ("cookie", cookie.as_str()),
+            (crate::csrf::CSRF_HEADER, csrf.as_str()),
+        ],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (status, _body) = get_with_cookie(&before, "/api/v1/apps", &session).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    drop(before);
+
+    let (after, _store) = daemon_over(dir.path(), LONG);
+    let (status, _body) = get_with_cookie(&after, "/api/v1/apps", &session).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "still signed out");
+    // A new session after the restart is unaffected.
+    let (other, _csrf) = sign_in(&after, LONG).await;
+    let (status, _body) = get_with_cookie(&after, "/api/v1/apps", &other).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_tampered_or_expired_cookie_is_refused() {
+    let (state, _store, _dir) = state(Some(LONG));
+    let (session, _csrf) = sign_in(&state, LONG).await;
+    let (status, _body) = get_with_cookie(&state, "/api/v1/apps", &session).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // One character changed anywhere: the MAC fails.
+    for at in [0, session.len() / 2, session.len() - 2] {
+        let mut tampered: Vec<char> = session.chars().collect();
+        tampered[at] = if tampered[at] == 'A' { 'B' } else { 'A' };
+        let tampered: String = tampered.into_iter().collect();
+        let (status, _body) = get_with_cookie(&state, "/api/v1/apps", &tampered).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "tampered at {at}");
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    // Past the absolute limit, and idle too long.
+    for issued_at in [
+        now - crate::session::ABSOLUTE.as_secs() - 1,
+        now - crate::session::IDLE.as_secs() - crate::session::REFRESH.as_secs(),
+    ] {
+        let old = state
+            .sessions()
+            .create_at(LONG, issued_at)
+            .expect("issued")
+            .cookie;
+        let (status, _body) = get_with_cookie(&state, "/api/v1/apps", &old).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "issued at {issued_at}");
+    }
+}
+
+#[tokio::test]
+async fn an_active_session_gets_a_refreshed_cookie() {
+    let (state, _store, _dir) = state(Some(LONG));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    let old = state
+        .sessions()
+        .create_at(LONG, now - 2 * crate::session::REFRESH.as_secs())
+        .expect("issued");
+    let cookie = format!("{}={}", crate::session::COOKIE, old.cookie);
+    let (status, headers, _body) = send(
+        &state,
+        "GET",
+        "/api/v1/apps",
+        None,
+        &[("cookie", cookie.as_str())],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let refreshed = headers
+        .get("set-cookie")
+        .and_then(|value| value.to_str().ok())
+        .expect("a refreshed cookie");
+    assert!(refreshed.starts_with("crosstalk_session="), "{refreshed}");
+    assert!(
+        refreshed.contains("HttpOnly; SameSite=Strict"),
+        "{refreshed}"
+    );
+
+    // A cookie from this bucket is not re-issued.
+    let (session, _csrf) = sign_in(&state, LONG).await;
+    let cookie = format!("{}={session}", crate::session::COOKIE);
+    let (_status, headers, _body) = send(
+        &state,
+        "GET",
+        "/api/v1/apps",
+        None,
+        &[("cookie", cookie.as_str())],
+        Vec::new(),
+    )
+    .await;
+    assert!(headers.get("set-cookie").is_none());
+}
+
+#[tokio::test]
+async fn rotating_the_token_signs_every_session_out() {
+    let (state, _store, _dir) = state(Some(LONG));
+    let (session, _csrf) = sign_in(&state, LONG).await;
+    let mut rotated = state.snapshot();
+    rotated.server.token = "fedcba9876543210fedcba9876543210".to_string();
+    state.config.replace(rotated);
+    let (status, _body) = get_with_cookie(&state, "/api/v1/apps", &session).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn revoking_every_session_signs_a_running_daemon_out() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (state, _store) = daemon_over(dir.path(), LONG);
+    let (session, _csrf) = sign_in(&state, LONG).await;
+    crate::session::rotate_key(&state.snapshot().data_dir()).expect("rotate");
+    let (status, _body) = get_with_cookie(&state, "/api/v1/apps", &session).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // A new sign-in works under the new key.
+    let (session, _csrf) = sign_in(&state, LONG).await;
+    let (status, _body) = get_with_cookie(&state, "/api/v1/apps", &session).await;
+    assert_eq!(status, StatusCode::OK);
 }

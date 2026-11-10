@@ -17,6 +17,7 @@
 //!   country, category, region, zone, timeshift, tags, key).
 //! * `zone`: `{name}` -> `{"zone": "EAST"|"WEST"|"DEFAULT"}` (noguard routing zone).
 //! * `pipe`: `{name}` -> `{"collapsed": ...}` (the decided N15 pipe collapse).
+//! * `language`: `{name}` -> `{"unwrapped": ...}` (the decided N16 language-word unwrap).
 //! * `version`: `{}` -> `{"data_version": ...}` (cache namespace).
 
 use crosstalk_matching::callsign::normalize_callsign;
@@ -186,6 +187,9 @@ fn handle(
         }
         "pipe" => serde_json::json!({
             "collapsed": crosstalk_matching::tags::collapse_pipe_segments(str_field(request, "name")),
+        }),
+        "language" => serde_json::json!({
+            "unwrapped": crosstalk_matching::language::unwrap_language_brackets(str_field(request, "name")),
         }),
         _ => serde_json::json!({"error": format!("unknown kind {kind}")}),
     }
